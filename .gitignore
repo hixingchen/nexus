@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+
+# Rust
+src-tauri/target/
+src-tauri/.cargo/
+*.pdb
+*.dmg
+*.msi
+*.nsis
+*.exe
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swn
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Nexus
+.nexus/
+
+# Cache
+.eslintcache
+.stylelintcache
+*.cache
+
+# AI Assistant
+CLAUDE.md
