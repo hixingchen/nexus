@@ -145,6 +145,9 @@ pub fn run() {
             commands::layout::save_layout,
             commands::layout::load_layout,
             commands::editor::set_project_root,
+            commands::claude::claude_start,
+            commands::claude::claude_stop,
+            commands::claude::claude_check,
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

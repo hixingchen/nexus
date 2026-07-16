@@ -4,6 +4,7 @@ import { TitleBar } from './TitleBar';
 import { StatusBar } from './StatusBar';
 import { ResizablePanel } from './ResizablePanel';
 import { DevConsole } from '../terminal/DevConsole';
+import { ClaudeChat } from '../claude';
 import { ProjectList } from './ProjectList';
 import { ProjectDetail } from './ProjectDetail';
 import { RestartConfirm } from './RestartConfirm';
@@ -12,12 +13,15 @@ import { useLogStore } from '../../stores/logStore';
 import type { ServiceLogEvent } from '../../services/logService';
 import { showNotification } from '../ui/Toast';
 
+type BottomPanelTab = 'terminal' | 'claude';
+
 export function MainLayout() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
   const [terminalInitCommand, setTerminalInitCommand] = useState<string | undefined>(undefined);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [bottomPanelTab, setBottomPanelTab] = useState<BottomPanelTab>('terminal');
   const [leftPanelWidth, setLeftPanelWidth] = useState(260);
   const [terminalHeight, setTerminalHeight] = useState(400);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
@@ -166,23 +170,80 @@ export function MainLayout() {
     );
   }
 
+  const bottomPanelContent = (
+    <div className="flex flex-col h-full">
+      {/* 标签栏 */}
+      <div className="flex-shrink-0 flex items-center h-[30px] bg-nexus-surface border-b border-nexus-border/20 px-1 gap-0.5">
+        <button
+          className={`flex items-center gap-1.5 px-2.5 h-[24px] rounded text-[11px] transition-colors ${
+            bottomPanelTab === 'terminal'
+              ? 'bg-nexus-bg text-nexus-text'
+              : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-bg/50'
+          }`}
+          onClick={() => setBottomPanelTab('terminal')}
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M2 3l3.5 3L2 9M7 9h4" />
+          </svg>
+          终端
+        </button>
+        <button
+          className={`flex items-center gap-1.5 px-2.5 h-[24px] rounded text-[11px] transition-colors ${
+            bottomPanelTab === 'claude'
+              ? 'bg-nexus-bg text-nexus-text'
+              : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-bg/50'
+          }`}
+          onClick={() => setBottomPanelTab('claude')}
+        >
+          <span className="text-[12px]">✦</span>
+          Claude Code
+        </button>
+      </div>
+
+      {/* 内容区域 */}
+      <div className="flex-1 overflow-hidden relative">
+        <div
+          className="absolute inset-0"
+          style={{ visibility: bottomPanelTab === 'terminal' ? 'visible' : 'hidden', pointerEvents: bottomPanelTab === 'terminal' ? 'auto' : 'none' }}
+        >
+          <DevConsole
+            projectId={selectedProjectId}
+            projectName={selectedProjectName}
+            projectPath={selectedProjectPath}
+            visible={showTerminal && bottomPanelTab === 'terminal'}
+            terminalInitCommand={terminalInitCommand}
+          />
+        </div>
+        <div
+          className="absolute inset-0"
+          style={{ visibility: bottomPanelTab === 'claude' ? 'visible' : 'hidden', pointerEvents: bottomPanelTab === 'claude' ? 'auto' : 'none' }}
+        >
+          <ClaudeChat
+            workingDir={selectedProjectPath || undefined}
+            visible={showTerminal && bottomPanelTab === 'claude'}
+          />
+        </div>
+      </div>
+    </div>
+  );
+
   const editorWithTerminal = (
     <div className="h-full w-full relative">
-      {/* 终端面板：始终挂载，用 visibility 控制显隐 */}
+      {/* 底部面板：始终挂载，用 visibility 控制显隐 */}
       <div
         className="absolute inset-0"
         style={{ visibility: showTerminal ? 'visible' : 'hidden', pointerEvents: showTerminal ? 'auto' : 'none' }}
       >
         <ResizablePanel
           left={detailPanel}
-          right={<DevConsole projectId={selectedProjectId} projectName={selectedProjectName} projectPath={selectedProjectPath} visible={showTerminal} terminalInitCommand={terminalInitCommand} />}
+          right={bottomPanelContent}
           defaultLeftWidth={terminalHeight}
           minWidth={120}
           direction="vertical"
           onResize={(h) => { setTerminalHeight(h); saveLayout({ terminal_height: String(h) }); }}
         />
       </div>
-      {/* 终端隐藏时显示纯编辑器 */}
+      {/* 面板隐藏时显示纯编辑器 */}
       {!showTerminal && (
         <div className="absolute inset-0">{detailPanel}</div>
       )}
@@ -206,7 +267,12 @@ export function MainLayout() {
       <TitleBar projectName={selectedProjectName} />
       <div className="flex-1 overflow-hidden">{mainContent}</div>
       <RestartConfirm />
-      <StatusBar showTerminal={showTerminal} onToggleTerminal={() => setShowTerminal(p => !p)} />
+      <StatusBar
+        showTerminal={showTerminal}
+        onToggleTerminal={() => setShowTerminal(p => !p)}
+        activeBottomTab={bottomPanelTab}
+        onSwitchBottomTab={setBottomPanelTab}
+      />
     </div>
   );
 }

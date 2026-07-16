@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod editor;
 pub mod layout;
 pub mod process;
