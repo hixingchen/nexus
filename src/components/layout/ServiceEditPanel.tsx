@@ -7,12 +7,23 @@ const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
 
+/** 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致） */
+type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'>;
+
 interface Props {
-  service: Service;
+  service: ServiceConfig;
   onSave: () => void;
+  /** 编辑模式：template 时保存到模板库，并隐藏「另存为模板」 */
+  mode?: 'service' | 'template';
+  /** 面板标题（有值时显示标题栏，区分服务/模板编辑） */
+  title?: string;
+  /** 另存为模板成功后的回调（父组件刷新模板库） */
+  onSavedAsTemplate?: () => void;
+  /** 面板右侧偏移（px）= 服务列宽度：服务列 absolute 覆盖在主区域上，编辑面板需显示在其左侧 */
+  rightOffset?: number;
 }
 
-export function ServiceEditPanel({ service, onSave }: Props) {
+export function ServiceEditPanel({ service, onSave, mode = 'service', title, rightOffset = 360, onSavedAsTemplate }: Props) {
   const [name, setName] = useState(service.name);
   const [command, setCommand] = useState(service.command);
   const [cwd, setCwd] = useState(service.cwd);
@@ -24,6 +35,7 @@ export function ServiceEditPanel({ service, onSave }: Props) {
   const [enabled, setEnabled] = useState(service.enabled);
   const [showFileTree, setShowFileTree] = useState(service.show_file_tree);
   const [saving, setSaving] = useState(false);
+  const [savingTemplate, setSavingTemplate] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // 工具命令状态
@@ -45,15 +57,37 @@ export function ServiceEditPanel({ service, onSave }: Props) {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await serviceApi.update({
+      const payload = {
         id: service.id, name: name.trim() || service.name,
         command, cwd, watchPaths, watchInclude, watchExclude, envVars, restartMode, enabled,
         showFileTree,
         toolCommands: JSON.stringify(toolCommands),
-      });
+      };
+      if (mode === 'template') {
+        await serviceApi.updateTemplate(payload);
+      } else {
+        await serviceApi.update(payload);
+      }
       onSave();
-    } catch (e: unknown) { console.error('保存服务配置失败:', e); showNotification({ variant: 'error', title: '保存服务配置失败', description: String(e) }); }
+    } catch (e: unknown) {
+      console.error('保存配置失败:', e);
+      showNotification({ variant: 'error', title: mode === 'template' ? '保存模板配置失败' : '保存服务配置失败', description: String(e) });
+    }
     setSaving(false);
+  };
+
+  // 另存为模板：值拷贝当前已持久化的服务配置到全局模板库（跨项目复用）
+  const handleSaveAsTemplate = async () => {
+    setSavingTemplate(true);
+    try {
+      const tpl = await serviceApi.saveServiceAsTemplate(service.id);
+      showNotification({ title: `已保存为模板「${tpl.name}」` });
+      onSavedAsTemplate?.();
+    } catch (e: unknown) {
+      console.error('保存模板失败:', e);
+      showNotification({ variant: 'error', title: '保存模板失败', description: String(e) });
+    }
+    setSavingTemplate(false);
   };
 
   // 添加/更新工具命令
@@ -87,7 +121,13 @@ export function ServiceEditPanel({ service, onSave }: Props) {
   const cardCls = "bg-nexus-bg/30 border border-nexus-border/50 rounded-lg p-3.5";
 
   return (
-    <div className="absolute right-0 top-0 bottom-0 w-[360px] bg-nexus-surface border-l border-nexus-border flex flex-col z-10 shadow-2xl">
+    <div className="absolute top-0 bottom-0 w-[360px] bg-nexus-surface border-l border-nexus-border flex flex-col z-10 shadow-2xl"
+      style={{ right: rightOffset }}>
+      {title && (
+        <div className="flex items-center px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
+          <span className="text-[13px] text-nexus-text font-medium">{title}</span>
+        </div>
+      )}
       <div className="flex-1 overflow-auto p-3 space-y-3">
         {/* ── 基本信息卡片 ── */}
         <div className={cardCls}>
@@ -168,11 +208,25 @@ export function ServiceEditPanel({ service, onSave }: Props) {
               { checked: enabled, onChange: setEnabled, label: '跟随项目启动' },
               { checked: showFileTree, onChange: setShowFileTree, label: '在项目列表中显示目录树' },
             ].map((item, i) => (
-              <label key={i} className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors">
-                <input type="checkbox" checked={item.checked} onChange={e => item.onChange(e.target.checked)}
-                  className="w-4 h-4 rounded border-nexus-border bg-nexus-bg accent-nexus-accent" />
-                <span className="text-[13px] text-nexus-text">{item.label}</span>
-              </label>
+              <div
+                key={i}
+                className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+                onClick={() => item.onChange(!item.checked)}
+              >
+                <span className="flex-1 text-[13px] text-nexus-text">{item.label}</span>
+                {/* 开关：选中时 accent 蓝轨道 + 滑块右移 */}
+                <span
+                  role="switch"
+                  aria-checked={item.checked}
+                  className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors ${
+                    item.checked ? 'bg-nexus-accent' : 'bg-nexus-border'
+                  }`}
+                >
+                  <span className={`absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
+                    item.checked ? 'translate-x-[16px]' : ''
+                  }`} />
+                </span>
+              </div>
             ))}
           </div>
         </div>
@@ -284,10 +338,18 @@ export function ServiceEditPanel({ service, onSave }: Props) {
       </div>
 
       {/* 底部 */}
-      <div className="p-3 border-t border-nexus-border flex-shrink-0">
+      <div className="p-3 border-t border-nexus-border flex-shrink-0 space-y-2">
+        {mode !== 'template' && (
+          <button
+            className="w-full px-4 py-1.5 text-[12px] text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 disabled:opacity-40 font-medium transition-colors"
+            disabled={savingTemplate}
+            onClick={handleSaveAsTemplate}
+            title="复制此服务配置到模板库，供其他项目复用"
+          >{savingTemplate ? '保存中…' : '☆ 另存为模板'}</button>
+        )}
         <button
           className="w-full px-4 py-2 text-[13px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover disabled:opacity-40 font-medium transition-colors"
-          disabled={saving || !name.trim()} onClick={handleSave}>{saving ? '保存中…' : '保存配置'}</button>
+          disabled={saving || !name.trim()} onClick={handleSave}>{saving ? '保存中…' : (mode === 'template' ? '保存模板' : '保存配置')}</button>
       </div>
     </div>
   );

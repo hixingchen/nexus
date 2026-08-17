@@ -3,32 +3,74 @@ use std::path::PathBuf;
 use tauri::State;
 use crate::AppState;
 
+/// 在系统终端中打开路径（Windows: 新开 cmd 窗口并定位到目录）
+#[tauri::command]
+pub fn open_terminal(path: String) -> Result<(), String> {
+    log::info!("[nexus] 打开终端: {}", path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_CONSOLE(0x10)：强制新控制台窗口，避免继承父进程（pnpm dev 等）的终端
+        // current_dir 直接设置工作目录（不经 shell，路径含空格/特殊字符都安全），
+        // cmd /K 启动后即停留在该目录，避免 start /D 或 cd /d 的引号嵌套错乱
+        std::process::Command::new("cmd")
+            .current_dir(&path)
+            .creation_flags(0x00000010)
+            .arg("/K")
+            .spawn()
+            .map_err(|e| format!("打开终端失败: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-a").arg("Terminal").arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开终端失败: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("x-terminal-emulator")
+            .arg("--working-directory").arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开终端失败: {}", e))?;
+    }
+    Ok(())
+}
+
 /// 在系统资源管理器中打开路径
 #[tauri::command]
 pub fn open_in_explorer(path: String) -> Result<(), String> {
     let path_buf = PathBuf::from(&path);
-    let target = if path_buf.is_dir() {
-        path.clone()
-    } else {
-        // 文件：打开所在目录
-        path_buf.parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.clone())
-    };
 
-    log::info!("[nexus] 打开资源管理器: {}", target);
+    log::info!("[nexus] 打开资源管理器: {}", path);
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: 使用 cmd /c start 处理中文路径
-        let win_path = target.replace('/', "\\");
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &win_path])
-            .spawn()
+        // Windows: 直接调用 explorer.exe（不经 cmd，避免 %VAR% 展开和 & | ^ 元字符注入）。
+        // 注意：文件场景必须传完整文件路径——/select,<目录> 会让 explorer 打开该目录的父级（少一层）
+        let win_path = path.replace('/', "\\");
+        let is_dir = path_buf.is_dir();
+        let mut cmd = std::process::Command::new("explorer.exe");
+        if is_dir {
+            cmd.arg(&win_path);
+        } else {
+            // 打开所在目录并选中该文件（/select, 必须与路径合并为单参数，否则部分环境只打开目录）
+            cmd.arg(format!("/select,{}", win_path));
+        }
+        cmd.spawn()
             .map_err(|e| format!("打开资源管理器失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
     {
+        // mac 没有"选中文件"的等价能力，文件退化为打开所在目录
+        let target = if path_buf.is_dir() {
+            path.clone()
+        } else {
+            path_buf.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        };
         std::process::Command::new("open")
             .arg(&target)
             .spawn()
@@ -36,6 +78,14 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // linux 同理，退化为打开所在目录
+        let target = if path_buf.is_dir() {
+            path.clone()
+        } else {
+            path_buf.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        };
         std::process::Command::new("xdg-open")
             .arg(&target)
             .spawn()
@@ -62,8 +112,8 @@ pub fn set_project_root(state: State<AppState>, path: Option<String>) -> Result<
     Ok(())
 }
 
-/// 检查路径是否在允许范围内
-fn is_path_allowed(requested: &str, allowed_root: &Option<String>) -> bool {
+/// 检查路径是否在允许范围内（search 等模块复用）
+pub(crate) fn is_path_allowed(requested: &str, allowed_root: &Option<String>) -> bool {
     if let Some(root) = allowed_root {
         // 使用 canonicalize 处理符号链接、.. 等
         let canon_req = match std::fs::canonicalize(requested) {
@@ -81,6 +131,9 @@ fn is_path_allowed(requested: &str, allowed_root: &Option<String>) -> bool {
     }
 }
 
+/// 读取文件大小上限（防止超大文件读入内存导致内存暴涨和 IPC 卡死）
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// 读取文件内容
 #[tauri::command]
 pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
@@ -91,7 +144,27 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<Strin
             return Err("访问被拒绝".into());
         }
     }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > MAX_FILE_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
     tokio::fs::read_to_string(&path).await.map_err(|e| format!("无法读取文件: {}", e))
+}
+
+/// 写入文件内容（与 read_file 同款安全校验：项目白名单 + 大小上限）
+#[tauri::command]
+pub async fn write_file(state: State<'_, AppState>, path: String, content: String) -> Result<(), String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    if (content.len() as u64) > MAX_FILE_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", content.len() as f64 / (1024.0 * 1024.0)));
+    }
+    tokio::fs::write(&path, content).await.map_err(|e| format!("无法写入文件: {}", e))
 }
 
 /// 列出目录内容（允许浏览任意路径，供 FilePicker/FileTree 使用）

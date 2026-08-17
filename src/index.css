@@ -26,11 +26,31 @@ html, body, #root {
 .cm-editor .cm-selectionBackground { background:#3e4451 !important; }
 .cm-editor .cm-matchingBracket { background:#3e4451; color:#61afef !important; }
 
-/* xterm */
-.xterm { padding: 4px; }
-.xterm .xterm-viewport { overflow-y: auto !important; }
-
 ::selection { background: rgba(122,173,232,0.3); }
+
+/* 深色主题滚动条（WebKit/Chromium） */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #484f58; }
+*::-webkit-scrollbar-corner { background: transparent; }
+
+/* Firefox */
+* { scrollbar-width: thin; scrollbar-color: #30363d transparent; }
+
+/* 日志行（LogViewer 每行一个 span，块级布局以便按行裁剪） */
+.log-line { display: block; min-height: 1.2em; }
+
+/* 日志行时间戳列：固定宽度保证对齐，不可选中 */
+.log-ts {
+  color: #484f58;
+  margin-right: 12px;
+  user-select: none;
+  display: inline-block;
+  width: 8ch;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 
 /* 弹窗动画 */
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }

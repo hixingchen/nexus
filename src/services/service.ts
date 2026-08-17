@@ -29,7 +29,6 @@ export interface Project {
   path: string;
   pinned: boolean;
   sort_index: number;
-  terminal_init_command: string;
 }
 
 export interface ProjectDetail {
@@ -39,9 +38,33 @@ export interface ProjectDetail {
 
 export interface ToolCommandResult {
   success: boolean;
-  stdout: string;
-  stderr: string;
+  /** stdout/stderr 按时间序合并的输出（与 cmd 终端展示一致） */
+  output: string;
   exit_code: number | null;
+}
+
+/** 服务模板：跨项目复用的服务配置 */
+export interface ServiceTemplate {
+  id: string;
+  name: string;
+  command: string;
+  cwd: string;
+  watch_paths: string;
+  watch_include: string;
+  watch_exclude: string;
+  env_vars: string;
+  restart_mode: number;
+  enabled: boolean;
+  show_file_tree: boolean;
+  tool_commands: string;
+  created_at: string;
+}
+
+/** 工具命令实时输出事件（run_id 用于区分并发执行） */
+export interface ToolCommandLogPayload {
+  run_id: string;
+  stream: 'stdout' | 'stderr';
+  data: string;
 }
 
 // ─── Service API (scoped to project) ────────────────────────
@@ -107,6 +130,47 @@ export const serviceApi = {
 
   /** 删除服务 */
   delete: (id: string) => invoke<void>('delete_service', { id }),
+
+  // ── 服务模板（跨项目复用） ──
+  getServiceTemplates: () => invoke<ServiceTemplate[]>('get_service_templates'),
+  saveServiceAsTemplate: (serviceId: string) =>
+    invoke<ServiceTemplate>('save_service_as_template', { serviceId }),
+  addServiceFromTemplate: (projectId: string, templateId: string) =>
+    invoke<Service>('add_service_from_template', { projectId, templateId }),
+
+  /** 更新模板配置（编辑模板本身） */
+  updateTemplate: (params: {
+    id: string;
+    name: string;
+    command: string;
+    cwd: string;
+    watchPaths: string;
+    watchInclude: string;
+    watchExclude: string;
+    envVars: string;
+    restartMode: number;
+    enabled: boolean;
+    showFileTree: boolean;
+    toolCommands: string;
+  }) => invoke<void>('update_service_template', {
+    params: {
+      id: params.id,
+      name: params.name,
+      command: params.command,
+      cwd: params.cwd,
+      watchPaths: params.watchPaths,
+      watchInclude: params.watchInclude,
+      watchExclude: params.watchExclude,
+      envVars: params.envVars,
+      restartMode: params.restartMode,
+      enabled: params.enabled,
+      showFileTree: params.showFileTree,
+      toolCommands: params.toolCommands,
+    }
+  }),
+
+  deleteServiceTemplate: (id: string) =>
+    invoke<void>('delete_service_template', { id }),
 };
 
 // ─── Project API ────────────────────────────────────────────
@@ -120,12 +184,12 @@ export const projectApi = {
     invoke<ProjectDetail>('get_project_detail', { projectId }),
 
   /** 创建项目 */
-  add: (name: string, path: string, terminalInitCommand: string = '') =>
-    invoke<Project>('add_project', { name, path, terminalInitCommand }),
+  add: (name: string, path: string) =>
+    invoke<Project>('add_project', { name, path }),
 
   /** 更新项目 */
-  update: (id: string, name: string, path: string, terminalInitCommand: string) =>
-    invoke<void>('update_project', { id, name, path, terminalInitCommand }),
+  update: (id: string, name: string, path: string) =>
+    invoke<void>('update_project', { id, name, path }),
 
   /** 删除项目 */
   delete: (id: string) => invoke<void>('delete_project', { id }),
@@ -138,6 +202,12 @@ export const projectApi = {
 };
 
 // ─── Process API ────────────────────────────────────────────
+
+/** 运行中的服务（含所属项目，供项目级运行状态判断） */
+export interface RunningService {
+  service_id: string;
+  project_id: string;
+}
 
 export const processApi = {
   /** 启动单个服务（传 service_id） */
@@ -160,12 +230,12 @@ export const processApi = {
   stopProject: (projectId: string) =>
     invoke<void>('stop_project_services', { projectId }),
 
-  /** 获取当前运行中的 key 列表 */
-  getRunning: () => invoke<string[]>('get_running'),
+  /** 获取当前运行中的服务（含所属项目） */
+  getRunning: () => invoke<RunningService[]>('get_running'),
 
   /** 执行工具命令 */
-  runToolCommand: (serviceId: string, commandId: string) =>
-    invoke<ToolCommandResult>('run_tool_command', { serviceId, commandId }),
+  runToolCommand: (serviceId: string, commandId: string, runId: string) =>
+    invoke<ToolCommandResult>('run_tool_command', { serviceId, commandId, runId }),
 };
 
 // ─── Watcher API ───────────────────────────────────────────
@@ -175,6 +245,8 @@ export interface FileChange {
   service_name: string;
   service_id: string;
   kind: string;
+  /** 0=关闭监听, 1=确认重启, 2=自动重启 */
+  restart_mode: number;
 }
 
 export interface FileChangeEvent {

@@ -1,5 +1,6 @@
+import { useEffect, useRef } from 'react';
 import { ProjectListItem } from './ProjectListItem';
-import { CreateProjectModal, EditProjectModal, DeleteProjectModal } from './ProjectModals';
+import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProjectModal } from './ProjectModals';
 import { useProjectList } from '../../hooks/useProjectList';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
@@ -20,11 +21,26 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
     ctxMenu, setCtxMenu,
     deleteTarget, setDeleteTarget,
     editTarget, setEditTarget,
+    duplicateTarget, setDuplicateTarget,
     filtered, isProjectRunning, load,
-    handleDuplicate, handleTogglePin,
+    handleTogglePin,
     handleStart, handleStop,
     toggleSvcExpand, toggleExpand,
   } = useProjectList();
+
+  // 关闭右键菜单：mousedown 而非 click（右键新项目触发 contextmenu 不触发 click，
+  // click 会残留旧菜单）；点在菜单内部不关闭，否则菜单项点击失效
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setCtxMenu(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [ctxMenu]);
 
   return (
     <div className="h-full bg-nexus-surface flex flex-col select-none">
@@ -61,6 +77,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
       {ctxMenu && (
         <ContextMenu
           ctx={ctxMenu}
+          menuRef={menuRef}
           onOpenInExplorer={async () => {
             try {
               await invoke('open_in_explorer', { path: ctxMenu.path });
@@ -70,7 +87,16 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
             }
             setCtxMenu(null);
           }}
-          onDuplicate={() => { handleDuplicate(ctxMenu.id); setCtxMenu(null); }}
+          onOpenTerminal={async () => {
+            try {
+              await invoke('open_terminal', { path: ctxMenu.path });
+            } catch (err) {
+              console.error('打开终端失败:', err);
+              showNotification({ variant: 'error', title: '打开终端失败' });
+            }
+            setCtxMenu(null);
+          }}
+          onDuplicate={() => { setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
           onEdit={() => {
             const p = projects.find(pr => pr.id === ctxMenu.id);
             if (p) setEditTarget(p);
@@ -92,6 +118,12 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
         onClose={() => setEditTarget(null)}
         onUpdated={load}
         onProjectName={onProjectName}
+      />
+
+      <DuplicateProjectModal
+        target={duplicateTarget}
+        onClose={() => setDuplicateTarget(null)}
+        onDuplicated={load}
       />
 
       <DeleteProjectModal
@@ -159,9 +191,11 @@ function EmptyState({ search, onNew }: { search: string; onNew: () => void }) {
   );
 }
 
-function ContextMenu({ ctx, onOpenInExplorer, onDuplicate, onEdit, onDelete }: {
+function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplicate, onEdit, onDelete }: {
   ctx: { id: string; name: string; path: string; x: number; y: number };
+  menuRef: React.Ref<HTMLDivElement>;
   onOpenInExplorer: () => void;
+  onOpenTerminal: () => void;
   onDuplicate: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -174,6 +208,7 @@ function ContextMenu({ ctx, onOpenInExplorer, onDuplicate, onEdit, onDelete }: {
 
   return (
     <div
+      ref={menuRef}
       className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
       style={menuStyle}
     >
@@ -189,6 +224,18 @@ function ContextMenu({ ctx, onOpenInExplorer, onDuplicate, onEdit, onDelete }: {
             </svg>
           </div>
           <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
+        </button>
+
+        <button
+          className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          onClick={onOpenTerminal}
+        >
+          <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+            </svg>
+          </div>
+          <span className="text-[12px] text-nexus-text">打开终端</span>
         </button>
 
         <button

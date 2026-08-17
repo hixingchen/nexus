@@ -12,13 +12,12 @@ interface CreateModalProps {
 export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProps) {
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
-  const [terminalInitCommand, setTerminalInitCommand] = useState('');
   const [saving, setSaving] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) {
-      setName(''); setPath(''); setTerminalInitCommand(''); setSaving(false);
+      setName(''); setPath(''); setSaving(false);
       setTimeout(() => nameRef.current?.focus(), 80);
     }
   }, [open]);
@@ -35,7 +34,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
     if (!n || !p) return;
     setSaving(true);
     try {
-      const project = await projectApi.add(n, p, terminalInitCommand);
+      const project = await projectApi.add(n, p);
       onCreated(project);
       onClose();
     } catch (e: unknown) {
@@ -78,20 +77,6 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
             </button>
           </div>
         </div>
-        <div>
-          <label className="text-[11px] font-semibold text-nexus-muted uppercase tracking-wider block mb-1">
-            终端初始命令
-            <span className="font-normal normal-case ml-1 text-nexus-muted/60">（可选）</span>
-          </label>
-          <textarea
-            className="w-full px-3 py-2 text-[13px] bg-nexus-bg border border-nexus-border rounded text-nexus-text font-mono placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent resize-none"
-            placeholder="终端创建时自动执行的命令，例如:&#10;cd src&#10;source .env"
-            rows={3}
-            value={terminalInitCommand}
-            onChange={e => setTerminalInitCommand(e.target.value)}
-          />
-          <p className="text-[11px] text-nexus-muted/50 mt-1">项目终端创建时自动执行，不影响服务终端</p>
-        </div>
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             className="px-4 py-1.5 text-[12px] text-nexus-text-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50"
@@ -120,7 +105,6 @@ interface EditModalProps {
 export function EditProjectModal({ project, onClose, onUpdated, onProjectName }: EditModalProps) {
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
-  const [terminalInitCommand, setTerminalInitCommand] = useState('');
   const [saving, setSaving] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
@@ -128,7 +112,6 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
     if (project) {
       setName(project.name);
       setPath(project.path);
-      setTerminalInitCommand(project.terminal_init_command || '');
       setSaving(false);
       setTimeout(() => nameRef.current?.focus(), 80);
     }
@@ -146,7 +129,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
     if (!n || !p || !project) return;
     setSaving(true);
     try {
-      await projectApi.update(project.id, n, p, terminalInitCommand);
+      await projectApi.update(project.id, n, p);
       onProjectName?.(n);
       showNotification({ title: `已更新「${n}」` });
       onUpdated();
@@ -188,20 +171,6 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3"><rect x="1" y="3" width="12" height="9" rx="1"/><path d="M1 5h12"/><path d="M5 1h2l1 2H5z"/></svg>
             </button>
           </div>
-        </div>
-        <div>
-          <label className="text-[11px] font-semibold text-nexus-muted uppercase tracking-wider block mb-1">
-            终端初始命令
-            <span className="font-normal normal-case ml-1 text-nexus-muted/60">（可选）</span>
-          </label>
-          <textarea
-            className="w-full px-3 py-2 text-[13px] bg-nexus-bg border border-nexus-border rounded text-nexus-text font-mono placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent resize-none"
-            placeholder="终端创建时自动执行的命令，例如:&#10;cd src&#10;source .env"
-            rows={3}
-            value={terminalInitCommand}
-            onChange={e => setTerminalInitCommand(e.target.value)}
-          />
-          <p className="text-[11px] text-nexus-muted/50 mt-1">项目终端创建时自动执行，不影响服务终端</p>
         </div>
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
@@ -264,6 +233,54 @@ export function DeleteProjectModal({ target, onClose, onDeleted, onDeselectIfSel
             disabled={deleting}
             onClick={handleDelete}
           >{deleting ? '删除中…' : '确认删除'}</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+interface DuplicateModalProps {
+  target: { id: string; name: string } | null;
+  onClose: () => void;
+  onDuplicated: () => void;
+}
+
+export function DuplicateProjectModal({ target, onClose, onDuplicated }: DuplicateModalProps) {
+  const [duplicating, setDuplicating] = useState(false);
+
+  const handleDuplicate = async () => {
+    if (!target) return;
+    setDuplicating(true);
+    try {
+      const p = await projectApi.duplicate(target.id);
+      showNotification({ title: `已复制为「${p.name}」` });
+      onDuplicated();
+      onClose();
+    } catch (e: unknown) {
+      showNotification({ variant: 'error', title: String(e) });
+    }
+    setDuplicating(false);
+  };
+
+  return (
+    <Modal open={!!target} title="确认复制" onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-[13px] text-nexus-text">
+          确定要复制项目 <span className="text-nexus-warning font-medium">「{target?.name}」</span> 吗？
+        </p>
+        <p className="text-[12px] text-nexus-muted">
+          将复制该项目及其下所有服务配置，复制后的项目以「副本」命名。
+        </p>
+        <div className="flex items-center justify-end gap-2">
+          <button
+            className="px-4 py-1.5 text-[12px] text-nexus-text-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50"
+            onClick={onClose}
+          >取消</button>
+          <button
+            className="px-5 py-1.5 text-[13px] bg-nexus-accent text-white rounded hover:bg-nexus-accent-hover disabled:opacity-40"
+            disabled={duplicating}
+            onClick={handleDuplicate}
+          >{duplicating ? '复制中…' : '确认复制'}</button>
         </div>
       </div>
     </Modal>

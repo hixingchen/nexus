@@ -12,10 +12,12 @@ export interface ServiceLogEvent {
   service_key: string;
   stream: 'stdout' | 'stderr';
   data: string;
+  /** 行产生时间（RFC3339，后端打点） */
+  timestamp: string;
 }
 
 export const logService = {
   /** 获取某服务的已缓冲日志 */
   getServiceLogs: (serviceKey: string) =>
-    invoke<ServiceLogLine[]>('get_service_logs', { service_key: serviceKey }),
+    invoke<ServiceLogLine[]>('get_service_logs', { serviceKey }),
 };

@@ -1,55 +1,151 @@
-import { useState } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { EditorTabs } from '../editor/EditorTabs';
 import { CodeViewer } from '../editor/CodeViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
+import { ResizablePanel } from './ResizablePanel';
 import { ServiceTreeEntry } from './ServiceTreeEntry';
+import { TemplateTreeEntry } from './TemplateTreeEntry';
+import { SearchResultPanel } from './SearchResultPanel';
 import { AddServiceFormContent } from './AddServiceFormContent';
 import { ServiceEditPanel } from './ServiceEditPanel';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
-import { processApi, type ToolCommandResult } from '../../services/service';
+import { useEditorStore } from '../../stores/editor';
+import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
-import type { Service } from '../../services/service';
+
+// 工具命令输出最多保留的行数（对齐服务日志上限，防止超长输出卡顿）
+const MAX_TOOL_CMD_LOG_LINES = 2000;
 
 interface Props {
   projectId: string;
   servicePanelCollapsed: boolean;
   onToggleServicePanel: () => void;
-  onProjectStart?: () => void;
 }
 
-export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel, onProjectStart }: Props) {
+export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel }: Props) {
   const {
     detail, loading, editingService, setEditingService,
     showAddServiceModal, setShowAddServiceModal,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
-    svcCtxMenu, setSvcCtxMenu, viewingLog, setViewingLog,
+    viewingLog, setViewingLog,
     activeTab, fileContent, load,
     isServiceRunning, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
-  } = useProjectDetail(projectId, onProjectStart);
+  } = useProjectDetail(projectId);
 
-  // 工具命令执行状态
+  // 工具命令执行状态（logs 为执行中的实时输出行数组，结束后由 result 兜底）
   const [toolCommandState, setToolCommandState] = useState<{
     open: boolean;
     loading: boolean;
     commandName: string;
     result: ToolCommandResult | null;
-  }>({ open: false, loading: false, commandName: '', result: null });
+    logs: string[];
+  }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
 
-  // 执行工具命令
+  // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
+  const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
+  const [addingTemplate, setAddingTemplate] = useState(false);
+  const [editingTemplate, setEditingTemplate] = useState<ServiceTemplate | null>(null);
+  const [deleteTplTarget, setDeleteTplTarget] = useState<{ id: string; name: string } | null>(null);
+  const [deletingTpl, setDeletingTpl] = useState(false);
+  // 上半区（项目服务）初始高度：默认 3/5 窗口高度（扣 TitleBar/StatusBar 约 56px），DB 恢复值到达后覆盖
+  const [topPanelHeight, setTopPanelHeight] = useState(() =>
+    Math.round(Math.max(96, Math.min((window.innerHeight - 56) * 0.6, window.innerHeight - 200))));
+  const topPanelMaxHeight = Math.round(window.innerHeight - 200);
+
+  const loadTemplates = useCallback(() => {
+    serviceApi.getServiceTemplates().then(setTemplates).catch(e => console.error('加载模板失败:', e));
+  }, []);
+
+  useEffect(() => {
+    loadTemplates();
+    layoutApi.load().then(l => {
+      if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
+    }).catch(() => {});
+  }, [loadTemplates]);
+
+  // 防抖保存上半区高度（对齐 MainLayout 的布局保存模式）
+  const topHeightTimer = useRef<ReturnType<typeof setTimeout>>();
+  const persistTopPanelHeight = useCallback((h: number) => {
+    clearTimeout(topHeightTimer.current);
+    topHeightTimer.current = setTimeout(() => {
+      layoutApi.save({ right_panel_top_height: String(h) }).catch(e => console.error('保存布局失败:', e));
+    }, 500);
+  }, []);
+  useEffect(() => () => clearTimeout(topHeightTimer.current), []);
+
+  // 执行工具命令（流式：先订阅 tool-command-log 事件实时追加，结束再取完整结果）
   const handleRunToolCommand = async (serviceId: string, commandId: string, commandName: string) => {
-    setToolCommandState({ open: true, loading: true, commandName, result: null });
+    const runId = crypto.randomUUID();
+    setToolCommandState({ open: true, loading: true, commandName, result: null, logs: [] });
+    const unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
+      if (event.payload.run_id !== runId) return;
+      setToolCommandState(prev => {
+        const logs = [...prev.logs, event.payload.data];
+        if (logs.length > MAX_TOOL_CMD_LOG_LINES) logs.splice(0, logs.length - MAX_TOOL_CMD_LOG_LINES);
+        return { ...prev, logs };
+      });
+    });
     try {
-      const result = await processApi.runToolCommand(serviceId, commandId);
-      setToolCommandState(prev => ({ ...prev, loading: false, result }));
+      const result = await processApi.runToolCommand(serviceId, commandId, runId);
+      // 以完整结果兜底（含按序号合并的顺序，避免事件流微乱序；同为最新 N 行）
+      const logs = result.output.split('\n').slice(-MAX_TOOL_CMD_LOG_LINES);
+      setToolCommandState(prev => ({ ...prev, loading: false, result, logs }));
     } catch (err) {
       console.error('执行工具命令失败:', err);
       showNotification({ variant: 'error', title: '执行工具命令失败', description: String(err) });
       setToolCommandState(prev => ({ ...prev, loading: false }));
+    } finally {
+      unlisten();
     }
   };
+
+  // 从模板添加到当前项目（值拷贝，模板不受影响）
+  const handleAddTemplate = async (tpl: ServiceTemplate) => {
+    setAddingTemplate(true);
+    try {
+      await serviceApi.addServiceFromTemplate(projectId, tpl.id);
+      showNotification({ title: `已从模板添加「${tpl.name}」` });
+      await load();
+    } catch (e: unknown) {
+      showNotification({ variant: 'error', title: '添加服务失败', description: String(e) });
+    }
+    setAddingTemplate(false);
+  };
+
+  // 删除模板：先弹确认框（与服务删除流程一致），确认后才执行
+  const requestDeleteTemplate = useCallback((tpl: ServiceTemplate) => {
+    setDeleteTplTarget({ id: tpl.id, name: tpl.name });
+  }, []);
+
+  const confirmDeleteTemplate = useCallback(async () => {
+    if (!deleteTplTarget) return;
+    setDeletingTpl(true);
+    try {
+      await serviceApi.deleteServiceTemplate(deleteTplTarget.id);
+      if (editingTemplate?.id === deleteTplTarget.id) setEditingTemplate(null);
+      loadTemplates();
+      showNotification({ variant: 'warning', title: `已删除模板「${deleteTplTarget.name}」` });
+    } catch (err) {
+      showNotification({ variant: 'error', title: '删除模板失败', description: String(err) });
+    }
+    setDeletingTpl(false);
+    setDeleteTplTarget(null);
+  }, [deleteTplTarget, editingTemplate, loadTemplates]);
+
+  // 打开服务/模板编辑面板（互斥：同一时间只开一个）
+  const openServiceEdit = useCallback((svc: Service) => {
+    setEditingTemplate(null);
+    setEditingService(prev => prev?.id === svc.id ? null : svc);
+  }, []);
+  // 与服务卡片一致：再次点击正在编辑的模板 → 关闭面板
+  const openTemplateEdit = useCallback((tpl: ServiceTemplate) => {
+    setEditingService(null);
+    setEditingTemplate(prev => prev?.id === tpl.id ? null : tpl);
+  }, []);
 
   if (!detail) {
     return (
@@ -62,16 +158,26 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const { project, services } = detail;
 
   return (
-    <div className="h-full bg-nexus-editor flex">
-      {/* 主区域：代码查看器 / 空状态 */}
-      <div className="flex-1 flex flex-col overflow-hidden relative">
+    <div className="h-full bg-nexus-editor flex relative overflow-hidden">
+      {/* 主区域：代码查看器 / 空状态。
+          padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow） */}
+      <div className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
         {viewingLog ? (
-          <LogViewer serviceKey={viewingLog} fill onClose={() => setViewingLog(null)} />
+          <LogViewer
+            serviceKey={viewingLog}
+            serviceName={services.find(s => s.id === viewingLog)?.name}
+            fill
+            onClose={() => setViewingLog(null)}
+          />
         ) : activeTab ? (
           <>
             <EditorTabs />
             <div className="flex-1 overflow-hidden">
-              <CodeViewer filePath={activeTab.path} content={fileContent ?? ''} />
+              <CodeViewer
+                filePath={activeTab.path}
+                content={fileContent ?? ''}
+                onChange={(content) => useEditorStore.getState().updateDraft(content)}
+              />
             </div>
           </>
         ) : (
@@ -83,20 +189,48 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             key={editingService.id}
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
+            onSavedAsTemplate={loadTemplates}
+            // 面板右侧偏移 = 服务列宽度（服务列 absolute 覆盖，编辑面板需显示在其左侧）
+            rightOffset={servicePanelCollapsed ? 32 : 360}
           />
         )}
+
+        {editingTemplate && (
+          <ServiceEditPanel
+            key={`tpl-${editingTemplate.id}`}
+            service={editingTemplate}
+            mode="template"
+            title="编辑模板"
+            onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
+            rightOffset={servicePanelCollapsed ? 32 : 360}
+          />
+        )}
+
+        {/* 底部搜索结果面板（编辑器下方，打开时挤压编辑器高度） */}
+        <SearchResultPanel />
       </div>
 
-      {/* 右侧面板：服务列表（可收缩） */}
+      {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
       <ServicePanel
         services={services}
         collapsed={servicePanelCollapsed}
-        onToggle={onToggleServicePanel}
+        onToggle={() => { onToggleServicePanel(); setEditingService(null); setEditingTemplate(null); }}
+        splitPanel={{
+          bottom: <TemplateSection
+            templates={templates}
+            busy={addingTemplate}
+            editingId={editingTemplate?.id ?? null}
+            onEdit={openTemplateEdit}
+            onAdd={handleAddTemplate}
+            onRequestDelete={requestDeleteTemplate}
+          />,
+          topHeight: topPanelHeight,
+          topMaxHeight: topPanelMaxHeight,
+          onResize: persistTopPanelHeight,
+        }}
         editingService={editingService}
-        setEditingService={setEditingService}
+        onEditService={openServiceEdit}
         isServiceRunning={isServiceRunning}
-        svcCtxMenu={svcCtxMenu}
-        setSvcCtxMenu={setSvcCtxMenu}
         setDeleteSvcTarget={setDeleteSvcTarget}
         setShowAddServiceModal={setShowAddServiceModal}
         handleStartAll={handleStartAll}
@@ -104,6 +238,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         handleViewLog={(svc) => {
           handleViewLog(svc);
           setEditingService(null);
+          setEditingTemplate(null);
         }}
         handleRunToolCommand={handleRunToolCommand}
         loading={loading}
@@ -139,11 +274,33 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         </div>
       </Modal>
 
+      {/* 删除模板确认（与服务删除同款；模板是值拷贝，不影响已添加的项目服务） */}
+      <Modal open={!!deleteTplTarget} title="确认删除" onClose={() => setDeleteTplTarget(null)}>
+        <div className="space-y-4">
+          <p className="text-[13px] text-nexus-text">
+            确定要删除模板 <span className="text-nexus-warning font-medium">「{deleteTplTarget?.name}」</span> 吗？
+          </p>
+          <p className="text-[12px] text-nexus-muted">此操作不可撤销，已从该模板添加的项目服务不受影响。</p>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              className="px-4 py-1.5 text-[12px] text-nexus-text-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50"
+              onClick={() => setDeleteTplTarget(null)}
+            >取消</button>
+            <button
+              className="px-5 py-1.5 text-[13px] bg-nexus-error text-white rounded hover:bg-nexus-error/80 disabled:opacity-40"
+              disabled={deletingTpl}
+              onClick={confirmDeleteTemplate}
+            >{deletingTpl ? '删除中…' : '确认删除'}</button>
+          </div>
+        </div>
+      </Modal>
+
       {/* 工具命令执行结果弹窗 */}
       <ToolCommandResultDialog
         open={toolCommandState.open}
         commandName={toolCommandState.commandName}
         result={toolCommandState.result}
+        logs={toolCommandState.logs}
         loading={toolCommandState.loading}
         onClose={() => setToolCommandState(prev => ({ ...prev, open: false }))}
       />
@@ -169,11 +326,12 @@ interface ServicePanelProps {
   services: Service[];
   collapsed: boolean;
   onToggle: () => void;
+  /** 右侧面板上下分栏配置 */
+  splitPanel: SplitPanel;
   editingService: Service | null;
-  setEditingService: React.Dispatch<React.SetStateAction<Service | null>>;
+  /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
+  onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
-  svcCtxMenu: { id: string; name: string; x: number; y: number } | null;
-  setSvcCtxMenu: (menu: { id: string; name: string; x: number; y: number } | null) => void;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   setShowAddServiceModal: (show: boolean) => void;
   handleStartAll: () => void;
@@ -185,29 +343,34 @@ interface ServicePanelProps {
 }
 
 function ServicePanel({
-  services, collapsed, onToggle, editingService, setEditingService,
-  isServiceRunning, svcCtxMenu, setSvcCtxMenu, setDeleteSvcTarget,
+  services, collapsed, onToggle, splitPanel, editingService, onEditService,
+  isServiceRunning, setDeleteSvcTarget,
   setShowAddServiceModal, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, loading, load,
 }: ServicePanelProps) {
   return (
-    <div className={`bg-nexus-surface border-l border-nexus-border flex flex-col flex-shrink-0 overflow-hidden transition-all duration-200 ${
+    <div className={`absolute right-0 top-0 bottom-0 z-10 flex flex-col flex-shrink-0 overflow-hidden bg-nexus-surface border-l border-nexus-border ${
       collapsed ? 'w-[32px]' : 'w-[360px]'
     }`}>
-      {collapsed ? (
+      {/* 折叠条（32px）：折叠时可见 */}
+      <div className={`h-full transition-opacity duration-200 ${collapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
         <CollapsedView
           services={services}
           isServiceRunning={isServiceRunning}
           onToggle={onToggle}
         />
-      ) : (
+      </div>
+      {/* 展开内容：折叠时用 transform 向右滑出（GPU 合成，不触发布局 reflow，
+          避免日志视图在动画期间每帧重排导致卡顿） */}
+      <div className={`absolute left-0 top-0 bottom-0 w-[360px] transition-transform duration-200 ${
+        collapsed ? 'translate-x-full' : 'translate-x-0'
+      }`}>
         <ExpandedView
           services={services}
+          splitPanel={splitPanel}
           editingService={editingService}
-          setEditingService={setEditingService}
+          onEditService={onEditService}
           isServiceRunning={isServiceRunning}
-          svcCtxMenu={svcCtxMenu}
-          setSvcCtxMenu={setSvcCtxMenu}
           setDeleteSvcTarget={setDeleteSvcTarget}
           setShowAddServiceModal={setShowAddServiceModal}
           handleStartAll={handleStartAll}
@@ -218,7 +381,7 @@ function ServicePanel({
           load={load}
           onToggle={onToggle}
         />
-      )}
+      </div>
     </div>
   );
 }
@@ -250,13 +413,21 @@ function CollapsedView({
   );
 }
 
+/** 右侧面板上下分栏配置：bottom 为下半区模板库内容，topHeight 为上半区（项目服务）高度 */
+interface SplitPanel {
+  bottom: React.ReactNode;
+  topHeight: number;
+  topMaxHeight: number;
+  onResize: (h: number) => void;
+}
+
 interface ExpandedViewProps {
   services: Service[];
+  splitPanel: SplitPanel;
   editingService: Service | null;
-  setEditingService: React.Dispatch<React.SetStateAction<Service | null>>;
+  /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
+  onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
-  svcCtxMenu: { id: string; name: string; x: number; y: number } | null;
-  setSvcCtxMenu: (menu: { id: string; name: string; x: number; y: number } | null) => void;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   setShowAddServiceModal: (show: boolean) => void;
   handleStartAll: () => void;
@@ -269,20 +440,72 @@ interface ExpandedViewProps {
 }
 
 function ExpandedView({
-  services, editingService, setEditingService, isServiceRunning,
-  svcCtxMenu, setSvcCtxMenu, setDeleteSvcTarget, setShowAddServiceModal,
+  services, splitPanel, editingService, onEditService, isServiceRunning,
+  setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   loading, load, onToggle,
 }: ExpandedViewProps) {
   return (
-    <>
+    <ResizablePanel
+      direction="vertical"
+      left={
+        <ServiceSection
+          services={services}
+          editingService={editingService}
+          onEditService={onEditService}
+          isServiceRunning={isServiceRunning}
+          setDeleteSvcTarget={setDeleteSvcTarget}
+          setShowAddServiceModal={setShowAddServiceModal}
+          handleStartAll={handleStartAll}
+          handleStopAll={handleStopAll}
+          handleViewLog={handleViewLog}
+          handleRunToolCommand={handleRunToolCommand}
+          loading={loading}
+          load={load}
+          onToggle={onToggle}
+        />
+      }
+      right={splitPanel.bottom}
+      defaultLeftWidth={splitPanel.topHeight}
+      minWidth={96}
+      maxWidth={splitPanel.topMaxHeight}
+      onResize={splitPanel.onResize}
+    />
+  );
+}
+
+interface ServiceSectionProps {
+  services: Service[];
+  editingService: Service | null;
+  /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
+  onEditService: (svc: Service) => void;
+  isServiceRunning: (svc: Service) => boolean;
+  setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
+  setShowAddServiceModal: (show: boolean) => void;
+  handleStartAll: () => void;
+  handleStopAll: () => void;
+  handleViewLog: (svc: Service) => void;
+  handleRunToolCommand: (serviceId: string, commandId: string, commandName: string) => void;
+  loading: Record<string, boolean>;
+  load: () => void;
+  onToggle: () => void;
+}
+
+function ServiceSection({
+  services, editingService, onEditService, isServiceRunning,
+  setDeleteSvcTarget, setShowAddServiceModal,
+  handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
+  loading, load, onToggle,
+}: ServiceSectionProps) {
+  return (
+    <div className="flex flex-col h-full">
       {/* 头部 */}
       <div className="flex items-center justify-between px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted flex-shrink-0">
             <rect x="1.5" y="1.5" width="11" height="11" rx="2"/><line x1="5" y1="5" x2="9" y2="5"/><line x1="5" y1="7" x2="9" y2="7"/><line x1="5" y1="9" x2="7" y2="9"/>
           </svg>
-          <span className="text-[13px] text-nexus-text font-medium truncate">服务</span>
+          <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
         </div>
         <div className="flex items-center gap-1">
           <button
@@ -297,7 +520,7 @@ function ExpandedView({
           <button
             className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
             title="收起服务列表"
-            onClick={() => { onToggle(); setEditingService(null); }}
+            onClick={onToggle}
           >
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <polyline points="5,2 10,7 5,12" />
@@ -324,30 +547,14 @@ function ExpandedView({
             service={svc}
             running={isServiceRunning(svc)}
             isEditing={editingService?.id === svc.id}
-            onEdit={() => setEditingService(prev => prev?.id === svc.id ? null : svc)}
+            onEdit={() => onEditService(svc)}
             onRefresh={load}
-            onContextMenu={(e, id, name) => setSvcCtxMenu({ id, name, x: e.clientX, y: e.clientY })}
+            onContextMenu={(id, name) => setDeleteSvcTarget({ id, name })}
             onViewLog={() => handleViewLog(svc)}
             onRunToolCommand={handleRunToolCommand}
           />
         ))}
       </div>
-
-      {/* 服务右键菜单 */}
-      {svcCtxMenu && (
-        <div
-          className="fixed z-[70] min-w-[120px] bg-nexus-surface border border-nexus-border rounded-md shadow-xl py-1"
-          style={{ left: svcCtxMenu.x, top: svcCtxMenu.y }}
-        >
-          <button
-            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-nexus-error hover:bg-nexus-error/10 text-left"
-            onClick={() => { setDeleteSvcTarget({ id: svcCtxMenu.id, name: svcCtxMenu.name }); setSvcCtxMenu(null); }}
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3"><line x1="3" y1="6" x2="9" y2="6"/></svg>
-            删除
-          </button>
-        </div>
-      )}
 
       {/* 底部操作 */}
       <div className="flex items-center gap-2 px-4 py-2.5 border-t border-nexus-border flex-shrink-0">
@@ -362,6 +569,57 @@ function ExpandedView({
           onClick={handleStopAll}
         >■ 全部停止</button>
       </div>
-    </>
+    </div>
+  );
+}
+
+// ── 服务模板库区块（右侧面板下半区） ───────────────────────
+
+interface TemplateSectionProps {
+  templates: ServiceTemplate[];
+  busy: boolean;
+  /** 正在编辑的模板 ID（用于卡片高亮） */
+  editingId: string | null;
+  /** 点击模板卡片：打开模板编辑面板 */
+  onEdit: (tpl: ServiceTemplate) => void;
+  onAdd: (tpl: ServiceTemplate) => void;
+  /** 请求删除（父组件弹确认框） */
+  onRequestDelete: (tpl: ServiceTemplate) => void;
+}
+
+function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestDelete }: TemplateSectionProps) {
+  return (
+    <div className="flex flex-col h-full">
+      {/* 头部 */}
+      <div className="flex items-center gap-2 px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted flex-shrink-0">
+          <path d="M7 1.5l1.4 2.9 3.1.4-2.3 2.2.6 3.1L7 8.8l-2.8 1.3.6-3.1L2.5 4.8l3.1-.4L7 1.5z"/>
+        </svg>
+        <span className="text-[13px] text-nexus-text font-medium truncate">服务模板库</span>
+      </div>
+
+      {/* 模板列表 */}
+      <div className="flex-1 overflow-auto py-1">
+        {templates.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
+            <span className="text-[24px] opacity-[0.08] select-none font-extralight mb-2">T</span>
+            <span className="text-[12px] text-nexus-muted mb-1">暂无模板</span>
+            <span className="text-[11px] text-nexus-muted/60">编辑服务时点「另存为模板」创建</span>
+          </div>
+        ) : (
+          templates.map(tpl => (
+            <TemplateTreeEntry
+              key={tpl.id}
+              tpl={tpl}
+              busy={busy}
+              isEditing={tpl.id === editingId}
+              onEdit={onEdit}
+              onAdd={onAdd}
+              onRequestDelete={onRequestDelete}
+            />
+          ))
+        )}
+      </div>
+    </div>
   );
 }

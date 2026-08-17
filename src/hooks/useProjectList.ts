@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { projectApi, processApi, type Project, type Service } from '../services/service';
+import { useRunningStore } from '../stores/runningStore';
 import { showNotification } from '../components/ui/Toast';
 
 /**
@@ -12,7 +13,8 @@ export function useProjectList() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [expandedSvc, setExpandedSvc] = useState<Set<string>>(new Set());
   const [svcCache, setSvcCache] = useState<Record<string, Service[]>>({});
-  const [running, setRunning] = useState<string[]>([]);
+  // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
+  const running = useRunningStore(s => s.running);
   const [actingId, setActingId] = useState<string | null>(null);
 
   // modal state
@@ -20,6 +22,7 @@ export function useProjectList() {
   const [ctxMenu, setCtxMenu] = useState<{ id: string; name: string; path: string; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [editTarget, setEditTarget] = useState<Project | null>(null);
+  const [duplicateTarget, setDuplicateTarget] = useState<{ id: string; name: string } | null>(null);
 
   // ── 数据加载 ──────────────────────────────────────────────
 
@@ -34,28 +37,7 @@ export function useProjectList() {
 
   useEffect(() => { load(); }, [load]);
 
-  // 轮询项目运行状态
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        setRunning(await processApi.getRunning());
-      } catch (e) {
-        console.error('获取运行状态失败:', e);
-        showNotification({ variant: 'error', title: '获取运行状态失败' });
-      }
-    };
-    poll();
-    const i = setInterval(poll, 3000);
-    return () => clearInterval(i);
-  }, []);
-
-  // 点击任意处关闭右键菜单
-  useEffect(() => {
-    if (!ctxMenu) return;
-    const handler = () => setCtxMenu(null);
-    document.addEventListener('click', handler);
-    return () => document.removeEventListener('click', handler);
-  }, [ctxMenu]);
+  // 右键菜单关闭逻辑在 ProjectList 组件内处理（mousedown + 菜单内部不关闭）
 
   // ── 派生状态 ──────────────────────────────────────────────
 
@@ -68,21 +50,11 @@ export function useProjectList() {
   }, [projects, search]);
 
   const isProjectRunning = useCallback((id: string) =>
-    running.some(k => k.startsWith(id + ':')),
+    running.some(r => r.project_id === id),
     [running]
   );
 
   // ── 项目操作 ──────────────────────────────────────────────
-
-  const handleDuplicate = useCallback(async (projectId: string) => {
-    try {
-      const p = await projectApi.duplicate(projectId);
-      await load();
-      showNotification({ title: `已复制为「${p.name}」` });
-    } catch (e: unknown) {
-      showNotification({ variant: 'error', title: String(e) });
-    }
-  }, [load]);
 
   const handleTogglePin = useCallback(async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
@@ -99,7 +71,7 @@ export function useProjectList() {
     setActingId(id);
     try {
       await processApi.startProject(id);
-      setRunning(await processApi.getRunning());
+      await useRunningStore.getState().refresh();
       showNotification({ title: `「${name}」已启动`, description: '所有已启用的服务已启动' });
     } catch (err: unknown) {
       showNotification({ variant: 'error', title: String(err) });
@@ -112,7 +84,7 @@ export function useProjectList() {
     setActingId(id);
     try {
       await processApi.stopProject(id);
-      setRunning(await processApi.getRunning());
+      await useRunningStore.getState().refresh();
       showNotification({ variant: 'info', title: `「${name}」已停止`, description: '所有服务已停止' });
     } catch (err: unknown) {
       showNotification({ variant: 'error', title: String(err) });
@@ -136,6 +108,11 @@ export function useProjectList() {
     const next = new Set(expanded);
     if (next.has(projectId)) {
       next.delete(projectId);
+      // 折叠时失效缓存：避免详情面板编辑/删除服务后左侧仍显示过期数据
+      setSvcCache(prev => {
+        const { [projectId]: _removed, ...rest } = prev;
+        return rest;
+      });
     } else {
       next.clear();
       next.add(projectId);
@@ -158,10 +135,11 @@ export function useProjectList() {
     ctxMenu, setCtxMenu,
     deleteTarget, setDeleteTarget,
     editTarget, setEditTarget,
+    duplicateTarget, setDuplicateTarget,
     filtered,
     isProjectRunning,
     load,
-    handleDuplicate, handleTogglePin,
+    handleTogglePin,
     handleStart, handleStop,
     toggleSvcExpand, toggleExpand,
   };

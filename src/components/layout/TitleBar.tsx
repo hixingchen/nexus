@@ -18,7 +18,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('button, [data-menu]')) return;
-    appWindow.startDragging();
+    appWindow.startDragging().catch(() => { /* 非 mousedown 上下文等场景下拖动被拒绝，忽略 */ });
   }, [appWindow]);
 
   return (

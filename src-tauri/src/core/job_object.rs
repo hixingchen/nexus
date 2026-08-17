@@ -115,25 +115,6 @@ impl JobObject {
         use std::os::windows::io::AsRawHandle;
         self.assign_raw(child.as_raw_handle() as isize, Some(child.id()));
     }
-
-    /// 通过进程 ID 将进程加入 Job Object（最小权限）
-    pub fn assign_by_pid(&self, pid: u32) {
-        extern "system" {
-            fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
-        }
-        const PROCESS_SET_QUOTA: DWORD = 0x0100;
-        const PROCESS_TERMINATE: DWORD = 0x0001;
-        const MINIMAL_ACCESS: DWORD = PROCESS_SET_QUOTA | PROCESS_TERMINATE;
-        unsafe {
-            let handle = OpenProcess(MINIMAL_ACCESS, 0, pid);
-            if handle == 0 {
-                log::warn!("[nexus] ⚠ OpenProcess 失败 (pid={}): {}", pid, std::io::Error::last_os_error());
-                return;
-            }
-            self.assign_raw(handle, Some(pid));
-            CloseHandle(handle);
-        }
-    }
 }
 
 impl Drop for JobObject {
@@ -146,4 +127,4 @@ impl Drop for JobObject {
 }
 
 // JobObject 包含的 HANDLE 是 isize，自动满足 Send + Sync。
-// 通过 Arc<JobObject> 在 TerminalManager 和 ProcessManager 间共享。
+// 通过 Arc<JobObject> 在 ProcessManager 间共享。

@@ -31,7 +31,7 @@ impl Database {
 
 /// 当前 schema 版本号，每次改表结构时递增。
 /// 版本不匹配时自动重建数据库（开发阶段策略，生产环境应做迁移）。
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 fn init_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
@@ -55,9 +55,9 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         }
         // 删旧表重建
         conn.execute_batch("
+            DROP TABLE IF EXISTS service_templates;
             DROP TABLE IF EXISTS services;
             DROP TABLE IF EXISTS projects;
-            DROP TABLE IF EXISTS project_services;
             DROP TABLE IF EXISTS schema_version;
         ").map_err(|e| format!("重建数据库表失败: {}", e))?;
     }
@@ -73,11 +73,26 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             path TEXT NOT NULL DEFAULT '',
             pinned INTEGER NOT NULL DEFAULT 0,
             sort_index INTEGER NOT NULL DEFAULT 0,
-            terminal_init_command TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS services (
             id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, command TEXT NOT NULL DEFAULT '',
+            cwd TEXT NOT NULL DEFAULT '',
+            watch_paths TEXT NOT NULL DEFAULT '[]',
+            watch_include TEXT NOT NULL DEFAULT '*',
+            watch_exclude TEXT NOT NULL DEFAULT 'node_modules\n.git\ndist\ntarget\n__pycache__\n.next\nbuild\ncoverage\n*.log',
+            env_vars TEXT NOT NULL DEFAULT '{}',
+            restart_mode INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            show_file_tree INTEGER NOT NULL DEFAULT 1,
+            sort_index INTEGER NOT NULL DEFAULT 0,
+            tool_commands TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        -- 服务模板库：跨项目复用的服务配置（独立于项目，不随项目删除）
+        CREATE TABLE IF NOT EXISTS service_templates (
+            id TEXT PRIMARY KEY,
             name TEXT NOT NULL, command TEXT NOT NULL DEFAULT '',
             cwd TEXT NOT NULL DEFAULT '',
             watch_paths TEXT NOT NULL DEFAULT '[]',

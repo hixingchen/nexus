@@ -23,6 +23,8 @@ pub struct ServiceWatchConfig {
     pub paths: Vec<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    /// 0=关闭监听, 1=确认重启, 2=自动重启（随事件透传给前端）
+    pub restart_mode: i32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -38,6 +40,8 @@ pub struct FileChange {
     pub service_name: String,
     pub service_id: String,
     pub kind: String,
+    /// 0=关闭监听, 1=确认重启, 2=自动重启（前端据此决定是否直接重启）
+    pub restart_mode: i32,
 }
 
 impl FileWatcher {
@@ -69,8 +73,8 @@ impl FileWatcher {
             return Ok(());
         }
 
-        // channel 用于接收文件事件和停止信号
-        let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
+        // channel 用于接收文件事件和停止信号（有界：接收端慢时丢弃旧事件，避免无限堆积）
+        let (event_tx, event_rx) = mpsc::sync_channel::<notify::Result<Event>>(1024);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -92,6 +96,7 @@ impl FileWatcher {
             let mut last_flush = Instant::now();
 
             loop {
+                let mut should_flush = false;
                 match event_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok(event)) => {
                         let kind = event_kind_str(&event.kind);
@@ -102,27 +107,31 @@ impl FileWatcher {
                                 pending.insert(p, kind.to_string());
                             }
                         }
+                        // 持续事件流下（recv 从不超时）也要在去抖间隔后及时 flush，
+                        // 否则 pending 永不发送且无限累积
+                        should_flush = !pending.is_empty() && last_flush.elapsed() >= debounce;
                     }
                     Ok(Err(_)) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if stop_rx.try_recv().is_ok() { break; }
-                        if !pending.is_empty() && last_flush.elapsed() >= debounce {
-                            let changes = match_changes(&svc_map, &pending);
-                            if !changes.is_empty() {
-                                for c in &changes {
-                                    log::trace!("文件变更 [{}] {}: {}", c.kind, c.service_name, c.path);
-                                }
-                                on_change(FileChangeEvent {
-                                    project_id: pid.clone(),
-                                    project_name: pname.clone(),
-                                    changes,
-                                });
-                            }
-                            pending.clear();
-                            last_flush = Instant::now();
-                        }
+                        should_flush = !pending.is_empty() && last_flush.elapsed() >= debounce;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if should_flush {
+                    let changes = match_changes(&svc_map, &pending);
+                    if !changes.is_empty() {
+                        for c in &changes {
+                            log::trace!("文件变更 [{}] {}: {}", c.kind, c.service_name, c.path);
+                        }
+                        on_change(FileChangeEvent {
+                            project_id: pid.clone(),
+                            project_name: pname.clone(),
+                            changes,
+                        });
+                    }
+                    pending.clear();
+                    last_flush = Instant::now();
                 }
             }
         });
@@ -158,10 +167,10 @@ impl FileWatcher {
                     e.into_inner()
                 }
             };
-            w.drain().map(|(_, mut state)| {
+            w.drain().filter_map(|(_, mut state)| {
                 let _ = state.stop_tx.send(());
                 state.listener_handle.take()
-            }).flatten().collect()
+            }).collect()
         };
         for h in handles {
             let _ = h.join();
@@ -192,7 +201,11 @@ fn normalize_prefix(path: &str) -> String {
     p
 }
 
-/// 检查路径是否匹配 glob 模式（支持 *）
+/// 检查路径是否匹配 glob 模式
+///
+/// 支持的语法子集：`*`（匹配任意）、`*.ext`（按扩展名匹配）、
+/// 无通配符（精确匹配目录名或目录前缀）。`src/**/*.ts` 这类复杂
+/// glob 不支持，会静默不匹配——需要完整 glob 时引入 globset crate。
 fn glob_match(pattern: &str, name: &str) -> bool {
     if pattern == "*" { return true; }
     if !pattern.contains('*') {
@@ -258,6 +271,7 @@ fn match_changes(
                     service_name: svc.name.clone(),
                     service_id: svc.id.clone(),
                     kind: kind.clone(),
+                    restart_mode: svc.restart_mode,
                 });
                 matched = true;
                 break;
@@ -269,6 +283,7 @@ fn match_changes(
                 service_name: "(project)".to_string(),
                 service_id: String::new(),
                 kind: kind.clone(),
+                restart_mode: 0,
             });
         }
     }
@@ -363,6 +378,7 @@ mod tests {
             paths: paths.into_iter().map(String::from).collect(),
             include: include.into_iter().map(String::from).collect(),
             exclude: exclude.into_iter().map(String::from).collect(),
+            restart_mode: 0,
         }
     }
 

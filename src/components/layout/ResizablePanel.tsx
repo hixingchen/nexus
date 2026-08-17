@@ -25,6 +25,15 @@ export function ResizablePanel({
   const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // 外部初始值变化（如布局从数据库异步恢复）时同步内部大小。
+  // 拖拽期间父组件不改 prop（onResize 只做持久化），故不会打断拖拽
+  const lastDefaultRef = useRef(defaultLeftWidth);
+  useEffect(() => {
+    if (lastDefaultRef.current === defaultLeftWidth) return;
+    lastDefaultRef.current = defaultLeftWidth;
+    setSize(defaultLeftWidth);
+  }, [defaultLeftWidth]);
+
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     setIsDragging(true);

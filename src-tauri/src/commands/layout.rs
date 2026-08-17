@@ -6,12 +6,23 @@ use crate::AppState;
 #[tauri::command]
 pub fn save_layout(state: State<AppState>, items: HashMap<String, String>) -> Result<(), String> {
     state.db.with_conn(|conn| {
-        let mut stmt = conn.prepare("INSERT OR REPLACE INTO layout (key, value) VALUES (?1, ?2)")
-            .map_err(|e| format!("准备布局保存语句失败: {}", e))?;
-        for (k, v) in &items {
-            stmt.execute(rusqlite::params![k, v]).map_err(|e| format!("保存布局项 '{}' 失败: {}", k, e))?;
+        // 事务：避免逐条自动提交（多次 fsync），中途失败时整体回滚
+        conn.execute_batch("BEGIN").map_err(|e| format!("开启事务失败: {}", e))?;
+        let result = (|| {
+            let mut stmt = conn.prepare("INSERT OR REPLACE INTO layout (key, value) VALUES (?1, ?2)")
+                .map_err(|e| format!("准备布局保存语句失败: {}", e))?;
+            for (k, v) in &items {
+                stmt.execute(rusqlite::params![k, v]).map_err(|e| format!("保存布局项 '{}' 失败: {}", k, e))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT").map_err(|e| format!("提交事务失败: {}", e)),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-        Ok(())
     })
 }
 

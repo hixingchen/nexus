@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { processApi, type Service, type ToolCommand } from '../../services/service';
 import { showNotification } from '../ui/Toast';
@@ -9,7 +10,7 @@ interface Props {
   isEditing: boolean;
   onEdit: () => void;
   onRefresh: () => void;
-  onContextMenu: (e: React.MouseEvent, id: string, name: string) => void;
+  onContextMenu: (id: string, name: string) => void;
   onViewLog?: () => void;
   onRunToolCommand?: (serviceId: string, commandId: string, commandName: string) => void;
 }
@@ -47,11 +48,8 @@ export function ServiceTreeEntry({
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (toolCommands.length > 0) {
-      setContextMenu({ x: e.clientX, y: e.clientY });
-    } else {
-      onContextMenu(e, service.id, service.name);
-    }
+    // 统一走内部菜单（在资源管理器中打开 / 工具命令 / 删除服务），工具命令为空时自然只显示兜底项
+    setContextMenu({ x: e.clientX, y: e.clientY });
   };
 
   const handleRunCommand = (cmd: ToolCommand) => {
@@ -114,8 +112,10 @@ export function ServiceTreeEntry({
         </div>
       </div>
 
-      {/* 右键菜单 */}
-      {contextMenu && (
+      {/* 右键菜单。
+          Portal 到 body：服务面板有 transform 容器（折叠动画），fixed 定位的菜单
+          若留在其内会以 transform 容器为包含块，导致坐标错位被裁剪而不可见 */}
+      {contextMenu && createPortal(
         <ContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
@@ -130,13 +130,23 @@ export function ServiceTreeEntry({
               showNotification({ variant: 'error', title: '打开资源管理器失败' });
             }
           }}
+          onOpenTerminal={async () => {
+            setContextMenu(null);
+            try {
+              await invoke('open_terminal', { path: service.cwd });
+            } catch (err) {
+              console.error('打开终端失败:', err);
+              showNotification({ variant: 'error', title: '打开终端失败' });
+            }
+          }}
           onRunCommand={handleRunCommand}
           onDelete={() => {
             setContextMenu(null);
-            onContextMenu(new MouseEvent('contextmenu') as any, service.id, service.name);
+            onContextMenu(service.id, service.name);
           }}
           onClose={() => setContextMenu(null)}
-        />
+        />,
+        document.body,
       )}
     </div>
   );
@@ -150,12 +160,13 @@ interface ContextMenuProps {
   cwd: string;
   toolCommands: ToolCommand[];
   onOpenInExplorer: () => void;
+  onOpenTerminal: () => void;
   onRunCommand: (cmd: ToolCommand) => void;
   onDelete: () => void;
   onClose: () => void;
 }
 
-const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
+const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // 点击外部关闭菜单
@@ -186,7 +197,7 @@ const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onRunCommand, 
       className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
       style={menuStyle}
     >
-      {/* 打开资源管理器 */}
+      {/* 打开资源管理器 / 打开终端 */}
       {cwd && (
         <div className="py-1.5 px-1.5">
           <button
@@ -197,6 +208,15 @@ const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onRunCommand, 
               <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
             </svg>
             <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
+          </button>
+          <button
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+            onClick={onOpenTerminal}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
+              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+            </svg>
+            <span className="text-[12px] text-nexus-text">打开终端</span>
           </button>
         </div>
       )}
@@ -219,7 +239,7 @@ const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onRunCommand, 
         </div>
       )}
 
-      {/* 分隔线和删除 */}
+      {/* 删除 */}
       <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
         <button
           className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-error/10 transition-colors group text-left"

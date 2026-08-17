@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type FileChangeEvent } from '../../services/service';
 import { showNotification } from '../ui/Toast';
@@ -11,9 +11,13 @@ type ConfirmItem = {
 };
 
 const MAX_RESTART_ITEMS = 5;
+/** 自动重启的最小间隔（ms）：连续文件变更风暴时避免反复重启 */
+const AUTO_RESTART_DEBOUNCE_MS = 2000;
 
 export function RestartConfirm() {
   const [items, setItems] = useState<ConfirmItem[]>([]);
+  /** 记录 2 秒内已自动重启过的服务，防止事件风暴触发连环重启 */
+  const autoRestartCooldownRef = useRef(new Set<string>());
 
   useEffect(() => {
     const unlisten = listen<FileChangeEvent>('file-changed', (event) => {
@@ -22,6 +26,19 @@ export function RestartConfirm() {
         if (c.service_name === '(project)' || !c.service_id) continue;
         const name = c.service_name;
         const sid = c.service_id;
+
+        // 自动重启模式：不弹确认框，直接重启（带 2 秒冷却去抖）
+        if (c.restart_mode === 2) {
+          if (autoRestartCooldownRef.current.has(sid)) continue;
+          autoRestartCooldownRef.current.add(sid);
+          setTimeout(() => { autoRestartCooldownRef.current.delete(sid); }, AUTO_RESTART_DEBOUNCE_MS);
+          processApi.restart(sid).catch((e) => {
+            console.error('自动重启服务失败:', e);
+            showNotification({ variant: 'error', title: '自动重启失败', description: String(e) });
+          });
+          continue;
+        }
+
         setItems(prev => {
           const existing = prev.find(i => i.serviceId === sid);
           if (existing) {
@@ -46,16 +63,16 @@ export function RestartConfirm() {
 
   const handleRestart = useCallback(async (item: ConfirmItem) => {
     setItems(prev => prev.map(i =>
-      i.serviceName === item.serviceName ? { ...i, restarting: true } : i
+      i.serviceId === item.serviceId ? { ...i, restarting: true } : i
     ));
     try {
       await processApi.restart(item.serviceId);
     } catch (e) { console.error('重启服务失败:', e); showNotification({ variant: 'error', title: '重启服务失败', description: String(e) }); }
-    setItems(prev => prev.filter(i => i.serviceName !== item.serviceName));
+    setItems(prev => prev.filter(i => i.serviceId !== item.serviceId));
   }, []);
 
-  const handleDismiss = useCallback((serviceName: string) => {
-    setItems(prev => prev.filter(i => i.serviceName !== serviceName));
+  const handleDismiss = useCallback((serviceId: string) => {
+    setItems(prev => prev.filter(i => i.serviceId !== serviceId));
   }, []);
 
   if (items.length === 0) return null;
@@ -63,7 +80,7 @@ export function RestartConfirm() {
   return (
     <div className="fixed bottom-10 right-6 z-[80] flex flex-col-reverse gap-3">
       {items.map(item => (
-        <div key={item.serviceName}
+        <div key={item.serviceId}
           className="flex items-center gap-4 bg-nexus-surface border border-nexus-border rounded-xl shadow-2xl pl-5 pr-3 py-3.5 min-w-[340px] max-w-[420px]"
         >
           <svg width="18" height="18" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3"
@@ -91,7 +108,7 @@ export function RestartConfirm() {
 
           <button
             className="p-1.5 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
-            onClick={() => handleDismiss(item.serviceName)}
+            onClick={() => handleDismiss(item.serviceId)}
           >
             <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5">
               <line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/>

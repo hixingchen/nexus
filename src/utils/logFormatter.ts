@@ -126,7 +126,10 @@ function colorizeLogLevels(text: string, addPh: PlaceholderFn): string {
 /** 匹配引号字符串、文件路径、括号并替换为带样式的占位符 */
 function colorizeSyntax(text: string, addPh: PlaceholderFn): string {
   let result = text;
-  result = result.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, match =>
+  // 引号字符串：线性复杂度的转义感知匹配（原惰性回溯模式在引号未闭合的超长行上会卡死主线程）
+  result = result.replace(/"[^"\\]*(?:\\.[^"\\]*)*"/g, match =>
+    addPh(`<span style="color:#fcd34d">${escapeHtml(match)}</span>`));
+  result = result.replace(/'[^'\\]*(?:\\.[^'\\]*)*'/g, match =>
     addPh(`<span style="color:#fcd34d">${escapeHtml(match)}</span>`));
   result = result.replace(/([a-zA-Z\/\\]+\.\w+:\d+)/g, match =>
     addPh(`<span style="color:#c4b5fd">${escapeHtml(match)}</span>`));
@@ -161,18 +164,35 @@ function smartColorize(text: string): string {
   return result;
 }
 
-/** 搜索高亮（使用函数替换器确保 HTML 安全） */
-function highlightSearch(text: string, term: string): string {
-  if (!term.trim()) return text;
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return text.replace(
-    new RegExp(`(${escaped})`, 'gi'),
-    (_match, captured) => `<mark style="background:rgba(251,191,36,0.2);color:#fcd34d;padding:1px 3px;border-radius:3px;border:1px solid rgba(251,191,36,0.3)">${escapeHtml(captured)}</mark>`
-  );
+const SEARCH_MARK_HTML = '<mark style="background:rgba(251,191,36,0.2);color:#fcd34d;padding:1px 3px;border-radius:3px;border:1px solid rgba(251,191,36,0.3)">';
+
+/** 转义正则特殊字符 */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** 渲染单行日志 */
+/**
+ * 渲染单行日志。
+ * 搜索高亮在**文本层**插入占位符（\x01N\x01，不与 smartColorize 内部的 \x00N\x00
+ * 占位符冲突，且不参与着色正则匹配、不被 escapeHtml 转义），着色完成后再恢复为
+ * <mark>——避免直接对已生成的 HTML 做正则高亮时把 mark 注入到
+ * <span style="..."> 标签内部（单字符/短词搜索会污染渲染）。
+ */
 export function renderLine(line: string, searchTerm: string): string {
-  const html = line.includes('\x1b[') ? ansiToHtml(line) : smartColorize(line);
-  return searchTerm ? highlightSearch(html, searchTerm) : html;
+  if (!searchTerm?.trim()) {
+    return line.includes('\x1b[') ? ansiToHtml(line) : smartColorize(line);
+  }
+  // 文本层高亮 → 占位符 → 着色 → 恢复 mark
+  const marks: { id: string; html: string }[] = [];
+  const re = new RegExp(escapeRegExp(searchTerm), 'gi');
+  const marked = line.replace(re, (m) => {
+    const id = `\x01${marks.length}\x01`;
+    marks.push({ id, html: `${SEARCH_MARK_HTML}${escapeHtml(m)}</mark>` });
+    return id;
+  });
+  let html = marked.includes('\x1b[') ? ansiToHtml(marked) : smartColorize(marked);
+  for (const { id, html: h } of marks) {
+    html = html.split(id).join(h);
+  }
+  return html;
 }
