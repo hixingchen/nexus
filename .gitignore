@@ -64,3 +64,6 @@ yarn-error.log*
 
 # AI Assistant
 CLAUDE.md
+
+# 前端调试 harness（CDP 复现用，见 memory/tauri-frontend-test-harness）
+repro/

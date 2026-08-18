@@ -1,8 +1,8 @@
 import { useRef, useState, useEffect } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, type Panel } from '@codemirror/view';
 import { EditorState, StateEffect, StateField } from '@codemirror/state';
-import { defaultKeymap, history, historyKeymap, redo } from '@codemirror/commands';
-import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, type Language, type LanguageSupport } from '@codemirror/language';
+import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
+import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, type LanguageSupport } from '@codemirror/language';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile } from '../../stores/editor';
@@ -28,6 +28,100 @@ interface CodeViewerProps {
   editable?: boolean;
   /** 内容变更回调（每次编辑触发，父组件写回 store） */
   onChange?: (content: string) => void;
+}
+
+/**
+ * 已打开文件的编辑器状态缓存（模块级，跨组件实例存活）：
+ * 切换标签页时编辑器销毁重建，重建 EditorState 会清空 history（Ctrl+Z 失效）——
+ * 缓存 state 复用可保留撤销历史与光标位置。内容被外部修改（watcher 刷新等）
+ * 导致与缓存不一致时自动失效重建。上限防止无限增长。
+ */
+const MAX_CACHED_STATES = 30;
+const stateCache = new Map<string, EditorState>();
+
+/** 缓存 key：打开序号（fileOpenSeq）区分会话——文件树重新打开时序号递增 → 缓存未命中、
+ * 重建编辑器（撤销历史清空）；标签切换不递增 → 缓存命中、历史保留 */
+function cacheKey(filePath: string, editable: boolean, openSeq: number): string {
+  return `${editable ? 'e' : 'r'}:${openSeq}:${filePath}`;
+}
+
+/**
+ * 当前挂载的活动编辑器（全局 Ctrl+Z 转发用）。
+ * CodeMirror 的 keymap 只在编辑器聚焦时接收键盘事件——用户切回文件后焦点
+ * 常在标签栏/文件树上，Ctrl+Z 无反应（内容未撤销却以为撤销了，dirty 提示"保存"
+ * 让人困惑）。焦点在编辑器或输入框时放行（CodeMirror/浏览器自己处理）
+ */
+let activeEditorView: EditorView | null = null;
+
+// ── 双击选中代码块（IDEA 风格，全语言通用） ────────────────
+
+/** 块边界字符：节点以这些符号开头/结尾时视为"块边界"（防双击单词中间误选大块） */
+const BLOCK_BOUNDARY_CHARS = new Set(['{', '}', '(', ')', '[', ']', '<', '>', ';']);
+
+/**
+ * 双击任意位置 → 尝试选中「以该位置为边界」的最大语法节点（IDEA/HBuilder 行为）：
+ * - 双击 { } ( ) [ ] → 代码块/参数列表/数组（节点边界与符号重合）
+ * - 双击 ; → 整条语句（Statement.to 在分号处）
+ * - 双击 JSX/HTML/XML/Vue 标签的 < > 甚至 </ 的 / → 整个元素
+ *   （StartTag 沿同起点扩展为 Element；EndTag 沿同终点扩展为 JSXElement）
+ * 不依赖语言类型或字符白名单：任何语言只要语法树节点边界与双击位置重合即可命中；
+ * 未命中（单词中间等）返回 false，走默认双击选词。
+ */
+const selectBracketBlock = EditorView.domEventHandlers({
+  dblclick(event: MouseEvent, view: EditorView) {
+    const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+    if (pos == null) return false;
+    // 双击可能落在符号上或紧邻符号（如 </ 的 /、} 右侧空白），三处边界都尝试
+    for (const p of [pos, pos - 1, pos + 1]) {
+      const best = findBoundNode(view, p);
+      if (!best) continue;
+      view.dispatch({ selection: { anchor: best.from, head: best.to } });
+      return true; // 阻止默认双击选词
+    }
+    return false;
+  },
+});
+
+/** 找与 pos 边界重合的节点（null = 未命中）。
+ * 开边界：字符在 pos → 节点 from == pos；闭边界：to 排他 → 字符在 pos 时节点 to == pos + 1。
+ * resolve 必须用 side=1（歧义时取"起始于 pos"的节点）——pos 在开括号/标签起点时，
+ * side=-1 会取到 pos 之前的节点导致所有开边界（{ < ( [）全部漏掉 */
+function findBoundNode(view: EditorView, pos: number) {
+  if (pos < 0 || pos > view.state.doc.length) return null;
+  const tree = syntaxTree(view.state);
+  const resolved = tree.resolve(pos, 1) ?? tree.topNode;
+  // 规则1：沿父链记录命中节点——first 为最小命中（{} 边界语义：双击 } 选中块本体），
+  // max 为最大命中（< > ; 等取整元素/整条语句；根节点排除，防文档末尾闭符号选中全文）
+  let node: typeof resolved | null = resolved;
+  let first: typeof resolved | null = null;
+  let max: typeof resolved | null = null;
+  while (node) {
+    if ((node.from === pos || node.to === pos + 1) && node.parent) {
+      if (!first) first = node;
+      max = node;
+    }
+    node = node.parent;
+  }
+  if (!first || first.from >= first.to) return null;
+  // 校验命中节点（最小命中）确实以块边界符号开头或结尾：防双击单词中间/文本节点整块误选。
+  // 注意校验针对 first 而非最终结果——比较运算符 < 扩展为 a < b 表达式后边界是普通字符
+  const fEdgeOpen = view.state.sliceDoc(first.from, first.from + 1);
+  const fEdgeClose = view.state.sliceDoc(first.to - 1, first.to);
+  if (!BLOCK_BOUNDARY_CHARS.has(fEdgeOpen) && !BLOCK_BOUNDARY_CHARS.has(fEdgeClose)) return null;
+  // 规则2：同起点向上扩展（StartTag → Element：双击开始标签的 > 选中整个元素而非仅标签）
+  let cur = max!;
+  while (cur.parent && cur.parent.parent && cur.parent.from === cur.from) {
+    cur = cur.parent;
+  }
+  // 规则3：{} 边界取最小命中（IDEA：双击 } 选中块本身，而非整个函数/类声明）；
+  // 其余（< > ; ( ) [ ]）取最大命中（整元素 / 整条语句 / 参数列表）
+  const chosen = (fEdgeOpen === '{' || fEdgeClose === '}') ? first : cur;
+  // 规则4：命中节点过小（≤2 字符，如比较运算符 a < b 的 <）→ 向上扩展一层到包含它的表达式
+  let result = chosen;
+  if (result.to - result.from <= 2 && result.parent) {
+    result = result.parent;
+  }
+  return result;
 }
 
 // ── 搜索命中高亮（动态装饰：定位时 dispatch 命中区间） ──
@@ -160,6 +254,34 @@ function createSearchPanel(view: EditorView): Panel {
   };
 }
 
+/** 光标是否在 HTML 注释节点内（<!-- -->；主树节点，script/style 的内嵌树不会误判） */
+function isInsideHtmlComment(view: EditorView, pos: number): boolean {
+  const resolved = syntaxTree(view.state).resolveInner(pos, 1);
+  let cur: typeof resolved | null = resolved;
+  while (cur && !cur.type.isTop) {
+    if (cur.name === 'Comment') return true;
+    cur = cur.parent;
+  }
+  return false;
+}
+
+/**
+ * Vue 模板注释修复：@codemirror/lang-vue 0.1.3 的嵌套解析结构导致
+ * languageDataAt("commentTokens") 在 template 普通文本区域查不到配置（isActiveAt 恒 false），
+ * 标准 toggleComment 直接失效。自定义 Mod-/ 分支：
+ * - template 普通文本 / HTML 注释节点 → toggleBlockCommentByLine（<!-- -->，按整行判断，
+ *   取消可靠；toggleComment 对光标在注释内部时按选区范围检测会失效）
+ * - script/style 区域（javascript/css 有自带配置且不在注释节点）→ 标准 toggleComment（行注释或块注释）
+ */
+function vueCommentToggle(view: EditorView): boolean {
+  const pos = view.state.selection.main.head;
+  const hasConfig = view.state.languageDataAt('commentTokens', pos, 1).length > 0;
+  if (hasConfig && !isInsideHtmlComment(view, pos)) {
+    return toggleComment(view);
+  }
+  return toggleBlockCommentByLine(view);
+}
+
 /** 根据文件扩展名获取语言支持 */
 function getLanguageExtension(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -206,6 +328,7 @@ function createEditorState(
     indentOnInput(),
     indentationMarkers(),
     bracketMatching(),
+    selectBracketBlock,
     foldGutter(),
     history(),
     // 文件内搜索（Ctrl+F 打开查找面板，仅编辑器聚焦时生效）
@@ -225,6 +348,9 @@ function createEditorState(
       { key: 'Mod-f', run: openSearchPanel, preventDefault: true },
       { key: 'F3', run: findNext, shift: findPrevious, preventDefault: true },
       { key: 'Mod-g', run: findNext, shift: findPrevious, preventDefault: true },
+      // Vue 模板注释修复（lang-vue 缺陷）：需先于语言包 keymap 注册才优先匹配；
+      // template 区域 HTML 注释，script/style 区域返回 false 交由语言包处理
+      ...(filePath.toLowerCase().endsWith('.vue') ? [{ key: 'Mod-/', run: vueCommentToggle }] : []),
     ]),
     ...getLanguageExtension(filePath),
     EditorView.theme({
@@ -297,27 +423,55 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
   const locate = useEditorStore(s => s.locate);
   const clearLocate = useEditorStore(s => s.clearLocate);
   const hitSeq = useEditorStore(s => s.hitSeq);
+  /** 文件树重新打开序号：递增 = 新会话（重建编辑器清空撤销历史） */
+  const openSeq = useEditorStore(s => s.fileOpenSeq[filePath] ?? 0);
 
   useEffect(() => {
     if (!editorRef.current) return;
 
     viewRef.current?.destroy();
-    const state = createEditorState(
-      contentRef.current,
-      filePath,
-      editable,
-      (doc) => onChangeRef.current?.(doc),
-    );
+    const key = cacheKey(filePath, editable, openSeq);
+    const currentContent = contentRef.current;
+    const cached = stateCache.get(key);
+    let state: EditorState;
+    if (cached && cached.doc.toString() === currentContent) {
+      // 缓存命中且内容未被外部修改 → 复用（保留撤销历史与光标位置）
+      state = cached;
+    } else {
+      // 内容变化（外部刷新/首次打开）→ 重建并更新缓存
+      // 记录会话起点（= 撤销历史锚点）：Ctrl+Z 撤销回该内容时不算未保存
+      useEditorStore.getState().markSessionStart(currentContent);
+      state = createEditorState(
+        currentContent,
+        filePath,
+        editable,
+        (doc) => {
+          onChangeRef.current?.(doc);
+          // EditorState 不可变：每次编辑产生新 state 对象，缓存里的引用会过期
+          // （doc 对比失败 → 切换回来重建 → 撤销历史丢失）。编辑后把最新
+          // state 写回缓存，切换回来 doc 对比命中、Ctrl+Z 历史保留
+          if (viewRef.current) stateCache.set(key, viewRef.current.state);
+        },
+      );
+      stateCache.set(key, state);
+      if (stateCache.size > MAX_CACHED_STATES) {
+        // 超出上限：淘汰最早缓存（Map 迭代顺序 = 插入顺序）
+        const oldestKey = stateCache.keys().next().value;
+        if (oldestKey !== undefined) stateCache.delete(oldestKey);
+      }
+    }
 
     viewRef.current = new EditorView({
       state,
       parent: editorRef.current,
     });
+    activeEditorView = viewRef.current;
 
     return () => {
+      if (activeEditorView === viewRef.current) activeEditorView = null;
       viewRef.current?.destroy();
     };
-  }, [filePath, editable]);
+  }, [filePath, editable, openSeq]);
 
   // 光标不在编辑器时 Ctrl+F 完全无效：
   // 焦点若不在 .cm-editor 内（点击空白/其他面板后编辑器失焦），在捕获阶段吞掉事件，
@@ -331,6 +485,25 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
           e.stopPropagation();
         }
       }
+    };
+    document.addEventListener('keydown', handler, true);
+    return () => document.removeEventListener('keydown', handler, true);
+  }, []);
+
+  // 全局 Ctrl+Z / Ctrl+Shift+Z 转发（焦点不在编辑器/输入框时）：
+  // 切回文件后焦点常在标签栏或文件树，编辑器 keymap 收不到按键——捕获阶段
+  // 转发到活动编辑器，撤销/重做照常生效（dirty 状态也随之正确更新）
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== 'z') return;
+      // 焦点在编辑器/输入框：放行（CodeMirror keymap 或浏览器原生撤销）
+      const el = document.activeElement;
+      if (el instanceof HTMLElement && el.closest('.cm-editor, input, textarea, select, [contenteditable="true"]')) return;
+      const view = activeEditorView;
+      if (!view) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) redo(view); else undo(view);
     };
     document.addEventListener('keydown', handler, true);
     return () => document.removeEventListener('keydown', handler, true);

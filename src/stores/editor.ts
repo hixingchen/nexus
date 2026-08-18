@@ -18,6 +18,12 @@ interface EditorStore {
   /** 定位触发信号：每次请求 +1（同一路径重复点击也生效） */
   revealSeq: number;
 
+  /**
+   * 每文件打开序号：文件树打开（loadAndOpenFile）时递增。
+   * CodeViewer 缓存 key 含此序号——重新打开文件 = 新会话（重建编辑器、撤销历史清空），
+   * 标签切换（switchToTab）不递增（保留历史）。修复"输入一个字符 Ctrl+Z 应回到打开时状态"
+   */
+  fileOpenSeq: Record<string, number>;
   /** 同步操作：打开标签页并设置内容 */
   openTab: (tab: FileTab, content: string) => void;
   closeTab: (id: string) => void;
@@ -28,7 +34,7 @@ interface EditorStore {
   /** 编辑器内容变更：写入草稿并标记当前标签未保存 */
   updateDraft: (content: string) => void;
   markDirty: (id: string) => void;
-  markClean: (id: string) => void;
+  markClean: (id: string, content?: string) => void;
   setLocate: (locate: { path: string; line: number; query: string }) => void;
   clearLocate: () => void;
   /** 清除编辑器中的搜索命中高亮 */
@@ -37,6 +43,8 @@ interface EditorStore {
   requestReveal: (path: string) => void;
   /** 清除定位标记（用户主动切换文件/选中树节点时调用，避免定位高亮残留） */
   clearReveal: () => void;
+  /** 记录当前标签的编辑器会话起点内容（CodeViewer 创建/重建编辑器时调用）：撤销回会话起点不算未保存 */
+  markSessionStart: (content: string) => void;
 }
 
 /**
@@ -61,6 +69,16 @@ const BINARY_EXTS = new Set([
 ]);
 
 const getExt = (path: string) => (path.split('.').pop() ?? '').toLowerCase();
+
+/**
+ * 换行符规范化：\r\n / \r / \n 统一为 \n。
+ * CodeMirror 编辑时会规范化文档换行（实测：CRLF 文件输入一个字符后整个文档变 \n），
+ * 撤销回原文件后 doc.toString() 与基线/打开时内容的换行符可能不同——
+ * 比较前统一，否则 Windows CRLF 文件撤销回最初版本永远算"未保存"
+ */
+function normalizeEOL(s: string): string {
+  return s.replace(/\r\n?/g, '\n');
+}
 
 /** jar:// 虚拟路径 → (jar 路径, 嵌套链, 条目名) */
 export function parseJarVirtualPath(path: string): { jarPath: string; nested: string[]; name: string } {
@@ -105,6 +123,17 @@ function openLoadedTab(tab: FileTab, content: string) {
  * 编辑后内容与基线一致（如撤销回原样）→ 不算未保存
  */
 const baselines = new Map<string, string>();
+/**
+ * 每标签：最初打开时（openTab）的内容，用于 dirty 推导。
+ * 撤销越过保存点回到最初打开版本（内容等于打开时内容但已保存过）→ 不算未保存
+ */
+const openedContents = new Map<string, string>();
+/**
+ * 每标签：编辑器会话起点内容（CodeViewer 创建/重建编辑器时的内容 = 撤销历史锚点）。
+ * 树点击重开（openSeq++）或编辑器重建时锚点可能是草稿等中间内容——
+ * 撤销回该锚点（用户眼中的"最初版本"）也不算未保存
+ */
+const sessionStarts = new Map<string, string>();
 /**
  * 每标签：未保存的草稿内容。切换到该标签时优先用草稿恢复，
  * 否则草稿只存在 store.fileContent（活动标签）里，切换标签会丢失
@@ -152,6 +181,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   activeTabId: null,
   fileContent: null,
   dirtyIds: [],
+  fileOpenSeq: {},
   locate: null,
   hitSeq: 0,
   revealPath: null,
@@ -161,6 +191,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const { tabs } = get();
     setCacheContent(tab.path, content);
     baselines.set(tab.id, content);
+    openedContents.set(tab.id, content);
     set({
       tabs: [...tabs, tab],
       activeTabId: tab.id,
@@ -175,6 +206,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const newDirty = dirtyIds.filter(d => d !== id);
     baselines.delete(id);
     drafts.delete(id);
+    openedContents.delete(id);
+    sessionStarts.delete(id);
 
     if (closedTab && !newTabs.some(t => t.path === closedTab.path)) {
       removeCacheForPath(closedTab.path);
@@ -227,10 +260,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const { activeTabId, dirtyIds } = get();
     if (!activeTabId) return;
     set({ fileContent: content });
-    // 与基线一致（如 Ctrl+Z 撤销回已保存版本）→ 草稿作废并清 dirty；
-    // 否则存草稿（切换标签时可恢复）并标 dirty
+    // 与基线（最后保存版本）一致（如 Ctrl+Z 撤销回保存点）、与最初打开版本一致
+    // （撤销越过保存点回到打开时内容）或与编辑器会话起点一致（撤销回重建时的草稿等）
+    // → 草稿作废并清 dirty；否则存草稿（切换标签时可恢复）并标 dirty。
+    // 比较前统一换行符（CodeMirror 编辑会规范化 CRLF，见 normalizeEOL）
+    const normalized = normalizeEOL(content);
+    const equalTo = (v?: string) => v !== undefined && normalizeEOL(v) === normalized;
+    const opened = openedContents.get(activeTabId);
     const baseline = baselines.get(activeTabId);
-    if (baseline !== undefined && baseline === content) {
+    const sessionStart = sessionStarts.get(activeTabId);
+    if (equalTo(opened) || equalTo(sessionStart) || equalTo(baseline)) {
       drafts.delete(activeTabId);
       if (dirtyIds.includes(activeTabId)) {
         set({ dirtyIds: dirtyIds.filter(d => d !== activeTabId) });
@@ -248,10 +287,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     if (!dirtyIds.includes(id)) set({ dirtyIds: [...dirtyIds, id] });
   },
 
-  markClean: (id) => {
+  markClean: (id, content?: string) => {
     const { dirtyIds, fileContent } = get();
-    // 保存成功后：内容成为新基线，草稿作废
-    baselines.set(id, fileContent ?? '');
+    // 保存成功后：实际写入磁盘的内容成为新基线，草稿作废。
+    // content 由调用方传写盘快照——避免 await 期间用户又编辑导致
+    // fileContent 已是新内容、baseline 错位（撤销到保存点时 dirty 无法清除）
+    baselines.set(id, content ?? fileContent ?? '');
     drafts.delete(id);
     if (dirtyIds.includes(id)) set({ dirtyIds: dirtyIds.filter(d => d !== id) });
   },
@@ -277,6 +318,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   clearReveal: () => {
     set({ revealPath: null });
   },
+
+  markSessionStart: (content) => {
+    const { activeTabId } = get();
+    if (!activeTabId) return;
+    sessionStarts.set(activeTabId, content);
+  },
 }));
 
 // ── 异步操作（组件调用） ──────────────────────────────────
@@ -295,6 +342,13 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
     const { jarPath, nested, name: entryName } = parseJarVirtualPath(path);
     await openJarEntry(jarPath, nested, { name: entryName });
     return;
+  }
+  // 文件树打开 = 新会话：递增打开序号（CodeViewer 缓存 key 含此序号 → 重建编辑器、
+  // 撤销历史清空——输入后 Ctrl+Z 应回到打开时的状态）。标签切换不经过此函数，历史保留
+  {
+    const st = useEditorStore.getState();
+    const seq = (st.fileOpenSeq[path] ?? 0) + 1;
+    useEditorStore.setState({ fileOpenSeq: { ...st.fileOpenSeq, [path]: seq } });
   }
   // 检查是否已打开
   const existing = useEditorStore.getState().tabs.find(t => t.path === path);
@@ -422,9 +476,12 @@ export async function saveActiveFile(): Promise<boolean> {
     return false;
   }
   try {
-    await editorService.writeFile(tab.path, fileContent ?? '');
-    setCacheContent(tab.path, fileContent ?? '');
-    useEditorStore.getState().markClean(activeTabId);
+    // 写盘前捕获快照：markClean 的基线必须等于实际写入磁盘的内容，
+    // 不能用 await 后的 fileContent（保存期间用户可能已继续编辑）
+    const contentToSave = fileContent ?? '';
+    await editorService.writeFile(tab.path, contentToSave);
+    setCacheContent(tab.path, contentToSave);
+    useEditorStore.getState().markClean(activeTabId, contentToSave);
     showNotification({ title: `已保存「${tab.name}」` });
     return true;
   } catch (e) {
