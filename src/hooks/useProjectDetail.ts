@@ -13,6 +13,8 @@ export function useProjectDetail(projectId: string) {
   const [detail, setDetail] = useState<PD | null>(null);
   // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
   const running = useRunningStore(s => s.running);
+  /** 意外退出的服务（崩溃/秒退/spawn 失败） */
+  const failed = useRunningStore(s => s.failed);
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [editingService, setEditingService] = useState<Service | null>(null);
   const [showAddServiceModal, setShowAddServiceModal] = useState(false);
@@ -43,7 +45,7 @@ export function useProjectDetail(projectId: string) {
       ]);
       if (seq !== loadSeqRef.current) return; // 已被更新的请求取代，丢弃过期响应
       setDetail(d);
-      useRunningStore.getState().setRunning(r);
+      useRunningStore.getState().setRunning(r.running, r.failed);
       runningLoadedRef.current = true;
       if (mountedRef.current) {
         watchApi.start(projectId).catch((e) => console.error('启动文件监听失败:', e));
@@ -76,16 +78,31 @@ export function useProjectDetail(projectId: string) {
 
   // ── 日志管理 ──────────────────────────────────────────────
 
+  // 日志面板生命周期：查看的服务既不在运行、也不在失败列表 = 已被主动停止
+  // （项目列表停止 / 单服务停止 / 全部停止）→ 关闭面板 + 清空日志。
+  // 崩溃服务在 failed 列表中，面板保留（报错是诊断关键）；
+  // 服务已从项目配置中删除 → 同样关闭面板并清日志
   useEffect(() => {
-    if (viewingLog && !running.some(r => r.service_id === viewingLog)) {
+    if (!viewingLog) return;
+    const svcExists = detail?.services.some(s => s.id === viewingLog) ?? false;
+    const isActive = running.some(r => r.service_id === viewingLog)
+      || failed.some(f => f.service_id === viewingLog);
+    if (!svcExists || !isActive) {
       setViewingLog(null);
       useLogStore.getState().clearLogs(viewingLog);
     }
-    // running 首次加载成功后才清理，避免挂载瞬间（running 尚为 []）误删正在运行服务的日志
-    if (runningLoadedRef.current) {
-      useLogStore.getState().pruneInactive(new Set(running.map(r => r.service_id)));
-    }
-  }, [running, viewingLog]);
+  }, [viewingLog, running, failed, detail]);
+
+  // 日志保留策略：日志仅在「服务已从项目配置中删除」时由 prune 清理；
+  // running 首次加载成功后才清理，避免挂载瞬间（running 尚为 []）误删日志
+  useEffect(() => {
+    if (!runningLoadedRef.current) return;
+    const activeKeys = new Set([
+      ...running.map(r => r.service_id),
+      ...(detail?.services ?? []).map(s => s.id),
+    ]);
+    useLogStore.getState().pruneInactive(activeKeys);
+  }, [running, detail]);
 
   // ── 服务操作 ──────────────────────────────────────────────
 
@@ -93,6 +110,21 @@ export function useProjectDetail(projectId: string) {
     if (!detail) return false;
     return running.some(r => r.service_id === svc.id);
   }, [detail, running]);
+
+  /** 拖拽排序后本地立即重排 services（不等后端重拉，回弹动画结束后 UI 无缝衔接） */
+  const reorderServicesLocal = useCallback((orderedIds: string[]) => {
+    setDetail(prev => {
+      if (!prev) return prev;
+      const byId = new Map(prev.services.map(s => [s.id, s]));
+      const next = orderedIds.map(id => byId.get(id)).filter((s): s is Service => !!s);
+      return { ...prev, services: next };
+    });
+  }, []);
+
+  /** 服务是否意外失败（崩溃/秒退/spawn 失败）：卡片显示"失败"按钮，日志保留可查看 */
+  const isServiceFailed = useCallback((svc: Service) => {
+    return failed.some(f => f.service_id === svc.id);
+  }, [failed]);
 
   const handleStartAll = useCallback(async () => {
     if (!detail) return;
@@ -113,6 +145,10 @@ export function useProjectDetail(projectId: string) {
     if (!detail) return;
     try {
       await processApi.stopProject(detail.project.id);
+      // 全部停止 = 主动关闭：清空本项目所有服务日志（含失败服务的日志）
+      for (const s of detail.services) {
+        useLogStore.getState().clearLogs(s.id);
+      }
       await load();
     } catch (e: unknown) {
       showNotification({ variant: 'error', title: '停止服务失败', description: String(e) });
@@ -155,7 +191,9 @@ export function useProjectDetail(projectId: string) {
     activeTab,
     fileContent,
     load,
+    reorderServicesLocal,
     isServiceRunning,
+    isServiceFailed,
     handleStartAll,
     handleStopAll,
     handleDeleteService,

@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
-import { useEditorStore, loadAndOpenFile } from '../../stores/editor';
+import { useEditorStore, loadAndOpenFile, parseJarVirtualPath } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
+import { listJar, type JarEntryInfo } from '../../services/editor';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
 import { SvgIcon } from '../ui/SvgIcon';
@@ -14,6 +15,62 @@ const INDENT_STEP = 14;
 const BASE_PADDING = 18;
 /** 目录展开时初始渲染条数，超出后显示"加载更多" */
 const INITIAL_RENDER_LIMIT = 200;
+
+/* ---- jar 虚拟节点（树内展开 jar 条目） ---- */
+
+/** jar 内目录节点的预构建子树缓存：合成目录路径（以 / 结尾）→ 子节点列表 */
+const jarTreeCache = new Map<string, FileEntry[]>();
+
+/** 路径段树节点 */
+interface JarTreeNode {
+  entry?: JarEntryInfo;
+  children?: Map<string, JarTreeNode>;
+}
+
+/** jar 条目扁平列表 → 目录树 FileEntry（目录在前、名称排序；目录子树写入缓存供懒展开） */
+function buildJarTree(realPath: string, nested: string[], entries: JarEntryInfo[]): FileEntry[] {
+  const root = new Map<string, JarTreeNode>();
+  for (const e of entries) {
+    const segs = e.name.split('/');
+    let node = root;
+    for (let i = 0; i < segs.length - 1; i++) {
+      let child = node.get(segs[i]);
+      if (!child || !child.children) {
+        child = { children: new Map() };
+        node.set(segs[i], child);
+      }
+      node = child.children!;
+    }
+    node.set(segs[segs.length - 1], { entry: e });
+  }
+
+  const base = `jar://${realPath}!/${nested.map(n => `${n}!/`).join('')}`;
+  const walk = (map: Map<string, JarTreeNode>, dirPath: string): FileEntry[] => {
+    const dirs: FileEntry[] = [];
+    const files: FileEntry[] = [];
+    for (const [name, node] of map) {
+      const childPath = `${dirPath}${name}`;
+      if (node.children) {
+        const dirPathWithSlash = `${childPath}/`;
+        jarTreeCache.set(dirPathWithSlash, walk(node.children, dirPathWithSlash));
+        dirs.push({ name, path: dirPathWithSlash, is_dir: true, size: 0, extension: null });
+      } else {
+        const e = node.entry!;
+        files.push({
+          name,
+          path: childPath,
+          is_dir: false,
+          size: e.size,
+          extension: name.includes('.') ? name.split('.').pop()!.toLowerCase() : null,
+        });
+      }
+    }
+    dirs.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    files.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    return [...dirs, ...files];
+  };
+  return walk(root, base);
+}
 
 /* ---- Entry ---- */
 interface EntryProps {
@@ -44,16 +101,63 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
   /** 定位目标文件（滚动 + 高亮） */
   const reveal = revealPath === e.path;
 
-  const toggle = useCallback(async () => {
-    if (!e.is_dir) return;
-    if (open) { setOpen(false); return; }
+  /** 可展开节点：磁盘目录 / 磁盘 jar / jar 内目录（jar://…/）/ jar 内嵌套 jar */
+  const isJarPath = e.path.startsWith('jar://');
+  const isJarFile = getExtension(e.name) === 'jar';
+  const expandable = e.is_dir || isJarFile;
+
+  /** 重新加载当前磁盘目录内容（展开与粘贴后刷新共用）。序号复用：粘贴刷新不会与过期展开响应竞争 */
+  const reloadDir = useCallback(async () => {
     const seq = ++toggleSeqRef.current;
     setLoading(true);
     try {
       const list = await invoke<FileEntry[]>('list_directory', { path: e.path });
-      if (seq !== toggleSeqRef.current) return; // 期间用户已折叠，丢弃结果
+      if (seq !== toggleSeqRef.current) return;
       setKids(list);
+      setShowAll(false);
       setOpen(true);
+    } catch (err) {
+      if (seq !== toggleSeqRef.current) return;
+      console.error('刷新目录失败:', err);
+      showNotification({ variant: 'error', title: '刷新目录失败' });
+    } finally {
+      if (seq === toggleSeqRef.current) setLoading(false);
+    }
+  }, [e.path]);
+
+  const toggle = useCallback(async () => {
+    if (!expandable) return;
+    if (open) { setOpen(false); return; }
+    const seq = ++toggleSeqRef.current;
+    setLoading(true);
+    try {
+      if (isJarPath) {
+        // jar 内目录：展开构建时预缓存的子树
+        const cached = jarTreeCache.get(e.path);
+        if (cached) {
+          if (seq !== toggleSeqRef.current) return;
+          setKids(cached);
+          setOpen(true);
+          return;
+        }
+        // jar 内嵌套 jar：列出下一层条目
+        const { jarPath, nested, name } = parseJarVirtualPath(e.path);
+        const chain = [...nested, name];
+        const list = await listJar(jarPath, chain);
+        if (seq !== toggleSeqRef.current) return;
+        setKids(buildJarTree(jarPath, chain, list));
+        setOpen(true);
+        return;
+      }
+      if (isJarFile) {
+        // 磁盘上的 jar：列出条目为虚拟子树
+        const list = await listJar(e.path, []);
+        if (seq !== toggleSeqRef.current) return;
+        setKids(buildJarTree(e.path, [], list));
+        setOpen(true);
+        return;
+      }
+      reloadDir();
     } catch (err) {
       if (seq !== toggleSeqRef.current) return;
       console.error('展开目录失败:', err);
@@ -61,11 +165,11 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     } finally {
       if (seq === toggleSeqRef.current) setLoading(false);
     }
-  }, [e, open]);
+  }, [e, open, expandable, isJarPath, isJarFile, reloadDir]);
 
   const go = () => {
     onSelect(e.path);
-    if (e.is_dir) { toggle(); } else { loadAndOpenFile(e.path, e.name); }
+    if (expandable) { toggle(); } else { loadAndOpenFile(e.path, e.name); }
   };
 
   // 定位请求（点击标签栏定位图标）：revealPath 在此目录下 → 自动加载并展开。
@@ -133,6 +237,31 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     useSearchModalStore.getState().openSearch(e.path, e.name);
   };
 
+  // 复制文件/文件夹到系统剪贴板（可在资源管理器中 Ctrl+V 粘贴）
+  const handleCopy = async () => {
+    setContextMenu(null);
+    try {
+      await invoke('copy_files_to_clipboard', { paths: [e.path] });
+      showNotification({ variant: 'success', title: '已复制，可在资源管理器中粘贴' });
+    } catch (err) {
+      console.error('复制到剪贴板失败:', err);
+      showNotification({ variant: 'error', title: String(err) });
+    }
+  };
+
+  // 粘贴系统剪贴板中的文件到当前目录（成功后刷新目录）
+  const handlePaste = async () => {
+    setContextMenu(null);
+    try {
+      const created = await invoke<string[]>('paste_files', { targetDir: e.path });
+      showNotification({ variant: 'success', title: `已粘贴 ${created.length} 个项目` });
+      reloadDir();
+    } catch (err) {
+      console.error('粘贴失败:', err);
+      showNotification({ variant: 'error', title: String(err) });
+    }
+  };
+
   // 右键菜单
   const handleContextMenu = (ev: React.MouseEvent) => {
     ev.preventDefault();
@@ -177,8 +306,8 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
       >
-        {e.is_dir && (open || hover) && <Chevron open={open} />}
-        {(!e.is_dir || (!open && !hover)) && <span className="w-[10px] flex-shrink-0" />}
+        {expandable && (open || hover) && <Chevron open={open} />}
+        {(!expandable || (!open && !hover)) && <span className="w-[10px] flex-shrink-0" />}
 
         <SvgIcon
           svg={iconSvg}
@@ -201,34 +330,93 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
             top: Math.min(contextMenu.y, window.innerHeight - 200),
           }}
         >
-          {/* 搜索文件内容（主操作，独立一组） */}
-          <div className="py-1.5 px-1.5">
-            <button
-              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-              onClick={handleOpenSearch}
-            >
-              <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
-                  <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
-                </svg>
-              </div>
-              <span className="text-[12px] text-nexus-text">搜索文件内容</span>
-            </button>
-          </div>
+          {/* 磁盘 jar：打开浏览器标签视图 */}
+          {isJarFile && !isJarPath && (
+            <div className="py-1.5 px-1.5">
+              <button
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+                onClick={() => {
+                  setContextMenu(null);
+                  loadAndOpenFile(e.path, e.name);
+                }}
+              >
+                <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                    <rect x="1" y="2" width="8" height="6" rx="1"/>
+                    <path d="M3.5 2v1M6.5 2v1"/>
+                  </svg>
+                </div>
+                <span className="text-[12px] text-nexus-text">打开 jar 浏览器</span>
+              </button>
+            </div>
+          )}
+
+          {/* 搜索文件内容（主操作，独立一组；jar 虚拟节点不支持） */}
+          {!isJarPath && (
+            <div className={`py-1.5 px-1.5 ${isJarFile ? 'border-t border-nexus-border/30' : ''}`}>
+              <button
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+                onClick={handleOpenSearch}
+              >
+                <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                    <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
+                  </svg>
+                </div>
+                <span className="text-[12px] text-nexus-text">搜索文件内容</span>
+              </button>
+            </div>
+          )}
+
+          {/* 复制 / 粘贴（磁盘节点；jar 虚拟节点不支持） */}
+          {!isJarPath && (
+            <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+              <button
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+                onClick={handleCopy}
+              >
+                <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                    <rect x="3.5" y="0.8" width="5.5" height="6" rx="0.8"/>
+                    <rect x="1" y="3.2" width="5.5" height="6" rx="0.8"/>
+                  </svg>
+                </div>
+                <span className="text-[12px] text-nexus-text">复制</span>
+              </button>
+
+              {e.is_dir && (
+                <button
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+                  onClick={handlePaste}
+                >
+                  <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                      <rect x="2" y="1.2" width="6" height="7.6" rx="0.8"/>
+                      <path d="M4.5 2.7h1"/>
+                      <path d="M5 4.5v3M3.7 6.2 5 7.5l1.3-1.3"/>
+                    </svg>
+                  </div>
+                  <span className="text-[12px] text-nexus-text">粘贴到此处</span>
+                </button>
+              )}
+            </div>
+          )}
 
           {/* 在资源管理器中打开 / 复制路径 / 复制文件名 */}
           <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-            <button
-              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-              onClick={handleOpenInExplorer}
-            >
-              <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
-                  <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-                </svg>
-              </div>
-              <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
-            </button>
+            {!isJarPath && (
+              <button
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+                onClick={handleOpenInExplorer}
+              >
+                <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                    <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
+                  </svg>
+                </div>
+                <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
+              </button>
+            )}
 
             <button
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
@@ -259,7 +447,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
         </div>
       )}
 
-      {open && e.is_dir && (
+      {open && expandable && (
         <>
           {loading && (
             <div className="text-[11px] text-nexus-muted py-0.5 relative z-10" style={{ paddingLeft: `${childIndentPx + 20}px` }}>…</div>
@@ -313,13 +501,48 @@ export function FileTree({ rootPath, embedded }: {
   /** 根目录加载序号：快速切换目录时丢弃旧响应，避免显示错目录内容 */
   const rootSeqRef = useRef(0);
 
+  const loadRoot = useCallback(async () => {
+    if (!rootPath) return;
+    const seq = ++rootSeqRef.current;
+    try {
+      const list = await invoke<FileEntry[]>('list_directory', { path: rootPath });
+      if (seq === rootSeqRef.current) { setEntries(list); setErr(null); }
+    } catch (e: unknown) {
+      if (seq === rootSeqRef.current) setErr(String(e));
+    }
+  }, [rootPath]);
+
   useEffect(() => {
     if (!rootPath) { setEntries([]); setErr(null); return; }
-    const seq = ++rootSeqRef.current;
-    invoke<FileEntry[]>('list_directory', { path: rootPath })
-      .then(list => { if (seq === rootSeqRef.current) setEntries(list); })
-      .catch((e: unknown) => { if (seq === rootSeqRef.current) setErr(String(e)); });
-  }, [rootPath]);
+    loadRoot();
+  }, [loadRoot, rootPath]);
+
+  /** 空白区域右键菜单（仅根目录存在时）：粘贴系统剪贴板文件到项目根 */
+  const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
+  const rootMenuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!rootMenu) return;
+    const handleClose = (e: MouseEvent) => {
+      if (rootMenuRef.current && !rootMenuRef.current.contains(e.target as Node)) {
+        setRootMenu(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClose);
+    return () => document.removeEventListener('mousedown', handleClose);
+  }, [rootMenu]);
+
+  const handlePasteToRoot = async () => {
+    setRootMenu(null);
+    if (!rootPath) return;
+    try {
+      const created = await invoke<string[]>('paste_files', { targetDir: rootPath });
+      showNotification({ variant: 'success', title: `已粘贴 ${created.length} 个项目` });
+      loadRoot();
+    } catch (err) {
+      console.error('粘贴失败:', err);
+      showNotification({ variant: 'error', title: String(err) });
+    }
+  };
 
   const basePadding = embedded ? 4 : BASE_PADDING;
 
@@ -333,6 +556,12 @@ export function FileTree({ rootPath, embedded }: {
 
       <div
         className={`overflow-y-auto overflow-x-hidden py-0.5 ${embedded ? '' : 'flex-1'}`}
+        onContextMenu={(ev) => {
+          // 空白区域右键 → 粘贴到项目根（节点自身的 contextmenu 已 stopPropagation，不会冲突）
+          if (!rootPath) return;
+          ev.preventDefault();
+          setRootMenu({ x: ev.clientX, y: ev.clientY });
+        }}
       >
         {!rootPath && (
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">
@@ -349,6 +578,32 @@ export function FileTree({ rootPath, embedded }: {
         {!err && entries.map(ent => (
           <Entry key={ent.path} e={ent} indentPx={basePadding} selectedPath={selectedPath} revealPath={revealPath} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} />
         ))}
+
+        {/* 空白区域右键菜单：粘贴到项目根目录 */}
+        {rootMenu && rootPath && (
+          <div
+            ref={rootMenuRef}
+            className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden py-1.5 px-1.5"
+            style={{
+              left: Math.min(rootMenu.x, window.innerWidth - 188),
+              top: Math.min(rootMenu.y, window.innerHeight - 200),
+            }}
+          >
+            <button
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+              onClick={handlePasteToRoot}
+            >
+              <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+                  <rect x="2" y="1.2" width="6" height="7.6" rx="0.8"/>
+                  <path d="M4.5 2.7h1"/>
+                  <path d="M5 4.5v3M3.7 6.2 5 7.5l1.3-1.3"/>
+                </svg>
+              </div>
+              <span className="text-[12px] text-nexus-text">粘贴到项目根目录</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

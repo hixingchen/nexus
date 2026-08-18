@@ -9,7 +9,7 @@ import { RestartConfirm } from './RestartConfirm';
 import { layoutApi, securityApi, projectApi } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
-import type { ServiceLogEvent } from '../../services/logService';
+import type { LogStream, ServiceLogEvent } from '../../services/logService';
 import { showNotification } from '../ui/Toast';
 
 export function MainLayout() {
@@ -25,7 +25,7 @@ export function MainLayout() {
   const logListenerRef = useRef<{ unlisten: () => void } | null>(null);
 
   useEffect(() => {
-    type Item = { serviceKey: string; stream: 'stdout' | 'stderr'; data: string; timestamp?: string };
+    type Item = { serviceKey: string; stream: LogStream; data: string; timestamp?: string };
     const batch: Item[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;

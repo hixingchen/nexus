@@ -37,6 +37,7 @@ const registry: Record<string, string> = {
   toml: tomlSvg,
   java: javaSvg,
   class: javaSvg,
+  jar: fileSvg,
   dockerfile: dockerSvg,
   lock: lockSvg,
   vue: vueSvg,

@@ -4,6 +4,7 @@ import { EditorTabs } from '../editor/EditorTabs';
 import { CodeViewer } from '../editor/CodeViewer';
 import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
+import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
@@ -13,6 +14,15 @@ import { TemplateTreeEntry } from './TemplateTreeEntry';
 import { SearchResultPanel } from './SearchResultPanel';
 import { AddServiceFormContent } from './AddServiceFormContent';
 import { ServiceEditPanel } from './ServiceEditPanel';
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
 import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
@@ -33,8 +43,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     showAddServiceModal, setShowAddServiceModal,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
-    activeTab, fileContent, load,
-    isServiceRunning, handleStartAll, handleStopAll,
+    activeTab, fileContent, load, reorderServicesLocal,
+    isServiceRunning, isServiceFailed, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
 
@@ -78,6 +88,29 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     }, 500);
   }, []);
   useEffect(() => () => clearTimeout(topHeightTimer.current), []);
+
+  // 拖拽排序持久化：本地立即重排（回弹动画结束后 UI 无缝衔接，不等后端重拉），
+  // 异步写入后端；失败才重载恢复后端顺序
+  const handleReorderServices = useCallback((orderedIds: string[]) => {
+    const pid = detail?.project?.id;
+    if (!pid) return;
+    reorderServicesLocal(orderedIds);
+    serviceApi.reorderServices(pid, orderedIds).catch(e => {
+      showNotification({ variant: 'error', title: '保存服务排序失败', description: String(e) });
+      load();
+    });
+  }, [detail?.project?.id, reorderServicesLocal, load]);
+
+  const handleReorderTemplates = useCallback((orderedIds: string[]) => {
+    setTemplates(prev => {
+      const byId = new Map(prev.map(t => [t.id, t]));
+      return orderedIds.map(id => byId.get(id)).filter((t): t is ServiceTemplate => !!t);
+    });
+    serviceApi.reorderServiceTemplates(orderedIds).catch(e => {
+      showNotification({ variant: 'error', title: '保存模板排序失败', description: String(e) });
+      loadTemplates();
+    });
+  }, [loadTemplates]);
 
   // 执行工具命令（流式：先订阅 tool-command-log 事件实时追加，结束再取完整结果）
   const handleRunToolCommand = async (serviceId: string, commandId: string, commandName: string) => {
@@ -179,6 +212,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                 <ImageViewer path={activeTab.path} name={activeTab.name} />
               ) : activeTab.viewerType === 'hex' ? (
                 <HexViewer path={activeTab.path} />
+              ) : activeTab.viewerType === 'jar' ? (
+                <JarViewer path={activeTab.path} />
               ) : (
                 <CodeViewer
                   filePath={activeTab.path}
@@ -232,6 +267,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             onEdit={openTemplateEdit}
             onAdd={handleAddTemplate}
             onRequestDelete={requestDeleteTemplate}
+            onReorderTemplates={handleReorderTemplates}
           />,
           topHeight: topPanelHeight,
           topMaxHeight: topPanelMaxHeight,
@@ -240,6 +276,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         editingService={editingService}
         onEditService={openServiceEdit}
         isServiceRunning={isServiceRunning}
+        isServiceFailed={isServiceFailed}
         setDeleteSvcTarget={setDeleteSvcTarget}
         setShowAddServiceModal={setShowAddServiceModal}
         handleStartAll={handleStartAll}
@@ -250,6 +287,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           setEditingTemplate(null);
         }}
         handleRunToolCommand={handleRunToolCommand}
+        handleReorderServices={handleReorderServices}
         loading={loading}
         load={load}
       />
@@ -341,21 +379,24 @@ interface ServicePanelProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
+  isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   setShowAddServiceModal: (show: boolean) => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
   handleRunToolCommand: (serviceId: string, commandId: string, commandName: string) => void;
+  /** 服务卡片拖拽排序持久化 */
+  handleReorderServices: (orderedIds: string[]) => void;
   loading: Record<string, boolean>;
   load: () => void;
 }
 
 function ServicePanel({
   services, collapsed, onToggle, splitPanel, editingService, onEditService,
-  isServiceRunning, setDeleteSvcTarget,
+  isServiceRunning, isServiceFailed, setDeleteSvcTarget,
   setShowAddServiceModal, handleStartAll, handleStopAll, handleViewLog,
-  handleRunToolCommand, loading, load,
+  handleRunToolCommand, handleReorderServices, loading, load,
 }: ServicePanelProps) {
   return (
     <div className={`absolute right-0 top-0 bottom-0 z-10 flex flex-col flex-shrink-0 overflow-hidden bg-nexus-surface border-l border-nexus-border ${
@@ -366,6 +407,7 @@ function ServicePanel({
         <CollapsedView
           services={services}
           isServiceRunning={isServiceRunning}
+          isServiceFailed={isServiceFailed}
           onToggle={onToggle}
         />
       </div>
@@ -380,12 +422,14 @@ function ServicePanel({
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
+          isServiceFailed={isServiceFailed}
           setDeleteSvcTarget={setDeleteSvcTarget}
           setShowAddServiceModal={setShowAddServiceModal}
           handleStartAll={handleStartAll}
           handleStopAll={handleStopAll}
           handleViewLog={handleViewLog}
           handleRunToolCommand={handleRunToolCommand}
+          handleReorderServices={handleReorderServices}
           loading={loading}
           load={load}
           onToggle={onToggle}
@@ -396,10 +440,11 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, onToggle,
+  services, isServiceRunning, isServiceFailed, onToggle,
 }: {
   services: Service[];
   isServiceRunning: (svc: Service) => boolean;
+  isServiceFailed: (svc: Service) => boolean;
   onToggle: () => void;
 }) {
   return (
@@ -412,9 +457,9 @@ function CollapsedView({
         {services.map(svc => (
           <span key={svc.id}
             className={`w-[6px] h-[6px] rounded-full flex-shrink-0 ${
-              isServiceRunning(svc) ? 'bg-nexus-success' : 'bg-nexus-muted/30'
+              isServiceRunning(svc) ? 'bg-nexus-success' : isServiceFailed(svc) ? 'bg-nexus-error' : 'bg-nexus-muted/30'
             }`}
-            title={`${svc.name}${isServiceRunning(svc) ? ' (运行中)' : ''}`}
+            title={`${svc.name}${isServiceRunning(svc) ? ' (运行中)' : isServiceFailed(svc) ? ' (失败)' : ''}`}
           />
         ))}
       </div>
@@ -437,21 +482,25 @@ interface ExpandedViewProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
+  isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   setShowAddServiceModal: (show: boolean) => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
   handleRunToolCommand: (serviceId: string, commandId: string, commandName: string) => void;
+  /** 服务卡片拖拽排序持久化 */
+  handleReorderServices: (orderedIds: string[]) => void;
   loading: Record<string, boolean>;
   load: () => void;
   onToggle: () => void;
 }
 
 function ExpandedView({
-  services, splitPanel, editingService, onEditService, isServiceRunning,
+  services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
+  handleReorderServices,
   loading, load, onToggle,
 }: ExpandedViewProps) {
   return (
@@ -463,12 +512,14 @@ function ExpandedView({
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
+          isServiceFailed={isServiceFailed}
           setDeleteSvcTarget={setDeleteSvcTarget}
           setShowAddServiceModal={setShowAddServiceModal}
           handleStartAll={handleStartAll}
           handleStopAll={handleStopAll}
           handleViewLog={handleViewLog}
           handleRunToolCommand={handleRunToolCommand}
+          handleReorderServices={handleReorderServices}
           loading={loading}
           load={load}
           onToggle={onToggle}
@@ -489,23 +540,40 @@ interface ServiceSectionProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
+  isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   setShowAddServiceModal: (show: boolean) => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
   handleRunToolCommand: (serviceId: string, commandId: string, commandName: string) => void;
+  /** 服务卡片拖拽排序持久化 */
+  handleReorderServices: (orderedIds: string[]) => void;
   loading: Record<string, boolean>;
   load: () => void;
   onToggle: () => void;
 }
 
 function ServiceSection({
-  services, editingService, onEditService, isServiceRunning,
+  services, editingService, onEditService, isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
-  loading, load, onToggle,
+  handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
+  // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
+  // 快速点击照常打开编辑面板
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const handleDragEnd = useCallback((event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = services.findIndex(s => s.id === active.id);
+    const newIndex = services.findIndex(s => s.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    handleReorderServices(arrayMove(services, oldIndex, newIndex).map(s => s.id));
+  }, [services, handleReorderServices]);
   return (
     <div className="flex flex-col h-full">
       {/* 头部 */}
@@ -538,7 +606,7 @@ function ServiceSection({
         </div>
       </div>
 
-      {/* 服务列表 */}
+      {/* 服务列表（dnd-kit 拖拽排序：拖手柄排序，整卡点击编辑） */}
       <div className="flex-1 overflow-auto py-1">
         {services.length === 0 && (
           <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
@@ -550,19 +618,24 @@ function ServiceSection({
             >添加服务</button>
           </div>
         )}
-        {services.map(svc => (
-          <ServiceTreeEntry
-            key={svc.id}
-            service={svc}
-            running={isServiceRunning(svc)}
-            isEditing={editingService?.id === svc.id}
-            onEdit={() => onEditService(svc)}
-            onRefresh={load}
-            onContextMenu={(id, name) => setDeleteSvcTarget({ id, name })}
-            onViewLog={() => handleViewLog(svc)}
-            onRunToolCommand={handleRunToolCommand}
-          />
-        ))}
+        <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+          <SortableContext items={services.map(s => s.id)} strategy={verticalListSortingStrategy}>
+            {services.map(svc => (
+              <ServiceTreeEntry
+                key={svc.id}
+                service={svc}
+                running={isServiceRunning(svc)}
+                failed={isServiceFailed(svc)}
+                isEditing={editingService?.id === svc.id}
+                onEdit={() => onEditService(svc)}
+                onRefresh={load}
+                onContextMenu={(id, name) => setDeleteSvcTarget({ id, name })}
+                onViewLog={() => handleViewLog(svc)}
+                onRunToolCommand={handleRunToolCommand}
+              />
+            ))}
+          </SortableContext>
+        </DndContext>
       </div>
 
       {/* 底部操作 */}
@@ -594,9 +667,25 @@ interface TemplateSectionProps {
   onAdd: (tpl: ServiceTemplate) => void;
   /** 请求删除（父组件弹确认框） */
   onRequestDelete: (tpl: ServiceTemplate) => void;
+  /** 模板卡片拖拽排序持久化 */
+  onReorderTemplates: (orderedIds: string[]) => void;
 }
 
-function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestDelete }: TemplateSectionProps) {
+function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestDelete, onReorderTemplates }: TemplateSectionProps) {
+  // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
+  // 快速点击照常打开编辑面板
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const handleDragEnd = useCallback((event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = templates.findIndex(t => t.id === active.id);
+    const newIndex = templates.findIndex(t => t.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    onReorderTemplates(arrayMove(templates, oldIndex, newIndex).map(t => t.id));
+  }, [templates, onReorderTemplates]);
   return (
     <div className="flex flex-col h-full">
       {/* 头部 */}
@@ -607,7 +696,7 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
         <span className="text-[13px] text-nexus-text font-medium truncate">服务模板库</span>
       </div>
 
-      {/* 模板列表 */}
+      {/* 模板列表（dnd-kit 拖拽排序：拖手柄排序，整卡点击编辑） */}
       <div className="flex-1 overflow-auto py-1">
         {templates.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
@@ -616,17 +705,21 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
             <span className="text-[11px] text-nexus-muted/60">编辑服务时点「另存为模板」创建</span>
           </div>
         ) : (
-          templates.map(tpl => (
-            <TemplateTreeEntry
-              key={tpl.id}
-              tpl={tpl}
-              busy={busy}
-              isEditing={tpl.id === editingId}
-              onEdit={onEdit}
-              onAdd={onAdd}
-              onRequestDelete={onRequestDelete}
-            />
-          ))
+          <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+            <SortableContext items={templates.map(t => t.id)} strategy={verticalListSortingStrategy}>
+              {templates.map(tpl => (
+                <TemplateTreeEntry
+                  key={tpl.id}
+                  tpl={tpl}
+                  busy={busy}
+                  isEditing={tpl.id === editingId}
+                  onEdit={onEdit}
+                  onAdd={onAdd}
+                  onRequestDelete={onRequestDelete}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
         )}
       </div>
     </div>

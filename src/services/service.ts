@@ -131,8 +131,15 @@ export const serviceApi = {
   /** 删除服务 */
   delete: (id: string) => invoke<void>('delete_service', { id }),
 
+  /** 重排项目服务顺序（orderedIds 为新的展示顺序） */
+  reorderServices: (projectId: string, orderedIds: string[]) =>
+    invoke<void>('reorder_services', { projectId, orderedIds }),
+
   // ── 服务模板（跨项目复用） ──
   getServiceTemplates: () => invoke<ServiceTemplate[]>('get_service_templates'),
+  /** 重排服务模板顺序 */
+  reorderServiceTemplates: (orderedIds: string[]) =>
+    invoke<void>('reorder_service_templates', { orderedIds }),
   saveServiceAsTemplate: (serviceId: string) =>
     invoke<ServiceTemplate>('save_service_as_template', { serviceId }),
   addServiceFromTemplate: (projectId: string, templateId: string) =>
@@ -209,6 +216,20 @@ export interface RunningService {
   project_id: string;
 }
 
+/** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */
+export interface FailedService {
+  service_id: string;
+  /** spawn 失败（进程未启动）时为 null */
+  exit_code: number | null;
+  timestamp: string;
+}
+
+/** 运行状态总览：运行中 + 意外失败 */
+export interface ProcessStatus {
+  running: RunningService[];
+  failed: FailedService[];
+}
+
 export const processApi = {
   /** 启动单个服务（传 service_id） */
   start: (serviceId: string) =>
@@ -230,8 +251,8 @@ export const processApi = {
   stopProject: (projectId: string) =>
     invoke<void>('stop_project_services', { projectId }),
 
-  /** 获取当前运行中的服务（含所属项目） */
-  getRunning: () => invoke<RunningService[]>('get_running'),
+  /** 获取运行状态总览（运行中 + 意外失败） */
+  getRunning: () => invoke<ProcessStatus>('get_running'),
 
   /** 执行工具命令 */
   runToolCommand: (serviceId: string, commandId: string, runId: string) =>

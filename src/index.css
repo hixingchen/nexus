@@ -41,6 +41,9 @@ html, body, #root {
 /* 日志行（LogViewer 每行一个 span，块级布局以便按行裁剪） */
 .log-line { display: block; min-height: 1.2em; }
 
+/* 系统标记行（启动失败/退出码/停止）：黄色斜体，与进程输出区分 */
+.log-line-system { color: #d29922; font-style: italic; }
+
 /* 日志行时间戳列：固定宽度保证对齐，不可选中 */
 .log-ts {
   color: #484f58;

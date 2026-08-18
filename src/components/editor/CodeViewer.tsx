@@ -19,6 +19,7 @@ import { rust } from '@codemirror/lang-rust';
 import { go } from '@codemirror/lang-go';
 import { sql } from '@codemirror/lang-sql';
 import { vue } from '@codemirror/lang-vue';
+import { xml } from '@codemirror/lang-xml';
 
 interface CodeViewerProps {
   filePath: string;
@@ -183,6 +184,7 @@ function getLanguageExtension(filePath: string) {
     go: () => go(),
     sql: () => sql(),
     vue: () => vue(),
+    xml: () => xml(),
     class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
   };
 

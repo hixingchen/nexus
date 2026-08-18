@@ -1,12 +1,17 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { processApi, type Service, type ToolCommand } from '../../services/service';
+import { useLogStore } from '../../stores/logStore';
 import { showNotification } from '../ui/Toast';
 
 interface Props {
   service: Service;
   running: boolean;
+  /** 意外失败（崩溃/秒退/spawn 失败）：显示"失败"按钮，点击可查看日志 */
+  failed: boolean;
   isEditing: boolean;
   onEdit: () => void;
   onRefresh: () => void;
@@ -16,8 +21,24 @@ interface Props {
 }
 
 export function ServiceTreeEntry({
-  service, running, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
+  service, running, failed, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
 }: Props) {
+  // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板）
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition: isDragging ? 'none' : transition,
+    zIndex: isDragging ? 50 : 'auto' as const,
+  };
+  /** 本次点击前发生过拖拽（长按松手会触发 click，需跳过编辑打开） */
+  const draggedRef = useRef(false);
+  useEffect(() => {
+    if (isDragging) draggedRef.current = true;
+  }, [isDragging]);
+  const handleClick = () => {
+    if (draggedRef.current) { draggedRef.current = false; return; }
+    onEdit();
+  };
   const [busy, setBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
@@ -35,12 +56,18 @@ export function ServiceTreeEntry({
     setBusy(true);
     try {
       if (action === 'start') await processApi.start(service.id);
-      else if (action === 'stop') await processApi.stop(service.id);
+      else if (action === 'stop') {
+        await processApi.stop(service.id);
+        // 正常停止：日志清空（后端已清缓冲，前端缓存同步清）
+        useLogStore.getState().clearLogs(service.id);
+      }
       else await processApi.restart(service.id);
       onRefresh();
     } catch (err: unknown) {
       console.error(String(err));
       showNotification({ variant: 'error', title: `${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, description: String(err) });
+      // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
+      if (action === 'start') onRefresh();
     }
     setBusy(false);
   };
@@ -58,27 +85,33 @@ export function ServiceTreeEntry({
   };
 
   return (
-    <div className="px-2 py-0.5">
+    <div className="px-2 py-0.5" ref={setNodeRef} style={style}>
       <div
-        className={`cursor-pointer group rounded-md px-3 py-2.5 ${
+        {...attributes}
+        {...listeners}
+        className={`cursor-pointer group rounded-md px-3 py-2.5 transition-colors select-none ${
           isEditing
             ? 'bg-nexus-accent/10 border border-nexus-accent/30'
             : 'bg-nexus-bg/30 border border-nexus-border hover:border-nexus-muted/70'
-        }`}
-        onClick={onEdit}
+        } ${isDragging ? 'shadow-[0_16px_48px_rgba(0,0,0,0.5)] ring-2 ring-nexus-accent/30 border-nexus-accent/50 bg-nexus-bg cursor-grabbing' : ''}`}
+        onClick={handleClick}
         onContextMenu={handleContextMenu}
+        title={isDragging ? '拖拽排序' : undefined}
       >
         <div className="flex items-center gap-2">
-          {/* 运行状态 */}
+          {/* 运行状态：绿=运行中，红=意外失败，灰=未运行 */}
           <span className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${
-            running ? 'bg-nexus-success' : 'bg-nexus-muted/40'
+            running ? 'bg-nexus-success' : failed ? 'bg-nexus-error' : 'bg-nexus-muted/40'
           }`} />
 
           {/* 名称 */}
           <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{service.name}</span>
 
-          {/* Hover 操作按钮 */}
-          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 flex-shrink-0">
+          {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽） */}
+          <div
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
             {running ? (
               <>
                 <button
@@ -99,6 +132,22 @@ export function ServiceTreeEntry({
                   onClick={e => handleAction(e, 'stop')}
                   title="停止"
                 >■</button>
+              </>
+            ) : failed ? (
+              <>
+                {/* 失败按钮：点击查看日志（崩溃/秒退的报错是诊断关键） */}
+                <button
+                  className="px-2 py-1 text-[11px] bg-nexus-error/15 text-nexus-error rounded hover:bg-nexus-error/25 disabled:opacity-40"
+                  disabled={busy}
+                  onClick={e => { e.stopPropagation(); onViewLog?.(); }}
+                  title="查看失败日志"
+                >失败</button>
+                <button
+                  className="px-2 py-1 text-[11px] bg-nexus-success/15 text-nexus-success rounded hover:bg-nexus-success/25 disabled:opacity-40"
+                  disabled={busy}
+                  onClick={e => handleAction(e, 'start')}
+                  title="重新启动"
+                >▶</button>
               </>
             ) : (
               <button

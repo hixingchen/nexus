@@ -25,6 +25,16 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// 意外退出的服务（崩溃/秒退/spawn 失败）：前端据此在卡片上显示"失败"按钮。
+/// 与"主动停止"区分：主动停止（stop）会清除该状态且清空日志
+#[derive(Clone, Serialize, Debug)]
+pub struct FailedService {
+    pub service_id: String,
+    /// spawn 失败（进程未启动）时为 None
+    pub exit_code: Option<i32>,
+    pub timestamp: String,
+}
+
 #[derive(Clone, Serialize)]
 pub struct ServiceLogPayload {
     pub service_key: String,
@@ -129,6 +139,8 @@ struct ProcessInfo {
 pub struct ProcessManager {
     processes: Mutex<HashMap<String, ProcessInfo>>,
     log_buffers: Arc<Mutex<HashMap<LogKey, VecDeque<LogLine>>>>,
+    /// 意外退出的服务：key → 失败信息。日志保留供查看（正常停止/重启/全部停止时清除）
+    failed: Mutex<HashMap<String, FailedService>>,
     #[cfg(windows)]
     job: Option<Arc<super::job_object::JobObject>>,
 }
@@ -138,6 +150,7 @@ impl ProcessManager {
         Self {
             processes: Mutex::new(HashMap::new()),
             log_buffers: Arc::new(Mutex::new(HashMap::new())),
+            failed: Mutex::new(HashMap::new()),
             #[cfg(windows)]
             job: None,
         }
@@ -166,6 +179,10 @@ impl ProcessManager {
         if let Ok(mut buffers) = self.log_buffers.lock() {
             buffers.remove(key);
         }
+        // 重新启动：清除旧失败标记（新生命周期）
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.remove(key);
+        }
 
         // Phase 2: 在锁外执行 spawn 和线程创建
         let mut cmd = build_command(command);
@@ -180,7 +197,20 @@ impl ProcessManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("启动失败: {}", e))?;
+            .map_err(|e| {
+                // spawn 失败（cwd 无效、命令不存在等）：写入日志缓冲 + 记失败状态，
+                // 卡片显示"失败"按钮，点击日志面板可见原因
+                let msg = format!("启动失败: {}", e);
+                self.append_system_line(key, msg.clone());
+                if let Ok(mut failed) = self.failed.lock() {
+                    failed.insert(key.to_string(), FailedService {
+                        service_id: key.to_string(),
+                        exit_code: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    });
+                }
+                msg
+            })?;
 
         #[cfg(windows)]
         if let Some(ref job) = self.job {
@@ -332,6 +362,11 @@ impl ProcessManager {
         } else {
             log::debug!("[nexus] stop: 服务 {} 未在运行，忽略", key);
         }
+        // 主动停止 = 正常关闭：无论进程是否还在管理表（崩溃的服务已被 running() 移出），
+        // 都清除失败标记并清空日志（含失败日志）——项目"全部停止"依赖此语义
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.remove(key);
+        }
         if let Ok(mut buffers) = self.log_buffers.lock() {
             let log_key: LogKey = Arc::from(key);
             buffers.remove(&*log_key);
@@ -342,6 +377,11 @@ impl ProcessManager {
     pub fn restart(&self, project_id: &str, key: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
         self.stop(key)?;
         self.start(project_id, key, command, cwd, env_vars, app_handle)
+    }
+
+    /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）
+    pub fn append_system_line(&self, key: &str, text: String) {
+        append_system_line(&self.log_buffers, key, text);
     }
 
     pub fn get_logs(&self, key: &str) -> Vec<LogLine> {
@@ -370,8 +410,23 @@ impl ProcessManager {
             };
             let mut dead_keys = Vec::new();
             for (k, info) in procs.iter_mut() {
-                if !matches!(info.child.try_wait(), Ok(None)) {
-                    dead_keys.push(k.clone());
+                match info.child.try_wait() {
+                    Ok(Some(status)) => {
+                        // 意外退出（崩溃/秒退）：保留日志 + 记失败状态，卡片显示"失败"按钮
+                        let code = status.code();
+                        let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                        self.append_system_line(k, format!("进程已退出（退出码: {}）", code_str));
+                        if let Ok(mut failed) = self.failed.lock() {
+                            failed.insert(k.clone(), FailedService {
+                                service_id: k.clone(),
+                                exit_code: code,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            });
+                        }
+                        dead_keys.push(k.clone());
+                    }
+                    Ok(None) => {} // 运行中
+                    Err(_) => dead_keys.push(k.clone()), // 无法检查状态，视为已死
                 }
             }
             dead_keys.into_iter().filter_map(|key| {
@@ -381,11 +436,9 @@ impl ProcessManager {
                 })
             }).collect()
         };
-        // Phase 2: 在锁外收尸已退出进程（已退出的进程不再 taskkill），并同步清理日志缓冲
-        for (key, pid, child, done_stdout, done_stderr) in dead {
-            if let Ok(mut buffers) = self.log_buffers.lock() {
-                buffers.remove(&*key);
-            }
+        // Phase 2: 在锁外收尸已退出进程（已退出的进程不再 taskkill）。
+        // 日志缓冲保留（Phase 1 已追加退出标记行）：崩溃/秒退的报错是诊断关键
+        for (_key, pid, child, done_stdout, done_stderr) in dead {
             cleanup_process(pid, child, done_stdout, done_stderr);
         }
         // Phase 3: 重新获取锁返回当前运行中的 (project_id, service_id)
@@ -422,7 +475,22 @@ impl ProcessManager {
         if let Ok(mut buffers) = self.log_buffers.lock() {
             buffers.clear();
         }
+        // 全部停止 = 主动关闭：清除所有失败标记（正常日志与失败日志都已清空）
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.clear();
+        }
         log::info!("[nexus] stop_all: 已完成");
+    }
+
+    /// 返回意外退出的服务列表（前端显示失败状态）
+    pub fn failed(&self) -> Vec<FailedService> {
+        match self.failed.lock() {
+            Ok(f) => f.values().cloned().collect(),
+            Err(e) => {
+                log::error!("ProcessManager failed 锁已中毒: {}", e);
+                Vec::new()
+            }
+        }
     }
 
 }
@@ -434,6 +502,18 @@ impl Drop for ProcessManager {
 }
 
 // ─── Utilities ──────────────────────────────────────────────
+
+/// 向日志缓冲追加一条系统标记行（stream="system"）。
+///
+/// 语义：进程生命周期事件（启动失败/退出码/停止）写入日志流，用户可从日志面板查因。
+/// 缓冲为空时自动创建；锁失败或超限时静默处理（系统行丢失不影响主流程）。
+fn append_system_line(buffers: &Arc<Mutex<HashMap<LogKey, VecDeque<LogLine>>>>, key: &str, text: String) {
+    if let Ok(mut b) = buffers.lock() {
+        let e = b.entry(Arc::from(key)).or_default();
+        while e.len() >= MAX_LOG_LINES { e.pop_front(); }
+        e.push_back(LogLine { timestamp: chrono::Utc::now().to_rfc3339(), stream: "system".into(), text });
+    }
+}
 
 /// 带超时等待子进程退出；超时返回 false（进程仍存活）
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {

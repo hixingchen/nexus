@@ -39,6 +39,41 @@ export async function readHexPage(path: string, offset: number, rows: number): P
   return await invoke('read_hex_page', { path, offset, rows });
 }
 
+/** jar 条目信息 */
+export interface JarEntryInfo {
+  name: string;
+  isDir: boolean;
+  size: number;
+  compressedSize: number;
+}
+
+/** jar 条目读取结果：kind = text（已解码）/ class（已反编译）/ binary（base64） */
+export interface JarEntryContent {
+  content: string;
+  kind: 'text' | 'class' | 'binary';
+  size: number;
+}
+
+/** 列 jar 条目（nested 为嵌套 jar 条目链，支持 Spring Boot fat jar） */
+export async function listJar(path: string, nested: string[]): Promise<JarEntryInfo[]> {
+  return await invoke('list_jar', { path, nested });
+}
+
+/** 读取 jar 条目内容 */
+export async function readJarEntry(path: string, nested: string[], name: string): Promise<JarEntryContent> {
+  return await invoke('read_jar_entry', { path, nested, name });
+}
+
+/** 读取 jar 二进制条目为字节数组（HexViewer 内存模式） */
+export async function readJarEntryBytes(path: string, nested: string[], name: string): Promise<{ bytes: Uint8Array; size: number }> {
+  const res = await readJarEntry(path, nested, name);
+  if (res.kind !== 'binary') throw new Error('条目不是二进制');
+  const bin = atob(res.content);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return { bytes, size: res.size };
+}
+
 /** 写入文件内容 */
 export async function writeFile(path: string, content: string): Promise<void> {
   return await invoke('write_file', { path, content });

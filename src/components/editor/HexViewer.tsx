@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { readHexPage } from '../../services/editor';
+import { readHexPage, readJarEntryBytes } from '../../services/editor';
+import { parseJarVirtualPath } from '../../stores/editor';
 
 const BYTES_PER_ROW = 16;
 /** 每页行数（256 行 = 4096 字节，与后端 IPC 单次传输上限匹配） */
@@ -17,16 +18,32 @@ export function HexViewer({ path }: { path: string }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [totalSize, setTotalSize] = useState<number | null>(null);
   const [pages, setPages] = useState<Map<number, number[]>>(new Map());
+  /** jar 内条目内存模式：整块字节数组（无后端分页） */
+  const [memoryBytes, setMemoryBytes] = useState<number[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   /** 在途页请求去重 */
   const inflight = useRef<Set<number>>(new Set());
 
-  // 首屏加载页 0 → 同时获得文件大小
+  // 首屏加载：jar:// 条目一次性读入内存；磁盘文件分页加载页 0 并获得大小
   useEffect(() => {
     let alive = true;
     setTotalSize(null);
     setPages(new Map());
+    setMemoryBytes(null);
     setErr(null);
+    if (path.startsWith('jar://')) {
+      const { jarPath, nested, name } = parseJarVirtualPath(path);
+      readJarEntryBytes(jarPath, nested, name)
+        .then(({ bytes, size }) => {
+          if (!alive) return;
+          setTotalSize(size);
+          setMemoryBytes(Array.from(bytes));
+        })
+        .catch(e => {
+          if (alive) setErr(String(e));
+        });
+      return () => { alive = false; };
+    }
     inflight.current.add(0);
     readHexPage(path, 0, ROWS_PER_PAGE)
       .then(res => {
@@ -43,7 +60,8 @@ export function HexViewer({ path }: { path: string }) {
     return () => { alive = false; };
   }, [path]);
 
-  const totalRows = totalSize === null ? 0 : Math.ceil(totalSize / BYTES_PER_ROW);
+  // Number.isFinite 兜底：totalSize 异常（如旧版本后端）时显示空列表而不是整页崩溃
+  const totalRows = totalSize === null || !Number.isFinite(totalSize) ? 0 : Math.ceil(totalSize / BYTES_PER_ROW);
   const virtualizer = useVirtualizer({
     count: totalRows,
     getScrollElement: () => parentRef.current,
@@ -52,9 +70,9 @@ export function HexViewer({ path }: { path: string }) {
   });
   const items = virtualizer.getVirtualItems();
 
-  // 可见行 → 所需页：缺失且不在途的才请求
+  // 可见行 → 所需页：缺失且不在途的才请求（内存模式无分页，跳过）
   useEffect(() => {
-    if (totalSize === null || items.length === 0) return;
+    if (totalSize === null || items.length === 0 || memoryBytes || path.startsWith('jar://')) return;
     const minPage = Math.floor((items[0].index * BYTES_PER_ROW) / PAGE_BYTES);
     const maxPage = Math.floor(
       ((items[items.length - 1].index + 1) * BYTES_PER_ROW - 1) / PAGE_BYTES
@@ -73,10 +91,17 @@ export function HexViewer({ path }: { path: string }) {
 
   const renderRow = (index: number) => {
     const byteOffset = index * BYTES_PER_ROW;
-    const page = Math.floor(byteOffset / PAGE_BYTES);
-    const data = pages.get(page);
-    const inPage = (byteOffset % PAGE_BYTES) / BYTES_PER_ROW;
-    const bytes = data ? data.slice(inPage * BYTES_PER_ROW, (inPage + 1) * BYTES_PER_ROW) : null;
+    let bytes: number[] | null;
+    if (memoryBytes) {
+      // 内存模式：直接从整块数组切片
+      const slice = memoryBytes.slice(byteOffset, byteOffset + BYTES_PER_ROW);
+      bytes = slice.length > 0 ? slice : null;
+    } else {
+      const page = Math.floor(byteOffset / PAGE_BYTES);
+      const data = pages.get(page);
+      const inPage = (byteOffset % PAGE_BYTES) / BYTES_PER_ROW;
+      bytes = data ? data.slice(inPage * BYTES_PER_ROW, (inPage + 1) * BYTES_PER_ROW) : null;
+    }
 
     return (
       <div

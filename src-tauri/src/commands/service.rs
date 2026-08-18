@@ -121,6 +121,30 @@ pub fn update_service(
     })
 }
 
+/// 重排项目服务顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）
+#[tauri::command]
+pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids: Vec<String>) -> Result<(), String> {
+    if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
+    state.db.with_conn_mut(|conn| {
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        // 校验 id 归属：只更新该项目下的服务，防御跨项目写入
+        let mut stmt = tx.prepare("SELECT id FROM services WHERE project_id=?1")
+            .map_err(|e| format!("查询服务失败: {}", e))?;
+        let existing: std::collections::HashSet<String> = stmt.query_map([&project_id], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("查询服务失败: {}", e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("查询服务失败: {}", e))?;
+        drop(stmt);
+        for (i, id) in ordered_ids.iter().enumerate() {
+            if !existing.contains(id) { continue; }
+            tx.execute("UPDATE services SET sort_index=?1 WHERE id=?2", rusqlite::params![i as i32, id])
+                .map_err(|e| format!("更新服务排序失败: {}", e))?;
+        }
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
+        Ok(())
+    })
+}
+
 /// 删除服务
 #[tauri::command]
 pub fn delete_service(state: State<AppState>, id: String) -> Result<(), String> {
@@ -136,13 +160,13 @@ pub fn delete_service(state: State<AppState>, id: String) -> Result<(), String> 
 
 // ─── 服务模板（跨项目复用） ─────────────────────────────────
 
-/// 查询全部服务模板
+/// 查询全部服务模板（按 sort_index 排序，与拖拽重排一致）
 #[tauri::command]
 pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTemplate>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, created_at
-             FROM service_templates ORDER BY name"
+             FROM service_templates ORDER BY sort_index, name"
         ).map_err(|e| format!("查询模板失败: {}", e))?;
         let rows = stmt.query_map([], |row| Ok(ServiceTemplate {
             id: row.get(0)?, name: row.get(1)?, command: row.get(2)?, cwd: row.get(3)?,
@@ -229,6 +253,28 @@ pub fn add_service_from_template(
             id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
         })
+    })
+}
+
+/// 重排服务模板顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）
+#[tauri::command]
+pub fn reorder_service_templates(state: State<AppState>, ordered_ids: Vec<String>) -> Result<(), String> {
+    state.db.with_conn_mut(|conn| {
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        let mut stmt = tx.prepare("SELECT id FROM service_templates")
+            .map_err(|e| format!("查询模板失败: {}", e))?;
+        let existing: std::collections::HashSet<String> = stmt.query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("查询模板失败: {}", e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("查询模板失败: {}", e))?;
+        drop(stmt);
+        for (i, id) in ordered_ids.iter().enumerate() {
+            if !existing.contains(id) { continue; }
+            tx.execute("UPDATE service_templates SET sort_index=?1 WHERE id=?2", rusqlite::params![i as i32, id])
+                .map_err(|e| format!("更新模板排序失败: {}", e))?;
+        }
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
+        Ok(())
     })
 }
 

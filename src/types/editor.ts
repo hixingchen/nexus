@@ -1,5 +1,5 @@
-/** 标签的查看器类型：text（编辑器）/ image（图片预览）/ hex（十六进制） */
-export type FileViewerType = 'text' | 'image' | 'hex';
+/** 标签的查看器类型：text（编辑器）/ image（图片预览）/ hex（十六进制）/ jar（jar 包浏览） */
+export type FileViewerType = 'text' | 'image' | 'hex' | 'jar';
 
 /** 打开的文件标签 */
 export interface FileTab {

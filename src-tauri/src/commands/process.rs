@@ -46,6 +46,13 @@ pub struct RunningService {
     pub project_id: String,
 }
 
+/// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
+#[derive(Serialize)]
+pub struct ProcessStatus {
+    pub running: Vec<RunningService>,
+    pub failed: Vec<crate::core::process::FailedService>,
+}
+
 // ─── Tauri Commands ───────────────────────────────────────────
 
 #[tauri::command]
@@ -114,10 +121,13 @@ pub fn stop_project_services(state: State<AppState>, project_id: String) -> Resu
 }
 
 #[tauri::command]
-pub fn get_running(state: State<AppState>) -> Result<Vec<RunningService>, String> {
-    Ok(state.process_mgr.running().into_iter()
-        .map(|(project_id, service_id)| RunningService { service_id, project_id })
-        .collect())
+pub fn get_running(state: State<AppState>) -> Result<ProcessStatus, String> {
+    Ok(ProcessStatus {
+        running: state.process_mgr.running().into_iter()
+            .map(|(project_id, service_id)| RunningService { service_id, project_id })
+            .collect(),
+        failed: state.process_mgr.failed(),
+    })
 }
 
 #[tauri::command]

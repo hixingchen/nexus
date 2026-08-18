@@ -27,6 +27,12 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| format!("数据库连接锁获取失败: {}", e))?;
         f(&conn)
     }
+
+    /// 可变连接（事务等需要 &mut 的场景）
+    pub fn with_conn_mut<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
+        let mut conn = self.conn.lock().map_err(|e| format!("数据库连接锁获取失败: {}", e))?;
+        f(&mut conn)
+    }
 }
 
 /// 当前 schema 版本号，每次改表结构时递增。

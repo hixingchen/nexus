@@ -53,17 +53,31 @@ const MAX_EDIT_SIZE = 10 * 1024 * 1024;
 
 /** 内建预览支持的图片扩展名（webview 原生解码，不走系统程序） */
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
-/** 常见二进制扩展名：直接进 hex 视图，免整文件读入嗅探 */
+/** 常见二进制扩展名：直接进 hex 视图，免整文件读入嗅探（jar 有专属浏览器，不在此列） */
 const BINARY_EXTS = new Set([
-  'ttf', 'otf', 'woff', 'woff2', 'eot', 'exe', 'dll', 'so', 'dylib', 'jar', 'zip',
+  'ttf', 'otf', 'woff', 'woff2', 'eot', 'exe', 'dll', 'so', 'dylib', 'zip',
   'gz', 'tgz', 'tar', '7z', 'rar', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
   'mp3', 'mp4', 'wav', 'flac', 'avi', 'mkv', 'mov', 'psd', 'ai', 'bin', 'dat', 'wasm', 'pyc',
 ]);
 
 const getExt = (path: string) => (path.split('.').pop() ?? '').toLowerCase();
 
-/** 读取文本内容：.class 走字节码视图，其余走 read_file（二进制抛 BINARY） */
+/** jar:// 虚拟路径 → (jar 路径, 嵌套链, 条目名) */
+export function parseJarVirtualPath(path: string): { jarPath: string; nested: string[]; name: string } {
+  const parts = path.slice('jar://'.length).split('!/');
+  const jarPath = parts[0];
+  const name = parts[parts.length - 1];
+  const nested = parts.slice(1, -1);
+  return { jarPath, nested, name };
+}
+
+/** 读取文本内容：jar 内条目走 jar 读取，.class 走 CFR/字节码视图，其余走 read_file（二进制抛 BINARY） */
 async function fetchTextContent(path: string): Promise<{ content: string; size: number }> {
+  if (path.startsWith('jar://')) {
+    const { jarPath, nested, name } = parseJarVirtualPath(path);
+    const res = await editorService.readJarEntry(jarPath, nested, name);
+    return { content: res.content, size: res.size };
+  }
   if (getExt(path) === 'class') {
     const content = await editorService.readClassFile(path);
     return { content, size: 0 };
@@ -276,6 +290,12 @@ const pendingLoads = new Map<string, Promise<void>>();
  * 由组件调用，store 不直接执行异步操作
  */
 export async function loadAndOpenFile(path: string, name: string): Promise<void> {
+  // jar 虚拟路径（树内展开的 jar 条目）：路由到 jar 条目打开，不读磁盘
+  if (path.startsWith('jar://')) {
+    const { jarPath, nested, name: entryName } = parseJarVirtualPath(path);
+    await openJarEntry(jarPath, nested, { name: entryName });
+    return;
+  }
   // 检查是否已打开
   const existing = useEditorStore.getState().tabs.find(t => t.path === path);
   if (existing) {
@@ -300,6 +320,13 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
         // 图片：内建预览（ImageViewer 自行加载，内容不进 store）
         tab.readonly = true;
         tab.viewerType = 'image';
+        openLoadedTab(tab, '');
+        return;
+      }
+      if (ext === 'jar') {
+        // jar 包：内建浏览（条目列表 → 点开 class/资源），只读
+        tab.readonly = true;
+        tab.viewerType = 'jar';
         openLoadedTab(tab, '');
         return;
       }
@@ -339,6 +366,37 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
 /** 切换活动标签：检查缓存 → 读取内容 → 更新 store */
 export async function switchToTab(id: string): Promise<void> {
   await loadContentInto(id);
+}
+
+/**
+ * 打开 jar 内条目为虚拟只读标签（路径格式 jar://<jar>!/<nested>!/<name>）。
+ * 后端已按类型处理：text/class 返回内容进编辑器，binary 由 HexViewer 内存模式渲染
+ */
+export async function openJarEntry(jarPath: string, nested: string[], entry: { name: string }): Promise<void> {
+  const virtualPath = `jar://${jarPath}!/${[...nested, entry.name].join('!/')}`;
+  const existing = useEditorStore.getState().tabs.find(t => t.path === virtualPath);
+  if (existing) {
+    await loadContentInto(existing.id, virtualPath);
+    return;
+  }
+  const tab: FileTab = {
+    id: `tab-${Date.now()}-${++tabSeq}`,
+    name: entry.name.split('/').pop() ?? entry.name,
+    path: virtualPath,
+    readonly: true,
+  };
+  try {
+    const res = await editorService.readJarEntry(jarPath, nested, entry.name);
+    if (res.kind === 'binary') {
+      tab.viewerType = 'hex';
+      openLoadedTab(tab, '');
+    } else {
+      openLoadedTab(tab, res.content);
+    }
+  } catch (e) {
+    console.error('读取 jar 条目失败:', e);
+    showNotification({ variant: 'error', title: '读取 jar 条目失败', description: String(e) });
+  }
 }
 
 /**
@@ -393,8 +451,8 @@ async function loadContentInto(id: string, knownPath?: string): Promise<void> {
     setFileContent(draft);
     return;
   }
-  // 图片/hex 标签内容由查看器组件自行管理
-  if (tab.viewerType === 'image' || tab.viewerType === 'hex') {
+  // 图片/hex/jar 标签内容由查看器组件自行管理
+  if (tab.viewerType === 'image' || tab.viewerType === 'hex' || tab.viewerType === 'jar') {
     setFileContent('');
     return;
   }

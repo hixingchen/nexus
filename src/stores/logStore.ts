@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ServiceLogLine } from '../services/logService';
+import type { LogStream, ServiceLogLine } from '../services/logService';
 
 interface LogStore {
   /** 跟随数据源：始终最新 2000 行（滑动窗口），后台持续维护 */
@@ -10,8 +10,8 @@ interface LogStore {
   version: Record<string, number>;
   /** 累计新增行数（只增不减，\r 刷新帧不计）。暂停时显示"新增 N 行"的依据 */
   totalAdded: Record<string, number>;
-  appendLog: (serviceKey: string, stream: 'stdout' | 'stderr', data: string) => void;
-  bulkAppend: (items: Array<{ serviceKey: string; stream: 'stdout' | 'stderr'; data: string; timestamp?: string }>) => void;
+  appendLog: (serviceKey: string, stream: LogStream, data: string) => void;
+  bulkAppend: (items: Array<{ serviceKey: string; stream: LogStream; data: string; timestamp?: string }>) => void;
   /** 同步设置跟随数据源（由组件调用 service 后传入；不影响暂停视图） */
   setLogs: (serviceKey: string, lines: ServiceLogLine[]) => void;
   clearLogs: (serviceKey: string) => void;
@@ -49,7 +49,7 @@ export const useLogStore = create<LogStore>((set) => ({
   version: {},
   totalAdded: {},
 
-  appendLog: (serviceKey, stream, data) => {
+  appendLog: (serviceKey, stream: LogStream, data) => {
     const now = new Date().toISOString();
     const line: ServiceLogLine = { timestamp: now, stream, text: data };
     set((state) => {

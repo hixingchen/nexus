@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import { useLogStore } from '../../stores/logStore';
+import { useRunningStore } from '../../stores/runningStore';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
 import type { ServiceLogLine } from '../../services/logService';
@@ -52,6 +53,36 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
   }, [paused, serviceKey]);
   const newSincePause = paused ? Math.max(0, totalAdded - baseAddedRef.current) : 0;
 
+  // ── 运行状态 ──────────────────────────────────────────────
+
+  const isRunning = useRunningStore(s => s.running.some(r => r.service_id === serviceKey));
+  // 以后端缓冲为权威同步日志：
+  // - 空快照（正常停止已清空）→ 清本地缓存，避免展示已清空的旧日志（含失败日志）
+  // - 非空快照（崩溃保留 / 运行中）→ 覆盖本地缓存（后端保证先写缓冲再 emit，快照不丢行）
+  const syncLogsFromBackend = useCallback(() => {
+    logService.getServiceLogs(serviceKey).then(
+      (snapshot) => {
+        if (snapshot.length === 0) {
+          useLogStore.getState().clearLogs(serviceKey);
+        } else {
+          useLogStore.getState().setLogs(serviceKey, snapshot);
+        }
+      },
+      (e) => { console.error('同步服务日志失败:', serviceKey, e); }
+    );
+  }, [serviceKey]);
+
+  // 运行中 → 已停止（崩溃/秒退/手动停止）：同步后端日志——
+  // 崩溃时快照含退出码行（system），正常停止时后端已清空、同步清本地缓存
+  const prevRunningRef = useRef(isRunning);
+  useEffect(() => {
+    const was = prevRunningRef.current;
+    prevRunningRef.current = isRunning;
+    if (was && !isRunning) {
+      syncLogsFromBackend();
+    }
+  }, [isRunning, serviceKey, syncLogsFromBackend]);
+
   // ── 搜索 ──────────────────────────────────────────────────
 
   // 输入防抖：逐字输入不触发全量匹配 + 全量渲染
@@ -82,19 +113,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     // 切换服务：清理上个服务的暂停状态
     useLogStore.getState().resumeLogs(serviceKey);
-    const existing = useLogStore.getState().logs[serviceKey];
-    if (!existing || existing.length === 0) {
-      logService.getServiceLogs(serviceKey).then(
-        (snapshot) => {
-          if (snapshot.length === 0) return;
-          // 直接覆盖：后端保证先写缓冲再 emit，快照包含所有已发送事件；
-          // 快照返回后到达的实时事件继续追加，不会丢行
-          useLogStore.getState().setLogs(serviceKey, snapshot);
-        },
-        (e) => { console.error('加载历史日志失败:', serviceKey, e); }
-      );
-    }
-  }, [serviceKey]);
+    // 打开面板：无条件以后端缓冲为准同步（后端清空过则本地缓存一并清掉）
+    syncLogsFromBackend();
+  }, [serviceKey, syncLogsFromBackend]);
 
   // ── 搜索渲染（独立 effect）：只按搜索词重建，不随日志增量刷新 ──
 
@@ -228,6 +249,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
       <LogHeader
         serviceName={serviceName}
         lineCount={lines.length}
+        isRunning={isRunning}
         onClose={onClose}
         searchTerm={searchTerm}
         setSearchTerm={setSearchTerm}
@@ -276,9 +298,10 @@ function renderSearchResults(
   renderedCountRef.current = 0;
 }
 
-/** 单行日志的 DOM 结构（span + display:block，便于按行裁剪） */
+/** 单行日志的 DOM 结构（span + display:block，便于按行裁剪）；system 行（生命周期标记）独立样式 */
 function lineHtml(l: ServiceLogLine): string {
-  return `<span class="log-line"><span class="log-ts">${fmtTime(l.timestamp)}</span>${renderLine(l.text, '')}</span>`;
+  const cls = l.stream === 'system' ? 'log-line log-line-system' : 'log-line';
+  return `<span class="${cls}"><span class="log-ts">${fmtTime(l.timestamp)}</span>${renderLine(l.text, '')}</span>`;
 }
 
 /** 时间戳显示为本地 HH:MM:SS */
@@ -337,13 +360,14 @@ function scrollToBottom(
 // ── 头部组件 ──────────────────────────────────────────────
 
 function LogHeader({
-  serviceName, lineCount, onClose,
+  serviceName, lineCount, isRunning, onClose,
   searchTerm, setSearchTerm, setSearchIdx, searchRef,
   searchActive, searchMatches, searchIdx, onGoMatch,
   paused, onPause, onClear, newSincePause,
 }: {
   serviceName: string;
   lineCount: number;
+  isRunning: boolean;
   onClose?: () => void;
   searchTerm: string;
   setSearchTerm: (s: string) => void;
@@ -368,7 +392,14 @@ function LogHeader({
       )}
       <span className="w-[7px] h-[7px] rounded-full bg-emerald-400 flex-shrink-0"/>
       <span className="text-[13px] text-[#c9d1d9] font-medium truncate">{serviceName}</span>
-      <span className="text-[11px] px-1.5 py-0.5 rounded-md bg-emerald-400/10 text-emerald-400 border border-emerald-400/20 flex-shrink-0">运行中</span>
+      {/* 状态标签：随运行状态变化（原为硬编码"运行中"，服务停止后显示错误状态） */}
+      <span className={`text-[11px] px-1.5 py-0.5 rounded-md border flex-shrink-0 ${
+        isRunning
+          ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20'
+          : 'bg-[#8b949e]/10 text-[#8b949e] border-[#30363d]'
+      }`}>
+        {isRunning ? '运行中' : '未运行'}
+      </span>
       <span className="text-[12px] text-[#8b949e] flex-shrink-0" title="当前行数（只保留最新 2000 行）">
         {lineCount.toLocaleString()} 行
       </span>

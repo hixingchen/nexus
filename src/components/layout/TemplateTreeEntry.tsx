@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import type { ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 
@@ -19,6 +21,25 @@ interface Props {
 
 /** 模板条目：视觉与服务条目一致（圆点 + 名称 + Hover 操作），点击打开编辑面板，Hover/右键提供「添加到项目 / 删除模板」 */
 export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onRequestDelete }: Props) {
+  // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板；添加中禁用拖拽）
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: tpl.id,
+    disabled: busy,
+  });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition: isDragging ? 'none' : transition,
+    zIndex: isDragging ? 50 : 'auto' as const,
+  };
+  /** 本次点击前发生过拖拽（长按松手会触发 click，需跳过编辑打开） */
+  const draggedRef = useRef(false);
+  useEffect(() => {
+    if (isDragging) draggedRef.current = true;
+  }, [isDragging]);
+  const handleClick = () => {
+    if (draggedRef.current) { draggedRef.current = false; return; }
+    onEdit(tpl);
+  };
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   const handleContextMenu = (e: React.MouseEvent) => {
@@ -48,24 +69,29 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
   };
 
   return (
-    <div className="px-2 py-0.5">
+    <div className="px-2 py-0.5" ref={setNodeRef} style={style}>
       <div
-        className={`cursor-pointer group rounded-md px-3 py-2.5 ${
+        {...attributes}
+        {...listeners}
+        className={`cursor-pointer group rounded-md px-3 py-2.5 transition-colors select-none ${
           isEditing
             ? 'bg-nexus-accent/10 border border-nexus-accent/30'
             : 'bg-nexus-bg/30 border border-nexus-border hover:border-nexus-muted/70'
-        } ${busy ? 'opacity-60 pointer-events-none' : ''}`}
-        onClick={() => onEdit(tpl)}
+        } ${busy ? 'opacity-60 pointer-events-none' : ''} ${isDragging ? 'shadow-[0_16px_48px_rgba(0,0,0,0.5)] ring-2 ring-nexus-accent/30 border-nexus-accent/50 bg-nexus-bg cursor-grabbing' : ''}`}
+        onClick={handleClick}
         onContextMenu={handleContextMenu}
-        title={`${tpl.command}${tpl.cwd ? ` (${tpl.cwd})` : ''}`}
+        title={isDragging ? '拖拽排序' : `${tpl.command}${tpl.cwd ? ` (${tpl.cwd})` : ''}`}
       >
         <div className="flex items-center gap-2">
           {/* 状态圆点（模板无运行态，恒为灰色，与服务条目视觉一致） */}
           <span className="w-[7px] h-[7px] rounded-full flex-shrink-0 bg-nexus-muted/40" />
           <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{tpl.name}</span>
 
-          {/* Hover 操作：添加到项目（删除在右键菜单） */}
-          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 flex-shrink-0">
+          {/* Hover 操作：添加到项目（删除在右键菜单；拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽） */}
+          <div
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
             <button
               className="px-2 py-1 text-[11px] bg-nexus-accent/15 text-nexus-accent rounded hover:bg-nexus-accent/25 font-medium"
               onClick={e => { e.stopPropagation(); onAdd(tpl); }}

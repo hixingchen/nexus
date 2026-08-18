@@ -144,6 +144,15 @@ pub struct ReadFileResponse {
     pub size: u64,
 }
 
+/// UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）。
+/// 写回统一 UTF-8（write_file），不保留原编码——GBK 编辑场景极低频，不值得复杂度
+fn decode_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
+    }
+}
+
 /// 读取文件内容
 #[tauri::command]
 pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadFileResponse, String> {
@@ -167,12 +176,8 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadF
         return Ok(ReadFileResponse { content: String::new(), is_binary: true, size: meta.len() });
     }
 
-    // 先 UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）。
-    // 写回统一 UTF-8（write_file），不保留原编码——GBK 编辑场景极低频，不值得复杂度
-    let content = match std::str::from_utf8(&bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => encoding_rs::GB18030.decode(&bytes).0.into_owned(),
-    };
+    // 先 UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）
+    let content = decode_text(&bytes);
 
     Ok(ReadFileResponse { content, is_binary: false, size: meta.len() })
 }
@@ -216,7 +221,9 @@ pub async fn read_image_data(state: State<'_, AppState>, path: String) -> Result
 }
 
 /// hex 视图分页读取响应：一页 rows 行 × 16 字节
+/// Tauri 只把命令参数 camelCase→snake_case，返回值字段保持原样，需显式转换
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HexPage {
     pub offset: u64,
     pub bytes: Vec<u8>,
@@ -278,6 +285,78 @@ pub async fn decompile_class(state: State<'_, AppState>, path: String) -> Result
     }
     let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
     crate::core::decompiler::decompile_class_bytes(&bytes).await
+}
+
+/// 列 jar 条目（nested 为嵌套 jar 条目链，支持 Spring Boot fat jar）
+#[tauri::command]
+pub async fn list_jar(
+    state: State<'_, AppState>,
+    path: String,
+    nested: Vec<String>,
+) -> Result<Vec<crate::core::jarfile::JarEntryInfo>, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > crate::core::jarfile::MAX_JAR_SIZE {
+        return Err(format!("jar 过大（{:.1} MB），超过 100 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    let inner = crate::core::jarfile::innermost_archive(&bytes, &nested)?;
+    crate::core::jarfile::list_entries(&inner)
+}
+
+/// jar 条目读取响应：kind = text（已解码）/ class（已反编译）/ binary（base64）
+#[derive(Debug, Serialize)]
+pub struct JarEntryContent {
+    pub content: String,
+    pub kind: String,
+    pub size: u64,
+}
+
+/// 读取 jar 条目内容
+#[tauri::command]
+pub async fn read_jar_entry(
+    state: State<'_, AppState>,
+    path: String,
+    nested: Vec<String>,
+    name: String,
+) -> Result<JarEntryContent, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > crate::core::jarfile::MAX_JAR_SIZE {
+        return Err(format!("jar 过大（{:.1} MB），超过 100 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    let entry = crate::core::jarfile::read_entry(&bytes, &nested, &name)?;
+
+    if name.to_ascii_lowercase().ends_with(".class") {
+        // class：CFR 反编译，失败回退字节码视图（与 readClassFile 前端回退同策略）
+        let content = match crate::core::decompiler::decompile_class_bytes(&entry).await {
+            Ok(src) => src,
+            Err(e) => {
+                log::warn!("[nexus] jar 内 class 反编译失败，回退字节码视图: {}", e);
+                crate::core::classfile::disassemble_class(&entry)?
+            }
+        };
+        Ok(JarEntryContent { content, kind: "class".into(), size: entry.len() as u64 })
+    } else if entry.iter().take(8192).any(|&b| b == 0) {
+        // 二进制：base64（前端 hex 视图内存模式渲染）
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        Ok(JarEntryContent { content: STANDARD.encode(&entry), kind: "binary".into(), size: entry.len() as u64 })
+    } else {
+        Ok(JarEntryContent { content: decode_text(&entry), kind: "text".into(), size: entry.len() as u64 })
+    }
 }
 
 /// 列出目录内容（允许浏览任意路径，供 FilePicker/FileTree 使用）
