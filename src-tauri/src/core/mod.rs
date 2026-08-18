@@ -1,3 +1,5 @@
+pub mod classfile;
+pub mod decompiler;
 pub mod file_watcher;
 pub mod process;
 #[cfg(windows)]

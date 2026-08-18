@@ -41,12 +41,50 @@ interface EditorStore {
 
 /**
  * 文件内容缓存，避免切换标签时重复读取（LRU，最多 50 个文件 / 64MB）。
- * 字节上限：后端单文件上限 10MB，若仅按文件数限制最坏可驻留 ~500MB。
+ * 字节上限：后端单文件读取上限 50MB，若仅按文件数限制最坏可驻留 ~2.5GB。
  */
 const MAX_CACHE_SIZE = 50;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
 const fileCache = new Map<string, string>();
 let cacheBytes = 0;
+
+/** 编辑大小上限（与后端 write_file 的 10MB 一致）：超过的文件只读查看 */
+const MAX_EDIT_SIZE = 10 * 1024 * 1024;
+
+/** 内建预览支持的图片扩展名（webview 原生解码，不走系统程序） */
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
+/** 常见二进制扩展名：直接进 hex 视图，免整文件读入嗅探 */
+const BINARY_EXTS = new Set([
+  'ttf', 'otf', 'woff', 'woff2', 'eot', 'exe', 'dll', 'so', 'dylib', 'jar', 'zip',
+  'gz', 'tgz', 'tar', '7z', 'rar', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+  'mp3', 'mp4', 'wav', 'flac', 'avi', 'mkv', 'mov', 'psd', 'ai', 'bin', 'dat', 'wasm', 'pyc',
+]);
+
+const getExt = (path: string) => (path.split('.').pop() ?? '').toLowerCase();
+
+/** 读取文本内容：.class 走字节码视图，其余走 read_file（二进制抛 BINARY） */
+async function fetchTextContent(path: string): Promise<{ content: string; size: number }> {
+  if (getExt(path) === 'class') {
+    const content = await editorService.readClassFile(path);
+    return { content, size: 0 };
+  }
+  const res = await editorService.readFile(path);
+  if (res.is_binary) throw new Error('BINARY');
+  return { content: res.content, size: res.size };
+}
+
+/** 打开新标签（读取期间可能已被其他调用打开：已有标签则切换过去，恢复其未保存草稿） */
+function openLoadedTab(tab: FileTab, content: string) {
+  const already = useEditorStore.getState().tabs.find(t => t.path === tab.path);
+  if (already) {
+    setCacheContent(tab.path, content);
+    const draft = drafts.get(already.id);
+    useEditorStore.getState().setFileContent(draft ?? content);
+    useEditorStore.getState().setActiveTabId(already.id);
+  } else {
+    useEditorStore.getState().openTab(tab, content);
+  }
+}
 
 /**
  * 每标签：已打开/最后保存的基线内容（用于 dirty 推导）。
@@ -257,19 +295,33 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
   const tab: FileTab = { id: `tab-${Date.now()}-${++tabSeq}`, name, path };
   const p = (async () => {
     try {
-      const content = await editorService.readFile(path);
-      // 读取期间可能已通过其他调用打开该文件
-      const already = useEditorStore.getState().tabs.find(t => t.path === path);
-      if (already) {
-        setCacheContent(path, content);
-        // 已有标签：优先恢复其未保存草稿，不覆盖
-        const draft = drafts.get(already.id);
-        useEditorStore.getState().setFileContent(draft ?? content);
-        useEditorStore.getState().setActiveTabId(already.id);
-      } else {
-        useEditorStore.getState().openTab(tab, content);
+      const ext = getExt(path);
+      if (IMAGE_EXTS.has(ext)) {
+        // 图片：内建预览（ImageViewer 自行加载，内容不进 store）
+        tab.readonly = true;
+        tab.viewerType = 'image';
+        openLoadedTab(tab, '');
+        return;
       }
+      if (BINARY_EXTS.has(ext)) {
+        // 已知二进制类型：直接 hex 视图，免整文件读入嗅探
+        tab.readonly = true;
+        tab.viewerType = 'hex';
+        openLoadedTab(tab, '');
+        return;
+      }
+      if (ext === 'class') tab.readonly = true; // 字节码视图只读
+      const { content, size } = await fetchTextContent(path);
+      if (size > MAX_EDIT_SIZE) tab.readonly = true;
+      openLoadedTab(tab, content);
     } catch (e) {
+      if (e instanceof Error && e.message === 'BINARY') {
+        // 扩展名未命中黑名单的二进制：NUL 嗅探后进 hex 视图
+        tab.readonly = true;
+        tab.viewerType = 'hex';
+        openLoadedTab(tab, '');
+        return;
+      }
       console.error('读取文件内容失败:', e);
       showNotification({ variant: 'error', title: '读取文件内容失败' });
       const already = useEditorStore.getState().tabs.find(t => t.path === path);
@@ -307,6 +359,10 @@ export async function saveActiveFile(): Promise<boolean> {
   if (!activeTabId) return false;
   const tab = tabs.find(t => t.id === activeTabId);
   if (!tab) return false;
+  if (tab.readonly) {
+    showNotification({ variant: 'warning', title: '文件过大，仅支持查看（超过 10 MB 不能编辑）' });
+    return false;
+  }
   try {
     await editorService.writeFile(tab.path, fileContent ?? '');
     setCacheContent(tab.path, fileContent ?? '');
@@ -337,13 +393,18 @@ async function loadContentInto(id: string, knownPath?: string): Promise<void> {
     setFileContent(draft);
     return;
   }
+  // 图片/hex 标签内容由查看器组件自行管理
+  if (tab.viewerType === 'image' || tab.viewerType === 'hex') {
+    setFileContent('');
+    return;
+  }
   const cached = getCachedContent(path);
   if (cached !== undefined) {
     setFileContent(cached);
     return;
   }
   try {
-    const content = await editorService.readFile(path);
+    const { content } = await fetchTextContent(path);
     // 读取期间用户可能已切换到其他标签，此时丢弃结果避免内容错位
     if (useEditorStore.getState().activeTabId !== id) return;
     setCacheContent(path, content);

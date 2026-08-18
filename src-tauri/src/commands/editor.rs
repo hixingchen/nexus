@@ -131,12 +131,22 @@ pub(crate) fn is_path_allowed(requested: &str, allowed_root: &Option<String>) ->
     }
 }
 
-/// 读取文件大小上限（防止超大文件读入内存导致内存暴涨和 IPC 卡死）
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// 读取文件大小上限：只读查看放宽到 50MB（大 SQL/日志/bundle 偶尔要看）
+const MAX_READ_SIZE: u64 = 50 * 1024 * 1024;
+/// 写入大小上限保持 10MB（编辑大文件内存压力大，且几乎无编辑需求）
+const MAX_WRITE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// 读取文件响应：is_binary 标记二进制文件（前端转交系统默认程序打开）
+#[derive(Debug, Serialize)]
+pub struct ReadFileResponse {
+    pub content: String,
+    pub is_binary: bool,
+    pub size: u64,
+}
 
 /// 读取文件内容
 #[tauri::command]
-pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
+pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadFileResponse, String> {
     // 在 await 前释放锁，确保 future 是 Send
     {
         let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
@@ -145,10 +155,26 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<Strin
         }
     }
     let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > MAX_FILE_SIZE {
-        return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
     }
-    tokio::fs::read_to_string(&path).await.map_err(|e| format!("无法读取文件: {}", e))
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+
+    // 二进制嗅探：前 8KB 含 NUL 字节即视为二进制（与 git 同策略），
+    // 前端收到 is_binary 后改用系统默认程序打开，不进入编辑器
+    let is_binary = bytes.iter().take(8192).any(|&b| b == 0);
+    if is_binary {
+        return Ok(ReadFileResponse { content: String::new(), is_binary: true, size: meta.len() });
+    }
+
+    // 先 UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）。
+    // 写回统一 UTF-8（write_file），不保留原编码——GBK 编辑场景极低频，不值得复杂度
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GB18030.decode(&bytes).0.into_owned(),
+    };
+
+    Ok(ReadFileResponse { content, is_binary: false, size: meta.len() })
 }
 
 /// 写入文件内容（与 read_file 同款安全校验：项目白名单 + 大小上限）
@@ -161,10 +187,97 @@ pub async fn write_file(state: State<'_, AppState>, path: String, content: Strin
             return Err("访问被拒绝".into());
         }
     }
-    if (content.len() as u64) > MAX_FILE_SIZE {
+    if (content.len() as u64) > MAX_WRITE_SIZE {
         return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", content.len() as f64 / (1024.0 * 1024.0)));
     }
     tokio::fs::write(&path, content).await.map_err(|e| format!("无法写入文件: {}", e))
+}
+
+/// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）
+const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024;
+
+/// 读取图片为 base64（内建预览，前端拼 data URL）
+#[tauri::command]
+pub async fn read_image_data(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > MAX_IMAGE_SIZE {
+        return Err(format!("图片过大（{:.1} MB），超过 20 MB 预览上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Ok(STANDARD.encode(&bytes))
+}
+
+/// hex 视图分页读取响应：一页 rows 行 × 16 字节
+#[derive(Debug, Serialize)]
+pub struct HexPage {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub total_size: u64,
+}
+
+/// 分页读取二进制内容（hex 视图按需加载，大文件不整体进内存/IPC）
+#[tauri::command]
+pub async fn read_hex_page(state: State<'_, AppState>, path: String, offset: u64, rows: u32) -> Result<HexPage, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let rows = rows.clamp(1, 1024);
+    let mut file = tokio::fs::File::open(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    let total_size = file.metadata().await.map_err(|e| format!("无法读取文件: {}", e))?.len();
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    let mut bytes = vec![0u8; rows as usize * 16];
+    let n = file.read(&mut bytes).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    bytes.truncate(n);
+    Ok(HexPage { offset, bytes, total_size })
+}
+
+/// 读取 .class 文件为字节码视图文本（javap 风格，只读）
+#[tauri::command]
+pub async fn read_class_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    crate::core::classfile::disassemble_class(&bytes)
+}
+
+/// 反编译 .class 文件为 Java 源码（捆绑 CFR，失败由前端回退字节码视图）
+#[tauri::command]
+pub async fn decompile_class(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    // 在 await 前释放锁，确保 future 是 Send
+    {
+        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
+        if !is_path_allowed(&path, &root) {
+            return Err("访问被拒绝".into());
+        }
+    }
+    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    crate::core::decompiler::decompile_class_bytes(&bytes).await
 }
 
 /// 列出目录内容（允许浏览任意路径，供 FilePicker/FileTree 使用）

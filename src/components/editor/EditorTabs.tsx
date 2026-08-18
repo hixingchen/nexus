@@ -12,6 +12,7 @@ export function EditorTabs() {
   const dirtyIds = useEditorStore(s => s.dirtyIds);
   const closeTab = useEditorStore(s => s.closeTab);
   const closeTabs = useEditorStore(s => s.closeTabs);
+  const activeTab = tabs.find(t => t.id === activeTabId) ?? null;
   /** 单标签关闭确认（未保存） */
   const [confirmTarget, setConfirmTarget] = useState<FileTab | null>(null);
   /** 右键菜单 */
@@ -138,12 +139,12 @@ export function EditorTabs() {
           );
         })}
 
-        {/* 右侧：保存当前文件（有未保存更改时可用） */}
+        {/* 右侧：保存当前文件（有未保存更改且非只读时可用） */}
         <div className="flex items-center ml-auto px-2 flex-shrink-0">
           <button
             className="p-1 rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted transition-colors"
-            title="保存当前文件（Ctrl+S）"
-            disabled={dirtyIds.length === 0}
+            title={activeTab?.readonly ? '文件过大，仅支持查看' : '保存当前文件（Ctrl+S）'}
+            disabled={dirtyIds.length === 0 || !!activeTab?.readonly}
             onClick={() => { void saveActiveFile(); }}
           >
             <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">

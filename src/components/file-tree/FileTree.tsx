@@ -6,6 +6,7 @@ import { useSearchModalStore } from '../../stores/searchModal';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
 import { SvgIcon } from '../ui/SvgIcon';
+import { getDirColorClass } from '../../utils/fileColors';
 import type { FileEntry } from '../../types/file';
 
 const getExtension = (name: string) => (name.split('.').pop() ?? '').toLowerCase();
@@ -158,6 +159,8 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
   const iconSvg = e.is_dir
     ? (open ? FolderOpen : FolderClosed)
     : getIconSvg(getExtension(e.name));
+  /** 生成物/依赖目录名淡化（规则表见 fileColors.ts） */
+  const dirColor = e.is_dir ? getDirColorClass(e.name) : null;
 
   return (
     <div>
@@ -183,7 +186,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
           style={{ width: 16, height: 16 }}
         />
 
-        <span className="truncate text-[13px] ml-1">
+        <span className={`truncate text-[13px] ml-1 ${dirColor ?? ''}`}>
           {e.name}
         </span>
       </div>

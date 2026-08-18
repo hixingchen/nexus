@@ -24,6 +24,13 @@
 - 文件树浏览
 - 代码查看器
 - 在资源管理器中打开
+- 多编码支持（UTF-8 / GBK 等自动识别）
+- 二进制内建查看：图片预览、十六进制视图
+- .class 文件查看：CFR 反编译为 Java 源码（无 JRE 时回退字节码视图）
+
+## 第三方组件
+
+- CFR（[MIT License](src-tauri/resources/cfr-LICENSE.txt)）：Java 字节码反编译，jar 随应用内嵌分发
 
 ### 界面
 - 深色主题

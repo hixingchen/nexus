@@ -36,6 +36,7 @@ const registry: Record<string, string> = {
   yaml: yamlSvg, yml: yamlSvg,
   toml: tomlSvg,
   java: javaSvg,
+  class: javaSvg,
   dockerfile: dockerSvg,
   lock: lockSvg,
   vue: vueSvg,

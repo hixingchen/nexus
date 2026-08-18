@@ -2,7 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, type Panel } from '@codemirror/view';
 import { EditorState, StateEffect, StateField } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, redo } from '@codemirror/commands';
-import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap } from '@codemirror/language';
+import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, type Language, type LanguageSupport } from '@codemirror/language';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile } from '../../stores/editor';
@@ -163,7 +163,7 @@ function createSearchPanel(view: EditorView): Panel {
 function getLanguageExtension(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
 
-  const langMap: Record<string, () => ReturnType<typeof javascript>> = {
+  const langMap: Record<string, () => Language | LanguageSupport> = {
     js: () => javascript(),
     jsx: () => javascript({ jsx: true }),
     ts: () => javascript({ typescript: true }),
@@ -183,6 +183,7 @@ function getLanguageExtension(filePath: string) {
     go: () => go(),
     sql: () => sql(),
     vue: () => vue(),
+    class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
   };
 
   const factory = langMap[ext];
@@ -274,7 +275,8 @@ function createEditorState(
       }]),
     );
   } else {
-    extensions.push(EditorView.editable.of(false));
+    // 只读：用 readOnly 而非 editable(false)——前者保留焦点/光标/选中复制，仅禁止编辑
+    extensions.push(EditorState.readOnly.of(true));
   }
 
   return EditorState.create({ doc: content, extensions });

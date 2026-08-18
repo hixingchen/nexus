@@ -2,6 +2,8 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { EditorTabs } from '../editor/EditorTabs';
 import { CodeViewer } from '../editor/CodeViewer';
+import { ImageViewer } from '../editor/ImageViewer';
+import { HexViewer } from '../editor/HexViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
@@ -173,11 +175,18 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           <>
             <EditorTabs />
             <div className="flex-1 overflow-hidden">
-              <CodeViewer
-                filePath={activeTab.path}
-                content={fileContent ?? ''}
-                onChange={(content) => useEditorStore.getState().updateDraft(content)}
-              />
+              {activeTab.viewerType === 'image' ? (
+                <ImageViewer path={activeTab.path} name={activeTab.name} />
+              ) : activeTab.viewerType === 'hex' ? (
+                <HexViewer path={activeTab.path} />
+              ) : (
+                <CodeViewer
+                  filePath={activeTab.path}
+                  content={fileContent ?? ''}
+                  editable={!activeTab.readonly}
+                  onChange={(content) => useEditorStore.getState().updateDraft(content)}
+                />
+              )}
             </div>
           </>
         ) : (
