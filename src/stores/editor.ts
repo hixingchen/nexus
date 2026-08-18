@@ -89,6 +89,9 @@ export function parseJarVirtualPath(path: string): { jarPath: string; nested: st
   return { jarPath, nested, name };
 }
 
+/** 每文件的原始字节特征（换行风格 + 编码）：保存时按此写回，保证字节保真 */
+const fileMetaCache = new Map<string, { lineEnding: 'lf' | 'crlf' | 'cr'; encoding: 'utf8' | 'gb18030' }>();
+
 /** 读取文本内容：jar 内条目走 jar 读取，.class 走 CFR/字节码视图，其余走 read_file（二进制抛 BINARY） */
 async function fetchTextContent(path: string): Promise<{ content: string; size: number }> {
   if (path.startsWith('jar://')) {
@@ -102,7 +105,15 @@ async function fetchTextContent(path: string): Promise<{ content: string; size: 
   }
   const res = await editorService.readFile(path);
   if (res.is_binary) throw new Error('BINARY');
+  fileMetaCache.set(path, { lineEnding: res.lineEnding, encoding: res.encoding });
   return { content: res.content, size: res.size };
+}
+
+/** 按文件原始换行风格还原（CodeMirror 编辑会规范化换行，保存时转回原风格防 git 误报变更） */
+function toOriginalEnding(text: string, lineEnding: 'lf' | 'crlf' | 'cr'): string {
+  if (lineEnding === 'crlf') return text.replace(/\n/g, '\r\n');
+  if (lineEnding === 'cr') return text.replace(/\n/g, '\r');
+  return text;
 }
 
 /** 打开新标签（读取期间可能已被其他调用打开：已有标签则切换过去，恢复其未保存草稿） */
@@ -211,6 +222,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
     if (closedTab && !newTabs.some(t => t.path === closedTab.path)) {
       removeCacheForPath(closedTab.path);
+      fileMetaCache.delete(closedTab.path);
     }
 
     // 关闭的不是活动标签：无需处理内容
@@ -479,7 +491,12 @@ export async function saveActiveFile(): Promise<boolean> {
     // 写盘前捕获快照：markClean 的基线必须等于实际写入磁盘的内容，
     // 不能用 await 后的 fileContent（保存期间用户可能已继续编辑）
     const contentToSave = fileContent ?? '';
-    await editorService.writeFile(tab.path, contentToSave);
+    // 按原文件换行风格/编码写回：CodeMirror 规范化换行 + UTF-8 写回会让
+    // "编辑→撤销→保存"后的字节与原始文件不同（git 误报变更）
+    const meta = fileMetaCache.get(tab.path);
+    const bytesToWrite = meta ? toOriginalEnding(contentToSave, meta.lineEnding) : contentToSave;
+    await editorService.writeFile(tab.path, bytesToWrite, meta?.encoding);
+    // 缓存与基线存编辑器内容（不转换），切换标签/撤销比较都在编辑器内容维度
     setCacheContent(tab.path, contentToSave);
     useEditorStore.getState().markClean(activeTabId, contentToSave);
     showNotification({ title: `已保存「${tab.name}」` });

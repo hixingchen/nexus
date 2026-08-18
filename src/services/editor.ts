@@ -5,11 +5,22 @@ export interface ReadFileResponse {
   content: string;
   is_binary: boolean;
   size: number;
+  /** 原始换行风格（保存时按此写回，避免编辑器规范化换行导致 git 误报变更） */
+  lineEnding: 'lf' | 'crlf' | 'cr';
+  /** 原始编码（'gb18030' 时保存按原编码写回，GBK 文件编辑后字节不变） */
+  encoding: 'utf8' | 'gb18030';
 }
 
-/** 读取文件内容 */
+/** 读取文件内容（Tauri 2 返回值保持 Rust snake_case 字段名，这里统一映射为 camelCase） */
 export async function readFile(path: string): Promise<ReadFileResponse> {
-  return await invoke('read_file', { path });
+  const res = await invoke('read_file', { path }) as ReadFileResponse & { line_ending?: string };
+  return {
+    content: res.content,
+    is_binary: res.is_binary,
+    size: res.size,
+    lineEnding: (res.lineEnding ?? res.line_ending ?? 'lf') as 'lf' | 'crlf' | 'cr',
+    encoding: (res.encoding ?? 'utf8') as 'utf8' | 'gb18030',
+  };
 }
 
 /** 读取 .class 源码视图：优先 CFR 反编译（IDEA 级），失败回退字节码视图（无 JRE/超时等） */
@@ -74,9 +85,9 @@ export async function readJarEntryBytes(path: string, nested: string[], name: st
   return { bytes, size: res.size };
 }
 
-/** 写入文件内容 */
-export async function writeFile(path: string, content: string): Promise<void> {
-  return await invoke('write_file', { path, content });
+/** 写入文件内容（encoding 为原编码，GBK 文件按原编码写回保证字节不变） */
+export async function writeFile(path: string, content: string, encoding?: 'utf8' | 'gb18030'): Promise<void> {
+  return await invoke('write_file', { path, content, encoding });
 }
 
 /** 单条文件搜索结果 */

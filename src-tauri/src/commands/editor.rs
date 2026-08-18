@@ -142,14 +142,34 @@ pub struct ReadFileResponse {
     pub content: String,
     pub is_binary: bool,
     pub size: u64,
+    /// 原始换行风格（保存时按此写回，避免编辑器规范化换行导致 git 误报变更）
+    pub line_ending: String,
+    /// 原始编码：'utf8' | 'gb18030'（保存时按此编码写回，GBK 文件编辑保存后字节不变）
+    pub encoding: String,
 }
 
 /// UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）。
-/// 写回统一 UTF-8（write_file），不保留原编码——GBK 编辑场景极低频，不值得复杂度
-fn decode_text(bytes: &[u8]) -> String {
+/// 返回 (解码内容, 编码标识)——保存时按原编码写回，保证字节保真
+fn decode_text(bytes: &[u8]) -> (String, &'static str) {
     match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
+        Ok(s) => (s.to_string(), "utf8"),
+        Err(_) => (encoding_rs::GB18030.decode(bytes).0.into_owned(), "gb18030"),
+    }
+}
+
+/// 检测文件原始换行风格：'lf' | 'crlf' | 'cr'（混合取占比最大的）
+fn detect_line_ending(bytes: &[u8]) -> &'static str {
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    let lf = bytes.iter().filter(|&&b| b == b'\n').count() - crlf;
+    let cr = bytes.iter().filter(|&&b| b == b'\r').count() - crlf;
+    if crlf == 0 && lf == 0 && cr == 0 {
+        "lf" // 无换行（空文件/单行）
+    } else if crlf >= lf && crlf >= cr {
+        "crlf"
+    } else if lf >= cr {
+        "lf"
+    } else {
+        "cr"
     }
 }
 
@@ -173,18 +193,38 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadF
     // 前端收到 is_binary 后改用系统默认程序打开，不进入编辑器
     let is_binary = bytes.iter().take(8192).any(|&b| b == 0);
     if is_binary {
-        return Ok(ReadFileResponse { content: String::new(), is_binary: true, size: meta.len() });
+        return Ok(ReadFileResponse {
+            content: String::new(),
+            is_binary: true,
+            size: meta.len(),
+            line_ending: "lf".into(),
+            encoding: "utf8".into(),
+        });
     }
 
     // 先 UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）
-    let content = decode_text(&bytes);
+    let (content, encoding) = decode_text(&bytes);
+    let line_ending = detect_line_ending(&bytes);
 
-    Ok(ReadFileResponse { content, is_binary: false, size: meta.len() })
+    Ok(ReadFileResponse {
+        content,
+        is_binary: false,
+        size: meta.len(),
+        line_ending: line_ending.into(),
+        encoding: encoding.into(),
+    })
 }
 
-/// 写入文件内容（与 read_file 同款安全校验：项目白名单 + 大小上限）
+/// 写入文件内容（与 read_file 同款安全校验：项目白名单 + 大小上限）。
+/// encoding 指定原编码（'gb18030'）时按原编码编码写回——GBK 文件编辑保存后字节不变，
+/// git 不会误报变更（前端按 read_file 返回的 encoding 传入）
 #[tauri::command]
-pub async fn write_file(state: State<'_, AppState>, path: String, content: String) -> Result<(), String> {
+pub async fn write_file(
+    state: State<'_, AppState>,
+    path: String,
+    content: String,
+    encoding: Option<String>,
+) -> Result<(), String> {
     // 在 await 前释放锁，确保 future 是 Send
     {
         let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
@@ -195,7 +235,11 @@ pub async fn write_file(state: State<'_, AppState>, path: String, content: Strin
     if (content.len() as u64) > MAX_WRITE_SIZE {
         return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", content.len() as f64 / (1024.0 * 1024.0)));
     }
-    tokio::fs::write(&path, content).await.map_err(|e| format!("无法写入文件: {}", e))
+    let data: Vec<u8> = match encoding.as_deref() {
+        Some("gb18030") => encoding_rs::GB18030.encode(&content).0.into_owned(),
+        _ => content.into_bytes(),
+    };
+    tokio::fs::write(&path, data).await.map_err(|e| format!("无法写入文件: {}", e))
 }
 
 /// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）
@@ -355,7 +399,7 @@ pub async fn read_jar_entry(
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         Ok(JarEntryContent { content: STANDARD.encode(&entry), kind: "binary".into(), size: entry.len() as u64 })
     } else {
-        Ok(JarEntryContent { content: decode_text(&entry), kind: "text".into(), size: entry.len() as u64 })
+        Ok(JarEntryContent { content: decode_text(&entry).0, kind: "text".into(), size: entry.len() as u64 })
     }
 }
 
