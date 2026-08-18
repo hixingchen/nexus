@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Modal } from '../ui/Modal';
 import { SvgIcon } from '../ui/SvgIcon';
@@ -20,6 +20,46 @@ export function EditorTabs() {
   /** 批量关闭确认（含未保存标签时） */
   const [confirmMany, setConfirmMany] = useState<{ title: string; ids: string[]; note: string } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  /** 标签滚动区（超出宽度时出现左右滚动按钮） */
+  const tabsScrollRef = useRef<HTMLDivElement | null>(null);
+  /** 内容溢出（标题栏容不下标签）→ 显示滚动按钮；常驻不随滚动位置消失 */
+  const [showScrollBtns, setShowScrollBtns] = useState(false);
+  /** 是否已滚到边界（到边界时按钮禁用置灰，但不消失） */
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  // 激活标签自动滚动到可见区域：标签超出宽度横向滚动时，切标签/打开文件后自动滚过去
+  // （scrollIntoView inline:'nearest' 仅在不可见时才滚动最小距离，可见时无动作）
+  useEffect(() => {
+    if (!activeTabId) return;
+    document.querySelector(`[data-tab-id="${activeTabId}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeTabId]);
+
+  // 滚动按钮状态：内容溢出才显示按钮（常驻，不随滚动位置消失）；
+  // 滚到边界时对应按钮禁用置灰（-1 容差防小数误差）
+  const updateScrollButtons = useCallback(() => {
+    const el = tabsScrollRef.current;
+    if (!el) return;
+    const overflow = el.scrollWidth > el.clientWidth + 1;
+    setShowScrollBtns(overflow);
+    setCanScrollLeft(el.scrollLeft > 0);
+    setCanScrollRight(el.scrollLeft < el.scrollWidth - el.clientWidth - 1);
+  }, []);
+
+  // 标签增减 / 容器宽度变化（窗口缩放、侧栏开关）时重新判断溢出
+  useEffect(() => {
+    updateScrollButtons();
+    const el = tabsScrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(updateScrollButtons);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [tabs.length, updateScrollButtons]);
+
+  /** 滚动按钮：每次滚 300px（约一个半标签宽），平滑滚动 */
+  const scrollTabs = (dir: 1 | -1) => {
+    tabsScrollRef.current?.scrollBy({ left: dir * 300, behavior: 'smooth' });
+  };
 
   // 右键菜单：mousedown 外部点击关闭（菜单内不关，否则菜单项点击失效）
   useEffect(() => {
@@ -86,8 +126,14 @@ export function EditorTabs() {
 
   return (
     <>
-      <div className="flex bg-nexus-surface border-b border-nexus-border overflow-x-auto">
-        {tabs.map(tab => {
+      <div className="flex bg-nexus-surface border-b border-nexus-border">
+        {/* 标签滚动区（仅标签内容滚动，右侧按钮固定不随滚动） */}
+        <div
+          ref={tabsScrollRef}
+          className="flex flex-1 overflow-x-auto"
+          onScroll={updateScrollButtons}
+        >
+          {tabs.map(tab => {
           const isActive = activeTabId === tab.id;
           const isDirty = dirtyIds.includes(tab.id);
           const ext = tab.name.split('.').pop() ?? '';
@@ -95,7 +141,8 @@ export function EditorTabs() {
           return (
             <div
               key={tab.id}
-              className={`group relative flex items-center gap-1.5 pl-3 pr-2 h-[34px] cursor-pointer border-r border-nexus-border min-w-0 transition-colors ${
+              data-tab-id={tab.id}
+              className={`group relative flex items-center gap-1.5 pl-3 pr-2 h-[34px] cursor-pointer border-r border-nexus-border flex-shrink-0 transition-colors ${
                 isActive
                   ? 'bg-nexus-bg text-nexus-text'
                   : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/40'
@@ -115,6 +162,8 @@ export function EditorTabs() {
                 style={{ width: 14, height: 14 }}
               />
 
+              {/* 标题宽度自适应文件名（短名窄、长名最多 140px 截断）；
+                  配合 flex-shrink-0 标签不随数量收缩，超宽走横向滚动按钮 */}
               <span className="truncate max-w-[140px] text-[12.5px]">{tab.name}</span>
 
               {/* 未保存圆点（hover 时变为关闭按钮） */}
@@ -138,9 +187,36 @@ export function EditorTabs() {
             </div>
           );
         })}
+        </div>
 
-        {/* 右侧：保存当前文件（有未保存更改且非只读时可用） */}
-        <div className="flex items-center ml-auto px-2 flex-shrink-0">
+        {/* 左右滚动按钮：并排在右侧（保存按钮之前）；内容溢出才显示，常驻不随滚动位置消失，
+            滚到边界时对应按钮禁用置灰 */}
+        {showScrollBtns && (
+          <>
+            <button
+              className="flex-shrink-0 w-[26px] flex items-center justify-center text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"
+              title="向左滚动标签"
+              disabled={!canScrollLeft}
+              onClick={() => scrollTabs(-1)}
+            >
+              <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="6,1 2,5 6,9" />
+              </svg>
+            </button>
+            <button
+              className="flex-shrink-0 w-[26px] flex items-center justify-center text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"
+              title="向右滚动标签"
+              disabled={!canScrollRight}
+              onClick={() => scrollTabs(1)}
+            >
+              <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="4,1 8,5 4,9" />
+              </svg>
+            </button>
+          </>
+        )}
+        {/* 右侧：保存当前文件（固定最右，标签滚动不覆盖；有未保存更改且非只读时可用） */}
+        <div className="flex items-center px-2 flex-shrink-0">
           <button
             className="p-1 rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted transition-colors"
             title={activeTab?.readonly ? '文件过大，仅支持查看' : '保存当前文件（Ctrl+S）'}

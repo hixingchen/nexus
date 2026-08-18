@@ -1,9 +1,10 @@
-import { useRef, useState, useEffect } from 'react';
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, type Panel } from '@codemirror/view';
-import { EditorState, StateEffect, StateField } from '@codemirror/state';
+import { useRef, useState, useEffect, useCallback } from 'react';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, type DecorationSet, type Panel } from '@codemirror/view';
+import { EditorState, StateEffect, StateField, type Range, type Text } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
-import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, type LanguageSupport } from '@codemirror/language';
-import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery } from '@codemirror/search';
+import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, LanguageSupport, LRLanguage } from '@codemirror/language';
+import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
+import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile } from '../../stores/editor';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
@@ -11,7 +12,7 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
 import { python } from '@codemirror/lang-python';
 import { java } from '@codemirror/lang-java';
-import { css } from '@codemirror/lang-css';
+import { css, cssLanguage } from '@codemirror/lang-css';
 import { html } from '@codemirror/lang-html';
 import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
@@ -51,7 +52,7 @@ function cacheKey(filePath: string, editable: boolean, openSeq: number): string 
  * 常在标签栏/文件树上，Ctrl+Z 无反应（内容未撤销却以为撤销了，dirty 提示"保存"
  * 让人困惑）。焦点在编辑器或输入框时放行（CodeMirror/浏览器自己处理）
  */
-let activeEditorView: EditorView | null = null;
+export let activeEditorView: EditorView | null = null;
 
 // ── 双击选中代码块（IDEA 风格，全语言通用） ────────────────
 
@@ -124,6 +125,112 @@ function findBoundNode(view: EditorView, pos: number) {
   return result;
 }
 
+// ── CSS 颜色值色块（VS Code 风格：颜色值后显示色块，仅 CSS/SCSS/LESS） ──
+
+class ColorSwatchWidget extends WidgetType {
+  constructor(readonly color: string) {
+    super();
+  }
+  toDOM(): HTMLElement {
+    const span = document.createElement('span');
+    span.className = 'cm-color-swatch';
+    span.style.background = this.color;
+    span.title = this.color;
+    return span;
+  }
+  eq(other: ColorSwatchWidget) {
+    return other.color === this.color;
+  }
+  ignoreEvent() {
+    return true;
+  }
+}
+
+/** 常用命名颜色（完整表太大，取高频项；hex / rgb() / hsl() 已覆盖其余） */
+const NAMED_COLORS: Record<string, string> = {
+  black: '#000', white: '#fff', red: '#f00', green: '#008000', blue: '#00f',
+  yellow: '#ff0', orange: '#ffa500', pink: '#ffc0cb', purple: '#800080',
+  brown: '#a52a2a', gray: '#808080', grey: '#808080', cyan: '#0ff',
+  magenta: '#f0f', lime: '#0f0', navy: '#000080', teal: '#008080',
+  silver: '#c0c0c0', gold: '#ffd700', coral: '#ff7f50', transparent: 'transparent',
+};
+
+/** 校验 rgb()/hsl() 参数：至少含 3 个数字（宽松容错，无效色不显示色块） */
+function isValidColorFunc(raw: string): boolean {
+  return (raw.match(/\d+(?:\.\d+)?/g) ?? []).length >= 3;
+}
+
+/** 提取颜色值 → 可直接作背景色的 CSS 色串；无法解析返回 null */
+function parseColorValue(raw: string): string | null {
+  const s = raw.trim();
+  if (s.startsWith('#')) return s; // hex（3/4/6/8 位已由正则保证格式）
+  if (/^(?:rgba?|hsla?)\(/i.test(s)) return isValidColorFunc(s) ? s : null;
+  return NAMED_COLORS[s.toLowerCase()] ?? null;
+}
+
+/** hex（3/4/6/8 位）、rgb()/hsl() 函数、命名颜色（命名色匹配后查表过滤） */
+const COLOR_RE = /#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b|\b(?:rgba?|hsla?)\([^)]*\)|\b[a-zA-Z]{2,20}(?=[\s;})]|$)/g;
+
+/** Vue/HTML 的 <style> 块区间（含 lang="scss" 等属性），仅块内启用色块 */
+const STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+
+/** 色块上限与文档大小上限：防超大文件编辑时全文档扫描卡顿 */
+const MAX_SWATCHES = 1000;
+const MAX_SWATCH_DOC = 2 * 1024 * 1024;
+
+/** 在 [from, to) 区间内扫描颜色值，追加色块装饰 */
+function scanRange(
+  text: string,
+  from: number,
+  to: number,
+  widgets: Range<Decoration>[],
+): void {
+  COLOR_RE.lastIndex = from;
+  let m: RegExpExecArray | null;
+  while (widgets.length < MAX_SWATCHES && (m = COLOR_RE.exec(text)) && m.index < to) {
+    const color = parseColorValue(m[0]);
+    if (!color) continue;
+    const end = m.index + m[0].length;
+    widgets.push(Decoration.widget({ widget: new ColorSwatchWidget(color), side: 1 }).range(end, end));
+  }
+}
+
+/**
+ * 扫描文档中的颜色值，生成色块装饰。
+ * styleBlockOnly（Vue/HTML）：只在 <style> 块内扫描，不误伤 template/script 里的文本颜色
+ */
+function buildSwatchDeco(doc: Text, styleBlockOnly: boolean): DecorationSet {
+  if (doc.length > MAX_SWATCH_DOC) return Decoration.none;
+  const widgets: Range<Decoration>[] = [];
+  const text = doc.toString();
+  if (styleBlockOnly) {
+    STYLE_BLOCK_RE.lastIndex = 0;
+    let sm: RegExpExecArray | null;
+    while (widgets.length < MAX_SWATCHES && (sm = STYLE_BLOCK_RE.exec(text))) {
+      const contentStart = sm.index + sm[0].indexOf('>') + 1;
+      const contentEnd = sm.index + sm[0].length - '</style>'.length;
+      scanRange(text, contentStart, contentEnd, widgets);
+    }
+  } else {
+    scanRange(text, 0, text.length, widgets);
+  }
+  return Decoration.set(widgets, true);
+}
+
+/** 颜色值色块装饰：创建/内容变化时重新解析文档，在颜色值后画色块 */
+function makeColorSwatchField(styleBlockOnly: boolean) {
+  return StateField.define<DecorationSet>({
+    create(state) {
+      return buildSwatchDeco(state.doc, styleBlockOnly);
+    },
+    update(deco, tr) {
+      if (!tr.docChanged) return deco.map(tr.changes);
+      return buildSwatchDeco(tr.state.doc, styleBlockOnly);
+    },
+    provide: f => EditorView.decorations.from(f),
+  });
+}
+
 // ── 搜索命中高亮（动态装饰：定位时 dispatch 命中区间） ──
 const searchHitEffect = StateEffect.define<{ from: number; to: number }[]>();
 const searchHitField = StateField.define({
@@ -153,7 +260,41 @@ function SearchPanelView({ view }: { view: EditorView }) {
   const [invalid, setInvalid] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { inputRef.current?.focus(); }, []);
+  useEffect(() => {
+    inputRef.current?.focus();
+    // 打开面板即清空上次搜索的 query/高亮：输入框初始为空，不能让上次的匹配残留
+    // （CodeMirror 关闭面板不会清 query；注意不能传 null——@codemirror/search 6.7.1
+    // 内部 effect.value.create() 对 null 崩溃，须传空 SearchQuery）
+    view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: '' })) });
+  }, [view]);
+
+  /** 统计匹配总数与当前序号：优先取"包含光标位置的匹配"，否则取光标后的第一个
+   * （1-based；getCursor 内部处理大小写/正则/全词。findNext 后光标 head 在匹配末尾，
+   * 若按 from>=head 会把当前匹配跳过——先检查 from<=head<=to） */
+  const computeMatchPosition = (q: SearchQuery): { total: number; current: number } => {
+    let t = 0;
+    let inside = 0;
+    let after = 0;
+    const head = view.state.selection.main.head;
+    const cursor = q.getCursor(view.state.doc);
+    let match = cursor.next();
+    while (!match.done) {
+      t++;
+      if (inside === 0 && head >= match.value.from && head <= match.value.to) inside = t;
+      if (after === 0 && match.value.from >= head) after = t;
+      match = cursor.next();
+    }
+    return { total: t, current: inside || after || t };
+  };
+
+  /** 按当前输入与光标位置刷新计数（跳转按钮用：findNext/Prev 移动光标后序号会变） */
+  const refreshCount = () => {
+    try {
+      const { total, current } = computeMatchPosition(new SearchQuery({ search: value, caseSensitive, regexp, wholeWord }));
+      setTotal(total);
+      setCurrent(current);
+    } catch { /* 无效正则：保持显示 */ }
+  };
 
   // 应用搜索：更新 query → 统计匹配与当前序号 → 跳转第一个
   const applySearch = (search: string, cs: boolean, re: boolean, ww: boolean) => {
@@ -167,22 +308,19 @@ function SearchPanelView({ view }: { view: EditorView }) {
       setCurrent(0);
       return;
     }
-    view.dispatch({ effects: setSearchQuery.of(q) });
-    // 统计匹配数，并定位光标位置后的第一个匹配序号
-    // （getCursor 内部处理大小写/正则/全词选项）
-    let t = 0;
-    let cur = 0;
-    const head = view.state.selection.main.head;
-    const cursor = q.getCursor(view.state.doc);
-    let match = cursor.next();
-    while (!match.done) {
-      t++;
-      if (cur === 0 && match.value.from >= head) cur = t;
-      match = cursor.next();
+    // 输入清空：显式清除 query（避免空 query 残留高亮；不能传 null，见上）
+    if (!search) {
+      view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: '' })) });
+      setTotal(0);
+      setCurrent(0);
+      return;
     }
-    setTotal(t);
-    setCurrent(cur === 0 ? t : cur);
+    view.dispatch({ effects: setSearchQuery.of(q) });
+    // 先跳转到第一个匹配再统计：光标已在新匹配上，计数与按钮跳转连续（不滞后一个）
     if (search) findNext(view);
+    const { total, current } = computeMatchPosition(q);
+    setTotal(total);
+    setCurrent(current);
   };
 
   const handleInput = (v: string) => {
@@ -192,8 +330,8 @@ function SearchPanelView({ view }: { view: EditorView }) {
   const toggleCase = () => { const v = !caseSensitive; setCaseSensitive(v); applySearch(value, v, regexp, wholeWord); };
   const toggleRegexp = () => { const v = !regexp; setRegexp(v); applySearch(value, caseSensitive, v, wholeWord); };
   const toggleWholeWord = () => { const v = !wholeWord; setWholeWord(v); applySearch(value, caseSensitive, regexp, v); };
-  const goPrev = () => { if (value) findPrevious(view); };
-  const goNext = () => { if (value) findNext(view); };
+  const goPrev = () => { if (!value) return; findPrevious(view); refreshCount(); };
+  const goNext = () => { if (!value) return; findNext(view); refreshCount(); };
 
   const btnCls = "flex-shrink-0 w-[22px] h-[22px] flex items-center justify-center rounded hover:bg-[#2c313c] text-[#abb2bf] transition-colors disabled:opacity-40 disabled:hover:bg-transparent";
   const toggleCls = (active: boolean) =>
@@ -282,6 +420,35 @@ function vueCommentToggle(view: EditorView): boolean {
   return toggleBlockCommentByLine(view);
 }
 
+// ── Vue 的 <style lang="scss"/"less"> 块解析（lang-html 缺陷修复） ─────
+
+/**
+ * lang-html 的 style 块混合解析只认 lang="css" 或无 lang（defaultNesting 硬编码），
+ * lang="scss"/"less" 的块完全不解析 → 无高亮/无缩进/无补全。
+ * 在 lang-vue 的 wrap 链上追加 StyleElement 处理（wrap 链式：返回 null 回落内置逻辑，
+ * 不影响 template 绑定表达式、script 块等原有解析）
+ */
+const vueScssMixed = parseMixed((nodeRef, input: Input) => {
+  // lezer html 树里 style 块内容节点名是 StyleText（html 内置混合按节点类型 id 匹配）
+  const node = nodeRef.node as SyntaxNode;
+  if (node.name !== 'StyleText') return null;
+  // 读 <style> 开始标签的属性（与 @lezer/html getAttrs 同法）
+  const openTag = node.parent?.firstChild;
+  if (!openTag) return null;
+  const attrs: Record<string, string> = {};
+  for (const att of openTag.getChildren('Attribute')) {
+    const name = att.getChild('AttributeName');
+    const value = att.getChild('AttributeValue') ?? att.getChild('UnquotedAttributeValue');
+    if (name) {
+      attrs[input.read(name.from, name.to)] = !value ? ''
+        : value.name === 'AttributeValue' ? input.read(value.from + 1, value.to - 1) : input.read(value.from, value.to);
+    }
+  }
+  // scss/less 用 CSS 解析器硬解析（嵌套选择器为 error 节点，但属性名/值/数字正常高亮）
+  if (attrs.lang === 'scss' || attrs.lang === 'less') return { parser: cssLanguage.parser, bracketed: true };
+  return null;
+});
+
 /** 根据文件扩展名获取语言支持 */
 function getLanguageExtension(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -305,7 +472,11 @@ function getLanguageExtension(filePath: string) {
     rs: () => rust(),
     go: () => go(),
     sql: () => sql(),
-    vue: () => vue(),
+    vue: () => {
+      const base = vue();
+      // 追加 style lang="scss"/"less" 块解析（见 vueScssMixed）
+      return new LanguageSupport((base.language as LRLanguage).configure({ wrap: vueScssMixed }), base.support);
+    },
     xml: () => xml(),
     class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
   };
@@ -314,12 +485,22 @@ function getLanguageExtension(filePath: string) {
   return factory ? [factory()] : [];
 }
 
+/** 选中匹配的滚动条标记：匹配行集合 + 总行数（按行聚合） */
+interface MatchMarks {
+  lines: Set<number>;
+  total: number;
+}
+
+/** 滚动条标记的文档大小上限（防超大文件选区扫描卡顿） */
+const MAX_MARK_DOC = 5 * 1024 * 1024;
+
 /** 创建 CodeMirror 编辑器状态（含语言支持和主题） */
 function createEditorState(
   content: string,
   filePath: string,
   editable: boolean,
   onChange: (content: string) => void,
+  onMatchMarks: (marks: MatchMarks | null) => void,
 ) {
   const extensions = [
     lineNumbers(),
@@ -333,6 +514,32 @@ function createEditorState(
     history(),
     // 文件内搜索（Ctrl+F 打开查找面板，仅编辑器聚焦时生效）
     search({ createPanel: createSearchPanel }),
+    // 选中文字 → 高亮文档中所有相同匹配（VS Code 风格，选区变化自动更新）
+    highlightSelectionMatches({ minSelectionLength: 2 }),
+    // 选区变化 → 计算匹配行集合（滚动条标记用，按行聚合：一行多个匹配只算一个）
+    EditorView.updateListener.of(update => {
+      if (!update.selectionSet && !update.docChanged) return;
+      const sel = update.state.selection.main;
+      const doc = update.state.doc;
+      if (
+        sel.empty || sel.from === sel.to ||
+        sel.to - sel.from < 2 || sel.to - sel.from > 200 ||
+        doc.length > MAX_MARK_DOC
+      ) {
+        onMatchMarks(null);
+        return;
+      }
+      const text = update.state.sliceDoc(sel.from, sel.to);
+      if (text.includes('\n')) {
+        onMatchMarks(null);
+        return;
+      }
+      const lines = new Set<number>();
+      for (let n = 1; n <= doc.lines; n++) {
+        if (doc.line(n).text.includes(text)) lines.add(n);
+      }
+      onMatchMarks({ lines, total: doc.lines });
+    }),
     searchHitField,
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     oneDark,
@@ -344,8 +551,19 @@ function createEditorState(
       // Windows 上需显式补绑定（Mod=Ctrl）
       { key: 'Mod-Shift-z', run: redo, preventDefault: true },
       // 文件内搜索：显式绑定保证生效（search() 自带绑定带 scope 且优先级靠后）。
-      // 仅编辑器聚焦时触发（keymap 只接收编辑器的键盘事件）
-      { key: 'Mod-f', run: openSearchPanel, preventDefault: true },
+      // Ctrl+F 打开/聚焦搜索框并全选其内容（VS Code 行为：面板已打开时再按也全选，直接输入即替换）。
+      // rAF 等 React 渲染出输入框（createRoot 渲染是异步调度）
+      { key: 'Mod-f', run: (view) => {
+        openSearchPanel(view);
+        requestAnimationFrame(() => {
+          const input = view.dom.querySelector('input[placeholder="查找"]') as HTMLInputElement | null;
+          if (input) {
+            input.focus();
+            input.select();
+          }
+        });
+        return true;
+      }, preventDefault: true },
       { key: 'F3', run: findNext, shift: findPrevious, preventDefault: true },
       { key: 'Mod-g', run: findNext, shift: findPrevious, preventDefault: true },
       // Vue 模板注释修复（lang-vue 缺陷）：需先于语言包 keymap 注册才优先匹配；
@@ -353,6 +571,13 @@ function createEditorState(
       ...(filePath.toLowerCase().endsWith('.vue') ? [{ key: 'Mod-/', run: vueCommentToggle }] : []),
     ]),
     ...getLanguageExtension(filePath),
+    // 颜色值色块（VS Code 风格）：CSS 类文件全文；Vue/HTML 仅 <style> 块内
+    ...(() => {
+      const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+      if (['css', 'scss', 'less'].includes(ext)) return [makeColorSwatchField(false)];
+      if (ext === 'vue' || ext === 'html' || ext === 'htm') return [makeColorSwatchField(true)];
+      return [];
+    })(),
     EditorView.theme({
       '&': {
         height: '100%',
@@ -360,7 +585,10 @@ function createEditorState(
         '--indent-marker-bg-color': '#3a3f4b',
         '--indent-marker-active-bg-color': '#4a5a7a',
       },
-      '.cm-scroller': { overflow: 'auto' },
+      // 原生滚动条隐藏（Chromium 新主题固定 10px 且忽略 ::-webkit-scrollbar 宽度，
+      // 无法加宽——改用自绘宽滚动条 EditorScrollbars）
+      '.cm-scroller': { overflow: 'auto', scrollbarWidth: 'none' },
+      '.cm-scroller::-webkit-scrollbar': { display: 'none' },
       '.cm-content': {
         fontFamily: "'JetBrains Mono', 'Fira Code', Consolas, monospace",
         fontSize: '14px',
@@ -378,6 +606,11 @@ function createEditorState(
         backgroundColor: 'rgba(240, 190, 60, 0.22)',
         borderRadius: '2px',
       },
+      // 选中文字的其他相同匹配（蓝色，区别于搜索的黄色）
+      '.cm-selectionMatch': {
+        backgroundColor: 'rgba(80, 140, 255, 0.18)',
+        borderRadius: '2px',
+      },
       // 匹配高亮：当前匹配亮、其余匹配暗
       '.cm-searchMatch': {
         backgroundColor: 'rgba(240, 190, 60, 0.15)',
@@ -386,6 +619,17 @@ function createEditorState(
       '.cm-searchMatch-selected': {
         backgroundColor: 'rgba(240, 190, 60, 0.35)',
         outline: '1px solid rgba(240, 190, 60, 0.9)',
+      },
+      // CSS 颜色值色块（值后的小方块）
+      '.cm-color-swatch': {
+        display: 'inline-block',
+        width: '10px',
+        height: '10px',
+        borderRadius: '2px',
+        border: '1px solid rgba(255, 255, 255, 0.35)',
+        marginLeft: '4px',
+        verticalAlign: 'middle',
+        cursor: 'pointer',
       },
     }),
   ];
@@ -410,9 +654,143 @@ function createEditorState(
   return EditorState.create({ doc: content, extensions });
 }
 
+// ── 自绘宽滚动条（Chromium 原生滚动条无法加宽，见 .cm-scroller 注释） ──
+
+const SCROLLBAR_THUMB = 12; // 滑块宽/高（靠左，右侧留给匹配标记）；轨道 30px
+
+/**
+ * 宽滚动条浮层：右侧垂直滑块 + 底部水平滑块，可拖拽，内容不溢出时隐藏。
+ * 轨道 pointer-events-none 透明（不挡内容点击），仅滑块可交互
+ */
+function EditorScrollbars({ scroller, matchMarks }: { scroller: HTMLDivElement | null; matchMarks: MatchMarks | null }) {
+  const [showV, setShowV] = useState(false);
+  const [showH, setShowH] = useState(false);
+  const [vThumb, setVThumb] = useState({ top: 0, height: 24 });
+  const [hThumb, setHThumb] = useState({ left: 0, width: 24 });
+  /** 轨道可视区域（相对包裹层）：搜索面板开合会挤压 scroller，轨道须与其对齐 */
+  const [view, setView] = useState({ top: 0, height: 0, left: 0, width: 0 });
+
+  /** 按 scrollTop/scrollLeft 计算滑块位置与大小（rAF 节流） */
+  const update = useCallback(() => {
+    const el = scroller;
+    if (!el) return;
+    const { scrollTop, scrollLeft, clientHeight, clientWidth, scrollHeight, scrollWidth } = el;
+    // 轨道对齐 scroller 可视区域（顶部面板如搜索框会挤压 scroller 高度）
+    const wrapper = el.closest('.cm-editor')?.parentElement;
+    if (wrapper) {
+      const e = el.getBoundingClientRect();
+      const w = wrapper.getBoundingClientRect();
+      setView({ top: e.top - w.top, height: e.height, left: e.left - w.left, width: e.width });
+    }
+    setShowV(scrollHeight > clientHeight);
+    setShowH(scrollWidth > clientWidth);
+    if (scrollHeight > clientHeight) {
+      const height = Math.max(24, clientHeight * clientHeight / scrollHeight);
+      setVThumb({
+        height,
+        top: scrollTop / (scrollHeight - clientHeight) * (clientHeight - height),
+      });
+    }
+    if (scrollWidth > clientWidth) {
+      const width = Math.max(24, clientWidth * clientWidth / scrollWidth);
+      setHThumb({
+        width,
+        left: scrollLeft / (scrollWidth - clientWidth) * (clientWidth - width),
+      });
+    }
+  }, [scroller]);
+
+  useEffect(() => {
+    if (!scroller) return;
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(scroller);
+    let raf = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(update);
+    };
+    scroller.addEventListener('scroll', onScroll);
+    return () => {
+      ro.disconnect();
+      scroller.removeEventListener('scroll', onScroll);
+      cancelAnimationFrame(raf);
+    };
+  }, [scroller, update]);
+
+  /** 拖拽滑块：鼠标位移 × (内容/视口) 比例映射到滚动位置 */
+  const startDrag = (axis: 'v' | 'h') => (e: React.MouseEvent) => {
+    e.preventDefault();
+    const el = scroller;
+    if (!el) return;
+    const startPos = axis === 'v' ? e.clientY : e.clientX;
+    const startScroll = axis === 'v' ? el.scrollTop : el.scrollLeft;
+    const ratio = axis === 'v' ? el.scrollHeight / el.clientHeight : el.scrollWidth / el.clientWidth;
+    const move = (ev: MouseEvent) => {
+      const delta = (axis === 'v' ? ev.clientY : ev.clientX) - startPos;
+      if (axis === 'v') el.scrollTop = startScroll + delta * ratio;
+      else el.scrollLeft = startScroll + delta * ratio;
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
+
+  // 轨道容器 pointer-events-none（不挡内容点击），滑块需显式恢复 pointer-events-auto
+  const thumbCls = 'cm-custom-scrollbar-thumb pointer-events-auto absolute rounded-[6px] bg-[#4a5161] hover:bg-[#5c6370] cursor-pointer transition-colors';
+
+  return (
+    <>
+      {/* 垂直轨道：滑块靠左、匹配标记靠右，互不遮挡；轨道对齐 scroller 可视区域 */}
+      {showV && (
+        <div
+          className="absolute right-0 w-[30px] z-10 pointer-events-none"
+          style={{ top: view.top, height: view.height }}
+        >
+          {/* 选中文字匹配行的标记（按行聚合：位置 = 行号/总行数 × 轨道高，上限防密集渲染） */}
+          {matchMarks && [...matchMarks.lines].slice(0, 500).map(n => (
+            <div
+              key={n}
+              className="cm-scrollbar-match absolute w-[6px] h-[2px] rounded-full bg-[#4f8cff]"
+              style={{ top: (n - 0.5) / matchMarks.total * view.height - 1, right: 3 }}
+            />
+          ))}
+          <div
+            className={thumbCls}
+            style={{ top: vThumb.top, height: vThumb.height, width: SCROLLBAR_THUMB, left: 3 }}
+            onMouseDown={startDrag('v')}
+            title="拖动滚动"
+          />
+        </div>
+      )}
+      {/* 水平滑块：底部 30px 高 */}
+      {showH && (
+        <div
+          className="absolute h-[30px] z-10 pointer-events-none"
+          style={{ left: view.left, width: view.width, bottom: 4 }}
+        >
+          <div
+            className={thumbCls}
+            style={{ left: hThumb.left, width: hThumb.width, height: SCROLLBAR_THUMB, bottom: 3 }}
+            onMouseDown={startDrag('h')}
+            title="拖动滚动"
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
 export function CodeViewer({ filePath, content, editable = true, onChange }: CodeViewerProps) {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  /** 自绘滚动条的目标滚动容器（= EditorView.scrollDOM），state 触发滚动条组件更新 */
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  /** 选中匹配的滚动条标记（选区变化时由 updateListener 计算） */
+  const [matchMarks, setMatchMarks] = useState<MatchMarks | null>(null);
   // 回调与最新内容存 ref：编辑器只在 filePath 变化时重建，
   // 编辑中 content 回写（onChange → store）不触发重建，避免光标/焦点丢失
   const onChangeRef = useRef(onChange);
@@ -452,6 +830,7 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
           // state 写回缓存，切换回来 doc 对比命中、Ctrl+Z 历史保留
           if (viewRef.current) stateCache.set(key, viewRef.current.state);
         },
+        setMatchMarks,
       );
       stateCache.set(key, state);
       if (stateCache.size > MAX_CACHED_STATES) {
@@ -466,6 +845,7 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
       parent: editorRef.current,
     });
     activeEditorView = viewRef.current;
+    setScroller(viewRef.current.scrollDOM as HTMLDivElement);
 
     return () => {
       if (activeEditorView === viewRef.current) activeEditorView = null;
@@ -473,17 +853,20 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
     };
   }, [filePath, editable, openSeq]);
 
-  // 光标不在编辑器时 Ctrl+F 完全无效：
-  // 焦点若不在 .cm-editor 内（点击空白/其他面板后编辑器失焦），在捕获阶段吞掉事件，
-  // 避免触发文件内搜索面板或任何自带查找行为；编辑器聚焦时放行（keymap 正常处理）
+  // 全局 Ctrl+F：焦点在搜索框 → 全选其内容（keymap 收不到搜索框的按键——
+  // 输入框在 .cm-editor 内但在 .cm-content 外，再按 Ctrl+F 也全选，直接输入即替换）；
+  // 焦点不在 .cm-editor 内 → 吞掉事件（避免触发浏览器查找）；编辑器聚焦时放行（keymap 处理）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'f') {
-        const el = document.activeElement;
-        if (el && !(el instanceof Element && el.closest('.cm-editor'))) {
-          e.preventDefault();
-          e.stopPropagation();
-        }
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== 'f') return;
+      const el = document.activeElement;
+      if (el instanceof HTMLInputElement && el.closest('.cm-editor')) {
+        e.preventDefault();
+        e.stopPropagation();
+        el.select();
+      } else if (el && !(el instanceof Element && el.closest('.cm-editor'))) {
+        e.preventDefault();
+        e.stopPropagation();
       }
     };
     document.addEventListener('keydown', handler, true);
@@ -562,5 +945,10 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
     view.dispatch({ effects: searchHitEffect.of([]) });
   }, [hitSeq]);
 
-  return <div ref={editorRef} className="h-full" />;
+  return (
+    <div className="relative h-full">
+      <div ref={editorRef} className="h-full" />
+      <EditorScrollbars scroller={scroller} matchMarks={matchMarks} />
+    </div>
+  );
 }
