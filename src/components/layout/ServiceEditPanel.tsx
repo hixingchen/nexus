@@ -49,9 +49,27 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [editingToolCmd, setEditingToolCmd] = useState<ToolCommand | null>(null);
   const [showToolCmdForm, setShowToolCmdForm] = useState(false);
 
+  /**
+   * 更新工作目录；若监听路径还处于"跟随工作目录"的默认状态
+   * （空 / [] / 恰好等于 [旧 cwd]），则同步更新为 [新 cwd]
+   */
+  const applyCwd = (next: string) => {
+    const prev = cwd;
+    setCwd(next);
+    const trimmed = watchPaths.trim();
+    let follows = trimmed === '' || trimmed === '[]';
+    if (!follows) {
+      try {
+        const arr = JSON.parse(trimmed) as unknown;
+        follows = Array.isArray(arr) && arr.length === 1 && arr[0] === prev;
+      } catch { /* 非 JSON（用户自定义格式）：不跟随 */ }
+    }
+    if (follows) setWatchPaths(next ? JSON.stringify([next]) : '[]');
+  };
+
   const handleSelectCwd = async () => {
     const selected = await open({ directory: true, title: '选择工作目录', defaultPath: cwd });
-    if (selected) setCwd(selected);
+    if (selected) applyCwd(selected);
   };
 
   const handleSave = async () => {
@@ -145,7 +163,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
               <label className={labelCls}>工作目录</label>
               <div className="relative mt-1">
                 <input className={`${inputCls} pr-8`} value={cwd}
-                  onChange={e => setCwd(e.target.value)} placeholder="/path/to/service" />
+                  onChange={e => applyCwd(e.target.value)} placeholder="/path/to/service" />
                 <button
                   className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
                   onClick={handleSelectCwd}

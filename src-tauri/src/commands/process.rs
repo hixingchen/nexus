@@ -58,9 +58,10 @@ pub struct ProcessStatus {
 #[tauri::command]
 pub fn start_service(state: State<AppState>, app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    let (_name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
+    let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
     let envs = crate::core::process::parse_env_vars(&env_vars);
-    state.process_mgr.start(&project_id, &service_id, &command, &cwd, &envs, &app_handle)
+    state.process_mgr.start(&project_id, &service_id, &name, &command, &cwd, &envs, &app_handle)
+        .map_err(|e| format!("服务「{}」{}", name, e))
 }
 
 #[tauri::command]
@@ -72,9 +73,10 @@ pub fn stop_service(state: State<AppState>, service_id: String) -> Result<(), St
 #[tauri::command]
 pub fn restart_service(state: State<AppState>, app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    let (_name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
+    let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
     let envs = crate::core::process::parse_env_vars(&env_vars);
-    state.process_mgr.restart(&project_id, &service_id, &command, &cwd, &envs, &app_handle)
+    state.process_mgr.restart(&project_id, &service_id, &name, &command, &cwd, &envs, &app_handle)
+        .map_err(|e| format!("服务「{}」{}", name, e))
 }
 
 #[tauri::command]
@@ -94,7 +96,7 @@ pub fn start_project_services(state: State<AppState>, app_handle: tauri::AppHand
     let mut errors = Vec::new();
     for (id, name, cmd, cwd, env_vars) in &services {
         let envs = crate::core::process::parse_env_vars(env_vars);
-        if let Err(e) = state.process_mgr.start(&project_id, id, cmd, cwd, &envs, &app_handle) {
+        if let Err(e) = state.process_mgr.start(&project_id, id, name, cmd, cwd, &envs, &app_handle) {
             errors.push(format!("{}: {}", name, e));
         }
     }

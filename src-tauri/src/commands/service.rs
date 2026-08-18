@@ -112,9 +112,26 @@ pub fn update_service(
     state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
+        // 监听路径跟随工作目录（兜底，覆盖任意保存入口）：
+        // watch_paths 为空/[]，或仍等于旧 cwd（默认跟随状态）→ 自动更新为新 cwd
+        let old: (String, String) = conn.query_row(
+            "SELECT cwd, watch_paths FROM services WHERE id=?1",
+            [&params.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(|e| format!("查询服务失败: {}", e))?;
+        let default_old = serde_json::to_string(&vec![old.0]).unwrap_or_default();
+        let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
+            if cwd.is_empty() { "[]".to_string() } else {
+                serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
+            }
+        } else if params.watch_paths.trim() == default_old {
+            serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| params.watch_paths)
+        } else {
+            params.watch_paths
+        };
         let affected = conn.execute(
             "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
+            rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
         ).map_err(|e| format!("更新服务失败: {}", e))?;
         if affected == 0 { return Err("服务不存在".into()); }
         Ok(())

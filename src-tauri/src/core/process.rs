@@ -162,8 +162,14 @@ impl ProcessManager {
         self.job = Some(job);
     }
 
-    pub fn start(&self, project_id: &str, key: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
-        log::info!("[nexus] 启动服务: {} (cmd={:?}, cwd={:?})", key, command, cwd);
+    pub fn start(&self, project_id: &str, key: &str, name: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
+        log::info!("[nexus] 启动服务: {} ({}) cmd={:?}, cwd={:?}", key, name, command, cwd);
+
+        // 工作目录为空：进程可能依赖相对路径/环境变量，直接拒绝并提示配置
+        // （错误不带服务名，由调用方按入口包装，避免批量启动时与"名称:"前缀重复）
+        if cwd.trim().is_empty() {
+            return Err("工作目录为空，无法启动".into());
+        }
 
         // Phase 1: 检查限制，然后释放锁
         {
@@ -374,9 +380,9 @@ impl ProcessManager {
         Ok(())
     }
 
-    pub fn restart(&self, project_id: &str, key: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
+    pub fn restart(&self, project_id: &str, key: &str, name: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
         self.stop(key)?;
-        self.start(project_id, key, command, cwd, env_vars, app_handle)
+        self.start(project_id, key, name, command, cwd, env_vars, app_handle)
     }
 
     /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）

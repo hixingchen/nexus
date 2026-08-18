@@ -58,11 +58,11 @@ export function showNotification({
           <span className={`${style.iconColor} text-sm font-bold`}>{style.icon}</span>
         </div>
 
-        {/* 文本 */}
+        {/* 文本：标题单行截断；描述可换行完整显示（错误/诊断信息不能截断） */}
         <div className="flex-1 min-w-0">
           <p className="text-[13px] text-nexus-text font-semibold truncate">{title}</p>
           {description && (
-            <p className="text-[11px] text-nexus-muted mt-0.5 truncate">{description}</p>
+            <p className="text-[11px] text-nexus-muted mt-0.5 break-words">{description}</p>
           )}
         </div>
 
