@@ -139,7 +139,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const cardCls = "bg-nexus-bg/30 border border-nexus-border/50 rounded-lg p-3.5";
 
   return (
-    <div className="absolute top-0 bottom-0 w-[360px] bg-nexus-surface border-l border-nexus-border flex flex-col z-10 shadow-2xl"
+    <div className="absolute top-0 bottom-0 w-[360px] bg-nexus-surface border-l border-nexus-border flex flex-col z-[60] shadow-2xl"
       style={{ right: rightOffset }}>
       {title && (
         <div className="flex items-center px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
