@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { processApi, type Service, type ToolCommand } from '../../services/service';
+import { processApi, watchApi, type Service, type ToolCommand } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
 import { showNotification } from '../ui/Toast';
 
@@ -55,9 +55,14 @@ export function ServiceTreeEntry({
     e.stopPropagation();
     setBusy(true);
     try {
-      if (action === 'start') await processApi.start(service.id);
-      else if (action === 'stop') {
+      if (action === 'start') {
+        await processApi.start(service.id);
+        // 启动单服务的文件监听（追加到项目监听中）
+        watchApi.start(service.project_id, service.id).catch((err) => console.error('启动文件监听失败:', err));
+      } else if (action === 'stop') {
         await processApi.stop(service.id);
+        // 停止单服务的文件监听（从项目监听中移除）
+        watchApi.stop(service.project_id, service.id).catch((err) => console.error('停止文件监听失败:', err));
         // 正常停止：日志清空（后端已清缓冲，前端缓存同步清）
         useLogStore.getState().clearLogs(service.id);
       }

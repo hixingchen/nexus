@@ -119,6 +119,8 @@ pub fn stop_project_services(state: State<AppState>, project_id: String) -> Resu
     for id in &ids {
         let _ = state.process_mgr.stop(id);
     }
+    // 停止项目级文件监听（项目停止 = 总开关，所有服务监听一并关闭）
+    let _ = state.file_watcher.stop_watching(&project_id);
     Ok(())
 }
 

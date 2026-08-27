@@ -13,6 +13,8 @@ struct WatcherState {
     _watcher: notify::RecommendedWatcher,
     stop_tx: Sender<()>,
     listener_handle: Option<std::thread::JoinHandle<()>>,
+    /// 当前正在监听的服务列表（用于追加/移除单服务）
+    services: Vec<ServiceWatchConfig>,
 }
 
 /// 单个服务的监听配置
@@ -137,7 +139,7 @@ impl FileWatcher {
         });
 
         self.watchers.lock().map_err(|e| format!("FileWatcher watchers 锁获取失败: {}", e))?
-            .insert(project_id.to_string(), WatcherState { _watcher: watcher, stop_tx, listener_handle: Some(listener_handle) });
+            .insert(project_id.to_string(), WatcherState { _watcher: watcher, stop_tx, listener_handle: Some(listener_handle), services: services.to_vec() });
 
         log::info!("文件监听已启动: project={} (id={})", project_name, project_id);
         Ok(())
@@ -156,6 +158,26 @@ impl FileWatcher {
             }
         }
         Ok(())
+    }
+
+    /// 获取项目当前正在监听的服务列表
+    pub fn get_watched_services(&self, project_id: &str) -> Option<Vec<ServiceWatchConfig>> {
+        let watchers = self.watchers.lock().ok()?;
+        watchers.get(project_id).map(|s| s.services.clone())
+    }
+
+    /// 从项目监听中移除指定服务，返回剩余的服务列表
+    pub fn remove_service_from_watching(&self, project_id: &str, service_id: &str) -> Vec<ServiceWatchConfig> {
+        let mut watchers = match self.watchers.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        if let Some(state) = watchers.get_mut(project_id) {
+            state.services.retain(|s| s.id != service_id);
+            state.services.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn stop_all(&self) {

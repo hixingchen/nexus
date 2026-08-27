@@ -47,9 +47,6 @@ export function useProjectDetail(projectId: string) {
       setDetail(d);
       useRunningStore.getState().setRunning(r.running, r.failed);
       runningLoadedRef.current = true;
-      if (mountedRef.current) {
-        watchApi.start(projectId).catch((e) => console.error('启动文件监听失败:', e));
-      }
     } catch (e) {
       if (seq !== loadSeqRef.current) return;
       console.error('加载项目详情失败:', e);
@@ -64,11 +61,6 @@ export function useProjectDetail(projectId: string) {
     setViewingLog(null);
     return () => { mountedRef.current = false; };
   }, [load]);
-
-  // 组件卸载或项目切换时停止文件监听
-  useEffect(() => {
-    return () => { watchApi.stop(projectId).catch((e) => console.error('停止文件监听失败:', e)); };
-  }, [projectId]);
 
   // 运行状态由全局 runningStore 轮询；首次加载成功后置位 runningLoadedRef
   const runningLoaded = useRunningStore(s => s.loaded);
@@ -134,6 +126,8 @@ export function useProjectDetail(projectId: string) {
       if (errors.length > 0) {
         showNotification({ variant: 'error', title: '部分服务启动失败', description: errors.join(', ') });
       }
+      // 启动项目级文件监听（所有 restart_mode>0 的服务）
+      watchApi.start(detail.project.id).catch((e) => console.error('启动文件监听失败:', e));
       await load();
     } catch (e: unknown) {
       showNotification({ variant: 'error', title: '启动服务失败', description: String(e) });
@@ -144,6 +138,7 @@ export function useProjectDetail(projectId: string) {
   const handleStopAll = useCallback(async () => {
     if (!detail) return;
     try {
+      // 后端 stop_project_services 同时停止所有进程和项目级文件监听（总开关）
       await processApi.stopProject(detail.project.id);
       // 全部停止 = 主动关闭：清空本项目所有服务日志（含失败服务的日志）
       for (const s of detail.services) {

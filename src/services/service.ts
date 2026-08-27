@@ -295,9 +295,11 @@ export const securityApi = {
 // ─── Watcher API ───────────────────────────────────────────
 
 export const watchApi = {
-  start: (projectId: string) =>
-    invoke<void>('start_watching', { projectId }),
+  /** 启动文件监听：serviceId 为空=项目级（所有服务），非空=单服务追加 */
+  start: (projectId: string, serviceId?: string) =>
+    invoke<void>('start_watching', { projectId, serviceId: serviceId ?? null }),
 
-  stop: (projectId: string) =>
-    invoke<void>('stop_watching', { projectId }),
+  /** 停止文件监听：serviceId 为空=项目级（全部停止），非空=仅移除该服务 */
+  stop: (projectId: string, serviceId?: string) =>
+    invoke<void>('stop_watching', { projectId, serviceId: serviceId ?? null }),
 };
