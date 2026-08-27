@@ -649,10 +649,21 @@ function createEditorState(
         '--indent-marker-bg-color': '#3a3f4b',
         '--indent-marker-active-bg-color': '#4a5a7a',
       },
-      // 原生滚动条隐藏（Chromium 新主题固定 10px 且忽略 ::-webkit-scrollbar 宽度，
-      // 无法加宽——改用自绘宽滚动条 EditorScrollbars）
-      '.cm-scroller': { overflow: 'auto', scrollbarWidth: 'none' },
-      '.cm-scroller::-webkit-scrollbar': { display: 'none' },
+      // 原生滚动条样式化（CSS 伪元素，浏览器处理布局，无重叠/遮挡问题）
+      '.cm-scroller': {
+        overflow: 'auto',
+        scrollbarWidth: 'thin',                              // Firefox
+        scrollbarColor: '#4a5161 #21252b',                   // Firefox: thumb track
+      },
+      '.cm-scroller::-webkit-scrollbar': { width: 14, height: 14 },
+      '.cm-scroller::-webkit-scrollbar-track': { background: '#21252b' },
+      '.cm-scroller::-webkit-scrollbar-thumb': {
+        background: '#4a5161',
+        borderRadius: 7,
+        border: '2px solid #21252b',
+        '&:hover': { background: '#5c6370' },
+      },
+      '.cm-scroller::-webkit-scrollbar-corner': { background: '#21252b' },
       '.cm-content': {
         fontFamily: "'JetBrains Mono', 'Fira Code', Consolas, monospace",
         fontSize: '14px',
@@ -665,6 +676,8 @@ function createEditorState(
       '.cm-activeLineGutter': { backgroundColor: '#2c313c' },
       '.cm-activeLine': { backgroundColor: '#2c313c' },
       '.cm-foldGutter': { color: '#5c6370' },
+      // 搜索面板层级：默认 300 过高，会盖住标签右键菜单等页面级弹窗
+      '.cm-panels': { zIndex: 50 },
       // 搜索结果命中高亮（背景色）
       '.cm-search-hit': {
         backgroundColor: 'rgba(240, 190, 60, 0.22)',
@@ -683,6 +696,20 @@ function createEditorState(
       '.cm-searchMatch-selected': {
         backgroundColor: 'rgba(240, 190, 60, 0.35)',
         outline: '1px solid rgba(240, 190, 60, 0.9)',
+      },
+      // 选区背景（双击选中/拖选）——最醒目
+      '& .cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
+        backgroundColor: 'rgba(55, 75, 115, 0.55) !important',
+      },
+      // 括号/标签匹配高亮（单击标签时）——柔和提示，低于选区
+      '& .cm-matchingBracket, & .cm-matchingTag, & .cm-selectionMatch': {
+        backgroundColor: 'rgba(80, 140, 255, 0.12) !important',
+        outline: '1px solid rgba(80, 140, 255, 0.25)',
+      },
+      // 非匹配侧的括号（失配提示）
+      '& .cm-nonmatchingBracket': {
+        backgroundColor: 'rgba(255, 80, 80, 0.2)',
+        outline: '1px solid rgba(255, 80, 80, 0.5)',
       },
       // CSS 颜色值色块（值后的小方块）
       '.cm-color-swatch': {
@@ -718,141 +745,28 @@ function createEditorState(
   return EditorState.create({ doc: content, extensions });
 }
 
-// ── 自绘宽滚动条（Chromium 原生滚动条无法加宽，见 .cm-scroller 注释） ──
-
-const SCROLLBAR_THUMB = 12; // 滑块宽/高（靠左，右侧留给匹配标记）；轨道 30px
-
 /**
- * 宽滚动条浮层：右侧垂直滑块 + 底部水平滑块，可拖拽，内容不溢出时隐藏。
- * 轨道 pointer-events-none 透明（不挡内容点击），仅滑块可交互
+ * 选中匹配标记 overlay：在垂直滚动条轨道上显示蓝色小圆点，
+ * 标记文档中与当前选中文字相同的行。pointer-events-none 不影响滚动条交互。
  */
-function EditorScrollbars({ scroller, matchMarks }: { scroller: HTMLDivElement | null; matchMarks: MatchMarks | null }) {
-  const [showV, setShowV] = useState(false);
-  const [showH, setShowH] = useState(false);
-  const [vThumb, setVThumb] = useState({ top: 0, height: 24 });
-  const [hThumb, setHThumb] = useState({ left: 0, width: 24 });
-  /** 轨道可视区域（相对包裹层）：搜索面板开合会挤压 scroller，轨道须与其对齐 */
-  const [view, setView] = useState({ top: 0, height: 0, left: 0, width: 0 });
-
-  /** 按 scrollTop/scrollLeft 计算滑块位置与大小（rAF 节流） */
-  const update = useCallback(() => {
-    const el = scroller;
-    if (!el) return;
-    const { scrollTop, scrollLeft, clientHeight, clientWidth, scrollHeight, scrollWidth } = el;
-    // 轨道对齐 scroller 可视区域（顶部面板如搜索框会挤压 scroller 高度）
-    const wrapper = el.closest('.cm-editor')?.parentElement;
-    if (wrapper) {
-      const e = el.getBoundingClientRect();
-      const w = wrapper.getBoundingClientRect();
-      setView({ top: e.top - w.top, height: e.height, left: e.left - w.left, width: e.width });
-    }
-    setShowV(scrollHeight > clientHeight);
-    setShowH(scrollWidth > clientWidth);
-    if (scrollHeight > clientHeight) {
-      const height = Math.max(24, clientHeight * clientHeight / scrollHeight);
-      setVThumb({
-        height,
-        top: scrollTop / (scrollHeight - clientHeight) * (clientHeight - height),
-      });
-    }
-    if (scrollWidth > clientWidth) {
-      const width = Math.max(24, clientWidth * clientWidth / scrollWidth);
-      setHThumb({
-        width,
-        left: scrollLeft / (scrollWidth - clientWidth) * (clientWidth - width),
-      });
-    }
-  }, [scroller]);
-
-  useEffect(() => {
-    if (!scroller) return;
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(scroller);
-    let raf = 0;
-    const onScroll = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(update);
-    };
-    scroller.addEventListener('scroll', onScroll);
-    return () => {
-      ro.disconnect();
-      scroller.removeEventListener('scroll', onScroll);
-      cancelAnimationFrame(raf);
-    };
-  }, [scroller, update]);
-
-  /** 拖拽滑块：鼠标位移 × (内容/视口) 比例映射到滚动位置 */
-  const startDrag = (axis: 'v' | 'h') => (e: React.MouseEvent) => {
-    e.preventDefault();
-    const el = scroller;
-    if (!el) return;
-    const startPos = axis === 'v' ? e.clientY : e.clientX;
-    const startScroll = axis === 'v' ? el.scrollTop : el.scrollLeft;
-    const ratio = axis === 'v' ? el.scrollHeight / el.clientHeight : el.scrollWidth / el.clientWidth;
-    const move = (ev: MouseEvent) => {
-      const delta = (axis === 'v' ? ev.clientY : ev.clientX) - startPos;
-      if (axis === 'v') el.scrollTop = startScroll + delta * ratio;
-      else el.scrollLeft = startScroll + delta * ratio;
-    };
-    const up = () => {
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
-    };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
-  };
-
-  // 轨道容器 pointer-events-none（不挡内容点击），滑块需显式恢复 pointer-events-auto
-  const thumbCls = 'cm-custom-scrollbar-thumb pointer-events-auto absolute rounded-[6px] bg-[#4a5161] hover:bg-[#5c6370] cursor-pointer transition-colors';
-
+function MatchMarksOverlay({ matchMarks }: { matchMarks: MatchMarks | null }) {
+  if (!matchMarks || matchMarks.lines.size === 0) return null;
   return (
-    <>
-      {/* 垂直轨道：滑块靠左、匹配标记靠右，互不遮挡；轨道对齐 scroller 可视区域 */}
-      {showV && (
+    <div className="absolute right-0 top-0 bottom-0 w-[14px] pointer-events-none z-10">
+      {[...matchMarks.lines].slice(0, 500).map(n => (
         <div
-          className="absolute right-0 w-[30px] z-10 pointer-events-none"
-          style={{ top: view.top, height: view.height }}
-        >
-          {/* 选中文字匹配行的标记（按行聚合：位置 = 行号/总行数 × 轨道高，上限防密集渲染） */}
-          {matchMarks && [...matchMarks.lines].slice(0, 500).map(n => (
-            <div
-              key={n}
-              className="cm-scrollbar-match absolute w-[6px] h-[2px] rounded-full bg-[#4f8cff]"
-              style={{ top: (n - 0.5) / matchMarks.total * view.height - 1, right: 3 }}
-            />
-          ))}
-          <div
-            className={thumbCls}
-            style={{ top: vThumb.top, height: vThumb.height, width: SCROLLBAR_THUMB, left: 3 }}
-            onMouseDown={startDrag('v')}
-            title="拖动滚动"
-          />
-        </div>
-      )}
-      {/* 水平滑块：底部 30px 高 */}
-      {showH && (
-        <div
-          className="absolute h-[30px] z-10 pointer-events-none"
-          style={{ left: view.left, width: view.width, bottom: 4 }}
-        >
-          <div
-            className={thumbCls}
-            style={{ left: hThumb.left, width: hThumb.width, height: SCROLLBAR_THUMB, bottom: 3 }}
-            onMouseDown={startDrag('h')}
-            title="拖动滚动"
-          />
-        </div>
-      )}
-    </>
+          key={n}
+          className="absolute w-[6px] h-[2px] rounded-full bg-[#4f8cff]"
+          style={{ top: `${(n - 0.5) / matchMarks.total * 100}%`, right: 3 }}
+        />
+      ))}
+    </div>
   );
 }
 
 export function CodeViewer({ filePath, content, editable = true, onChange }: CodeViewerProps) {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
-  /** 自绘滚动条的目标滚动容器（= EditorView.scrollDOM），state 触发滚动条组件更新 */
-  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   /** 选中匹配的滚动条标记（选区变化时由 updateListener 计算） */
   const [matchMarks, setMatchMarks] = useState<MatchMarks | null>(null);
   // 回调与最新内容存 ref：编辑器只在 filePath 变化时重建，
@@ -909,7 +823,6 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
       parent: editorRef.current,
     });
     activeEditorView = viewRef.current;
-    setScroller(viewRef.current.scrollDOM as HTMLDivElement);
 
     return () => {
       if (activeEditorView === viewRef.current) activeEditorView = null;
@@ -1012,7 +925,7 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
   return (
     <div className="relative h-full">
       <div ref={editorRef} className="h-full" />
-      <EditorScrollbars scroller={scroller} matchMarks={matchMarks} />
+      <MatchMarksOverlay matchMarks={matchMarks} />
     </div>
   );
 }

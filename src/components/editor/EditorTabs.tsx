@@ -236,7 +236,7 @@ export function EditorTabs() {
       {tabMenu && createPortal(
         <div
           ref={menuRef}
-          className="fixed z-[70] w-[170px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
+          className="fixed z-[200] w-[170px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
           style={{
             left: Math.min(tabMenu.x, window.innerWidth - 178),
             top: Math.min(tabMenu.y, window.innerHeight - 220),
