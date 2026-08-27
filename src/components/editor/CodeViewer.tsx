@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, useCallback } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, type DecorationSet, type Panel } from '@codemirror/view';
 import { EditorState, StateEffect, StateField, type Range, type Text } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
-import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, LanguageSupport, LRLanguage } from '@codemirror/language';
+import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, LanguageSupport, LRLanguage, StreamLanguage, type StreamParser } from '@codemirror/language';
 import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
@@ -21,6 +21,23 @@ import { go } from '@codemirror/lang-go';
 import { sql } from '@codemirror/lang-sql';
 import { vue } from '@codemirror/lang-vue';
 import { xml } from '@codemirror/lang-xml';
+import { cpp } from '@codemirror/lang-cpp';
+import { yaml } from '@codemirror/lang-yaml';
+import { php } from '@codemirror/lang-php';
+import { sass } from '@codemirror/lang-sass';
+import { less } from '@codemirror/lang-less';
+// legacy-modes：无官方 @codemirror/lang-* 的常用语言，用 StreamLanguage 桥接
+import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
+import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
+import { ruby } from '@codemirror/legacy-modes/mode/ruby';
+import { swift } from '@codemirror/legacy-modes/mode/swift';
+import { lua } from '@codemirror/legacy-modes/mode/lua';
+import { toml } from '@codemirror/legacy-modes/mode/toml';
+import { protobuf } from '@codemirror/legacy-modes/mode/protobuf';
+import { properties } from '@codemirror/legacy-modes/mode/properties';
+import { csharp, kotlin } from '@codemirror/legacy-modes/mode/clike';
+import { stylus } from '@codemirror/legacy-modes/mode/stylus';
 
 interface CodeViewerProps {
   filePath: string;
@@ -449,6 +466,11 @@ const vueScssMixed = parseMixed((nodeRef, input: Input) => {
   return null;
 });
 
+/** legacy-modes 桥接：无官方 @codemirror/lang-* 的常用语言用 StreamLanguage 包装 */
+function legacyLang(mode: StreamParser<unknown>): Language {
+  return StreamLanguage.define(mode);
+}
+
 /** 根据文件扩展名获取语言支持 */
 function getLanguageExtension(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -462,12 +484,18 @@ function getLanguageExtension(filePath: string) {
     cjs: () => javascript(),
     py: () => python(),
     java: () => java(),
+    class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
     css: () => css(),
-    scss: () => css(),
-    less: () => css(),
+    scss: () => css(), // 无官方 lang-scss，CSS 解析器近似（嵌套选择器标 error 但属性正常高亮）
+    less: () => less(),
+    sass: () => sass(), // 官方 lang-sass，仅缩进语法（.sass）
+    styl: () => legacyLang(stylus),
     html: () => html(),
     htm: () => html(),
     json: () => json(),
+    jsonc: () => json(),
+    json5: () => json(),
+    geojson: () => json(),
     md: () => markdown(),
     rs: () => rust(),
     go: () => go(),
@@ -478,7 +506,43 @@ function getLanguageExtension(filePath: string) {
       return new LanguageSupport((base.language as LRLanguage).configure({ wrap: vueScssMixed }), base.support);
     },
     xml: () => xml(),
-    class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
+    xhtml: () => xml(),
+    svg: () => xml(),
+    // C/C++
+    c: () => cpp(),
+    h: () => cpp(),
+    cc: () => cpp(),
+    cpp: () => cpp(),
+    cxx: () => cpp(),
+    hpp: () => cpp(),
+    // YAML / PHP
+    yml: () => yaml(),
+    yaml: () => yaml(),
+    php: () => php(),
+    // 脚本（legacy-modes）
+    sh: () => legacyLang(shell),
+    bash: () => legacyLang(shell),
+    zsh: () => legacyLang(shell),
+    bat: () => legacyLang(powerShell), // 无 batch 模式，PowerShell 近似
+    cmd: () => legacyLang(powerShell),
+    ps1: () => legacyLang(powerShell),
+    rb: () => legacyLang(ruby),
+    erb: () => legacyLang(ruby), // ERB 模板，Ruby 模式近似
+    // 其他（legacy-modes）
+    dockerfile: () => legacyLang(dockerFile), // 无扩展名，按文件名匹配
+    makefile: () => legacyLang(shell), // 无官方包，Shell 近似
+    swift: () => legacyLang(swift),
+    lua: () => legacyLang(lua),
+    toml: () => legacyLang(toml),
+    proto: () => legacyLang(protobuf),
+    cs: () => legacyLang(csharp),
+    kt: () => legacyLang(kotlin),
+    kts: () => legacyLang(kotlin),
+    ini: () => legacyLang(properties),
+    conf: () => legacyLang(properties),
+    properties: () => legacyLang(properties),
+    env: () => legacyLang(properties),
+    gitignore: () => legacyLang(properties), // .gitignore 无扩展名，按文件名匹配
   };
 
   const factory = langMap[ext];
@@ -574,7 +638,7 @@ function createEditorState(
     // 颜色值色块（VS Code 风格）：CSS 类文件全文；Vue/HTML 仅 <style> 块内
     ...(() => {
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
-      if (['css', 'scss', 'less'].includes(ext)) return [makeColorSwatchField(false)];
+      if (['css', 'scss', 'less', 'sass', 'styl'].includes(ext)) return [makeColorSwatchField(false)];
       if (ext === 'vue' || ext === 'html' || ext === 'htm') return [makeColorSwatchField(true)];
       return [];
     })(),
