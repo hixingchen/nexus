@@ -60,16 +60,13 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
 
   // ── 内嵌终端（右侧列，claude CLI 会话；关闭即销毁后端会话） ──
-  const [terminalHost, setTerminalHost] = useState<{ cwd: string; name: string } | null>(null);
+  // 终端列会话状态全局化（terminalStore）：右侧面板展开/收起态按钮直接订阅开关。
+  // 布局占用只看「会话存在且可见」；面板挂载只看 session（隐藏=display:none 保活会话）
+  const terminalSession = useTerminalStore(s => s.session);
+  const terminalVisible = useTerminalStore(s => s.visible);
+  const termActive = !!terminalSession && terminalVisible;
   const [terminalWidth, setTerminalWidth] = useState(440);
   const terminalDragRef = useRef<{ startX: number; startW: number } | null>(null);
-
-  // 服务右键「Claude 终端」→ store 请求 → 挂载/切换终端列
-  const terminalRequest = useTerminalStore(s => s.request);
-  useEffect(() => {
-    if (!terminalRequest) return;
-    setTerminalHost({ cwd: terminalRequest.cwd, name: terminalRequest.name });
-  }, [terminalRequest]);
 
   // 拖宽条（终端列左缘）：mousedown 后全局跟踪，终端变宽 = 主代码区变窄（reflow）
   const startTerminalResize = useCallback((e: React.MouseEvent) => {
@@ -230,7 +227,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       {/* 主区域：代码查看器 / 空状态。
           padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow）；
           终端列打开时主区域右侧由终端承接，无需再为服务列让位 */}
-      <div className={`flex-1 flex flex-col overflow-hidden relative ${terminalHost ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
+      <div className={`flex-1 flex flex-col overflow-hidden relative ${termActive ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
         {viewingLog ? (
           <LogViewer
             serviceKey={viewingLog}
@@ -270,7 +267,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             onSavedAsTemplate={loadTemplates}
             // 面板右侧偏移：无终端列时 = 服务列宽（absolute 覆盖需让位）；
             // 有终端列时主区域右缘已是终端列左缘，面板贴右即可（服务列在终端更右侧）
-            rightOffset={terminalHost ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            rightOffset={termActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
@@ -281,7 +278,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             mode="template"
             title="编辑模板"
             onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
-            rightOffset={terminalHost ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            rightOffset={termActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
@@ -290,10 +287,15 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       </div>
 
       {/* ── 内嵌终端列（主区域右侧、可拖宽；marginRight 为右侧服务列让位） ── */}
-      {terminalHost && (
+      {terminalSession && (
         <div
           className="flex items-stretch flex-shrink-0 overflow-hidden"
-          style={{ width: terminalWidth, marginRight: servicePanelCollapsed ? 32 : 360 }}
+          style={{
+            width: terminalWidth,
+            marginRight: servicePanelCollapsed ? 32 : 360,
+            // 图标隐藏 = 收起面板但会话保活（组件不卸载、claude 继续跑）
+            display: terminalVisible ? 'flex' : 'none',
+          }}
         >
           {/* 拖宽条 */}
           <div
@@ -303,9 +305,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           />
           <div className="flex-1 min-w-0">
             <TerminalPanel
-              cwd={terminalHost.cwd}
-              serviceName={terminalHost.name}
-              onClose={() => setTerminalHost(null)}
+              cwd={terminalSession.cwd}
+              serviceName={terminalSession.name}
+              onClose={() => useTerminalStore.getState().closeTerminal()}
             />
           </div>
         </div>
@@ -314,6 +316,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
       <ServicePanel
         services={services}
+        projectPath={project.path}
+        projectName={project.name}
         collapsed={servicePanelCollapsed}
         onToggle={() => { onToggleServicePanel(); setEditingService(null); setEditingTemplate(null); }}
         splitPanel={{
@@ -428,6 +432,9 @@ function EmptyState({ name, path }: { name: string; path: string }) {
 
 interface ServicePanelProps {
   services: Service[];
+  /** 项目路径/名（Claude 终端按钮的目标工作目录） */
+  projectPath: string;
+  projectName: string;
   collapsed: boolean;
   onToggle: () => void;
   /** 右侧面板上下分栏配置 */
@@ -450,7 +457,7 @@ interface ServicePanelProps {
 }
 
 function ServicePanel({
-  services, collapsed, onToggle, splitPanel, editingService, onEditService,
+  services, projectPath, projectName, collapsed, onToggle, splitPanel, editingService, onEditService,
   isServiceRunning, isServiceFailed, setDeleteSvcTarget,
   setShowAddServiceModal, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
@@ -463,6 +470,8 @@ function ServicePanel({
       <div className={`h-full transition-opacity duration-200 ${collapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
         <CollapsedView
           services={services}
+          projectPath={projectPath}
+          projectName={projectName}
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
           onToggle={onToggle}
@@ -476,6 +485,8 @@ function ServicePanel({
       }`}>
         <ExpandedView
           services={services}
+          projectPath={projectPath}
+          projectName={projectName}
           splitPanel={splitPanel}
           editingService={editingService}
           onEditService={onEditService}
@@ -498,27 +509,45 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, isServiceFailed, onToggle, onViewLog,
+  services, projectPath, projectName, isServiceRunning, isServiceFailed, onToggle, onViewLog,
 }: {
   services: Service[];
+  projectPath: string;
+  projectName: string;
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   onToggle: () => void;
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
 }) {
+  const terminalSession = useTerminalStore(s => s.session);
   return (
     <div className="flex flex-col h-full w-full">
-      {/* 顶部：展开服务列表 */}
-      <button
-        className="h-9 flex items-center justify-center cursor-pointer hover:bg-nexus-hover/40 transition-colors flex-shrink-0"
-        title="展开服务列表"
-        onClick={onToggle}
-      >
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-nexus-muted">
-          <path d="M2 2.5h8M2 6h8M2 9.5h8"/>
-        </svg>
-      </button>
+      {/* 顶部：展开服务列表 / Claude 终端（收起态也常驻可开关） */}
+      <div className="flex flex-col items-center py-1 gap-0.5 flex-shrink-0 border-b border-nexus-border/40">
+        <button
+          className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-nexus-hover/40 transition-colors"
+          title="展开服务列表"
+          onClick={onToggle}
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-nexus-muted">
+            <path d="M2 2.5h8M2 6h8M2 9.5h8"/>
+          </svg>
+        </button>
+        <button
+          className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
+            terminalSession?.cwd === projectPath
+              ? 'text-nexus-accent bg-nexus-accent/15'
+              : 'text-nexus-muted hover:bg-nexus-hover/40'
+          }`}
+          title="Claude 终端"
+          onClick={() => useTerminalStore.getState().toggleTerminal(projectPath, projectName)}
+        >
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4">
+            <path d="M2 3.5l5 3.5-5 3.5" /><line x1="8" y1="10" x2="12" y2="10" />
+          </svg>
+        </button>
+      </div>
 
       {/* 服务日志入口：运行/失败的服务点击直接打开日志面板（无需展开列）。
           状态点同时充当运行指示与可点区域 */}
@@ -558,6 +587,8 @@ interface SplitPanel {
 
 interface ExpandedViewProps {
   services: Service[];
+  projectPath: string;
+  projectName: string;
   splitPanel: SplitPanel;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
@@ -578,7 +609,7 @@ interface ExpandedViewProps {
 }
 
 function ExpandedView({
-  services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
+  services, projectPath, projectName, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
@@ -590,6 +621,8 @@ function ExpandedView({
       left={
         <ServiceSection
           services={services}
+          projectPath={projectPath}
+          projectName={projectName}
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
@@ -617,6 +650,9 @@ function ExpandedView({
 
 interface ServiceSectionProps {
   services: Service[];
+  /** 项目路径/名（Claude 终端按钮目标） */
+  projectPath: string;
+  projectName: string;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
@@ -636,11 +672,14 @@ interface ServiceSectionProps {
 }
 
 function ServiceSection({
-  services, editingService, onEditService, isServiceRunning, isServiceFailed,
+  services, projectPath, projectName, editingService, onEditService,
+  isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
+  // Claude 终端会话存在（含隐藏保活中）→ 高亮
+  const terminalSession = useTerminalStore(s => s.session);
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
   const sensors = useSensors(
@@ -666,6 +705,20 @@ function ServiceSection({
           <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
         </div>
         <div className="flex items-center gap-1">
+          {/* Claude 终端开关（store 订阅：打开状态高亮） */}
+          <button
+            className={`p-1.5 rounded-md flex-shrink-0 transition-colors ${
+              terminalSession?.cwd === projectPath
+                ? 'text-nexus-accent bg-nexus-accent/10'
+                : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50'
+            }`}
+            title="Claude 终端"
+            onClick={() => useTerminalStore.getState().toggleTerminal(projectPath, projectName)}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
+              <path d="M2 3.5l5 3.5-5 3.5" /><line x1="8" y1="10" x2="12" y2="10" />
+            </svg>
+          </button>
           <button
             className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
             title="添加服务"
