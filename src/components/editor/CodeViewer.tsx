@@ -54,8 +54,30 @@ interface CodeViewerProps {
  * 缓存 state 复用可保留撤销历史与光标位置。内容被外部修改（watcher 刷新等）
  * 导致与缓存不一致时自动失效重建。上限防止无限增长。
  */
+// 双上限：条目数（30）+ 估算字节（256MB，单文件最大 10MB + 撤销历史可能数倍膨胀）
 const MAX_CACHED_STATES = 30;
+const MAX_CACHE_BYTES = 256 * 1024 * 1024;
+let stateCacheBytes = 0;
 const stateCache = new Map<string, EditorState>();
+
+/** 写入缓存并维护估算字节（doc 长度 × 2 为 UTF-16 单元，history 按 8 倍系数粗估） */
+function stateCacheSet(key: string, st: EditorState): void {
+  const prev = stateCache.get(key);
+  if (prev !== undefined) {
+    stateCacheBytes -= prev.doc.length * 2 * 8;
+  }
+  const bytes = st.doc.length * 2 * 8;
+  stateCacheBytes += bytes;
+  stateCache.set(key, st);
+  // 先按估算字节、再按条目数淘汰最旧
+  while ((stateCacheBytes > MAX_CACHE_BYTES || stateCache.size > MAX_CACHED_STATES) && stateCache.size > 1) {
+    const oldestKey = stateCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const v = stateCache.get(oldestKey);
+    if (v !== undefined) stateCacheBytes -= v.doc.length * 2 * 8;
+    stateCache.delete(oldestKey);
+  }
+}
 
 /** 缓存 key：打开序号（fileOpenSeq）区分会话——文件树重新打开时序号递增 → 缓存未命中、
  * 重建编辑器（撤销历史清空）；标签切换不递增 → 缓存命中、历史保留 */
@@ -806,16 +828,11 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
           // EditorState 不可变：每次编辑产生新 state 对象，缓存里的引用会过期
           // （doc 对比失败 → 切换回来重建 → 撤销历史丢失）。编辑后把最新
           // state 写回缓存，切换回来 doc 对比命中、Ctrl+Z 历史保留
-          if (viewRef.current) stateCache.set(key, viewRef.current.state);
+          if (viewRef.current) stateCacheSet(key, viewRef.current.state);
         },
         setMatchMarks,
       );
-      stateCache.set(key, state);
-      if (stateCache.size > MAX_CACHED_STATES) {
-        // 超出上限：淘汰最早缓存（Map 迭代顺序 = 插入顺序）
-        const oldestKey = stateCache.keys().next().value;
-        if (oldestKey !== undefined) stateCache.delete(oldestKey);
-      }
+      stateCacheSet(key, state);
     }
 
     viewRef.current = new EditorView({

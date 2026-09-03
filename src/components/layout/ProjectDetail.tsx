@@ -66,26 +66,45 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const terminalVisible = useTerminalStore(s => s.visible);
   const termActive = !!terminalSession && terminalVisible;
   const [terminalWidth, setTerminalWidth] = useState(440);
+  /** 终端宽度实时值（拖宽结束持久化用；setState 异步拿不到最终值） */
+  const terminalWidthRef = useRef(440);
   const terminalDragRef = useRef<{ startX: number; startW: number } | null>(null);
 
-  // 拖宽条（终端列左缘）：mousedown 后全局跟踪，终端变宽 = 主代码区变窄（reflow）
+  // 拖宽条（终端列左缘）：拖拽状态驱动 document 监听（useEffect 管理，卸载/失焦自动清理，
+  // 不会像手动 add/remove 那样在组件卸载或窗口外松手时残留监听并更新已卸载组件）
+  const [termDragging, setTermDragging] = useState(false);
   const startTerminalResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     terminalDragRef.current = { startX: e.clientX, startW: terminalWidth };
+    setTermDragging(true);
+  }, [terminalWidth]);
+
+  useEffect(() => {
+    if (!termDragging) return;
     const onMove = (ev: MouseEvent) => {
       const drag = terminalDragRef.current;
       if (!drag) return;
+      // 函数式更新：不依赖外部 terminalWidth，effect 只需在 dragging 翻转时重建
       const w = Math.max(240, Math.min(780, drag.startW + drag.startX - ev.clientX));
+      terminalWidthRef.current = w;
       setTerminalWidth(w);
     };
-    const onUp = () => {
+    const finish = () => {
       terminalDragRef.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      setTermDragging(false);
+      // 拖宽结束：持久化宽度（下次打开终端列恢复同样大小）
+      layoutApi.save({ terminal_width: String(terminalWidthRef.current) })
+        .catch(e => console.error('保存布局失败:', e));
     };
     document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }, [terminalWidth]);
+    document.addEventListener('mouseup', finish);
+    window.addEventListener('blur', finish); // 拖拽中窗口失焦（Alt+Tab 等）结束拖拽
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', finish);
+      window.removeEventListener('blur', finish);
+    };
+  }, [termDragging]);
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -106,6 +125,11 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     loadTemplates();
     layoutApi.load().then(l => {
       if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
+      if (l.terminal_width) {
+        const w = Math.max(240, Math.min(780, Number(l.terminal_width) || 440));
+        terminalWidthRef.current = w;
+        setTerminalWidth(w);
+      }
     }).catch(() => {});
   }, [loadTemplates]);
 

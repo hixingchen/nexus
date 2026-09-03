@@ -306,7 +306,15 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 <span
                   role="switch"
                   aria-checked={item.checked}
-                  className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors ${
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    // 键盘切换（Enter/空格与 switch 惯例一致），鼠标走外层 div 点击
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      item.onChange(!item.checked);
+                    }
+                  }}
+                  className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-nexus-accent/40 ${
                     item.checked ? 'bg-nexus-accent' : 'bg-nexus-border'
                   }`}
                 >

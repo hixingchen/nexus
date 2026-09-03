@@ -7,6 +7,8 @@ const BYTES_PER_ROW = 16;
 /** 每页行数（256 行 = 4096 字节，与后端 IPC 单次传输上限匹配） */
 const ROWS_PER_PAGE = 256;
 const PAGE_BYTES = BYTES_PER_ROW * ROWS_PER_PAGE;
+/** 可视区外保留的页数（前后各 8 页，防滚动抖动时反复读盘） */
+const KEEP_PAGE_MARGIN = 8;
 const ROW_HEIGHT = 20;
 
 /** 字节 → 可见 ASCII 字符（不可见用 ·） */
@@ -87,6 +89,18 @@ export function HexViewer({ path }: { path: string }) {
           inflight.current.delete(p);
         });
     }
+    // 页级 LRU：保留可视区前后若干页，淘汰远处页——大文件从头顶滚到底
+    // 不再让全部页常驻内存（此前 Map 只增不减）
+    setPages(prev => {
+      if (prev.size <= KEEP_PAGE_MARGIN * 2 + (maxPage - minPage + 1)) return prev;
+      const keepMin = minPage - KEEP_PAGE_MARGIN;
+      const keepMax = maxPage + KEEP_PAGE_MARGIN;
+      const next = new Map(prev);
+      for (const k of next.keys()) {
+        if (k < keepMin || k > keepMax) next.delete(k);
+      }
+      return next;
+    });
   }, [items, pages, totalSize, path]);
 
   const renderRow = (index: number) => {

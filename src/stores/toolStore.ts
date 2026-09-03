@@ -43,12 +43,14 @@ export const useToolStore = create<ToolStore>((set, get) => ({
     await get().ensureToolsLoaded();
     try {
       const list = await openToolsApi.listBindings(projectId);
+      // 响应返回前可能已切到另一项目：过期响应不得覆盖新项目的绑定
+      if (get().loadedProject !== projectId) return;
       const bindings: Record<string, string> = {};
       for (const b of list) bindings[b.service_id] = b.tool_id;
       set({ bindings });
     } catch (e) {
       console.error('加载服务工具绑定失败:', e);
-      set({ bindings: {} });
+      if (get().loadedProject === projectId) set({ bindings: {} });
     }
   },
 

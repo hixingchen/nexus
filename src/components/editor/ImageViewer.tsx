@@ -14,8 +14,25 @@ const MIME: Record<string, string> = {
   avif: 'image/avif',
 };
 
-/** 跨标签缓存 data URL，切换标签不重复读盘 */
+/** 跨标签缓存 data URL，切换标签不重复读盘。字节上限（base64 膨胀 + 大图反复打开
+ * 会无限驻留）→ 超限淘汰最久未用的条目 */
 const cache = new Map<string, string>();
+const MAX_CACHE_BYTES = 128 * 1024 * 1024;
+let cacheBytes = 0;
+
+function cacheSet(path: string, url: string): void {
+  const bytes = url.length * 2; // UTF-16 单元
+  cache.set(path, url);
+  cacheBytes += bytes;
+  // 超限：从最旧开始淘汰（Map 迭代 = 插入序）
+  while (cacheBytes > MAX_CACHE_BYTES && cache.size > 1) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const v = cache.get(oldestKey);
+    if (v !== undefined) cacheBytes -= v.length * 2;
+    cache.delete(oldestKey);
+  }
+}
 
 /** 图片内建预览（data URL，不依赖系统默认程序） */
 export function ImageViewer({ path, name }: { path: string; name: string }) {
@@ -36,7 +53,7 @@ export function ImageViewer({ path, name }: { path: string; name: string }) {
       .then(b64 => {
         const ext = path.split('.').pop()?.toLowerCase() ?? '';
         const url = `data:${MIME[ext] ?? 'application/octet-stream'};base64,${b64}`;
-        cache.set(path, url);
+        cacheSet(path, url);
         if (alive) setSrc(url);
       })
       .catch(e => {

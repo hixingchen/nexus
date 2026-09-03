@@ -27,6 +27,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
   const searchRenderedRef = useRef(false);
   /** 上次渲染时数据头部行的引用：变化 = 滑动窗口滚动（满 5000 行后行号增量失效）→ 全量重建 */
   const lastHeadRef = useRef<ServiceLogLine | null>(null);
+  /** 高频日志窗口滑动时的全量重建节流：排程合并多次 flush，到期用最新数据一次重建 */
+  const fullTimerRef = useRef<number | undefined>(undefined);
+  const fullLinesRef = useRef<ServiceLogLine[]>([]);
   /** 上次渲染时数据最后一条的文本：变化（\r 单行刷新合并，行数不变）→ 更新 DOM 最后一行 */
   const lastTextRef = useRef<string | null>(null);
   /** 上一次的暂停状态：从暂停恢复时强制全量重建（直接渲染最新 2000 行） */
@@ -169,7 +172,29 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
     const needFull = prevVer < 0 || lines.length < renderedCountRef.current || justExitedSearch || headChanged || justResumed;
 
     if (needFull) {
-      renderFull(pre, lines, renderedCountRef);
+      const urgent = prevVer < 0 || lines.length < renderedCountRef.current || justExitedSearch || justResumed;
+      if (urgent) {
+        // 首次/清空/搜索退出/暂停恢复：必须立即重建
+        if (fullTimerRef.current !== undefined) {
+          window.clearTimeout(fullTimerRef.current);
+          fullTimerRef.current = undefined;
+        }
+        renderFull(pre, lines, renderedCountRef);
+      } else {
+        // 高频输出下窗口滑动几乎每 50ms flush 触发一次 headChanged：
+        // 每次全量重建 2000 行 innerHTML 既费 CPU 又打断文本选择——
+        // 排程合并，到期以最新数据一次重建（中间行短暂缺省，数据不丢）
+        fullLinesRef.current = lines;
+        if (fullTimerRef.current === undefined) {
+          fullTimerRef.current = window.setTimeout(() => {
+            fullTimerRef.current = undefined;
+            const host = preRef.current;
+            if (host && !searchRenderedRef.current) {
+              renderFull(host, fullLinesRef.current, renderedCountRef);
+            }
+          }, 200);
+        }
+      }
     } else {
       renderIncremental(pre, lines, renderedCountRef);
       if (lastTextChanged && lastLine && pre.lastElementChild) {
@@ -390,12 +415,13 @@ function LogHeader({
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
         </button>
       )}
-      <span className="w-[7px] h-[7px] rounded-full bg-emerald-400 flex-shrink-0"/>
+      {/* 运行态语义色用项目 nexus-success（与服务卡片状态点同源，避免双绿不一致） */}
+      <span className="w-[7px] h-[7px] rounded-full bg-nexus-success flex-shrink-0"/>
       <span className="text-[13px] text-[#c9d1d9] font-medium truncate">{serviceName}</span>
       {/* 状态标签：随运行状态变化（原为硬编码"运行中"，服务停止后显示错误状态） */}
       <span className={`text-[11px] px-1.5 py-0.5 rounded-md border flex-shrink-0 ${
         isRunning
-          ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20'
+          ? 'bg-nexus-success/15 text-nexus-success border-nexus-success/30'
           : 'bg-[#8b949e]/10 text-[#8b949e] border-[#30363d]'
       }`}>
         {isRunning ? '运行中' : '未运行'}

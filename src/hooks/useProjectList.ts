@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { projectApi, processApi, watchApi, type Project, type Service } from '../services/service';
+import { projectApi, processApi, watchApi, type Project } from '../services/service';
 import { useRunningStore } from '../stores/runningStore';
+import { useSvcCacheStore } from '../stores/svcCacheStore';
 import { showNotification } from '../components/ui/Toast';
 
 /**
@@ -12,7 +13,8 @@ export function useProjectList() {
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [expandedSvc, setExpandedSvc] = useState<Set<string>>(new Set());
-  const [svcCache, setSvcCache] = useState<Record<string, Service[]>>({});
+  // 项目服务缓存共享 store：详情页 load 每次写入，保持左侧展开与服务编辑即时一致
+  const svcCache = useSvcCacheStore(s => s.cache);
   // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
   const running = useRunningStore(s => s.running);
   const [actingId, setActingId] = useState<string | null>(null);
@@ -111,17 +113,14 @@ export function useProjectList() {
     const next = new Set(expanded);
     if (next.has(projectId)) {
       next.delete(projectId);
-      // 折叠时失效缓存：避免详情面板编辑/删除服务后左侧仍显示过期数据
-      setSvcCache(prev => {
-        const { [projectId]: _removed, ...rest } = prev;
-        return rest;
-      });
+      // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）
+      useSvcCacheStore.getState().invalidate(projectId);
     } else {
       next.clear();
       next.add(projectId);
       try {
         const detail = await projectApi.getDetail(projectId);
-        setSvcCache(prev => ({ ...prev, [projectId]: detail.services }));
+        useSvcCacheStore.getState().setCache(projectId, detail.services);
       } catch (e) {
         console.error('加载服务列表失败:', e);
         showNotification({ variant: 'error', title: '加载服务列表失败' });
@@ -132,7 +131,7 @@ export function useProjectList() {
 
   return {
     projects, search, setSearch,
-    expanded, expandedSvc, svcCache, setSvcCache,
+    expanded, expandedSvc, svcCache,
     running, actingId,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,

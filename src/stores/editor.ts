@@ -17,6 +17,8 @@ interface EditorStore {
   revealPath: string | null;
   /** 定位触发信号：每次请求 +1（同一路径重复点击也生效） */
   revealSeq: number;
+  /** 已消费的定位请求序号（= revealSeq 表示最近一次定位已被目录树命中） */
+  revealConsumedSeq: number;
 
   /**
    * 每文件打开序号：文件树打开（loadAndOpenFile）时递增。
@@ -41,6 +43,8 @@ interface EditorStore {
   clearHits: () => void;
   /** 请求在目录树中定位指定文件（EditorTabs 定位图标调用） */
   requestReveal: (path: string) => void;
+  /** 目录树实际消费定位请求（命中节点滚动/选中后置位；用于未命中时的提示判定） */
+  markRevealConsumed: () => void;
   /** 清除定位标记（用户主动切换文件/选中树节点时调用，避免定位高亮残留） */
   clearReveal: () => void;
   /** 记录当前标签的编辑器会话起点内容（CodeViewer 创建/重建编辑器时调用）：撤销回会话起点不算未保存 */
@@ -197,12 +201,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   hitSeq: 0,
   revealPath: null,
   revealSeq: 0,
+  revealConsumedSeq: 0,
 
   openTab: (tab, content) => {
     const { tabs } = get();
     setCacheContent(tab.path, content);
-    baselines.set(tab.id, content);
-    openedContents.set(tab.id, content);
+    baselines.set(tab.id, normalizeEOL(content));
+    openedContents.set(tab.id, normalizeEOL(content));
     set({
       tabs: [...tabs, tab],
       activeTabId: tab.id,
@@ -275,13 +280,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     // 与基线（最后保存版本）一致（如 Ctrl+Z 撤销回保存点）、与最初打开版本一致
     // （撤销越过保存点回到打开时内容）或与编辑器会话起点一致（撤销回重建时的草稿等）
     // → 草稿作废并清 dirty；否则存草稿（切换标签时可恢复）并标 dirty。
-    // 比较前统一换行符（CodeMirror 编辑会规范化 CRLF，见 normalizeEOL）
+    // 快照在写入时已统一换行符（normalizeEOL 存储），此处只需归一当前内容一次；
+    // 早前实现对每个快照重复 normalize（每次键击 3~4 趟全量扫描，大文件卡顿）
     const normalized = normalizeEOL(content);
-    const equalTo = (v?: string) => v !== undefined && normalizeEOL(v) === normalized;
     const opened = openedContents.get(activeTabId);
     const baseline = baselines.get(activeTabId);
     const sessionStart = sessionStarts.get(activeTabId);
-    if (equalTo(opened) || equalTo(sessionStart) || equalTo(baseline)) {
+    if (normalized === opened || normalized === sessionStart || normalized === baseline) {
       drafts.delete(activeTabId);
       if (dirtyIds.includes(activeTabId)) {
         set({ dirtyIds: dirtyIds.filter(d => d !== activeTabId) });
@@ -304,7 +309,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     // 保存成功后：实际写入磁盘的内容成为新基线，草稿作废。
     // content 由调用方传写盘快照——避免 await 期间用户又编辑导致
     // fileContent 已是新内容、baseline 错位（撤销到保存点时 dirty 无法清除）
-    baselines.set(id, content ?? fileContent ?? '');
+    baselines.set(id, normalizeEOL(content ?? fileContent ?? ''));
     drafts.delete(id);
     if (dirtyIds.includes(id)) set({ dirtyIds: dirtyIds.filter(d => d !== id) });
   },
@@ -327,6 +332,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ revealPath: path, revealSeq: get().revealSeq + 1 });
   },
 
+  markRevealConsumed: () => {
+    set({ revealConsumedSeq: get().revealSeq });
+  },
+
   clearReveal: () => {
     set({ revealPath: null });
   },
@@ -334,7 +343,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   markSessionStart: (content) => {
     const { activeTabId } = get();
     if (!activeTabId) return;
-    sessionStarts.set(activeTabId, content);
+    sessionStarts.set(activeTabId, normalizeEOL(content));
   },
 }));
 

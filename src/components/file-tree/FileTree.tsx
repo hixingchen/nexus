@@ -193,6 +193,8 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
   // 同步选中态：避免与之前点击选中的文件残留两个高亮
   useEffect(() => {
     if (!reveal) return;
+    // 命中定位：标记已消费（EditorTabs 据此判断"目录树未展开"给出提示）
+    useEditorStore.getState().markRevealConsumed();
     entryRef.current?.scrollIntoView({ block: 'center' });
     onSelect(e.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 触发信号用 revealSeq（reveal 由 revealPath 推导）

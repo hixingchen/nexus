@@ -48,7 +48,7 @@ export function TerminalPanel({ cwd, serviceName, onClose }: Props) {
 
     const terminal = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: 16,
       fontFamily: 'Consolas, "Courier New", monospace',
       theme: {
         background: '#1a1a1a',

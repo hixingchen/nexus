@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Modal } from '../ui/Modal';
+import { showNotification } from '../ui/Toast';
 import { SvgIcon } from '../ui/SvgIcon';
 import { getIconSvg } from '../file-tree/FileIcons';
 import { useEditorStore, switchToTab, saveActiveFile } from '../../stores/editor';
@@ -249,6 +250,19 @@ export function EditorTabs() {
               onClick={() => {
                 useEditorStore.getState().requestReveal(tabMenu.tab.path);
                 setTabMenu(null);
+                // 目录树可能未挂载（服务行折叠/项目列表折叠）——短暂等待后未被
+                // 任何 FileTree 命中则提示，避免"点了没反应"
+                const st = useEditorStore.getState();
+                const seq = st.revealSeq;
+                window.setTimeout(() => {
+                  const now = useEditorStore.getState();
+                  if (now.revealConsumedSeq < seq) {
+                    showNotification({
+                      title: '未定位到文件',
+                      description: '所属服务目录树未展开，请先在左侧展开对应服务再试',
+                    });
+                  }
+                }, 400);
               }}
             >
               <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">

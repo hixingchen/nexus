@@ -33,6 +33,21 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
   refresh: async () => {
     try {
       const r = await processApi.getRunning();
+      const st = get();
+      // 变更检测：内容未变则不 set——避免每 3 秒产生新数组引用，
+      // 触发所有订阅方（项目行/服务面板/展开的目录树）全量重渲染
+      const same = st.loaded
+        && st.running.length === r.running.length
+        && st.failed.length === r.failed.length
+        && st.running.every((x, i) => {
+          const y = r.running[i];
+          return y && x.service_id === y.service_id && x.project_id === y.project_id;
+        })
+        && st.failed.every((x, i) => {
+          const y = r.failed[i];
+          return y && x.service_id === y.service_id && x.exit_code === y.exit_code && x.timestamp === y.timestamp;
+        });
+      if (same) return;
       set({ running: r.running, failed: r.failed, loaded: true });
     } catch (e) {
       console.error('获取运行状态失败:', e);

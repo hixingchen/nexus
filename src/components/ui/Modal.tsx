@@ -44,6 +44,8 @@ export function Modal({ open, title, onClose, children, width = '420px', closeOn
           <span className="text-[13px] text-nexus-text font-medium">{title}</span>
           <button
             className="text-nexus-muted hover:text-nexus-text p-1 rounded hover:bg-nexus-hover/50"
+            aria-label="关闭"
+            title="关闭"
             onClick={onClose}
           >
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">

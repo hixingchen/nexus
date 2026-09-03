@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { ProjectListItem } from './ProjectListItem';
 import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProjectModal } from './ProjectModals';
 import { useProjectList } from '../../hooks/useProjectList';
+import { useSvcCacheStore } from '../../stores/svcCacheStore';
 import { useTerminalStore } from '../../stores/terminalStore';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
@@ -16,7 +17,7 @@ interface Props {
 export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath }: Props) {
   const {
     projects, search, setSearch,
-    expanded, expandedSvc, svcCache, setSvcCache,
+    expanded, expandedSvc, svcCache,
     actingId,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,
@@ -138,11 +139,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
         onClose={() => setDeleteTarget(null)}
         onDeleted={() => {
           load();
-          setSvcCache(prev => {
-            const next = { ...prev };
-            if (deleteTarget) delete next[deleteTarget.id];
-            return next;
-          });
+          if (deleteTarget) useSvcCacheStore.getState().invalidate(deleteTarget.id);
         }}
         onDeselectIfSelected={() => {
           if (selectedId && deleteTarget && selectedId === deleteTarget.id) {

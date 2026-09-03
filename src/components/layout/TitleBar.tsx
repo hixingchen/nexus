@@ -35,7 +35,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
       {/* ── 窗口控制 ── */}
       <div className="flex h-full">
-        <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-hover hover:text-nexus-text" onClick={() => appWindow.minimize()}>
+        <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-hover hover:text-nexus-text" aria-label="最小化" title="最小化" onClick={() => appWindow.minimize()}>
           <svg width="10" height="1" viewBox="0 0 10 1" fill="currentColor"><rect width="10" height="1"/></svg>
         </button>
         <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-hover hover:text-nexus-text" onClick={() => appWindow.toggleMaximize()} title={isMaximized ? "还原" : "最大化"}>
@@ -45,7 +45,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
           )}
         </button>
-        <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-error hover:text-white" onClick={() => appWindow.close()}>
+        <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-error hover:text-white" aria-label="关闭窗口" title="关闭窗口" onClick={() => appWindow.close()}>
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
         </button>
       </div>
