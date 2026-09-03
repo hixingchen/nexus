@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
 use std::time::Duration;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use serde::Serialize;
 use crate::AppState;
 use crate::core::process::LogLine;
@@ -64,19 +64,27 @@ pub fn start_service(state: State<AppState>, app_handle: tauri::AppHandle, servi
         .map_err(|e| format!("服务「{}」{}", name, e))
 }
 
+/// 停止服务（清理含 taskkill + 等待 reader 线程，最长数秒 → 异步执行避免阻塞 IPC）
 #[tauri::command]
-pub fn stop_service(state: State<AppState>, service_id: String) -> Result<(), String> {
+pub async fn stop_service(app: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    state.process_mgr.stop(&service_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state.process_mgr.stop(&service_id)
+    }).await.map_err(|e| format!("停止服务任务失败: {}", e))?
 }
 
+/// 重启服务（stop + start 两段等待 → 异步执行）
 #[tauri::command]
-pub fn restart_service(state: State<AppState>, app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
+pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
-    let envs = crate::core::process::parse_env_vars(&env_vars);
-    state.process_mgr.restart(&project_id, &service_id, &name, &command, &cwd, &envs, &app_handle)
-        .map_err(|e| format!("服务「{}」{}", name, e))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
+        let envs = crate::core::process::parse_env_vars(&env_vars);
+        state.process_mgr.restart(&project_id, &service_id, &name, &command, &cwd, &envs, &app)
+            .map_err(|e| format!("服务「{}」{}", name, e))
+    }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
 
 #[tauri::command]
@@ -107,25 +115,29 @@ pub fn start_project_services(state: State<AppState>, app_handle: tauri::AppHand
     Ok(errors)
 }
 
+/// 停止项目全部服务（每服务清理最长数秒 × N → 异步执行避免阻塞 IPC）
 #[tauri::command]
-pub fn stop_project_services(state: State<AppState>, project_id: String) -> Result<(), String> {
+pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    // 进程 key 为 service_id，需查出项目下所有服务 id 逐个停止
-    let ids: Vec<String> = state.db.with_conn(|conn| {
-        let mut stmt = conn.prepare("SELECT id FROM services WHERE project_id=?1")
-            .map_err(|e| format!("查询项目服务失败: {}", e))?;
-        let rows = stmt.query_map([&project_id], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("读取项目服务失败: {}", e))?;
-        let mut ids = Vec::new();
-        for r in rows { ids.push(r.map_err(|e| format!("解析项目服务失败: {}", e))?); }
-        Ok::<_, String>(ids)
-    })?;
-    for id in &ids {
-        let _ = state.process_mgr.stop(id);
-    }
-    // 停止项目级文件监听（项目停止 = 总开关，所有服务监听一并关闭）
-    let _ = state.file_watcher.stop_watching(&project_id);
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 进程 key 为 service_id，需查出项目下所有服务 id 逐个停止
+        let ids: Vec<String> = state.db.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM services WHERE project_id=?1")
+                .map_err(|e| format!("查询项目服务失败: {}", e))?;
+            let rows = stmt.query_map([&project_id], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("读取项目服务失败: {}", e))?;
+            let mut ids = Vec::new();
+            for r in rows { ids.push(r.map_err(|e| format!("解析项目服务失败: {}", e))?); }
+            Ok::<_, String>(ids)
+        })?;
+        for id in &ids {
+            let _ = state.process_mgr.stop(id);
+        }
+        // 停止项目级文件监听（项目停止 = 总开关，所有服务监听一并关闭）
+        let _ = state.file_watcher.stop_watching(&project_id);
+        Ok(())
+    }).await.map_err(|e| format!("停止项目服务任务失败: {}", e))?
 }
 
 #[tauri::command]
@@ -262,9 +274,16 @@ pub async fn run_tool_command(
     let result = match result {
         Ok(inner) => inner?,
         Err(_) => {
-            // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）
-            if let Ok(pid) = pid_rx.try_recv() {
-                crate::core::process::kill_process_tree(pid);
+            // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）。
+            // pid 由 spawn_blocking 任务在启动后上报：任务若在阻塞池排队，try_recv 拿不到，
+            // 此时任务仍会照常启动执行（无人可杀 → 孤儿）。短暂轮询等待 pid 到达后必杀
+            let mut pid: Option<u32> = None;
+            for _ in 0..50 {
+                if let Ok(p) = pid_rx.try_recv() { pid = Some(p); break; }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Some(p) = pid {
+                crate::core::process::kill_process_tree(p);
             }
             return Err("命令执行超时（60 秒），已终止".into());
         }

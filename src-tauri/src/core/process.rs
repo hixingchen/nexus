@@ -260,10 +260,15 @@ impl ProcessManager {
                         let e = b.entry(Arc::clone(&key1)).or_default();
                         if is_refresh {
                             let text = line.trim_start_matches('\r').to_string();
-                            if let Some(last) = e.back_mut() {
-                                last.text = text.clone();
-                                last.timestamp = now.clone();
+                            // 仅当队尾同属 stdout 才原地替换：stdout 进度条不得覆盖 stderr 队尾的错误行
+                            let mergeable = e.back().map(|l| l.stream == "stdout").unwrap_or(false);
+                            if mergeable {
+                                if let Some(last) = e.back_mut() {
+                                    last.text = text.clone();
+                                    last.timestamp = now.clone();
+                                }
                             } else {
+                                while e.len() >= MAX_LOG_LINES { e.pop_front(); }
                                 e.push_back(LogLine { timestamp: now.clone(), stream: "stdout".into(), text });
                             }
                         } else {
@@ -310,10 +315,15 @@ impl ProcessManager {
                         let e = b.entry(Arc::clone(&key2)).or_default();
                         if is_refresh {
                             let text = line.trim_start_matches('\r').to_string();
-                            if let Some(last) = e.back_mut() {
-                                last.text = text.clone();
-                                last.timestamp = now.clone();
+                            // 仅当队尾同属 stderr 才原地替换（理由同 stdout 段）
+                            let mergeable = e.back().map(|l| l.stream == "stderr").unwrap_or(false);
+                            if mergeable {
+                                if let Some(last) = e.back_mut() {
+                                    last.text = text.clone();
+                                    last.timestamp = now.clone();
+                                }
                             } else {
+                                while e.len() >= MAX_LOG_LINES { e.pop_front(); }
                                 e.push_back(LogLine { timestamp: now.clone(), stream: "stderr".into(), text });
                             }
                         } else {

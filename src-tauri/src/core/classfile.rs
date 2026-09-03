@@ -290,23 +290,33 @@ fn register_desc(reg: &mut TypeRegistry, desc: &str) {
 
 /// 类型描述符 → 展示名（数组递归、基本类型映射）
 fn display_type(reg: &TypeRegistry, desc: &str) -> String {
-    if let Some(rest) = desc.strip_prefix('[') {
-        return format!("{}[]", display_type(reg, rest));
+    // 数组前缀迭代剥离：desc 来自 class 文件，可含海量 '['（恶意输入会栈溢出）
+    let mut dims = 0usize;
+    let mut base = desc;
+    while let Some(rest) = base.strip_prefix('[') {
+        dims += 1;
+        base = rest;
     }
-    if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
-        return reg.display(inner);
-    }
-    match desc {
-        "B" => "byte".into(),
-        "C" => "char".into(),
-        "D" => "double".into(),
-        "F" => "float".into(),
-        "I" => "int".into(),
-        "J" => "long".into(),
-        "S" => "short".into(),
-        "Z" => "boolean".into(),
-        "V" => "void".into(),
-        other => other.to_string(),
+    let name = if let Some(inner) = base.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        reg.display(inner)
+    } else {
+        match base {
+            "B" => "byte".into(),
+            "C" => "char".into(),
+            "D" => "double".into(),
+            "F" => "float".into(),
+            "I" => "int".into(),
+            "J" => "long".into(),
+            "S" => "short".into(),
+            "Z" => "boolean".into(),
+            "V" => "void".into(),
+            other => other.to_string(),
+        }
+    };
+    if dims > 0 {
+        format!("{}{}", name, "[]".repeat(dims))
+    } else {
+        name
     }
 }
 
@@ -319,8 +329,15 @@ fn parse_type_desc(s: &str, i: usize) -> Option<(String, usize)> {
             Some((s[i..=end].to_string(), end + 1 - i))
         }
         b'[' => {
-            let (t, n) = parse_type_desc(s, i + 1)?;
-            Some((format!("[{}", t), n + 1))
+            // 迭代剥前缀：恶意描述符可含海量 '['，逐层递归会栈溢出
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            while j < s.len() && b[j] == b'[' {
+                depth += 1;
+                j += 1;
+            }
+            let (t, n) = parse_type_desc(s, j)?;
+            Some((format!("{}{}", "[".repeat(depth), t), n + depth))
         }
         _ => Some((s[i..i + 1].to_string(), 1)),
     }
@@ -478,7 +495,18 @@ struct Annotation {
 }
 
 /// 解析 annotation 元素值；同时把引用类型登记进注册表
-fn parse_element_value(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeRegistry) -> Result<ElementValue, String> {
+
+/// 注解/元素值递归嵌套深度上限：class 输入不可信，超限视为恶意/损坏
+const MAX_ANNOTATION_DEPTH: usize = 64;
+
+fn check_depth(depth: usize) -> Result<(), String> {
+    if depth > MAX_ANNOTATION_DEPTH {
+        return Err("注解/数组嵌套过深（疑似损坏或恶意 class）".into());
+    }
+    Ok(())
+}
+fn parse_element_value(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeRegistry, depth: usize) -> Result<ElementValue, String> {
+    check_depth(depth)?;
     let tag = r.u1()?;
     Ok(match tag {
         b'B' | b'C' | b'I' | b'S' | b'Z' => {
@@ -528,12 +556,12 @@ fn parse_element_value(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeR
             reg.register(&ty);
             ElementValue::Class { ty }
         }
-        b'@' => ElementValue::Ann(parse_annotation(r, pool, reg)?),
+        b'@' => ElementValue::Ann(parse_annotation(r, pool, reg, depth + 1)?),
         b'[' => {
             let n = r.u2()? as usize;
             let mut vals = vec![];
             for _ in 0..n {
-                vals.push(parse_element_value(r, pool, reg)?);
+                vals.push(parse_element_value(r, pool, reg, depth + 1)?);
             }
             ElementValue::Array(vals)
         }
@@ -542,7 +570,8 @@ fn parse_element_value(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeR
 }
 
 /// 解析单个 annotation 结构
-fn parse_annotation(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeRegistry) -> Result<Annotation, String> {
+fn parse_annotation(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeRegistry, depth: usize) -> Result<Annotation, String> {
+    check_depth(depth)?;
     let ty_desc = cp_utf8(pool, r.u2()?);
     let ty = ty_desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')).unwrap_or(&ty_desc).to_string();
     reg.register(&ty);
@@ -550,7 +579,7 @@ fn parse_annotation(r: &mut Reader, pool: &[Option<CpEntry>], reg: &mut TypeRegi
     let mut pairs = vec![];
     for _ in 0..n {
         let name = cp_utf8(pool, r.u2()?);
-        pairs.push((name, parse_element_value(r, pool, reg)?));
+        pairs.push((name, parse_element_value(r, pool, reg, depth + 1)?));
     }
     Ok(Annotation { ty, pairs })
 }
@@ -561,7 +590,7 @@ fn parse_annotations(data: &[u8], pool: &[Option<CpEntry>], reg: &mut TypeRegist
     let n = r.u2()?;
     let mut out = vec![];
     for _ in 0..n {
-        out.push(parse_annotation(&mut r, pool, reg)?);
+        out.push(parse_annotation(&mut r, pool, reg, 0)?);
     }
     Ok(out)
 }
@@ -866,7 +895,13 @@ fn disassemble_code(code: &[u8], pool: &[Option<CpEntry>], lines: &mut Vec<Strin
                 if high < low {
                     return Err("tableswitch 范围非法 (high < low)".into());
                 }
-                let n = (high - low + 1) as usize;
+                // high-low 可达 u32 跨度（i32 相减溢出）；真实 switch 表都很小，
+                // 给上限同时防止恶意 class 强制分配超大偏移表
+                let span = (high as i64 - low as i64) + 1;
+                if span > 1 << 20 {
+                    return Err("tableswitch 范围过大（疑似损坏/恶意 class）".into());
+                }
+                let n = span as usize;
                 let total = r.pos as i64 + (n as i64) * 4; // 指令结束位置（偏移表尚未读取）
                 push_line(lines, pc, format!("tableswitch {{ // {} to {}", low, high));
                 for k in 0..n {
@@ -1047,7 +1082,7 @@ fn parse_method_attrs(
             }
             "AnnotationDefault" => {
                 let mut er = Reader::new(data);
-                info.default_value = Some(parse_element_value(&mut er, pool, reg)?);
+                info.default_value = Some(parse_element_value(&mut er, pool, reg, 0)?);
             }
             "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations" => {
                 info.annotations.extend(parse_annotations(data, pool, reg)?);

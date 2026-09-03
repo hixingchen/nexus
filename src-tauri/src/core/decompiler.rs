@@ -40,7 +40,9 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     let class_path = std::env::temp_dir().join(format!("nexus-decompile-{}.class", seq));
     tokio::fs::write(&class_path, bytes).await.map_err(|e| format!("写入临时 class 失败: {}", e))?;
 
-    let result = tokio::time::timeout(
+    // kill_on_drop：timeout 丢弃 future 时 Child 被 drop → 自动终止 java 进程，
+    // 避免反复打开卡死的 class 堆积僵尸 JVM
+    let output = tokio::time::timeout(
         DECOMPILE_TIMEOUT,
         tokio::process::Command::new("java")
             .arg("-jar")
@@ -49,15 +51,16 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
             .arg("--showversion").arg("false")
             .arg(&class_path)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output(),
     )
     .await
-    .map_err(|_| "反编译超时（>15s）".to_string());
+    .map_err(|_| "反编译超时（>15s），已终止 java 进程".to_string());
 
     // 无论成败都清理临时文件
     let _ = tokio::fs::remove_file(&class_path).await;
 
-    match result {
+    match output {
         Ok(Ok(output)) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout);
             Ok(strip_cfr_banner(&text).to_string())

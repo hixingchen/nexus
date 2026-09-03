@@ -109,6 +109,9 @@ impl FileWatcher {
                 let mut should_flush = false;
                 match event_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok(event)) => {
+                        // 每个事件分支都检查停止信号：事件洪泛（事件间隔 <200ms）时
+                        // 永不进 Timeout 分支，若只在 Timeout 里查 stop，stop/join 会被饿死
+                        if stop_rx.try_recv().is_ok() { break; }
                         let kind = event_kind_str(&event.kind);
                         for path in &event.paths {
                             if path.is_dir() { continue; }
@@ -122,7 +125,9 @@ impl FileWatcher {
                         // 否则 pending 永不发送且无限累积
                         should_flush = !pending.is_empty() && last_flush.elapsed() >= debounce;
                     }
-                    Ok(Err(_)) => {}
+                    Ok(Err(_)) => {
+                        if stop_rx.try_recv().is_ok() { break; }
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if stop_rx.try_recv().is_ok() { break; }
                         should_flush = !pending.is_empty() && last_flush.elapsed() >= debounce;

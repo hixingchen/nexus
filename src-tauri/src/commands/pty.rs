@@ -23,11 +23,23 @@ impl PtyState {
         }
     }
 
-    /// 清理 PTY 会话：杀死子进程（幂等，空会话 no-op）
+    /// 清理 PTY 会话：杀死整个进程树（幂等，空会话 no-op）
+    ///
+    /// 进程链是 cmd /C → claude(.cmd) → node：只 kill 顶层 cmd 会留下孙进程
+    /// （未挂 job object，应用退出也不收），故用 taskkill /T /F 与服务进程一致
     pub fn cleanup(&self) {
         if let Ok(mut guard) = self.session.lock() {
             if let Some(mut session) = guard.take() {
-                let _ = session.child.kill();
+                #[cfg(windows)]
+                {
+                    if let Some(pid) = session.child.process_id() {
+                        crate::core::process::kill_process_tree(pid);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = session.child.kill();
+                }
                 let _ = session.child.wait();
                 log::info!("[nexus] PTY 会话已清理");
             }
@@ -96,15 +108,26 @@ pub fn pty_spawn(
             e
         ))?;
 
-    let writer = pty_pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("获取 PTY 写入句柄失败: {}", e))?;
-
-    let reader = pty_pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("获取 PTY 读取句柄失败: {}", e))?;
+    // 句柄获取失败路径必须杀掉已启动的 child（否则进程无人持有、无 job 覆盖，
+    // 成为永久孤儿）
+    let mut child = child;
+    let (writer, reader) = match (pty_pair.master.take_writer(), pty_pair.master.try_clone_reader()) {
+        (Ok(w), Ok(r)) => (w, r),
+        (Err(e), _) | (_, Err(e)) => {
+            #[cfg(windows)]
+            {
+                if let Some(pid) = child.process_id() {
+                    crate::core::process::kill_process_tree(pid);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            return Err(format!("获取 PTY 读写句柄失败: {}", e));
+        }
+    };
 
     // 存储会话
     {
@@ -157,7 +180,7 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, app: AppHandle) {
 
 /// 向 PTY 写入用户输入
 #[tauri::command]
-pub fn pty_write(app: AppHandle, state: State<'_, AppState>, data: String) -> Result<(), String> {
+pub fn pty_write(state: State<'_, AppState>, data: String) -> Result<(), String> {
     let pty_state = &state.pty;
 
     let mut guard = pty_state
@@ -182,7 +205,7 @@ pub fn pty_write(app: AppHandle, state: State<'_, AppState>, data: String) -> Re
 
 /// 调整 PTY 尺寸（窗口大小变化时调用）
 #[tauri::command]
-pub fn pty_resize(app: AppHandle, state: State<'_, AppState>, rows: u16, cols: u16) -> Result<(), String> {
+pub fn pty_resize(state: State<'_, AppState>, rows: u16, cols: u16) -> Result<(), String> {
     let pty_state = &state.pty;
 
     let guard = pty_state
@@ -207,7 +230,7 @@ pub fn pty_resize(app: AppHandle, state: State<'_, AppState>, rows: u16, cols: u
 
 /// 关闭 PTY 会话（杀死子进程）
 #[tauri::command]
-pub fn pty_kill(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn pty_kill(state: State<'_, AppState>) -> Result<(), String> {
     state.pty.cleanup();
     Ok(())
 }

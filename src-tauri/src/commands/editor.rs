@@ -239,7 +239,20 @@ pub async fn write_file(
         Some("gb18030") => encoding_rs::GB18030.encode(&content).0.into_owned(),
         _ => content.into_bytes(),
     };
-    tokio::fs::write(&path, data).await.map_err(|e| format!("无法写入文件: {}", e))
+    // 原子写：先写同目录临时文件再 rename——直接覆写会在写入中途崩溃/磁盘满时
+    // 留下截断的坏文件（大文件整份丢失）。rename 失败（Windows 目标已存在时
+    // rename 不覆盖）→ 先删目标再 rename（极小窗口，但主体损坏风险已消除）
+    let p = std::path::Path::new(&path);
+    let tmp = p.with_extension(format!("{}.tmp", p.extension().and_then(|e| e.to_str()).unwrap_or("")));
+    tokio::fs::write(&tmp, &data).await.map_err(|e| format!("无法写入文件: {}", e))?;
+    match tokio::fs::rename(&tmp, p).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows：目标已存在时 rename 报错（含 AlreadyExists 语义）
+            let _ = tokio::fs::remove_file(p).await;
+            tokio::fs::rename(&tmp, p).await.map_err(|e| format!("无法写入文件: {}", e))
+        }
+    }
 }
 
 /// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）

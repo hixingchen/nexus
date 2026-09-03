@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Manager, State};
 use crate::AppState;
 use crate::models::{Project, ProjectDetail};
 use crate::database::query_services_by_project;
@@ -103,29 +103,32 @@ pub fn update_project(state: State<AppState>, id: String, name: String, path: St
     })
 }
 
-/// 删除项目（先停进程，再删数据）
+/// 删除项目（先停进程，再删数据；进程清理含长等待 → 异步执行避免阻塞 IPC）
 #[tauri::command]
-pub fn delete_project(state: State<AppState>, id: String) -> Result<(), String> {
+pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), String> {
     if id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    // 1. 查询服务 id（在 DB 锁外）
-    let ids: Vec<String> = state.db.with_conn(|conn| {
-        Ok(query_services_by_project(conn, &id)?
-            .into_iter().map(|s| s.id).collect())
-    })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 1. 查询服务 id（在 DB 锁外）
+        let ids: Vec<String> = state.db.with_conn(|conn| {
+            Ok(query_services_by_project(conn, &id)?
+                .into_iter().map(|s| s.id).collect())
+        })?;
 
-    // 2. 停止所有运行中的服务进程
-    for sid in &ids {
-        let _ = state.process_mgr.stop(sid);
-    }
+        // 2. 停止所有运行中的服务进程
+        for sid in &ids {
+            let _ = state.process_mgr.stop(sid);
+        }
 
-    // 3. 停止文件监听（避免已删除项目的 watcher 线程泄漏并持续发送事件）
-    let _ = state.file_watcher.stop_watching(&id);
+        // 3. 停止文件监听（避免已删除项目的 watcher 线程泄漏并持续发送事件）
+        let _ = state.file_watcher.stop_watching(&id);
 
-    // 4. 删除数据库记录（级联删除服务）
-    state.db.with_conn(|conn| {
-        conn.execute("DELETE FROM projects WHERE id=?1", [&id]).map_err(|e| format!("删除项目失败: {}", e))?;
-        Ok(())
-    })
+        // 4. 删除数据库记录（级联删除服务）
+        state.db.with_conn(|conn| {
+            conn.execute("DELETE FROM projects WHERE id=?1", [&id]).map_err(|e| format!("删除项目失败: {}", e))?;
+            Ok(())
+        })
+    }).await.map_err(|e| format!("删除项目任务失败: {}", e))?
 }
 
 /// 复制项目（含所有服务配置）

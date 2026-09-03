@@ -183,9 +183,14 @@ fn file_is_searchable(path: &Path, exts: &[String]) -> bool {
 
 /// 在单文件中逐行搜索，返回命中行
 fn search_file(path: &Path, q: &str, case_sensitive: bool, limit: usize) -> Option<Vec<SearchResultItem>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return None, // 非 UTF-8 或读取失败：跳过
+    // UTF-8 严格解码失败 → 回退 GB18030（GBK 超集）：与编辑器读取（decode_text）对齐，
+    // 否则 Windows 中文老项目的 GBK 文件在搜索中静默缺失
+    let content = match std::fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(c) => c,
+            Err(utf8_bytes) => encoding_rs::GB18030.decode(&utf8_bytes.into_bytes()).0.into_owned(),
+        },
+        Err(_) => return None, // 读取失败：跳过
     };
     let mut hits = Vec::new();
     let q_char_count = q.chars().count();
