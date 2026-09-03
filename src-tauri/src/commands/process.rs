@@ -94,7 +94,11 @@ pub fn start_project_services(state: State<AppState>, app_handle: tauri::AppHand
         Ok::<_, String>(svcs)
     })?;
     let mut errors = Vec::new();
+    // 已在运行的服务跳过（start 对已运行返回"已在运行中"，混在 errors 里会误报启动失败）
+    let running_ids: std::collections::HashSet<String> = state.process_mgr.running()
+        .into_iter().map(|(_, service_id)| service_id).collect();
     for (id, name, cmd, cwd, env_vars) in &services {
+        if running_ids.contains(id) { continue; }
         let envs = crate::core::process::parse_env_vars(env_vars);
         if let Err(e) = state.process_mgr.start(&project_id, id, name, cmd, cwd, &envs, &app_handle) {
             errors.push(format!("{}: {}", name, e));

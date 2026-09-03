@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { projectApi, processApi, type Project, type Service } from '../services/service';
+import { projectApi, processApi, watchApi, type Project, type Service } from '../services/service';
 import { useRunningStore } from '../stores/runningStore';
 import { showNotification } from '../components/ui/Toast';
 
@@ -71,6 +71,8 @@ export function useProjectList() {
     setActingId(id);
     try {
       await processApi.startProject(id);
+      // 与详情页 handleStartAll 对齐：项目启动 → 开启项目级文件监听（restart_mode>0 且 enabled=1 的服务）
+      watchApi.start(id).catch((err) => console.error('启动文件监听失败:', err));
       await useRunningStore.getState().refresh();
       showNotification({ title: `「${name}」已启动`, description: '所有已启用的服务已启动' });
     } catch (err: unknown) {
@@ -83,6 +85,7 @@ export function useProjectList() {
     e.stopPropagation();
     setActingId(id);
     try {
+      // stop_project_services 后端同时停止进程与项目级文件监听（总开关）
       await processApi.stopProject(id);
       await useRunningStore.getState().refresh();
       showNotification({ variant: 'info', title: `「${name}」已停止`, description: '所有服务已停止' });

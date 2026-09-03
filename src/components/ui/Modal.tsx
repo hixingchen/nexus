@@ -23,10 +23,11 @@ export function Modal({ open, title, onClose, children, width = '420px', closeOn
 
   if (!open) return null;
 
+  // 遮罩层级 z-[65]：必须高于编辑面板 z-[60]（否则抽屉浮在遮罩上仍可点击），低于右键菜单 z-[70]
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50"
       onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
       onMouseUp={(e) => {
         if (closeOnOverlay && mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) {

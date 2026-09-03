@@ -72,6 +72,14 @@ impl FileWatcher {
         }
 
         if unique_paths.is_empty() {
+            // 静默跳过会表现为"改了文件什么都没发生"，显式记录无效路径便于诊断
+            let total: usize = services.iter().map(|s| s.paths.len()).sum();
+            let invalid: Vec<&str> = services.iter().flat_map(|s| s.paths.iter().map(|p| p.as_str()))
+                .filter(|p| !Path::new(p).exists()).collect();
+            log::warn!(
+                "文件监听未启动: 有效路径 0/{total}（无效路径 {:?}，可能路径不存在或全部服务未启用监听）",
+                invalid
+            );
             return Ok(());
         }
 
@@ -104,7 +112,8 @@ impl FileWatcher {
                         let kind = event_kind_str(&event.kind);
                         for path in &event.paths {
                             if path.is_dir() { continue; }
-                            if !should_ignore_path(path, &svc_map) {
+                            // 预过滤：有服务需要该路径才入队（防 node_modules 等全员排除目录洪泛）
+                            if should_queue_event(path, &svc_map) {
                                 let p = path.to_string_lossy().replace('\\', "/");
                                 pending.insert(p, kind.to_string());
                             }
@@ -240,64 +249,81 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     false
 }
 
-/// 路径是否被所有服务的排除规则共同忽略
-fn should_ignore_path(path: &Path, services: &[ServiceWatchConfig]) -> bool {
+/// 单个服务对路径的接收判定：命中该服务的排除规则、或不在其包含列表中 → 不接收
+///
+/// 注意：判定是 per-service 的。路径被服务 A 排除不影响同目录的服务 B 接收它，
+/// 排除/包含规则不得跨服务串扰（之前全局"任一排除即丢弃"会让 B 漏事件）。
+fn service_accepts(svc: &ServiceWatchConfig, path_str: &str, components: &[&str]) -> bool {
+    // 检查排除规则
+    for ex in &svc.exclude {
+        let ex = ex.trim();
+        if ex.is_empty() { continue; }
+        // 目录名精确匹配（如 node_modules, .git）
+        if !ex.contains('*') && components.contains(&ex) {
+            return false;
+        }
+        // glob 匹配文件名
+        if let Some(name) = path_str.rsplit('/').next() {
+            if glob_match(ex, name) { return false; }
+        }
+    }
+
+    // 检查包含规则（如果有非 * 的规则）
+    let has_include = svc.include.iter().any(|i| i.trim() != "*" && !i.trim().is_empty());
+    if has_include {
+        if let Some(name) = path_str.rsplit('/').next() {
+            let included = svc.include.iter().any(|inc| glob_match(inc.trim(), name));
+            if !included { return false; } // 不在包含列表中 → 不接收
+        }
+    }
+    true
+}
+
+/// 预过滤方向判定：路径是否值得进入待发送队列
+///
+/// true = 至少一个归属服务接收该路径（需要事件）；false = 无人需要（丢弃）。
+/// 入队条件直接用本函数本身（`if should_queue_event(...)`），**不要取反**——取反会让
+/// 有服务需要的文件全部被丢弃、被全员排除的目录反而入队，表现为"改文件永远不触发"。
+fn should_queue_event(path: &Path, services: &[ServiceWatchConfig]) -> bool {
+    path_needed_by_any(path, services)
+}
+
+/// 路径是否至少被一个归属服务接收（粗过滤：全部归属服务都拒绝或无人归属才丢弃）
+fn path_needed_by_any(path: &Path, services: &[ServiceWatchConfig]) -> bool {
     let path_str = normalize(&path.to_string_lossy());
     // 提取路径各组件用于目录名匹配
     let components: Vec<&str> = path_str.split('/').collect();
-
-    // 检查每个服务的排除规则
-    for svc in services {
-        // 先检查路径是否在服务的监听范围内
+    services.iter().any(|svc| {
         let in_watch = svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp)));
-        if !in_watch { continue; }
-
-        // 检查排除规则
-        for ex in &svc.exclude {
-            let ex = ex.trim();
-            if ex.is_empty() { continue; }
-            // 目录名精确匹配（如 node_modules, .git）
-            if !ex.contains('*') && components.contains(&ex) {
-                return true;
-            }
-            // glob 匹配文件名
-            if let Some(name) = path_str.rsplit('/').next() {
-                if glob_match(ex, name) { return true; }
-            }
-        }
-
-        // 检查包含规则（如果有非 * 的规则）
-        let has_include = svc.include.iter().any(|i| i.trim() != "*" && !i.trim().is_empty());
-        if has_include {
-            if let Some(name) = path_str.rsplit('/').next() {
-                let included = svc.include.iter().any(|inc| glob_match(inc.trim(), name));
-                if !included { return true; } // 不在包含列表中 → 忽略
-            }
-        }
-    }
-    false
+        in_watch && service_accepts(svc, &path_str, &components)
+    })
 }
 
 /// 将变更路径归属到对应服务
+///
+/// 归属判定 per-service：路径须在该服务监听范围内**且**被其规则接收
+/// （接收由 service_accepts 判定——服务 A 的排除不得压制服务 B 的事件）。
 fn match_changes(
     services: &[ServiceWatchConfig],
     paths: &HashMap<String, String>,
 ) -> Vec<FileChange> {
     let mut changes = Vec::new();
     for (path_str, kind) in paths {
+        let components: Vec<&str> = path_str.split('/').collect();
         let mut matched = false;
         for svc in services {
-            if svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp))) {
-                changes.push(FileChange {
-                    path: path_str.clone(),
-                    service_name: svc.name.clone(),
-                    service_id: svc.id.clone(),
-                    kind: kind.clone(),
-                    restart_mode: svc.restart_mode,
-                });
-                matched = true;
-                break;
-            }
+            let in_watch = svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp)));
+            if !in_watch { continue; }
+            if !service_accepts(svc, path_str, &components) { continue; }
+            changes.push(FileChange {
+                path: path_str.clone(),
+                service_name: svc.name.clone(),
+                service_id: svc.id.clone(),
+                kind: kind.clone(),
+                restart_mode: svc.restart_mode,
+            });
+            matched = true;
+            break;
         }
         if !matched {
             changes.push(FileChange {
@@ -391,7 +417,7 @@ mod tests {
         assert!(!glob_match("*.log", "debug.txt"));
     }
 
-    // ── should_ignore_path ─────────────────────────────────
+    // ── path_needed_by_any / service_accepts ────────────────
 
     fn make_svc(id: &str, paths: Vec<&str>, exclude: Vec<&str>, include: Vec<&str>) -> ServiceWatchConfig {
         ServiceWatchConfig {
@@ -405,42 +431,102 @@ mod tests {
     }
 
     #[test]
-    fn test_should_ignore_node_modules() {
+    fn test_needed_ignore_node_modules() {
         let svc = make_svc("s1", vec!["/project"], vec!["node_modules"], vec!["*"]);
-        assert!(should_ignore_path(Path::new("/project/node_modules/express/index.js"), &[svc]));
+        assert!(!path_needed_by_any(Path::new("/project/node_modules/express/index.js"), &[svc]));
     }
 
     #[test]
-    fn test_should_not_ignore_normal_file() {
+    fn test_needed_normal_file() {
         let svc = make_svc("s1", vec!["/project"], vec!["node_modules"], vec!["*"]);
-        assert!(!should_ignore_path(Path::new("/project/src/index.js"), &[svc]));
+        assert!(path_needed_by_any(Path::new("/project/src/index.js"), &[svc]));
     }
 
     #[test]
-    fn test_should_ignore_outside_watch_path() {
+    fn test_needed_outside_watch_path() {
         let svc = make_svc("s1", vec!["/project"], vec!["node_modules"], vec!["*"]);
-        // 路径不在监听范围内，不处理（返回 false）
-        assert!(!should_ignore_path(Path::new("/other/node_modules/express/index.js"), &[svc]));
+        // 路径不在监听范围内：无归属服务 → 丢弃
+        assert!(!path_needed_by_any(Path::new("/other/node_modules/express/index.js"), &[svc]));
     }
 
     #[test]
-    fn test_should_ignore_glob_pattern() {
+    fn test_needed_glob_pattern() {
         let svcs = vec![make_svc("s1", vec!["/project"], vec!["*.log"], vec!["*"])];
-        assert!(should_ignore_path(Path::new("/project/debug.log"), &svcs));
-        assert!(!should_ignore_path(Path::new("/project/debug.txt"), &svcs));
+        assert!(!path_needed_by_any(Path::new("/project/debug.log"), &svcs));
+        assert!(path_needed_by_any(Path::new("/project/debug.txt"), &svcs));
     }
 
     #[test]
-    fn test_should_ignore_include_filter() {
+    fn test_needed_include_filter() {
         let svcs = vec![make_svc("s1", vec!["/project"], vec![], vec!["*.ts"])];
         // 有非 * 的 include 规则，不在 include 中的文件应被忽略
-        assert!(should_ignore_path(Path::new("/project/index.js"), &svcs));
-        assert!(!should_ignore_path(Path::new("/project/index.ts"), &svcs));
+        assert!(!path_needed_by_any(Path::new("/project/index.js"), &svcs));
+        assert!(path_needed_by_any(Path::new("/project/index.ts"), &svcs));
     }
 
     #[test]
-    fn test_should_ignore_git_directory() {
+    fn test_needed_git_directory() {
         let svc = make_svc("s1", vec!["/project"], vec![".git"], vec!["*"]);
-        assert!(should_ignore_path(Path::new("/project/.git/config"), &[svc]));
+        assert!(!path_needed_by_any(Path::new("/project/.git/config"), &[svc]));
+    }
+
+    // ── should_queue_event（回归：入队方向，取反会让正常文件全部丢失）──
+
+    #[test]
+    fn test_queue_direction_source_file_queued() {
+        // 源码文件被服务需要 → 必须入队
+        let svc = make_svc("s1", vec!["/project"], vec!["node_modules"], vec!["*"]);
+        assert!(should_queue_event(Path::new("/project/src/index.ts"), &[svc]));
+    }
+
+    #[test]
+    fn test_queue_direction_excluded_dir_dropped() {
+        // 被服务排除的目录（node_modules）→ 不入队（防洪泛）
+        let svc = make_svc("s1", vec!["/project"], vec!["node_modules"], vec!["*"]);
+        assert!(!should_queue_event(Path::new("/project/node_modules/pkg/index.js"), &[svc]));
+    }
+
+    // ── 跨服务规则串扰（回归：A 的排除/包含不得压制 B 的事件）──
+
+    #[test]
+    fn test_cross_service_exclude_does_not_leak() {
+        // A 排除 *.log，B 全收：.log 事件应由 B 接收，而不是全局被 A 丢弃
+        let svcs = vec![
+            make_svc("A", vec!["/project"], vec!["*.log"], vec!["*"]),
+            make_svc("B", vec!["/project"], vec![], vec!["*"]),
+        ];
+        assert!(path_needed_by_any(Path::new("/project/a.log"), &svcs), "B 应接收该路径");
+
+        let mut paths = HashMap::new();
+        paths.insert("/project/a.log".to_string(), "modify".to_string());
+        let changes = match_changes(&svcs, &paths);
+        assert_eq!(changes.len(), 1, "A 被自身规则排除，不应产生事件");
+        assert_eq!(changes[0].service_id, "B");
+        assert_eq!(changes[0].path, "/project/a.log");
+    }
+
+    #[test]
+    fn test_cross_service_include_does_not_leak() {
+        // A 只收 *.ts，B 全收：.js 事件 B 应收到，不被 A 的包含规则拦截
+        let svcs = vec![
+            make_svc("A", vec!["/project"], vec![], vec!["*.ts"]),
+            make_svc("B", vec!["/project"], vec![], vec!["*"]),
+        ];
+        let mut paths = HashMap::new();
+        paths.insert("/project/app.js".to_string(), "modify".to_string());
+        let changes = match_changes(&svcs, &paths);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].service_id, "B");
+    }
+
+    #[test]
+    fn test_match_changes_all_excluded_falls_back_to_project() {
+        // 全部归属服务都拒绝该路径（预过滤已拦截，兜底场景）→ "(project)" 事件
+        let svcs = vec![make_svc("A", vec!["/project"], vec!["*.log"], vec!["*"])];
+        let mut paths = HashMap::new();
+        paths.insert("/project/a.log".to_string(), "modify".to_string());
+        let changes = match_changes(&svcs, &paths);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].service_name, "(project)");
     }
 }

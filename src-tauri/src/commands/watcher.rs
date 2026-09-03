@@ -3,10 +3,13 @@ use crate::AppState;
 use crate::core::file_watcher::{FileChangeEvent, ServiceWatchConfig};
 
 /// 从数据库读取单个服务的监听配置
+///
+/// restart_mode=0（关闭监听）的服务不返回——与项目级加载（restart_mode>0）语义一致：
+/// 任何入口都不得让"关闭监听"的服务实际监听文件。
 fn load_service_watch_config(db: &crate::database::Database, service_id: &str) -> Result<Option<ServiceWatchConfig>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1"
+            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1 AND restart_mode>0"
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         let mut rows = stmt.query_map([service_id], |row| {
             Ok((
@@ -40,11 +43,14 @@ fn load_service_watch_config(db: &crate::database::Database, service_id: &str) -
     })
 }
 
-/// 从数据库读取项目所有启用监听的服务（restart_mode>0）
+/// 从数据库读取项目所有启用监听的服务
+///
+/// 条件 restart_mode>0 AND enabled=1：监听集合 = 项目启动实际会拉起的服务中开了
+/// 监听模式的子集——不跟随项目启动（enabled=0）的服务若被手动启动，由单服务入口另行监听。
 fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) -> Result<Vec<ServiceWatchConfig>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE project_id=?1 AND restart_mode>0"
+            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE project_id=?1 AND restart_mode>0 AND enabled=1"
         ).map_err(|e| format!("查询文件监听服务列表失败: {}", e))?;
         let rows = stmt.query_map([project_id], |row| {
             Ok((
@@ -126,6 +132,74 @@ pub fn start_watching(app: AppHandle, state: State<AppState>, project_id: String
     )
 }
 
+/// 从项目监听中移除单服务；无剩余服务时停止整个项目监听。
+/// 重建时按剩余服务的当前配置重建 notify watcher（否则旧路径仍被监听产生孤儿事件）。
+/// 停止按钮（stop_watching）与删除服务（delete_service）共用。
+pub(crate) fn remove_service_watch(
+    app: AppHandle,
+    state: &AppState,
+    project_id: &str,
+    service_id: &str,
+) -> Result<(), String> {
+    let remaining = state.file_watcher.remove_service_from_watching(project_id, service_id);
+    if remaining.is_empty() {
+        return state.file_watcher.stop_watching(project_id);
+    }
+    let project_name: String = state.db.with_conn(|conn| {
+        conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
+            |row| row.get(0)
+        ).map_err(|e| format!("项目不存在: {}", e))
+    })?;
+    state.file_watcher.start_watching(
+        project_id,
+        &project_name,
+        &remaining,
+        move |event: FileChangeEvent| {
+            let _ = app.emit("file-changed", event);
+        },
+    )
+}
+
+/// 服务配置保存后刷新其监听（配置热更新）
+///
+/// 仅当该服务当前正在被监听时生效：用数据库新配置替换旧条目并重建 watcher；
+/// 新配置 restart_mode=0 或无监听路径 → 从监听中摘除该服务。
+/// 服务不在监听中 → no-op（下次启动时自然读新配置）。
+pub(crate) fn refresh_service_watch(
+    app: AppHandle,
+    state: &AppState,
+    project_id: &str,
+    service_id: &str,
+) -> Result<(), String> {
+    let Some(existing) = state.file_watcher.get_watched_services(project_id) else {
+        return Ok(());
+    };
+    if !existing.iter().any(|s| s.id == service_id) {
+        return Ok(());
+    }
+    let mut updated = existing;
+    updated.retain(|s| s.id != service_id);
+    if let Some(cfg) = load_service_watch_config(&state.db, service_id)? {
+        updated.push(cfg);
+    }
+    if updated.is_empty() {
+        return state.file_watcher.stop_watching(project_id);
+    }
+    let project_name: String = state.db.with_conn(|conn| {
+        conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
+            |row| row.get(0)
+        ).map_err(|e| format!("项目不存在: {}", e))
+    })?;
+    state.file_watcher.start_watching(
+        project_id,
+        &project_name,
+        &updated,
+        move |event: FileChangeEvent| {
+            let _ = app.emit("file-changed", event);
+        },
+    )
+}
+
 /// 停止文件监听
 ///
 /// - `service_id` 为空：停止整个项目的监听
@@ -134,31 +208,8 @@ pub fn start_watching(app: AppHandle, state: State<AppState>, project_id: String
 pub fn stop_watching(app: AppHandle, state: State<AppState>, project_id: String, service_id: Option<String>) -> Result<(), String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
 
-    if service_id.is_none() {
-        // 项目模式：停止整个项目监听
-        return state.file_watcher.stop_watching(&project_id);
-    }
-
-    let sid = service_id.unwrap();
-    // 单服务模式：从监听中移除该服务
-    let remaining = state.file_watcher.remove_service_from_watching(&project_id, &sid);
-    if remaining.is_empty() {
-        // 没有剩余服务，停止整个项目监听
-        state.file_watcher.stop_watching(&project_id)
-    } else {
-        // 重建监听（含剩余服务）
-        let project_name: String = state.db.with_conn(|conn| {
-            conn.query_row("SELECT name FROM projects WHERE id=?1", [&project_id],
-                |row| row.get(0)
-            ).map_err(|e| format!("项目不存在: {}", e))
-        })?;
-        state.file_watcher.start_watching(
-            &project_id,
-            &project_name,
-            &remaining,
-            move |event: FileChangeEvent| {
-                let _ = app.emit("file-changed", event);
-            },
-        )
+    match service_id {
+        None => state.file_watcher.stop_watching(&project_id),
+        Some(sid) => remove_service_watch(app, &state, &project_id, &sid),
     }
 }

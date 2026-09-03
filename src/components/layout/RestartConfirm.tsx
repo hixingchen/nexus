@@ -24,6 +24,8 @@ export function RestartConfirm() {
       const { changes } = event.payload;
       for (const c of changes) {
         if (c.service_name === '(project)' || !c.service_id) continue;
+        // 0=关闭监听：后端已不为其生成事件（此处兜底旧 watcher 残留/异常事件）
+        if (c.restart_mode === 0) continue;
         const name = c.service_name;
         const sid = c.service_id;
 
