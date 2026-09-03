@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, type DecorationSet, type Panel } from '@codemirror/view';
 import { EditorState, StateEffect, StateField, type Range, type Text } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
