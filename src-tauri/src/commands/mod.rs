@@ -5,4 +5,5 @@ pub mod process;
 pub mod project;
 pub mod search;
 pub mod service;
+pub mod tools;
 pub mod watcher;

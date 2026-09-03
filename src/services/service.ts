@@ -57,6 +57,8 @@ export interface ServiceTemplate {
   enabled: boolean;
   show_file_tree: boolean;
   tool_commands: string;
+  /** 模板携带的默认打开工具（从模板添加服务时复制为新服务绑定） */
+  open_tool_id: string;
   created_at: string;
 }
 
@@ -159,6 +161,7 @@ export const serviceApi = {
     enabled: boolean;
     showFileTree: boolean;
     toolCommands: string;
+    openToolId: string;
   }) => invoke<void>('update_service_template', {
     params: {
       id: params.id,
@@ -173,6 +176,7 @@ export const serviceApi = {
       enabled: params.enabled,
       showFileTree: params.showFileTree,
       toolCommands: params.toolCommands,
+      openToolId: params.openToolId,
     }
   }),
 
@@ -302,4 +306,44 @@ export const watchApi = {
   /** 停止文件监听：serviceId 为空=项目级（全部停止），非空=仅移除该服务 */
   stop: (projectId: string, serviceId?: string) =>
     invoke<void>('stop_watching', { projectId, serviceId: serviceId ?? null }),
+};
+
+// ─── 外部打开工具 API（服务右键「用 XX 打开」）────────────
+
+/**
+ * 外部打开工具（服务右键「用 XX 打开」）
+ * executable：程序路径（.exe 直启；.cmd/.bat 自动走 cmd）
+ * args：参数模板，{path} 以独立参数注入（不经过 shell，路径含空格无需引号）
+ * command：旧版整串命令（遗留字段，executable 为空的历史行使用）
+ */
+export interface OpenTool {
+  id: string;
+  name: string;
+  command: string;
+  executable: string;
+  args: string;
+}
+
+export const openToolsApi = {
+  /** 全部工具（全局共享，按添加顺序） */
+  list: () => invoke<OpenTool[]>('list_open_tools'),
+
+  /** 新增（id 空）或更新工具 */
+  save: (tool: { id?: string | null; name: string; executable: string; args: string }) =>
+    invoke<OpenTool>('save_open_tool', { params: tool }),
+
+  /** 删除工具（服务绑定级联解除） */
+  delete: (id: string) => invoke<void>('delete_open_tool', { id }),
+
+  /** 绑定/解绑服务与工具（toolId 为 null → 解绑） */
+  bindService: (serviceId: string, toolId: string | null) =>
+    invoke<void>('set_service_open_tool', { serviceId, toolId }),
+
+  /** 项目下所有服务的工具绑定 */
+  listBindings: (projectId: string) =>
+    invoke<{ service_id: string; tool_id: string }[]>('list_service_open_tool_bindings', { projectId }),
+
+  /** 用服务绑定的工具打开其工作目录 */
+  openWith: (serviceId: string) =>
+    invoke<void>('open_service_with_tool', { serviceId }),
 };

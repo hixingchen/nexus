@@ -3,8 +3,9 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { processApi, watchApi, type Service, type ToolCommand } from '../../services/service';
+import { openToolsApi, processApi, watchApi, type Service, type ToolCommand } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
+import { useToolStore } from '../../stores/toolStore';
 import { showNotification } from '../ui/Toast';
 
 interface Props {
@@ -41,6 +42,11 @@ export function ServiceTreeEntry({
   };
   const [busy, setBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+  // 绑定的打开工具（服务设置中选择，全局工具库共享）
+  const boundToolId = useToolStore(s => s.bindings[service.id]);
+  const openTools = useToolStore(s => s.openTools);
+  const boundTool = openTools.find(t => t.id === boundToolId);
 
   // 解析工具命令
   const toolCommands = useMemo(() => {
@@ -87,6 +93,16 @@ export function ServiceTreeEntry({
   const handleRunCommand = (cmd: ToolCommand) => {
     setContextMenu(null);
     onRunToolCommand?.(service.id, cmd.id, cmd.name);
+  };
+
+  const handleOpenWithTool = async () => {
+    setContextMenu(null);
+    try {
+      await openToolsApi.openWith(service.id);
+    } catch (err) {
+      console.error('用工具打开失败:', err);
+      showNotification({ variant: 'error', title: '用工具打开失败', description: String(err) });
+    }
   };
 
   return (
@@ -174,7 +190,9 @@ export function ServiceTreeEntry({
           x={contextMenu.x}
           y={contextMenu.y}
           cwd={service.cwd}
+          openToolName={boundTool?.name ?? null}
           toolCommands={toolCommands}
+          onOpenWithTool={handleOpenWithTool}
           onOpenInExplorer={async () => {
             setContextMenu(null);
             try {
@@ -212,7 +230,10 @@ interface ContextMenuProps {
   x: number;
   y: number;
   cwd: string;
+  /** 绑定的打开工具名（null = 未绑定，不显示该项） */
+  openToolName: string | null;
   toolCommands: ToolCommand[];
+  onOpenWithTool: () => void;
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
   onRunCommand: (cmd: ToolCommand) => void;
@@ -220,7 +241,7 @@ interface ContextMenuProps {
   onClose: () => void;
 }
 
-const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
+const ContextMenu = ({ x, y, cwd, openToolName, toolCommands, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // 点击外部关闭菜单
@@ -236,14 +257,15 @@ const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onOpenTerminal
   // 计算菜单位置，确保不超出屏幕
   const menuStyle = useMemo(() => {
     const menuWidth = 200;
-    const menuHeight = toolCommands.length * 36 + 80;
+    // 工具分组（33px）+ 资源管理器/终端组 + 工具命令组 + 删除组
+    const menuHeight = (openToolName ? 33 : 0) + toolCommands.length * 36 + 80;
     const maxX = window.innerWidth - menuWidth - 8;
     const maxY = window.innerHeight - menuHeight - 8;
     return {
       left: Math.min(x, maxX),
       top: Math.min(y, maxY),
     };
-  }, [x, y, toolCommands.length]);
+  }, [x, y, openToolName, toolCommands.length]);
 
   return (
     <div
@@ -251,6 +273,21 @@ const ContextMenu = ({ x, y, cwd, toolCommands, onOpenInExplorer, onOpenTerminal
       className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
       style={menuStyle}
     >
+      {/* 用绑定的工具打开（服务设置中选择，如 IDEA / VS Code） */}
+      {openToolName && (
+        <div className="py-1.5 px-1.5">
+          <button
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+            onClick={onOpenWithTool}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
+              <path d="M2 1h6a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1z"/><path d="M1.5 6.5h7M3.5 6.5V9"/>
+            </svg>
+            <span className="text-[12px] text-nexus-text truncate">用 {openToolName} 打开</span>
+          </button>
+        </div>
+      )}
+
       {/* 打开资源管理器 / 打开终端 */}
       {cwd && (
         <div className="py-1.5 px-1.5">

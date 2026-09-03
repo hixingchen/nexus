@@ -59,8 +59,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         if version > 0 {
             log::warn!("schema 版本不兼容 (db={}, code={}), 重建数据库", version, SCHEMA_VERSION);
         }
-        // 删旧表重建
+        // 删旧表重建（先删引用方，避免外键约束阻止 DROP）
         conn.execute_batch("
+            DROP TABLE IF EXISTS service_open_tools;
+            DROP TABLE IF EXISTS open_tools;
             DROP TABLE IF EXISTS service_templates;
             DROP TABLE IF EXISTS services;
             DROP TABLE IF EXISTS projects;
@@ -110,9 +112,33 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             show_file_tree INTEGER NOT NULL DEFAULT 1,
             sort_index INTEGER NOT NULL DEFAULT 0,
             tool_commands TEXT NOT NULL DEFAULT '[]',
+            -- 模板携带的默认打开工具（从模板添加服务时复制为服务绑定；工具被删时由命令清空）
+            open_tool_id TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        -- 外部打开工具库（服务右键「用 XX 打开」）：executable 为可执行程序路径，
+        -- args 为参数模板（{path} 参数化注入，不经过 shell——避免引号/元字符地狱）。
+        -- command 为旧版整串命令（已废弃，仅兼容历史行：executable 为空时按旧格式执行）
+        CREATE TABLE IF NOT EXISTS open_tools (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            command TEXT NOT NULL DEFAULT '',
+            executable TEXT NOT NULL DEFAULT '',
+            args TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        -- 服务 ↔ 打开工具绑定：删除任一侧记录时级联清理
+        CREATE TABLE IF NOT EXISTS service_open_tools (
+            service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,
+            tool_id TEXT NOT NULL REFERENCES open_tools(id) ON DELETE CASCADE
+        );
     ").map_err(|e| format!("创建数据库表失败: {}", e))?;
+
+    // 增量迁移：老库补列（新库 CREATE 已带，幂等跳过）。不升 SCHEMA_VERSION——
+    // 版本号不匹配会触发上方删表重建，禁止用版本号当迁移开关
+    ensure_column(&conn, "open_tools", "executable", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "open_tools", "args", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "service_templates", "open_tool_id", "TEXT NOT NULL DEFAULT ''")?;
 
     // 使用参数化查询写入 schema 版本
     conn.execute(
@@ -120,6 +146,20 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         [SCHEMA_VERSION],
     ).map_err(|e| format!("写入 schema 版本失败: {}", e))?;
 
+    Ok(())
+}
+
+/// 幂等加列：列已存在则跳过（pragma_table_info 表值函数）
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
+        rusqlite::params![table, column],
+        |r| r.get(0),
+    ).unwrap_or(false);
+    if exists { return Ok(()); }
+    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, decl))
+        .map_err(|e| format!("迁移数据库（加列 {}.{}）失败: {}", table, column, e))?;
+    log::info!("[nexus] 数据库迁移: {}.{} 已添加", table, column);
     Ok(())
 }
 

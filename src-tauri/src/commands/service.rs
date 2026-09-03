@@ -84,14 +84,14 @@ pub fn add_service(
         let wx = DEFAULT_WATCH_EXCLUDE;
         conn.execute(
             "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,?11,?12)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,0,?11,?12)",
             rusqlite::params![id, params.project_id, params.name.trim(), params.command, cwd, wp, wi, wx, params.env_vars, params.restart_mode, max_sort + 1, tool_commands],
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
             id, project_id: params.project_id, name: params.name.trim().to_string(), command: params.command,
             cwd, watch_paths: wp, watch_include: wi.into(), watch_exclude: wx.into(),
             env_vars: params.env_vars, restart_mode: params.restart_mode, enabled: true,
-            show_file_tree: true,
+            show_file_tree: false,
             sort_index: max_sort + 1,
             tool_commands,
         })
@@ -102,6 +102,7 @@ pub fn add_service(
 #[tauri::command]
 pub fn update_service(
     state: State<AppState>,
+    app: tauri::AppHandle,
     params: UpdateServiceParams,
 ) -> Result<(), String> {
     if params.id.trim().is_empty() { return Err("服务ID不能为空".into()); }
@@ -109,15 +110,15 @@ pub fn update_service(
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
-    state.db.with_conn(|conn| {
+    let project_id = state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
         // 监听路径跟随工作目录（兜底，覆盖任意保存入口）：
         // watch_paths 为空/[]，或仍等于旧 cwd（默认跟随状态）→ 自动更新为新 cwd
-        let old: (String, String) = conn.query_row(
-            "SELECT cwd, watch_paths FROM services WHERE id=?1",
+        let old: (String, String, String) = conn.query_row(
+            "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
             [&params.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         let default_old = serde_json::to_string(&vec![old.0]).unwrap_or_default();
         let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
@@ -134,8 +135,14 @@ pub fn update_service(
             rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
         ).map_err(|e| format!("更新服务失败: {}", e))?;
         if affected == 0 { return Err("服务不存在".into()); }
-        Ok(())
-    })
+        Ok(old.2)
+    })?;
+    // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）；
+    // 失败只告警不阻塞保存（保存已成功，监听下次项目级启停时自然重建）
+    if let Err(e) = crate::commands::watcher::refresh_service_watch(app, &state, &project_id, &params.id) {
+        log::warn!("更新服务后刷新文件监听失败: {}", e);
+    }
+    Ok(())
 }
 
 /// 重排项目服务顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）
@@ -164,15 +171,26 @@ pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids:
 
 /// 删除服务
 #[tauri::command]
-pub fn delete_service(state: State<AppState>, id: String) -> Result<(), String> {
+pub fn delete_service(state: State<AppState>, app: tauri::AppHandle, id: String) -> Result<(), String> {
     if id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    // 1. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
+    // 1. 查所属项目（文件监听以项目为维度；服务不存在时容忍跳过监听清理）
+    let project_id: Option<String> = state.db.with_conn(|conn| {
+        Ok(conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get(0)).ok())
+    })?;
+    // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
     let _ = state.process_mgr.stop(&id);
-    // 2. 删除数据库记录
+    // 3. 删除数据库记录
     state.db.with_conn(|conn| {
         conn.execute("DELETE FROM services WHERE id=?1", [&id]).map_err(|e| format!("删除服务失败: {}", e))?;
         Ok(())
-    })
+    })?;
+    // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
+    if let Some(pid) = project_id {
+        if let Err(e) = crate::commands::watcher::remove_service_watch(app, &state, &pid, &id) {
+            log::warn!("删除服务后清理文件监听失败: {}", e);
+        }
+    }
+    Ok(())
 }
 
 // ─── 服务模板（跨项目复用） ─────────────────────────────────
@@ -182,14 +200,15 @@ pub fn delete_service(state: State<AppState>, id: String) -> Result<(), String> 
 pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTemplate>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, created_at
+            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id, created_at
              FROM service_templates ORDER BY sort_index, name"
         ).map_err(|e| format!("查询模板失败: {}", e))?;
         let rows = stmt.query_map([], |row| Ok(ServiceTemplate {
             id: row.get(0)?, name: row.get(1)?, command: row.get(2)?, cwd: row.get(3)?,
             watch_paths: row.get(4)?, watch_include: row.get(5)?, watch_exclude: row.get(6)?,
             env_vars: row.get(7)?, restart_mode: row.get(8)?, enabled: row.get(9)?,
-            show_file_tree: row.get(10)?, tool_commands: row.get(11)?, created_at: row.get(12)?,
+            show_file_tree: row.get(10)?, tool_commands: row.get(11)?,
+            open_tool_id: row.get(12)?, created_at: row.get(13)?,
         })).map_err(|e| format!("查询模板失败: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("查询模板失败: {}", e))
     })
@@ -211,18 +230,24 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
             )),
         ).map_err(|e| format!("服务不存在: {}", e))?;
         let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands) = t;
+        // 模板随服务带走当前绑定的打开工具（从模板添加服务时复制为新服务绑定）
+        let open_tool_id: String = conn.query_row(
+            "SELECT tool_id FROM service_open_tools WHERE service_id=?1", [&service_id],
+            |r| r.get(0),
+        ).unwrap_or_default();
 
         let id = uuid::Uuid::new_v4().to_string();
         let en = if enabled { 1 } else { 0 };
         let sft = if show_file_tree { 1 } else { 0 };
         conn.execute(
-            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
-            rusqlite::params![id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, tool_commands],
+            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)",
+            rusqlite::params![id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, tool_commands, open_tool_id],
         ).map_err(|e| format!("保存模板失败: {}", e))?;
         Ok(ServiceTemplate {
             id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, tool_commands,
+            open_tool_id,
             created_at: String::new(),
         })
     })
@@ -242,17 +267,17 @@ pub fn add_service_from_template(
         if !project_exists { return Err("所属项目不存在".into()); }
 
         let t = conn.query_row(
-            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands
+            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id
              FROM service_templates WHERE id=?1",
             [&template_id],
             |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?, row.get::<_, i32>(7)?, row.get::<_, bool>(8)?,
-                row.get::<_, bool>(9)?, row.get::<_, String>(10)?,
+                row.get::<_, bool>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?,
             )),
         ).map_err(|e| format!("模板不存在: {}", e))?;
-        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands) = t;
+        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = conn.query_row(
@@ -266,6 +291,18 @@ pub fn add_service_from_template(
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, max_sort + 1, tool_commands],
         ).map_err(|e| format!("添加服务失败: {}", e))?;
+        // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
+        if !open_tool_id.is_empty() {
+            let tool_exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM open_tools WHERE id=?1", [&open_tool_id], |r| r.get(0)
+            ).unwrap_or(false);
+            if tool_exists {
+                conn.execute(
+                    "INSERT OR REPLACE INTO service_open_tools (service_id, tool_id) VALUES (?1,?2)",
+                    rusqlite::params![id, open_tool_id],
+                ).map_err(|e| format!("复制模板打开工具失败: {}", e))?;
+            }
+        }
         Ok(Service {
             id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
@@ -322,6 +359,7 @@ pub struct UpdateServiceTemplateParams {
     pub enabled: bool,
     pub show_file_tree: bool,
     pub tool_commands: String,
+    pub open_tool_id: String,
 }
 
 /// 更新服务模板配置（编辑模板本身，不影响已从模板添加的项目服务）
@@ -339,8 +377,8 @@ pub fn update_service_template(
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
         let affected = conn.execute(
-            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
+            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11, open_tool_id=?13 WHERE id=?12",
+            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id, params.open_tool_id],
         ).map_err(|e| format!("更新模板失败: {}", e))?;
         if affected == 0 { return Err("模板不存在".into()); }
         Ok(())

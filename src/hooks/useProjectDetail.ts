@@ -3,6 +3,7 @@ import { projectApi, processApi, serviceApi, watchApi, type ProjectDetail as PD,
 import { useLogStore } from '../stores/logStore';
 import { useEditorStore } from '../stores/editor';
 import { useRunningStore } from '../stores/runningStore';
+import { useToolStore } from '../stores/toolStore';
 import { showNotification } from '../components/ui/Toast';
 
 /**
@@ -44,6 +45,8 @@ export function useProjectDetail(projectId: string) {
         processApi.getRunning(),
       ]);
       if (seq !== loadSeqRef.current) return; // 已被更新的请求取代，丢弃过期响应
+      // 并行刷新打开工具绑定（服务增删后右键"用 XX 打开"显示才准）
+      useToolStore.getState().loadProject(projectId).catch(() => {});
       setDetail(d);
       useRunningStore.getState().setRunning(r.running, r.failed);
       runningLoadedRef.current = true;

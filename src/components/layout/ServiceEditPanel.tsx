@@ -1,14 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { serviceApi, type Service, type ToolCommand } from '../../services/service';
 import { open } from '@tauri-apps/plugin-dialog';
+import { useToolStore } from '../../stores/toolStore';
+import { ToolsManagerModal } from './ToolsManagerModal';
 import { showNotification } from '../ui/Toast';
 
 const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
 
-/** 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致） */
-type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'>;
+/** 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致；模板额外带 open_tool_id） */
+type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'> & { open_tool_id?: string };
 
 interface Props {
   service: ServiceConfig;
@@ -48,6 +51,72 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   });
   const [editingToolCmd, setEditingToolCmd] = useState<ToolCommand | null>(null);
   const [showToolCmdForm, setShowToolCmdForm] = useState(false);
+  const [showToolManager, setShowToolManager] = useState(false);
+
+  // 打开工具绑定（全局工具库 + 当前服务绑定）
+  const openTools = useToolStore(s => s.openTools);
+  const boundToolId = useToolStore(s => service.id ? s.bindings[service.id] : undefined);
+  const bindTool = useToolStore(s => s.bind);
+  // 模板模式：默认打开工具存模板字段（随"保存模板"提交，不是即时绑定）
+  const [tplToolId, setTplToolId] = useState(service.open_tool_id ?? '');
+  // 当前模式生效的工具选择值（服务=store 即时绑定；模板=表单状态）
+  const pickerToolId = mode === 'template' ? (tplToolId || undefined) : boundToolId;
+  const pickerTool = openTools.find(t => t.id === pickerToolId);
+  const pickerToolName = pickerTool?.name;
+
+  // 打开方式选择器：自定义浮层（fixed + portal，参考右键菜单模式）。
+  // 原生 <select> 的选项样式/展开体验与面板风格割裂，且不可控
+  const [toolPickerOpen, setToolPickerOpen] = useState(false);
+  const pickerAnchorRef = useRef<HTMLButtonElement | null>(null);
+  const [pickerPos, setPickerPos] = useState<{ left: number; top: number; width: number } | null>(null);
+
+  const toolPickerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!toolPickerOpen) return;
+    // 外部点击 / 滚动 / Escape 时关闭（滚动容器非 window，需捕获阶段监听）。
+    // contains 判断：点在菜单内、或点的是触发器本身 → 不自动关（触发器走 click 显式 toggle），
+    // 否则会出现"mousedown 刚关掉、click 又打开"导致菜单关不掉
+    const inMenu = (e: Event) => toolPickerRef.current?.contains(e.target as Node) ?? false;
+    const inAnchor = (e: Event) => pickerAnchorRef.current?.contains(e.target as Node) ?? false;
+    const onMouseDown = (e: MouseEvent) => { if (!inMenu(e) && !inAnchor(e)) setToolPickerOpen(false); };
+    const onScroll = (e: Event) => { if (!inMenu(e)) setToolPickerOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setToolPickerOpen(false); };
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('scroll', onScroll, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('scroll', onScroll, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [toolPickerOpen]);
+
+  const openToolPicker = () => {
+    const anchor = pickerAnchorRef.current;
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    // 菜单与触发器等宽（视觉对齐），超出视口时收拢
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - rect.width - 8));
+    setPickerPos({ left, top: rect.bottom + 4, width: rect.width });
+    setToolPickerOpen(true);
+  };
+
+  const handleBindTool = async (toolId: string | null) => {
+    setToolPickerOpen(false);
+    if (mode === 'template') {
+      // 模板：默认打开工具随「保存模板」提交，此处仅改本地状态
+      setTplToolId(toolId ?? '');
+      return;
+    }
+    try {
+      await bindTool(service.id, toolId);
+      showNotification({ variant: 'success', title: toolId ? '已绑定打开工具' : '已解除绑定' });
+    } catch (err) {
+      console.error('设置打开工具失败:', err);
+      showNotification({ variant: 'error', title: '设置打开工具失败', description: String(err) });
+    }
+  };
 
   /**
    * 更新工作目录；若监听路径还处于"跟随工作目录"的默认状态
@@ -82,7 +151,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
         toolCommands: JSON.stringify(toolCommands),
       };
       if (mode === 'template') {
-        await serviceApi.updateTemplate(payload);
+        // 模板：默认打开工具随保存提交（从模板添加服务时复制为绑定）
+        await serviceApi.updateTemplate({ ...payload, openToolId: tplToolId });
       } else {
         await serviceApi.update(payload);
       }
@@ -249,6 +319,43 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           </div>
         </div>
 
+        {/* ── 打开方式卡片（服务即时绑定；模板存默认值随保存提交，从模板添加服务时复制） ── */}
+        <div className={cardCls}>
+          <div className="flex items-center justify-between mb-2">
+            <span className={labelCls}>打开方式</span>
+            <button
+              className="text-[11px] text-nexus-muted hover:text-nexus-accent rounded px-1.5 py-0.5 hover:bg-nexus-hover/50 transition-colors"
+              onClick={() => setShowToolManager(true)}
+            >管理工具</button>
+          </div>
+          <button
+            ref={pickerAnchorRef}
+            onClick={() => {
+              if (toolPickerOpen) { setToolPickerOpen(false); return; }
+              openToolPicker();
+            }}
+            className="w-full flex items-center gap-2 px-2.5 py-2 bg-nexus-bg border border-nexus-border rounded-md hover:border-nexus-accent/50 hover:bg-nexus-bg/80 transition-colors text-left"
+            title={pickerToolName ? `${pickerToolName} · ${pickerTool?.executable ?? ''}` : '选择打开工具'}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3"
+              className={`flex-shrink-0 ${pickerToolId ? 'text-nexus-accent' : 'text-nexus-muted/40'}`}>
+              <path d="M2 1h8a1 1 0 011 1v8a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1z"/><path d="M1.5 7.5h9M4 7.5V11"/>
+            </svg>
+            <span className={`flex-1 truncate text-[13px] ${pickerToolId ? 'text-nexus-text' : 'text-nexus-muted/60'}`}>
+              {pickerToolName ?? '未设置'}
+            </span>
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4"
+              className={`flex-shrink-0 text-nexus-muted/50 transition-transform ${toolPickerOpen ? 'rotate-180' : ''}`}>
+              <polyline points="2,3.5 5,6.5 8,3.5" />
+            </svg>
+          </button>
+          <p className="text-[10px] text-nexus-muted/50 mt-1.5">
+            {mode === 'template'
+              ? '作为模板默认值：从模板添加服务时自动带上该绑定'
+              : '服务右键菜单将出现「用所选工具打开」，打开其工作目录'}
+          </p>
+        </div>
+
         {/* ── 工具命令卡片 ── */}
         <div className={cardCls}>
           <div className="flex items-center justify-between mb-2.5">
@@ -369,6 +476,65 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           className="w-full px-4 py-2 text-[13px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover disabled:opacity-40 font-medium transition-colors"
           disabled={saving || !name.trim()} onClick={handleSave}>{saving ? '保存中…' : (mode === 'template' ? '保存模板' : '保存配置')}</button>
       </div>
+
+      {/* 打开方式浮层列表（portal 到 body：面板容器 overflow 会裁剪内部 absolute 菜单；宽度与触发器等宽） */}
+      {toolPickerOpen && pickerPos && createPortal(
+        <div
+          ref={toolPickerRef}
+          className="fixed z-[70] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
+          style={{ left: pickerPos.left, top: pickerPos.top, width: pickerPos.width }}
+        >
+          <div className="max-h-[264px] overflow-auto py-1">
+            {/* 解绑 */}
+            <button
+              className={`w-full flex items-center gap-2 px-3 py-2 text-left transition-colors ${
+                !pickerToolId ? 'bg-nexus-accent/10' : 'hover:bg-nexus-hover/50'
+              }`}
+              onClick={() => handleBindTool(null)}
+            >
+              <span className={`flex-1 text-[12px] ${pickerToolId ? 'text-nexus-muted/70' : 'text-nexus-text font-medium'}`}>
+                未设置
+              </span>
+              {!pickerToolId && (
+                <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6"
+                  className="text-nexus-accent flex-shrink-0">
+                  <polyline points="1.5,5.5 4,7.5 8.5,2.5" />
+                </svg>
+              )}
+            </button>
+            {openTools.length === 0 && (
+              <p className="px-3 py-1.5 text-[11px] text-nexus-muted/40">暂无工具，点右上「管理工具」添加</p>
+            )}
+            {openTools.map(t => {
+              const active = pickerToolId === t.id;
+              return (
+                <button
+                  key={t.id}
+                  className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${
+                    active ? 'bg-nexus-accent/10' : 'hover:bg-nexus-hover/50'
+                  }`}
+                  title={t.command}
+                  onClick={() => handleBindTool(t.id)}
+                >
+                  <span className={`text-[12px] truncate flex-1 ${active ? 'text-nexus-text font-medium' : 'text-nexus-text/90'}`}>
+                    {t.name}
+                  </span>
+                  {active && (
+                    <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6"
+                      className="text-nexus-accent flex-shrink-0">
+                      <polyline points="1.5,5.5 4,7.5 8.5,2.5" />
+                    </svg>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>,
+        document.body,
+      )}
+
+      {/* 工具库管理（全局增删改 + 快捷填充） */}
+      <ToolsManagerModal open={showToolManager} onClose={() => setShowToolManager(false)} />
     </div>
   );
 }

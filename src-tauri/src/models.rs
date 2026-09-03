@@ -17,6 +17,26 @@ pub struct ToolCommand {
     pub command: String,
 }
 
+/// 外部打开工具（服务右键「用 XX 打开」）
+///
+/// 新模型：executable（程序路径）+ args（参数模板，`{path}` 参数化注入，不经过 shell）。
+/// command 为已废弃的整串命令（仅历史行使用：executable 为空时后端按旧格式执行）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenTool {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub executable: String,
+    pub args: String,
+}
+
+/// 服务 ↔ 打开工具绑定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceOpenToolBinding {
+    pub service_id: String,
+    pub tool_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
     pub id: String,
@@ -50,6 +70,8 @@ pub struct ServiceTemplate {
     pub enabled: bool,
     pub show_file_tree: bool,
     pub tool_commands: String,
+    /// 模板携带的默认打开工具（从模板添加服务时复制为新服务的绑定）
+    pub open_tool_id: String,
     pub created_at: String,
 }
 
