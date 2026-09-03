@@ -6,6 +6,7 @@ mod models;
 use std::sync::Arc;
 use tauri::Manager;
 
+use crate::commands::pty::PtyState;
 use crate::core::file_watcher::FileWatcher;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
@@ -14,6 +15,7 @@ pub struct AppState {
     pub db: Database,
     pub process_mgr: ProcessManager,
     pub file_watcher: FileWatcher,
+    pub pty: PtyState,
     // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
     pub project_root: std::sync::Mutex<Option<String>>,
 }
@@ -31,6 +33,9 @@ fn cleanup_resources(state: &AppState) {
 
     // 2. 停止文件监听
     state.file_watcher.stop_all();
+
+    // 3. 清理 PTY 终端会话
+    state.pty.cleanup();
 
     log::info!("[nexus] 清理完成 (总耗时 {:.0}ms)", start.elapsed().as_millis());
 }
@@ -65,10 +70,12 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             db,
             process_mgr,
             file_watcher: FileWatcher::new(),
+            pty: PtyState::new(),
             project_root: std::sync::Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -120,6 +127,10 @@ pub fn run() {
             commands::tools::set_service_open_tool,
             commands::tools::list_service_open_tool_bindings,
             commands::tools::open_service_with_tool,
+            commands::pty::pty_spawn,
+            commands::pty::pty_write,
+            commands::pty::pty_resize,
+            commands::pty::pty_kill,
             commands::layout::save_layout,
             commands::layout::load_layout,
             commands::editor::set_project_root,

@@ -347,3 +347,22 @@ export const openToolsApi = {
   openWith: (serviceId: string) =>
     invoke<void>('open_service_with_tool', { serviceId }),
 };
+
+// ─── 内嵌终端 API（PTY + claude CLI）───────────────────────
+
+export const ptyApi = {
+  /** 在指定目录启动 claude CLI（后端单例：自动清理旧会话） */
+  spawn: (cwd: string, claudePath?: string | null) =>
+    invoke<void>('pty_spawn', { cwd, claudePath: claudePath ?? null }),
+
+  /** 写入用户输入（xterm onData → PTY） */
+  write: (data: string) =>
+    invoke<void>('pty_write', { data }),
+
+  /** 同步 PTY 尺寸（列/行） */
+  resize: (rows: number, cols: number) =>
+    invoke<void>('pty_resize', { rows, cols }),
+
+  /** 关闭会话（杀死 claude 子进程） */
+  kill: () => invoke<void>('pty_kill'),
+};

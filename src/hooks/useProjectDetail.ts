@@ -26,6 +26,8 @@ export function useProjectDetail(projectId: string) {
   // 请求序号：项目切换时旧请求的响应被丢弃，避免错项目数据
   const loadSeqRef = useRef(0);
   const mountedRef = useRef(true);
+  /** 最近一次活动标签 id（打开/切换文件时若在日志面板则自动关闭——文件内容优先） */
+  const lastTabIdRef = useRef<string | null>(null);
   // running 首次加载成功后才允许 pruneInactive，避免挂载瞬间误清日志
   const runningLoadedRef = useRef(false);
 
@@ -72,6 +74,17 @@ export function useProjectDetail(projectId: string) {
   }, [runningLoaded]);
 
   // ── 日志管理 ──────────────────────────────────────────────
+
+  // 打开/切换文件时自动关闭日志面板（日志与文件区互斥，文件优先）。
+  // 仅当活动标签 id 变化才关：点"日志"按钮本身不触发（id 未变），避免日志打不开
+  useEffect(() => {
+    const id = activeTabId ?? null;
+    const changed = id !== lastTabIdRef.current;
+    lastTabIdRef.current = id;
+    if (changed && viewingLog) {
+      setViewingLog(null);
+    }
+  }, [activeTabId, viewingLog, setViewingLog]);
 
   // 日志面板生命周期：查看的服务既不在运行、也不在失败列表 = 已被主动停止
   // （项目列表停止 / 单服务停止 / 全部停止）→ 关闭面板 + 清空日志。

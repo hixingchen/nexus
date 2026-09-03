@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { ProjectListItem } from './ProjectListItem';
 import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProjectModal } from './ProjectModals';
 import { useProjectList } from '../../hooks/useProjectList';
+import { useTerminalStore } from '../../stores/terminalStore';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
 
@@ -94,6 +95,12 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
               console.error('打开终端失败:', err);
               showNotification({ variant: 'error', title: '打开终端失败' });
             }
+            setCtxMenu(null);
+          }}
+          onOpenClaudeTerminal={() => {
+            // 未选中该项目时先切换详情（ProjectDetail 挂载后消费 terminalStore 请求）
+            if (ctxMenu.id !== selectedId) onSelect(ctxMenu.id);
+            useTerminalStore.getState().openTerminal(ctxMenu.path, ctxMenu.name);
             setCtxMenu(null);
           }}
           onDuplicate={() => { setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
@@ -191,11 +198,12 @@ function EmptyState({ search, onNew }: { search: string; onNew: () => void }) {
   );
 }
 
-function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplicate, onEdit, onDelete }: {
+function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onOpenClaudeTerminal, onDuplicate, onEdit, onDelete }: {
   ctx: { id: string; name: string; path: string; x: number; y: number };
   menuRef: React.Ref<HTMLDivElement>;
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
+  onOpenClaudeTerminal: () => void;
   onDuplicate: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -203,7 +211,7 @@ function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplica
   // 计算菜单位置，确保不超出屏幕
   const menuStyle = {
     left: Math.min(ctx.x, window.innerWidth - 188),
-    top: Math.min(ctx.y, window.innerHeight - 200),
+    top: Math.min(ctx.y, window.innerHeight - 260),
   };
 
   return (
@@ -236,6 +244,19 @@ function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplica
             </svg>
           </div>
           <span className="text-[12px] text-nexus-text">打开终端</span>
+        </button>
+
+        {/* Claude 终端（内嵌：右侧终端列，项目路径下运行 claude CLI） */}
+        <button
+          className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          onClick={onOpenClaudeTerminal}
+        >
+          <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
+              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="5.5" y1="8.5" x2="8.5" y2="8.5"/>
+            </svg>
+          </div>
+          <span className="text-[12px] text-nexus-text">Claude 终端</span>
         </button>
 
         <button

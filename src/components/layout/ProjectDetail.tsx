@@ -6,6 +6,7 @@ import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
+import { TerminalPanel } from '../terminal/TerminalPanel';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
@@ -25,6 +26,7 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
+import { useTerminalStore } from '../../stores/terminalStore';
 import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 
@@ -56,6 +58,37 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     result: ToolCommandResult | null;
     logs: string[];
   }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
+
+  // ── 内嵌终端（右侧列，claude CLI 会话；关闭即销毁后端会话） ──
+  const [terminalHost, setTerminalHost] = useState<{ cwd: string; name: string } | null>(null);
+  const [terminalWidth, setTerminalWidth] = useState(440);
+  const terminalDragRef = useRef<{ startX: number; startW: number } | null>(null);
+
+  // 服务右键「Claude 终端」→ store 请求 → 挂载/切换终端列
+  const terminalRequest = useTerminalStore(s => s.request);
+  useEffect(() => {
+    if (!terminalRequest) return;
+    setTerminalHost({ cwd: terminalRequest.cwd, name: terminalRequest.name });
+  }, [terminalRequest]);
+
+  // 拖宽条（终端列左缘）：mousedown 后全局跟踪，终端变宽 = 主代码区变窄（reflow）
+  const startTerminalResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    terminalDragRef.current = { startX: e.clientX, startW: terminalWidth };
+    const onMove = (ev: MouseEvent) => {
+      const drag = terminalDragRef.current;
+      if (!drag) return;
+      const w = Math.max(240, Math.min(780, drag.startW + drag.startX - ev.clientX));
+      setTerminalWidth(w);
+    };
+    const onUp = () => {
+      terminalDragRef.current = null;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [terminalWidth]);
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -195,8 +228,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   return (
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
       {/* 主区域：代码查看器 / 空状态。
-          padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow） */}
-      <div className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
+          padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow）；
+          终端列打开时主区域右侧由终端承接，无需再为服务列让位 */}
+      <div className={`flex-1 flex flex-col overflow-hidden relative ${terminalHost ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
         {viewingLog ? (
           <LogViewer
             serviceKey={viewingLog}
@@ -234,8 +268,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
             onSavedAsTemplate={loadTemplates}
-            // 面板右侧偏移 = 服务列宽度（服务列 absolute 覆盖，编辑面板需显示在其左侧）
-            rightOffset={servicePanelCollapsed ? 32 : 360}
+            // 面板右侧偏移：无终端列时 = 服务列宽（absolute 覆盖需让位）；
+            // 有终端列时主区域右缘已是终端列左缘，面板贴右即可（服务列在终端更右侧）
+            rightOffset={terminalHost ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
@@ -246,13 +281,35 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             mode="template"
             title="编辑模板"
             onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
-            rightOffset={servicePanelCollapsed ? 32 : 360}
+            rightOffset={terminalHost ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
         {/* 底部搜索结果面板（编辑器下方，打开时挤压编辑器高度） */}
         <SearchResultPanel />
       </div>
+
+      {/* ── 内嵌终端列（主区域右侧、可拖宽；marginRight 为右侧服务列让位） ── */}
+      {terminalHost && (
+        <div
+          className="flex items-stretch flex-shrink-0 overflow-hidden"
+          style={{ width: terminalWidth, marginRight: servicePanelCollapsed ? 32 : 360 }}
+        >
+          {/* 拖宽条 */}
+          <div
+            className="w-[3px] flex-shrink-0 bg-nexus-border hover:bg-nexus-accent cursor-col-resize transition-colors"
+            onMouseDown={startTerminalResize}
+            title="拖动调整宽度"
+          />
+          <div className="flex-1 min-w-0">
+            <TerminalPanel
+              cwd={terminalHost.cwd}
+              serviceName={terminalHost.name}
+              onClose={() => setTerminalHost(null)}
+            />
+          </div>
+        </div>
+      )}
 
       {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
       <ServicePanel
@@ -409,6 +466,7 @@ function ServicePanel({
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
           onToggle={onToggle}
+          onViewLog={handleViewLog}
         />
       </div>
       {/* 展开内容：折叠时用 transform 向右滑出（GPU 合成，不触发布局 reflow，
@@ -440,30 +498,53 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, isServiceFailed, onToggle,
+  services, isServiceRunning, isServiceFailed, onToggle, onViewLog,
 }: {
   services: Service[];
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   onToggle: () => void;
+  /** 收起态直接查看服务日志（不展开列） */
+  onViewLog: (svc: Service) => void;
 }) {
   return (
-    <button
-      className="flex flex-col items-center h-full w-full cursor-pointer hover:bg-nexus-hover/30 transition-colors"
-      title="展开服务列表"
-      onClick={onToggle}
-    >
-      <div className="flex-1 flex flex-col items-center justify-center gap-1.5">
-        {services.map(svc => (
-          <span key={svc.id}
-            className={`w-[6px] h-[6px] rounded-full flex-shrink-0 ${
-              isServiceRunning(svc) ? 'bg-nexus-success' : isServiceFailed(svc) ? 'bg-nexus-error' : 'bg-nexus-muted/30'
-            }`}
-            title={`${svc.name}${isServiceRunning(svc) ? ' (运行中)' : isServiceFailed(svc) ? ' (失败)' : ''}`}
-          />
-        ))}
+    <div className="flex flex-col h-full w-full">
+      {/* 顶部：展开服务列表 */}
+      <button
+        className="h-9 flex items-center justify-center cursor-pointer hover:bg-nexus-hover/40 transition-colors flex-shrink-0"
+        title="展开服务列表"
+        onClick={onToggle}
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-nexus-muted">
+          <path d="M2 2.5h8M2 6h8M2 9.5h8"/>
+        </svg>
+      </button>
+
+      {/* 服务日志入口：运行/失败的服务点击直接打开日志面板（无需展开列）。
+          状态点同时充当运行指示与可点区域 */}
+      <div className="flex-1 flex flex-col items-center gap-1 overflow-y-auto py-2">
+        {services.map(svc => {
+          const running = isServiceRunning(svc);
+          const failed = isServiceFailed(svc);
+          const clickable = running || failed; // 停止的服务无日志可看
+          return (
+            <button
+              key={svc.id}
+              disabled={!clickable}
+              onClick={() => onViewLog(svc)}
+              className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors ${
+                clickable ? 'hover:bg-nexus-accent/20 cursor-pointer' : 'cursor-default'
+              }`}
+              title={`${svc.name}${running ? '（运行中）' : failed ? '（失败）' : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}`}
+            >
+              <span className={`w-[8px] h-[8px] rounded-full flex-shrink-0 ${
+                running ? 'bg-nexus-success' : failed ? 'bg-nexus-error' : 'bg-nexus-muted/25'
+              }`} />
+            </button>
+          );
+        })}
       </div>
-    </button>
+    </div>
   );
 }
 
