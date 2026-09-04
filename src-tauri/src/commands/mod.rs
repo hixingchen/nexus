@@ -1,10 +1,10 @@
 pub mod editor;
 pub mod fileops;
 pub mod layout;
+pub mod opencode;
 pub mod process;
 pub mod project;
 pub mod search;
 pub mod service;
-pub mod pty;
 pub mod tools;
 pub mod watcher;

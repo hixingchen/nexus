@@ -348,21 +348,28 @@ export const openToolsApi = {
     invoke<void>('open_service_with_tool', { serviceId }),
 };
 
-// ─── 内嵌终端 API（PTY + claude CLI）───────────────────────
+// ─── OpenCode 助手 API（受管 opencode serve 子进程）──────────
 
-export const ptyApi = {
-  /** 在指定目录启动 claude CLI（后端单例：自动清理旧会话） */
-  spawn: (cwd: string, claudePath?: string | null) =>
-    invoke<void>('pty_spawn', { cwd, claudePath: claudePath ?? null }),
+export interface OpenCodeInfo {
+  port: number;
+  /** 会话用的是应用自管的二进制（可显示「更新」按钮） */
+  managed: boolean;
+}
 
-  /** 写入用户输入（xterm onData → PTY） */
-  write: (data: string) =>
-    invoke<void>('pty_write', { data }),
+export interface OpenCodeDownloadResult {
+  path: string;
+  version: string;
+}
 
-  /** 同步 PTY 尺寸（列/行） */
-  resize: (rows: number, cols: number) =>
-    invoke<void>('pty_resize', { rows, cols }),
+export const opencodeApi = {
+  /** 在项目目录启动 opencode serve（后端单例：自动清理旧会话；返回监听端口） */
+  start: (cwd: string, opencodePath?: string | null) =>
+    invoke<OpenCodeInfo>('opencode_start', { cwd, opencodePath: opencodePath ?? null }),
 
-  /** 关闭会话（杀死 claude 子进程） */
-  kill: () => invoke<void>('pty_kill'),
+  /** 停止 serve 会话（杀死子进程树） */
+  stop: () => invoke<void>('opencode_stop'),
+
+  /** 下载最新版到应用数据目录（force=true 重新下载覆盖 = 更新） */
+  downloadLatest: (force?: boolean) =>
+    invoke<OpenCodeDownloadResult>('opencode_download_latest', { force: force ?? false }),
 };

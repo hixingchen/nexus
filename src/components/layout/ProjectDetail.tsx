@@ -6,7 +6,7 @@ import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
-import { TerminalPanel } from '../terminal/TerminalPanel';
+import { OpenCodePanel } from './OpenCodePanel';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
@@ -26,7 +26,7 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
-import { useTerminalStore } from '../../stores/terminalStore';
+import { useOpenCodeStore } from '../../stores/opencodeStore';
 import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 
@@ -59,41 +59,45 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     logs: string[];
   }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
 
-  // ── 内嵌终端（右侧列，claude CLI 会话；关闭即销毁后端会话） ──
-  // 终端列会话状态全局化（terminalStore）：右侧面板展开/收起态按钮直接订阅开关。
-  // 布局占用只看「会话存在且可见」；面板挂载只看 session（隐藏=display:none 保活会话）
-  const terminalSession = useTerminalStore(s => s.session);
-  const terminalVisible = useTerminalStore(s => s.visible);
-  const termActive = !!terminalSession && terminalVisible;
-  const [terminalWidth, setTerminalWidth] = useState(440);
-  /** 终端宽度实时值（拖宽结束持久化用；setState 异步拿不到最终值） */
-  const terminalWidthRef = useRef(440);
-  const terminalDragRef = useRef<{ startX: number; startW: number } | null>(null);
+  // ── OpenCode 助手（iframe 内嵌官方 Web UI；store 全局单例，隐藏保活） ──
+  const ocSession = useOpenCodeStore(s => s.session);
+  const ocVisible = useOpenCodeStore(s => s.visible);
+  const ocStarting = useOpenCodeStore(s => s.starting);
+  const ocInstalling = useOpenCodeStore(s => s.installing);
+  const ocError = useOpenCodeStore(s => s.error);
+  const ocClose = useOpenCodeStore(s => s.close);
 
-  // 拖宽条（终端列左缘）：拖拽状态驱动 document 监听（useEffect 管理，卸载/失焦自动清理，
-  // 不会像手动 add/remove 那样在组件卸载或窗口外松手时残留监听并更新已卸载组件）
-  const [termDragging, setTermDragging] = useState(false);
-  const startTerminalResize = useCallback((e: React.MouseEvent) => {
+  // 项目切换：面板若展示着另一项目的会话 → 自动收起（避免在错误项目的上下文里操作 agent）
+  useEffect(() => {
+    const st = useOpenCodeStore.getState();
+    if (st.visible && st.session && detail && st.session.cwd !== detail.project.path) st.hide();
+  }, [projectId, ocSession?.cwd, detail?.project.path]);
+
+  // ── OpenCode 面板宽度（左缘拖宽，松手持久化，下次打开恢复） ──
+  const [ocWidth, setOcWidth] = useState(600);
+  /** 拖宽实时值（setState 异步拿不到最终值，持久化用 ref） */
+  const ocWidthRef = useRef(600);
+  const ocDragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [ocDragging, setOcDragging] = useState(false);
+  const startOcResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    terminalDragRef.current = { startX: e.clientX, startW: terminalWidth };
-    setTermDragging(true);
-  }, [terminalWidth]);
+    ocDragRef.current = { startX: e.clientX, startW: ocWidth };
+    setOcDragging(true);
+  }, [ocWidth]);
 
   useEffect(() => {
-    if (!termDragging) return;
+    if (!ocDragging) return;
     const onMove = (ev: MouseEvent) => {
-      const drag = terminalDragRef.current;
+      const drag = ocDragRef.current;
       if (!drag) return;
-      // 函数式更新：不依赖外部 terminalWidth，effect 只需在 dragging 翻转时重建
-      const w = Math.max(240, Math.min(780, drag.startW + drag.startX - ev.clientX));
-      terminalWidthRef.current = w;
-      setTerminalWidth(w);
+      const w = Math.max(320, Math.min(880, drag.startW + drag.startX - ev.clientX));
+      ocWidthRef.current = w;
+      setOcWidth(w);
     };
     const finish = () => {
-      terminalDragRef.current = null;
-      setTermDragging(false);
-      // 拖宽结束：持久化宽度（下次打开终端列恢复同样大小）
-      layoutApi.save({ terminal_width: String(terminalWidthRef.current) })
+      ocDragRef.current = null;
+      setOcDragging(false);
+      layoutApi.save({ opencode_width: String(ocWidthRef.current) })
         .catch(e => console.error('保存布局失败:', e));
     };
     document.addEventListener('mousemove', onMove);
@@ -104,7 +108,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       document.removeEventListener('mouseup', finish);
       window.removeEventListener('blur', finish);
     };
-  }, [termDragging]);
+  }, [ocDragging]);
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -125,10 +129,10 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     loadTemplates();
     layoutApi.load().then(l => {
       if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
-      if (l.terminal_width) {
-        const w = Math.max(240, Math.min(780, Number(l.terminal_width) || 440));
-        terminalWidthRef.current = w;
-        setTerminalWidth(w);
+      if (l.opencode_width) {
+        const w = Math.max(320, Math.min(880, Number(l.opencode_width) || 600));
+        ocWidthRef.current = w;
+        setOcWidth(w);
       }
     }).catch(() => {});
   }, [loadTemplates]);
@@ -245,13 +249,16 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   }
 
   const { project, services } = detail;
+  // OpenCode 面板是否正占着主区域右侧空间（可见会话属于本项目）。
+  // 占用时服务列在面板更右侧，主区域无需再为它让位（否则双重让位内容被挤窄）
+  const ocPanelActive = !!ocSession && ocSession.cwd === project.path && ocVisible;
 
   return (
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
       {/* 主区域：代码查看器 / 空状态。
           padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow）；
-          终端列打开时主区域右侧由终端承接，无需再为服务列让位 */}
-      <div className={`flex-1 flex flex-col overflow-hidden relative ${termActive ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
+          OpenCode 面板占位时主区域右侧由面板承接，无需再为服务列让位 */}
+      <div className={`flex-1 flex flex-col overflow-hidden relative ${ocPanelActive ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
         {viewingLog ? (
           <LogViewer
             serviceKey={viewingLog}
@@ -289,9 +296,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
             onSavedAsTemplate={loadTemplates}
-            // 面板右侧偏移：无终端列时 = 服务列宽（absolute 覆盖需让位）；
-            // 有终端列时主区域右缘已是终端列左缘，面板贴右即可（服务列在终端更右侧）
-            rightOffset={termActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            // 面板右侧偏移：OpenCode 面板占位时贴面板左缘（服务列在面板更右侧）；
+            // 否则 = 服务列宽（absolute 覆盖需让位）
+            rightOffset={ocPanelActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
@@ -302,7 +309,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             mode="template"
             title="编辑模板"
             onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
-            rightOffset={termActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            rightOffset={ocPanelActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
           />
         )}
 
@@ -310,28 +317,33 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         <SearchResultPanel />
       </div>
 
-      {/* ── 内嵌终端列（主区域右侧、可拖宽；marginRight 为右侧服务列让位） ── */}
-      {terminalSession && (
+      {/* ── OpenCode 助手面板（右侧列；左缘可拖宽；marginRight 为服务列让位；隐藏保活 = display none） ── */}
+      {ocSession && ocSession.cwd === project.path && (
         <div
-          className="flex items-stretch flex-shrink-0 overflow-hidden"
+          className="flex flex-shrink-0 overflow-hidden"
           style={{
-            width: terminalWidth,
+            width: ocWidth,
             marginRight: servicePanelCollapsed ? 32 : 360,
-            // 图标隐藏 = 收起面板但会话保活（组件不卸载、claude 继续跑）
-            display: terminalVisible ? 'flex' : 'none',
+            display: ocVisible ? 'flex' : 'none',
           }}
         >
-          {/* 拖宽条 */}
+          {/* 拖宽条（面板左缘） */}
           <div
             className="w-[3px] flex-shrink-0 bg-nexus-border hover:bg-nexus-accent cursor-col-resize transition-colors"
-            onMouseDown={startTerminalResize}
+            onMouseDown={startOcResize}
             title="拖动调整宽度"
           />
           <div className="flex-1 min-w-0">
-            <TerminalPanel
-              cwd={terminalSession.cwd}
-              serviceName={terminalSession.name}
-              onClose={() => useTerminalStore.getState().closeTerminal()}
+            <OpenCodePanel
+              session={ocSession}
+              starting={ocStarting}
+              installing={ocInstalling}
+              error={ocError}
+              onRetry={() => useOpenCodeStore.getState().open(ocSession.cwd, ocSession.name)}
+              onInstall={() => useOpenCodeStore.getState().installAndOpen(ocSession.cwd, ocSession.name, false)}
+              onUpdate={() => useOpenCodeStore.getState().installAndOpen(ocSession.cwd, ocSession.name, true)}
+              onHide={() => useOpenCodeStore.getState().hide()}
+              onClose={() => { void ocClose(); }}
             />
           </div>
         </div>
@@ -456,7 +468,7 @@ function EmptyState({ name, path }: { name: string; path: string }) {
 
 interface ServicePanelProps {
   services: Service[];
-  /** 项目路径/名（Claude 终端按钮的目标工作目录） */
+  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
   projectPath: string;
   projectName: string;
   collapsed: boolean;
@@ -536,6 +548,7 @@ function CollapsedView({
   services, projectPath, projectName, isServiceRunning, isServiceFailed, onToggle, onViewLog,
 }: {
   services: Service[];
+  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
   projectPath: string;
   projectName: string;
   isServiceRunning: (svc: Service) => boolean;
@@ -544,10 +557,13 @@ function CollapsedView({
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
 }) {
-  const terminalSession = useTerminalStore(s => s.session);
+  // OpenCode 会话/展开态（会话可能隐藏保活 → cwd 相同即本项目的助手，可见才高亮）
+  const ocCwd = useOpenCodeStore(s => s.session?.cwd ?? null);
+  const ocVisible = useOpenCodeStore(s => s.visible);
+  const ocForThis = ocCwd === projectPath;
   return (
     <div className="flex flex-col h-full w-full">
-      {/* 顶部：展开服务列表 / Claude 终端（收起态也常驻可开关） */}
+      {/* 顶部：展开服务列表 / OpenCode 助手（收起态也常驻可开关） */}
       <div className="flex flex-col items-center py-1 gap-0.5 flex-shrink-0 border-b border-nexus-border/40">
         <button
           className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-nexus-hover/40 transition-colors"
@@ -560,15 +576,19 @@ function CollapsedView({
         </button>
         <button
           className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
-            terminalSession?.cwd === projectPath
+            ocForThis && ocVisible
               ? 'text-nexus-accent bg-nexus-accent/15'
               : 'text-nexus-muted hover:bg-nexus-hover/40'
           }`}
-          title="Claude 终端"
-          onClick={() => useTerminalStore.getState().toggleTerminal(projectPath, projectName)}
+          title={ocForThis && ocVisible ? '收起 OpenCode 助手（保留会话）' : '展开 OpenCode 助手'}
+          onClick={() => {
+            const st = useOpenCodeStore.getState();
+            if (ocForThis && ocVisible) st.hide();
+            else void st.open(projectPath, projectName);
+          }}
         >
-          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4">
-            <path d="M2 3.5l5 3.5-5 3.5" /><line x1="8" y1="10" x2="12" y2="10" />
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
+            <path d="M7 1.6l1.7 3.7 3.7 1.7-3.7 1.7L7 12.4 5.3 8.7 1.6 7l3.7-1.7z"/>
           </svg>
         </button>
       </div>
@@ -611,6 +631,7 @@ interface SplitPanel {
 
 interface ExpandedViewProps {
   services: Service[];
+  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
   projectPath: string;
   projectName: string;
   splitPanel: SplitPanel;
@@ -674,7 +695,7 @@ function ExpandedView({
 
 interface ServiceSectionProps {
   services: Service[];
-  /** 项目路径/名（Claude 终端按钮目标） */
+  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
   projectPath: string;
   projectName: string;
   editingService: Service | null;
@@ -702,8 +723,10 @@ function ServiceSection({
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
-  // Claude 终端会话存在（含隐藏保活中）→ 高亮
-  const terminalSession = useTerminalStore(s => s.session);
+  // OpenCode 会话存在且展开（含隐藏保活会话：cwd 相同即可高亮，visible 决定实心/空心）
+  const ocCwd = useOpenCodeStore(s => s.session?.cwd ?? null);
+  const ocVisible = useOpenCodeStore(s => s.visible);
+  const ocForThis = ocCwd === projectPath;
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
   const sensors = useSensors(
@@ -729,18 +752,22 @@ function ServiceSection({
           <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
         </div>
         <div className="flex items-center gap-1">
-          {/* Claude 终端开关（store 订阅：打开状态高亮） */}
+          {/* OpenCode 助手开关（store 订阅：本项目会话且展开时高亮） */}
           <button
             className={`p-1.5 rounded-md flex-shrink-0 transition-colors ${
-              terminalSession?.cwd === projectPath
+              ocForThis && ocVisible
                 ? 'text-nexus-accent bg-nexus-accent/10'
                 : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50'
             }`}
-            title="Claude 终端"
-            onClick={() => useTerminalStore.getState().toggleTerminal(projectPath, projectName)}
+            title={ocForThis && ocVisible ? '收起 OpenCode 助手（保留会话）' : '展开 OpenCode 助手'}
+            onClick={() => {
+              const st = useOpenCodeStore.getState();
+              if (ocForThis && ocVisible) st.hide();
+              else void st.open(projectPath, projectName);
+            }}
           >
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
-              <path d="M2 3.5l5 3.5-5 3.5" /><line x1="8" y1="10" x2="12" y2="10" />
+              <path d="M7 1.6l1.7 3.7 3.7 1.7-3.7 1.7L7 12.4 5.3 8.7 1.6 7l3.7-1.7z"/>
             </svg>
           </button>
           <button

@@ -3,7 +3,7 @@ import { ProjectListItem } from './ProjectListItem';
 import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProjectModal } from './ProjectModals';
 import { useProjectList } from '../../hooks/useProjectList';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
-import { useTerminalStore } from '../../stores/terminalStore';
+import { useOpenCodeStore } from '../../stores/opencodeStore';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
 
@@ -98,10 +98,10 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
             }
             setCtxMenu(null);
           }}
-          onOpenClaudeTerminal={() => {
-            // 未选中该项目时先切换详情（ProjectDetail 挂载后消费 terminalStore 请求）
+          onOpenCode={() => {
+            // 未选中该项目时先切换详情（ProjectDetail 挂载后展示面板）
             if (ctxMenu.id !== selectedId) onSelect(ctxMenu.id);
-            useTerminalStore.getState().openTerminal(ctxMenu.path, ctxMenu.name);
+            useOpenCodeStore.getState().open(ctxMenu.path, ctxMenu.name);
             setCtxMenu(null);
           }}
           onDuplicate={() => { setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
@@ -195,12 +195,12 @@ function EmptyState({ search, onNew }: { search: string; onNew: () => void }) {
   );
 }
 
-function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onOpenClaudeTerminal, onDuplicate, onEdit, onDelete }: {
+function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onOpenCode, onDuplicate, onEdit, onDelete }: {
   ctx: { id: string; name: string; path: string; x: number; y: number };
   menuRef: React.Ref<HTMLDivElement>;
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
-  onOpenClaudeTerminal: () => void;
+  onOpenCode: () => void;
   onDuplicate: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -243,17 +243,17 @@ function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onOpenCla
           <span className="text-[12px] text-nexus-text">打开终端</span>
         </button>
 
-        {/* Claude 终端（内嵌：右侧终端列，项目路径下运行 claude CLI） */}
+        {/* OpenCode 助手（内嵌：右侧面板 iframe 加载官方 Web UI，项目路径下运行） */}
         <button
           className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-          onClick={onOpenClaudeTerminal}
+          onClick={onOpenCode}
         >
           <div className="w-5 h-5 rounded bg-nexus-bg border border-nexus-border/30 flex items-center justify-center flex-shrink-0 group-hover:border-nexus-accent/30">
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent">
-              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="5.5" y1="8.5" x2="8.5" y2="8.5"/>
+            <svg width="10" height="10" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted group-hover:text-nexus-accent">
+              <path d="M7 1.6l1.7 3.7 3.7 1.7-3.7 1.7L7 12.4 5.3 8.7 1.6 7l3.7-1.7z"/>
             </svg>
           </div>
-          <span className="text-[12px] text-nexus-text">Claude 终端</span>
+          <span className="text-[12px] text-nexus-text">OpenCode 助手</span>
         </button>
 
         <button

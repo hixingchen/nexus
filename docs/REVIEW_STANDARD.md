@@ -187,11 +187,9 @@ user.name = "张三";
 | 检查项 | 合格标准 | 检查方法 |
 |--------|----------|----------|
 | 文件句柄 | 文件操作后必须关闭，使用 RAII | 检查 File 的生命周期 |
-| 进程清理 | 子进程退出时必须 kill + wait（不 wait 会导致句柄残留） | 检查 ProcessManager 和 TerminalSession |
-| PTY 清理 | 终端关闭时必须：①kill 子进程 ②wait 确认退出 ③drop reader/writer ④drop master | 检查 TerminalSession::close() |
+| 进程清理 | 子进程退出时必须 kill + wait（不 wait 会导致句柄残留） | 检查 ProcessManager |
 | 清理锁竞争 | close_all() 对 tokio::Mutex 使用 try_lock 时必须有重试机制，否则可能跳过清理 | 检查 close_all() 实现 |
 | Job Object | Windows 上所有子进程必须加入 Job Object（确保应用退出时自动终止） | 检查 job_object.rs 和 assign 调用 |
-| 终端会话清理 | CloseRequested 和 RunEvent::Exit 都必须清理终端会话 | 检查 lib.rs 的事件处理 |
 | 内存泄漏 | 避免循环引用，Weak 引用打破循环 | 检查 Arc 使用 |
 | 临时数据 | 大数据用完及时释放，不要长期持有 | 检查缓冲区管理 |
 | 连接关闭 | 数据库/网络连接用完必须关闭 | 检查连接池管理 |
@@ -227,9 +225,9 @@ user.name = "张三";
 | 检查项 | 合格标准 | 检查方法 |
 |--------|----------|----------|
 | 插件初始化 | 插件必须在 Builder 中正确初始化 | 检查 plugin() 调用 |
-| 窗口事件 | CloseRequested 必须清理资源（进程、终端、文件监听） | 检查 on_window_event |
+| 窗口事件 | CloseRequested 必须清理资源（进程、文件监听） | 检查 on_window_event |
 | Exit 事件 | RunEvent::Exit 必须完整清理所有资源 | 检查 .run() 中的事件处理 |
-| 清理顺序 | 先停进程 → 再关终端 → 最后停监听 | 检查清理代码顺序 |
+| 清理顺序 | 先停进程 → 再停监听 | 检查清理代码顺序 |
 | 等待时间 | 清理后必须等待足够时间（≥200ms）让线程退出 | 检查 sleep 时长 |
 | IPC 安全 | invoke 参数必须校验 | 检查所有 command 函数 |
 | 权限配置 | tauri.conf.json 权限最小化 | 检查 capabilities |
@@ -246,7 +244,6 @@ user.name = "张三";
 | CREATE_NO_WINDOW | Windows 上通过 `Command::new` 启动的后台进程必须设置 `creation_flags(0x08000000)`，否则会弹出控制台窗口 | 检查所有 `Command::new` 调用 |
 | taskkill 静默 | `taskkill` 等系统命令必须带 `CREATE_NO_WINDOW`，否则每次调用产生一个 conhost.exe | 检查 kill_process_tree 等函数 |
 | 进程等待 | `child.kill()` 后必须 `child.wait()`，不 wait 会导致句柄残留 | 检查所有 kill 调用 |
-| PTY 伪控制台 | portable_pty 创建的 PTY 会关联 conhost.exe，close 时必须按顺序：kill → wait → drop reader/writer → drop master | 检查 TerminalSession::close() |
 | Job Object 唯一性 | 避免重复创建 JobObject，通过 set_job() 传入共享实例 | 检查 JobObject::new() 调用次数 |
 
 ```bash

@@ -44,7 +44,6 @@
 |---|---|
 | 前端 | React 18, TypeScript, Tailwind CSS |
 | 状态管理 | Zustand |
-| 终端 | xterm.js |
 | 桌面框架 | Tauri 2 |
 | 后端 | Rust |
 | 构建工具 | Vite |
