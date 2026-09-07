@@ -347,29 +347,3 @@ export const openToolsApi = {
   openWith: (serviceId: string) =>
     invoke<void>('open_service_with_tool', { serviceId }),
 };
-
-// ─── OpenCode 助手 API（受管 opencode serve 子进程）──────────
-
-export interface OpenCodeInfo {
-  port: number;
-  /** 会话用的是应用自管的二进制（可显示「更新」按钮） */
-  managed: boolean;
-}
-
-export interface OpenCodeDownloadResult {
-  path: string;
-  version: string;
-}
-
-export const opencodeApi = {
-  /** 在项目目录启动 opencode serve（后端单例：自动清理旧会话；返回监听端口） */
-  start: (cwd: string, opencodePath?: string | null) =>
-    invoke<OpenCodeInfo>('opencode_start', { cwd, opencodePath: opencodePath ?? null }),
-
-  /** 停止 serve 会话（杀死子进程树） */
-  stop: () => invoke<void>('opencode_stop'),
-
-  /** 下载最新版到应用数据目录（force=true 重新下载覆盖 = 更新） */
-  downloadLatest: (force?: boolean) =>
-    invoke<OpenCodeDownloadResult>('opencode_download_latest', { force: force ?? false }),
-};

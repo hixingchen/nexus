@@ -162,6 +162,12 @@ impl ProcessManager {
         self.job = Some(job);
     }
 
+    /// 返回共享 Job Object 句柄（供 dsh 等外部启动的子进程加入同一清理域）
+    #[cfg(windows)]
+    pub fn job_arc(&self) -> Option<Arc<super::job_object::JobObject>> {
+        self.job.clone()
+    }
+
     pub fn start(&self, project_id: &str, key: &str, name: &str, command: &str, cwd: &str, env_vars: &[(String, String)], app_handle: &tauri::AppHandle) -> Result<(), String> {
         log::info!("[nexus] 启动服务: {} ({}) cmd={:?}, cwd={:?}", key, name, command, cwd);
 

@@ -6,8 +6,8 @@ mod models;
 use std::sync::Arc;
 use tauri::Manager;
 
-use crate::commands::opencode::OpenCodeState;
 use crate::core::file_watcher::FileWatcher;
+use crate::core::harness_web::HarnessWeb;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
 
@@ -15,15 +15,19 @@ pub struct AppState {
     pub db: Database,
     pub process_mgr: ProcessManager,
     pub file_watcher: FileWatcher,
-    pub opencode: OpenCodeState,
     // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
     pub project_root: std::sync::Mutex<Option<String>>,
+    /// 内嵌 DeepSeek Harness Web GUI 的 dsh web 进程（None = 未启动）
+    pub harness_web: std::sync::Mutex<Option<HarnessWeb>>,
+    /// harness 会话代数：harness_stop 时递增，后台 boot 线程据此识别
+    /// 「启动窗口内被停止」并丢弃自己刚启动的实例（防幽灵进程）
+    pub harness_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// 统一的资源清理逻辑
 ///
 /// 幂等设计：多次调用安全（stop_all 对空集合是 no-op）。
-/// 清理顺序：服务进程 → 文件监听 → OpenCode 服务
+/// 清理顺序：服务进程 → 内嵌 dsh web → 文件监听
 fn cleanup_resources(state: &AppState) {
     let start = std::time::Instant::now();
 
@@ -31,11 +35,16 @@ fn cleanup_resources(state: &AppState) {
     state.process_mgr.stop_all();
     log::info!("[nexus] 清理: 服务进程已停止 ({:.0}ms)", start.elapsed().as_millis());
 
-    // 2. 停止文件监听
-    state.file_watcher.stop_all();
+    // 2. 停止内嵌 dsh web（Harness GUI；Job Object 仅兜底应用退出场景）
+    if let Ok(mut h) = state.harness_web.lock() {
+        if let Some(runtime) = h.as_mut() {
+            runtime.stop();
+        }
+        *h = None;
+    }
 
-    // 3. 停止 OpenCode 服务（serve 子进程树）
-    state.opencode.cleanup();
+    // 3. 停止文件监听
+    state.file_watcher.stop_all();
 
     log::info!("[nexus] 清理完成 (总耗时 {:.0}ms)", start.elapsed().as_millis());
 }
@@ -75,10 +84,15 @@ pub fn run() {
             db,
             process_mgr,
             file_watcher: FileWatcher::new(),
-            opencode: OpenCodeState::new(),
             project_root: std::sync::Mutex::new(None),
+            harness_web: std::sync::Mutex::new(None),
+            harness_epoch: std::sync::atomic::AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
+            commands::harness::harness_start,
+            commands::harness::harness_status,
+            commands::harness::harness_install,
+            commands::harness::harness_stop,
             commands::editor::read_file,
             commands::editor::write_file,
             commands::search::search_files,
@@ -127,9 +141,6 @@ pub fn run() {
             commands::tools::set_service_open_tool,
             commands::tools::list_service_open_tool_bindings,
             commands::tools::open_service_with_tool,
-            commands::opencode::opencode_start,
-            commands::opencode::opencode_stop,
-            commands::opencode::opencode_download_latest,
             commands::layout::save_layout,
             commands::layout::load_layout,
             commands::editor::set_project_root,

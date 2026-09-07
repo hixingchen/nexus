@@ -1,7 +1,7 @@
 pub mod editor;
 pub mod fileops;
+pub mod harness;
 pub mod layout;
-pub mod opencode;
 pub mod process;
 pub mod project;
 pub mod search;

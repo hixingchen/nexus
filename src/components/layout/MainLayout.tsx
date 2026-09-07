@@ -6,6 +6,7 @@ import { ResizablePanel } from './ResizablePanel';
 import { ProjectList } from './ProjectList';
 import { ProjectDetail } from './ProjectDetail';
 import { RestartConfirm } from './RestartConfirm';
+import { HarnessEmbed } from '../ai/HarnessEmbed';
 import { layoutApi, securityApi, projectApi } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
@@ -167,9 +168,16 @@ export function MainLayout() {
   );
 
   return (
-    <div className="h-screen flex flex-col bg-nexus-editor text-nexus-text">
+    <div className="h-screen flex flex-col relative bg-nexus-editor text-nexus-text">
       <TitleBar projectName={selectedProjectName} />
-      <div className="flex-1 overflow-hidden">{mainContent}</div>
+      <div className="relative flex-1 flex overflow-hidden">
+        {/* 主内容（项目列表 / 编辑器 / 服务列）：AI Dock 打开时自动让出宽度 */}
+        <div className="flex-1 min-w-0 relative overflow-hidden">
+          {mainContent}
+        </div>
+        {/* AI 停靠栏：作为布局一列，不遮挡文本区 */}
+        <HarnessEmbed cwd={selectedProjectPath} />
+      </div>
       <RestartConfirm />
       <StatusBar />
     </div>

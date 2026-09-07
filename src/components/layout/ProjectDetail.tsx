@@ -6,7 +6,6 @@ import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
-import { OpenCodePanel } from './OpenCodePanel';
 import { Modal } from '../ui/Modal';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
@@ -26,7 +25,8 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
-import { useOpenCodeStore } from '../../stores/opencodeStore';
+import { useHarnessStore } from '../../stores/harnessStore';
+import { RobotIcon } from '../ai/HarnessEmbed';
 import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 
@@ -59,57 +59,6 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     logs: string[];
   }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
 
-  // ── OpenCode 助手（iframe 内嵌官方 Web UI；store 全局单例，隐藏保活） ──
-  const ocSession = useOpenCodeStore(s => s.session);
-  const ocVisible = useOpenCodeStore(s => s.visible);
-  const ocStarting = useOpenCodeStore(s => s.starting);
-  const ocInstalling = useOpenCodeStore(s => s.installing);
-  const ocError = useOpenCodeStore(s => s.error);
-  const ocClose = useOpenCodeStore(s => s.close);
-
-  // 项目切换：面板若展示着另一项目的会话 → 自动收起（避免在错误项目的上下文里操作 agent）
-  useEffect(() => {
-    const st = useOpenCodeStore.getState();
-    if (st.visible && st.session && detail && st.session.cwd !== detail.project.path) st.hide();
-  }, [projectId, ocSession?.cwd, detail?.project.path]);
-
-  // ── OpenCode 面板宽度（左缘拖宽，松手持久化，下次打开恢复） ──
-  const [ocWidth, setOcWidth] = useState(600);
-  /** 拖宽实时值（setState 异步拿不到最终值，持久化用 ref） */
-  const ocWidthRef = useRef(600);
-  const ocDragRef = useRef<{ startX: number; startW: number } | null>(null);
-  const [ocDragging, setOcDragging] = useState(false);
-  const startOcResize = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    ocDragRef.current = { startX: e.clientX, startW: ocWidth };
-    setOcDragging(true);
-  }, [ocWidth]);
-
-  useEffect(() => {
-    if (!ocDragging) return;
-    const onMove = (ev: MouseEvent) => {
-      const drag = ocDragRef.current;
-      if (!drag) return;
-      const w = Math.max(320, Math.min(880, drag.startW + drag.startX - ev.clientX));
-      ocWidthRef.current = w;
-      setOcWidth(w);
-    };
-    const finish = () => {
-      ocDragRef.current = null;
-      setOcDragging(false);
-      layoutApi.save({ opencode_width: String(ocWidthRef.current) })
-        .catch(e => console.error('保存布局失败:', e));
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', finish);
-    window.addEventListener('blur', finish); // 拖拽中窗口失焦（Alt+Tab 等）结束拖拽
-    return () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', finish);
-      window.removeEventListener('blur', finish);
-    };
-  }, [ocDragging]);
-
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
   const [addingTemplate, setAddingTemplate] = useState(false);
@@ -129,11 +78,6 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     loadTemplates();
     layoutApi.load().then(l => {
       if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
-      if (l.opencode_width) {
-        const w = Math.max(320, Math.min(880, Number(l.opencode_width) || 600));
-        ocWidthRef.current = w;
-        setOcWidth(w);
-      }
     }).catch(() => {});
   }, [loadTemplates]);
 
@@ -249,16 +193,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   }
 
   const { project, services } = detail;
-  // OpenCode 面板是否正占着主区域右侧空间（可见会话属于本项目）。
-  // 占用时服务列在面板更右侧，主区域无需再为它让位（否则双重让位内容被挤窄）
-  const ocPanelActive = !!ocSession && ocSession.cwd === project.path && ocVisible;
 
   return (
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
       {/* 主区域：代码查看器 / 空状态。
-          padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow）；
-          OpenCode 面板占位时主区域右侧由面板承接，无需再为服务列让位 */}
-      <div className={`flex-1 flex flex-col overflow-hidden relative ${ocPanelActive ? '' : servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
+          padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow） */}
+      <div className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
         {viewingLog ? (
           <LogViewer
             serviceKey={viewingLog}
@@ -296,9 +236,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
             onSavedAsTemplate={loadTemplates}
-            // 面板右侧偏移：OpenCode 面板占位时贴面板左缘（服务列在面板更右侧）；
-            // 否则 = 服务列宽（absolute 覆盖需让位）
-            rightOffset={ocPanelActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            // 面板右侧偏移 = 服务列宽（absolute 覆盖需让位）
+            rightOffset={servicePanelCollapsed ? 32 : 360}
           />
         )}
 
@@ -309,7 +248,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             mode="template"
             title="编辑模板"
             onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
-            rightOffset={ocPanelActive ? 0 : (servicePanelCollapsed ? 32 : 360)}
+            rightOffset={servicePanelCollapsed ? 32 : 360}
           />
         )}
 
@@ -317,43 +256,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         <SearchResultPanel />
       </div>
 
-      {/* ── OpenCode 助手面板（右侧列；左缘可拖宽；marginRight 为服务列让位；隐藏保活 = display none） ── */}
-      {ocSession && ocSession.cwd === project.path && (
-        <div
-          className="flex flex-shrink-0 overflow-hidden"
-          style={{
-            width: ocWidth,
-            marginRight: servicePanelCollapsed ? 32 : 360,
-            display: ocVisible ? 'flex' : 'none',
-          }}
-        >
-          {/* 拖宽条（面板左缘） */}
-          <div
-            className="w-[3px] flex-shrink-0 bg-nexus-border hover:bg-nexus-accent cursor-col-resize transition-colors"
-            onMouseDown={startOcResize}
-            title="拖动调整宽度"
-          />
-          <div className="flex-1 min-w-0">
-            <OpenCodePanel
-              session={ocSession}
-              starting={ocStarting}
-              installing={ocInstalling}
-              error={ocError}
-              onRetry={() => useOpenCodeStore.getState().open(ocSession.cwd, ocSession.name)}
-              onInstall={() => useOpenCodeStore.getState().installAndOpen(ocSession.cwd, ocSession.name, false)}
-              onUpdate={() => useOpenCodeStore.getState().installAndOpen(ocSession.cwd, ocSession.name, true)}
-              onHide={() => useOpenCodeStore.getState().hide()}
-              onClose={() => { void ocClose(); }}
-            />
-          </div>
-        </div>
-      )}
-
       {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
       <ServicePanel
         services={services}
-        projectPath={project.path}
-        projectName={project.name}
         collapsed={servicePanelCollapsed}
         onToggle={() => { onToggleServicePanel(); setEditingService(null); setEditingTemplate(null); }}
         splitPanel={{
@@ -468,9 +373,6 @@ function EmptyState({ name, path }: { name: string; path: string }) {
 
 interface ServicePanelProps {
   services: Service[];
-  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
-  projectPath: string;
-  projectName: string;
   collapsed: boolean;
   onToggle: () => void;
   /** 右侧面板上下分栏配置 */
@@ -493,7 +395,7 @@ interface ServicePanelProps {
 }
 
 function ServicePanel({
-  services, projectPath, projectName, collapsed, onToggle, splitPanel, editingService, onEditService,
+  services, collapsed, onToggle, splitPanel, editingService, onEditService,
   isServiceRunning, isServiceFailed, setDeleteSvcTarget,
   setShowAddServiceModal, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
@@ -506,8 +408,6 @@ function ServicePanel({
       <div className={`h-full transition-opacity duration-200 ${collapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
         <CollapsedView
           services={services}
-          projectPath={projectPath}
-          projectName={projectName}
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
           onToggle={onToggle}
@@ -521,8 +421,6 @@ function ServicePanel({
       }`}>
         <ExpandedView
           services={services}
-          projectPath={projectPath}
-          projectName={projectName}
           splitPanel={splitPanel}
           editingService={editingService}
           onEditService={onEditService}
@@ -545,25 +443,20 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, projectPath, projectName, isServiceRunning, isServiceFailed, onToggle, onViewLog,
+  services, isServiceRunning, isServiceFailed, onToggle, onViewLog,
 }: {
   services: Service[];
-  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
-  projectPath: string;
-  projectName: string;
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   onToggle: () => void;
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
 }) {
-  // OpenCode 会话/展开态（会话可能隐藏保活 → cwd 相同即本项目的助手，可见才高亮）
-  const ocCwd = useOpenCodeStore(s => s.session?.cwd ?? null);
-  const ocVisible = useOpenCodeStore(s => s.visible);
-  const ocForThis = ocCwd === projectPath;
+  const aiOpen = useHarnessStore(s => s.panelOpen);
+  const toggleAi = () => useHarnessStore.getState().togglePanel();
   return (
     <div className="flex flex-col h-full w-full">
-      {/* 顶部：展开服务列表 / OpenCode 助手（收起态也常驻可开关） */}
+      {/* 顶部：展开服务列表在上，AI 开关在它下方（收起态依旧可点） */}
       <div className="flex flex-col items-center py-1 gap-0.5 flex-shrink-0 border-b border-nexus-border/40">
         <button
           className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-nexus-hover/40 transition-colors"
@@ -575,21 +468,11 @@ function CollapsedView({
           </svg>
         </button>
         <button
-          className={`w-6 h-6 flex items-center justify-center rounded-md transition-colors ${
-            ocForThis && ocVisible
-              ? 'text-nexus-accent bg-nexus-accent/15'
-              : 'text-nexus-muted hover:bg-nexus-hover/40'
-          }`}
-          title={ocForThis && ocVisible ? '收起 OpenCode 助手（保留会话）' : '展开 OpenCode 助手'}
-          onClick={() => {
-            const st = useOpenCodeStore.getState();
-            if (ocForThis && ocVisible) st.hide();
-            else void st.open(projectPath, projectName);
-          }}
+          className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (aiOpen ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:bg-nexus-hover/40 hover:text-nexus-text')}
+          title={aiOpen ? '关闭 AI 助手' : '打开 AI 助手'}
+          onClick={toggleAi}
         >
-          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
-            <path d="M7 1.6l1.7 3.7 3.7 1.7-3.7 1.7L7 12.4 5.3 8.7 1.6 7l3.7-1.7z"/>
-          </svg>
+          <RobotIcon size={13} />
         </button>
       </div>
 
@@ -631,9 +514,6 @@ interface SplitPanel {
 
 interface ExpandedViewProps {
   services: Service[];
-  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
-  projectPath: string;
-  projectName: string;
   splitPanel: SplitPanel;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
@@ -654,7 +534,7 @@ interface ExpandedViewProps {
 }
 
 function ExpandedView({
-  services, projectPath, projectName, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
+  services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
@@ -666,8 +546,6 @@ function ExpandedView({
       left={
         <ServiceSection
           services={services}
-          projectPath={projectPath}
-          projectName={projectName}
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
@@ -695,9 +573,6 @@ function ExpandedView({
 
 interface ServiceSectionProps {
   services: Service[];
-  /** 当前项目路径/名（OpenCode 助手按钮的目标工作目录） */
-  projectPath: string;
-  projectName: string;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
@@ -717,16 +592,14 @@ interface ServiceSectionProps {
 }
 
 function ServiceSection({
-  services, projectPath, projectName, editingService, onEditService,
+  services, editingService, onEditService,
   isServiceRunning, isServiceFailed,
   setDeleteSvcTarget, setShowAddServiceModal,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
-  // OpenCode 会话存在且展开（含隐藏保活会话：cwd 相同即可高亮，visible 决定实心/空心）
-  const ocCwd = useOpenCodeStore(s => s.session?.cwd ?? null);
-  const ocVisible = useOpenCodeStore(s => s.visible);
-  const ocForThis = ocCwd === projectPath;
+  const aiOpen = useHarnessStore(s => s.panelOpen);
+  const toggleAi = () => useHarnessStore.getState().togglePanel();
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
   const sensors = useSensors(
@@ -752,23 +625,12 @@ function ServiceSection({
           <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
         </div>
         <div className="flex items-center gap-1">
-          {/* OpenCode 助手开关（store 订阅：本项目会话且展开时高亮） */}
           <button
-            className={`p-1.5 rounded-md flex-shrink-0 transition-colors ${
-              ocForThis && ocVisible
-                ? 'text-nexus-accent bg-nexus-accent/10'
-                : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50'
-            }`}
-            title={ocForThis && ocVisible ? '收起 OpenCode 助手（保留会话）' : '展开 OpenCode 助手'}
-            onClick={() => {
-              const st = useOpenCodeStore.getState();
-              if (ocForThis && ocVisible) st.hide();
-              else void st.open(projectPath, projectName);
-            }}
+            className={'p-1.5 rounded-md flex-shrink-0 transition-colors ' + (aiOpen ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50')}
+            title={aiOpen ? '关闭 AI 助手' : '打开 AI 助手'}
+            onClick={toggleAi}
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
-              <path d="M7 1.6l1.7 3.7 3.7 1.7-3.7 1.7L7 12.4 5.3 8.7 1.6 7l3.7-1.7z"/>
-            </svg>
+            <RobotIcon size={15} />
           </button>
           <button
             className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
