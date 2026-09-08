@@ -163,7 +163,7 @@ pub fn open_service_with_tool(state: State<AppState>, service_id: String) -> Res
     } else {
         // 历史行兼容：整串 shell 命令（{path} 占位替换）
         log::info!("[nexus] 工具「{}」为旧版命令格式，建议重新编辑保存升级", tool_name);
-        spawn_detached(&legacy_command.replace("{path}", &cwd))
+        spawn_detached(&render_legacy_command(&legacy_command, &cwd))
             .map_err(|e| format!("启动工具「{}」失败: {}", tool_name, e))?;
     }
     log::info!("[nexus] 用工具打开服务: {} ({}) -> {}", name, tool_name, cwd);
@@ -244,6 +244,20 @@ fn spawn_tool_program(executable: &str, args_template: &str, path: &str) -> Resu
     }
 }
 
+/// 渲染历史行命令：`{path}` 占位替换并包双引号。
+///
+/// 历史行最终经 `cmd /C`/`sh -c` 整串执行——cwd 含空格时断参、含 `&`/`|` 等
+/// 元字符时会被 shell 解释执行。包引号后空格与大多数元字符只作为路径一部分。
+/// 模板自带引号（`"{path}"`）时先整体替换，避免二次包引号出现 `""C:\x""`。
+/// 注意信任边界：command 本身仍是用户配置的 shell 命令串（与工具命令同级），
+/// 本函数只保证**注入的路径**不成为新命令。
+fn render_legacy_command(template: &str, path: &str) -> String {
+    let quoted = format!("\"{}\"", path.replace('"', ""));
+    template
+        .replace("\"{path}\"", &quoted)
+        .replace("{path}", &quoted)
+}
+
 /// 迷你参数分词：空白分隔 + 双引号分组
 ///
 /// 有意的限制：不支持转义/单引号/cmd 元字符——参数以数组直传进程，解析只负责
@@ -269,6 +283,35 @@ fn split_args(template: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── render_legacy_command ──────────────────────────────
+
+    #[test]
+    fn test_render_legacy_bare_placeholder_gets_quoted() {
+        // 裸 {path} 必须包引号：路径含空格/& 时不被 shell 拆成多 token
+        assert_eq!(
+            render_legacy_command("idea64 {path}", r"C:\My & calc Project"),
+            "idea64 \"C:\\My & calc Project\""
+        );
+    }
+
+    #[test]
+    fn test_render_legacy_pre_quoted_not_double_quoted() {
+        // 模板自带引号：整体替换，不出现 ""C:\x"" 二次包裹
+        assert_eq!(
+            render_legacy_command("idea64 \"{path}\"", r"C:\My Project"),
+            "idea64 \"C:\\My Project\""
+        );
+    }
+
+    #[test]
+    fn test_render_legacy_embedded_placeholder() {
+        // 占位符嵌在 token 中同样补引号（防元字符逃逸，token 完整性由用户模板负责）
+        assert_eq!(
+            render_legacy_command("prog dir={path}", r"C:\a&b"),
+            "prog dir=\"C:\\a&b\""
+        );
+    }
 
     // ── split_args ──────────────────────────────────────────
 

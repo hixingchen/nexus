@@ -135,8 +135,11 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
 #[tauri::command]
 pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, String> {
     if id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    state.db.with_conn(|conn| {
-        let src = conn.query_row(
+    state.db.with_conn_mut(|conn| {
+        // 事务包裹：项目 + 全部服务是原子写入——中途失败（磁盘满等）自动回滚，
+        // 不会留下「项目已建、服务残缺」的半复制状态
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        let src = tx.query_row(
             "SELECT id, name, path, pinned, sort_index FROM projects WHERE id=?1",
             [&id],
             |row| Ok(Project {
@@ -146,12 +149,12 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
             })
         ).map_err(|e| format!("项目不存在: {}", e))?;
 
-        let services = query_services_by_project(conn, &id)?;
+        let services = query_services_by_project(&tx, &id)?;
 
         let mut new_name = format!("{}_copy", src.name.trim());
         let mut n: u32 = 2;
         while n <= MAX_DUPLICATE_NAME_ATTEMPTS {
-            let exists: bool = conn.query_row(
+            let exists: bool = tx.query_row(
                 "SELECT COUNT(*) > 0 FROM projects WHERE name=?1",
                 [&new_name], |r| r.get(0)
             ).unwrap_or(false);
@@ -164,10 +167,10 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
-        let max_sort: i32 = conn.query_row(
+        let max_sort: i32 = tx.query_row(
             "SELECT COALESCE(MAX(sort_index), -1) FROM projects", [], |r| r.get(0)
         ).unwrap_or(-1);
-        conn.execute(
+        tx.execute(
             "INSERT INTO projects (id, name, path, pinned, sort_index) VALUES (?1,?2,?3,0,?4)",
             rusqlite::params![new_id, new_name, src.path, max_sort + 1],
         ).map_err(|e| format!("创建复制项目失败: {}", e))?;
@@ -176,12 +179,13 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
             let svc_id = uuid::Uuid::new_v4().to_string();
             let en = if svc.enabled { 1 } else { 0 };
             let sft = if svc.show_file_tree { 1 } else { 0 };
-            conn.execute(
+            tx.execute(
                 "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 rusqlite::params![svc_id, new_id, svc.name, svc.command, svc.cwd, svc.watch_paths, svc.watch_include, svc.watch_exclude, svc.env_vars, svc.restart_mode, en, sft, svc.sort_index, svc.tool_commands],
             ).map_err(|e| format!("复制服务配置失败: {}", e))?;
         }
+        tx.commit().map_err(|e| format!("提交复制项目事务失败: {}", e))?;
 
         Ok(Project {
             id: new_id, name: new_name, path: src.path,

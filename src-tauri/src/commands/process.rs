@@ -206,7 +206,7 @@ pub async fn run_tool_command(
     // 输出由双线程逐行读取并 emit（前端实时展示），主线程只等进程退出拿退出码
     let cmd_str = tool_cmd.command;
     let cwd_clone = cwd.clone();
-    let (pid_tx, pid_rx) = std::sync::mpsc::channel::<u32>();
+    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
     let result = tokio::time::timeout(TOOL_COMMAND_TIMEOUT, async {
         tauri::async_runtime::spawn_blocking(move || {
             let mut cmd = crate::core::process::build_command(&cmd_str);
@@ -275,17 +275,17 @@ pub async fn run_tool_command(
         Ok(inner) => inner?,
         Err(_) => {
             // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）。
-            // pid 由 spawn_blocking 任务在启动后上报：任务若在阻塞池排队，try_recv 拿不到，
-            // 此时任务仍会照常启动执行（无人可杀 → 孤儿）。短暂轮询等待 pid 到达后必杀
-            let mut pid: Option<u32> = None;
-            for _ in 0..50 {
-                if let Ok(p) = pid_rx.try_recv() { pid = Some(p); break; }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if let Some(p) = pid {
-                crate::core::process::kill_process_tree(p);
-            }
-            return Err("命令执行超时（60 秒），已终止".into());
+            // pid 由 spawn_blocking 任务 spawn 成功后上报：oneshot 等待非阻塞
+            // （原 50×100ms sleep 轮询会占用 tokio worker）。若任务仍在阻塞池排队
+            // 收不到 pid——命令随后仍会照常启动（无法拦截），如实告知而非谎报"已终止"
+            let pid = tokio::time::timeout(Duration::from_secs(5), pid_rx).await.ok().and_then(|r| r.ok());
+            return match pid {
+                Some(p) => {
+                    crate::core::process::kill_process_tree(p);
+                    Err("命令执行超时（60 秒），已终止".into())
+                }
+                None => Err("命令执行超时（60 秒），且未能取得进程 ID——命令可能仍在启动队列中，请留意是否残留运行".into()),
+            };
         }
     };
 

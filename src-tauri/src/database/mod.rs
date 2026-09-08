@@ -35,15 +35,18 @@ impl Database {
     }
 }
 
-/// 当前 schema 版本号，每次改表结构时递增。
-/// 版本不匹配时自动重建数据库（开发阶段策略，生产环境应做迁移）。
+/// 当前 schema 版本号（仅记录用途，**不是迁移开关**）。
+///
+/// 历史教训：版本号不匹配曾触发删表重建——用户升级即清空全部项目/服务配置。
+/// 表结构变更一律走下方 MIGRATION_COLUMNS 增量 ALTER（幂等加列），
+/// 任何旧版本数据库都能原地升级，禁止再引入 DROP 任何用户表。
 const SCHEMA_VERSION: i32 = 9;
 
 fn init_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
         .map_err(|e| format!("初始化数据库 PRAGMA 失败: {}", e))?;
 
-    // 检查 schema 版本，不匹配则重建
+    // 读取旧版本号（仅日志用；老库由 CREATE IF NOT EXISTS + 增量加列原地升级）
     let current: i32 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
         [], |r| r.get(0)
@@ -55,19 +58,8 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         0
     };
 
-    if version < SCHEMA_VERSION {
-        if version > 0 {
-            log::warn!("schema 版本不兼容 (db={}, code={}), 重建数据库", version, SCHEMA_VERSION);
-        }
-        // 删旧表重建（先删引用方，避免外键约束阻止 DROP）
-        conn.execute_batch("
-            DROP TABLE IF EXISTS service_open_tools;
-            DROP TABLE IF EXISTS open_tools;
-            DROP TABLE IF EXISTS service_templates;
-            DROP TABLE IF EXISTS services;
-            DROP TABLE IF EXISTS projects;
-            DROP TABLE IF EXISTS schema_version;
-        ").map_err(|e| format!("重建数据库表失败: {}", e))?;
+    if version > 0 && version != SCHEMA_VERSION {
+        log::warn!("schema 版本不兼容 (db={}, code={})，原地增量迁移，不删除任何数据", version, SCHEMA_VERSION);
     }
 
     conn.execute_batch("
@@ -132,13 +124,21 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             service_id TEXT PRIMARY KEY REFERENCES services(id) ON DELETE CASCADE,
             tool_id TEXT NOT NULL REFERENCES open_tools(id) ON DELETE CASCADE
         );
+        -- 服务按项目过滤是主查询路径（列表/运行状态/启动全部），缺索引时全表扫描
+        CREATE INDEX IF NOT EXISTS idx_services_project_id ON services(project_id);
     ").map_err(|e| format!("创建数据库表失败: {}", e))?;
 
-    // 增量迁移：老库补列（新库 CREATE 已带，幂等跳过）。不升 SCHEMA_VERSION——
-    // 版本号不匹配会触发上方删表重建，禁止用版本号当迁移开关
-    ensure_column(&conn, "open_tools", "executable", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(&conn, "open_tools", "args", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(&conn, "service_templates", "open_tool_id", "TEXT NOT NULL DEFAULT ''")?;
+    // 项目名唯一索引兜底（add/update 已做代码层查重；此处防未来新写入路径漏查）。
+    // 历史数据若已有重名项目则建索引失败——降级为警告，绝不阻塞启动
+    if let Err(e) = conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)") {
+        log::warn!("[nexus] 创建项目名唯一索引失败（可能已有重名项目，建议手动清理）: {}", e);
+    }
+
+    // 增量迁移：老库逐列补齐（幂等——列已存在直接跳过；新库 CREATE 已带全部列）。
+    // 新增表结构字段时两条缺一不可：① 上方 CREATE TABLE 加列 ② 此处追加一行
+    for (table, column, decl) in MIGRATION_COLUMNS {
+        ensure_column(conn, table, column, decl)?;
+    }
 
     // 使用参数化查询写入 schema 版本
     conn.execute(
@@ -148,6 +148,25 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
 
     Ok(())
 }
+
+/// 历史上各版本逐步新增的列。老库缺列时 ALTER TABLE 补上（含默认值，旧行无副作用），
+/// 新库创建时已含、跳过。覆盖全部历史版本 → 任意旧库首次打开即原地升级为当前结构
+const MIGRATION_COLUMNS: &[(&str, &str, &str)] = &[
+    ("projects", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "sort_index", "INTEGER NOT NULL DEFAULT 0"),
+    ("services", "watch_paths", "TEXT NOT NULL DEFAULT '[]'"),
+    ("services", "watch_include", "TEXT NOT NULL DEFAULT '*'"),
+    ("services", "watch_exclude", "TEXT NOT NULL DEFAULT 'node_modules\n.git\ndist\ntarget\n__pycache__\n.next\nbuild\ncoverage\n*.log'"),
+    ("services", "env_vars", "TEXT NOT NULL DEFAULT '{}'"),
+    ("services", "restart_mode", "INTEGER NOT NULL DEFAULT 0"),
+    ("services", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+    ("services", "show_file_tree", "INTEGER NOT NULL DEFAULT 1"),
+    ("services", "sort_index", "INTEGER NOT NULL DEFAULT 0"),
+    ("services", "tool_commands", "TEXT NOT NULL DEFAULT '[]'"),
+    ("open_tools", "executable", "TEXT NOT NULL DEFAULT ''"),
+    ("open_tools", "args", "TEXT NOT NULL DEFAULT ''"),
+    ("service_templates", "open_tool_id", "TEXT NOT NULL DEFAULT ''"),
+];
 
 /// 幂等加列：列已存在则跳过（pragma_table_info 表值函数）
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
@@ -184,4 +203,96 @@ pub fn query_services_by_project(conn: &Connection, project_id: &str) -> Result<
     let mut services = Vec::new();
     for r in rows { services.push(r.map_err(|e| format!("解析服务数据失败: {}", e))?); }
     Ok(services)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_memory() -> Connection {
+        Connection::open_in_memory().expect("打开内存数据库失败")
+    }
+
+    /// 所有表 + 索引都在
+    #[test]
+    fn test_init_schema_creates_tables_and_indexes() {
+        let conn = in_memory();
+        init_schema(&conn).unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('schema_version','layout','projects','services','service_templates','open_tools','service_open_tools')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 7);
+        // services.project_id 索引（服务查询主路径）
+        let idx: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_services_project_id'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    /// 老库（低版本、缺列）升级：数据保留、缺列补齐、版本号更新——绝不删表
+    #[test]
+    fn test_init_schema_upgrades_old_db_without_data_loss() {
+        let conn = in_memory();
+        // 构造历史老库（version=3）：projects/services 只有早期列，schema_version 表在
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             CREATE TABLE projects (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE services (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                name TEXT NOT NULL, command TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO schema_version (rowid, version) VALUES (1, 3);
+             INSERT INTO projects (id, name, path) VALUES ('p1', '老项目', 'C:/old');
+             INSERT INTO services (id, project_id, name) VALUES ('s1', 'p1', '老服务');",
+        ).unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // 数据原样保留（升级不丢用户数据是硬约束）
+        let (name, path): (String, String) = conn.query_row(
+            "SELECT name, path FROM projects WHERE id='p1'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(name, "老项目");
+        assert_eq!(path, "C:/old");
+        let svc: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM services WHERE project_id='p1'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(svc, 1);
+        // 缺列补齐（新代码的 INSERT/SELECT 依赖这些列）
+        for col in ["pinned", "sort_index"] {
+            let has: i32 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name=?1", [col], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(has, 1, "projects.{col} 应被补齐");
+        }
+        for col in ["watch_paths", "env_vars", "restart_mode", "enabled", "show_file_tree", "sort_index", "tool_commands"] {
+            let has: i32 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('services') WHERE name=?1", [col], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(has, 1, "services.{col} 应被补齐");
+        }
+        // 版本号更新到当前
+        let v: i32 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// 重复初始化幂等（每次启动都会跑 init_schema）
+    #[test]
+    fn test_init_schema_idempotent() {
+        let conn = in_memory();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
 }
