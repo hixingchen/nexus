@@ -1,6 +1,6 @@
+pub mod ai;
 pub mod editor;
 pub mod fileops;
-pub mod harness;
 pub mod layout;
 pub mod process;
 pub mod project;

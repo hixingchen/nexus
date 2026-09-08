@@ -111,7 +111,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
       <CreateProjectModal
         open={showNewModal}
         onClose={() => setShowNewModal(false)}
-        onCreated={(p) => { load(); onSelect(p.id); onProjectName?.(p.name); }}
+        onCreated={(p) => { load(); onSelect(p.id); onProjectName?.(p.name); onProjectPath?.(p.path); }}
       />
 
       <EditProjectModal

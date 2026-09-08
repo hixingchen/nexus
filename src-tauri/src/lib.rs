@@ -6,8 +6,8 @@ mod models;
 use std::sync::Arc;
 use tauri::Manager;
 
+use crate::core::ai::AiSession;
 use crate::core::file_watcher::FileWatcher;
-use crate::core::harness_web::HarnessWeb;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
 
@@ -17,17 +17,16 @@ pub struct AppState {
     pub file_watcher: FileWatcher,
     // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
     pub project_root: std::sync::Mutex<Option<String>>,
-    /// 内嵌 DeepSeek Harness Web GUI 的 dsh web 进程（None = 未启动）
-    pub harness_web: std::sync::Mutex<Option<HarnessWeb>>,
-    /// harness 会话代数：harness_stop 时递增，后台 boot 线程据此识别
-    /// 「启动窗口内被停止」并丢弃自己刚启动的实例（防幽灵进程）
-    pub harness_epoch: std::sync::atomic::AtomicU64,
+    /// 内嵌 dsh web（AI 助手 iframe 会话）；None = 未运行
+    pub ai: std::sync::Mutex<Option<AiSession>>,
+    /// 会话代数：每次 start/stop 递增，启动中的进程据此识别「被取代」并自杀
+    pub ai_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// 统一的资源清理逻辑
 ///
 /// 幂等设计：多次调用安全（stop_all 对空集合是 no-op）。
-/// 清理顺序：服务进程 → 内嵌 dsh web → 文件监听
+/// 清理顺序：服务进程 → AI 会话 → 文件监听
 fn cleanup_resources(state: &AppState) {
     let start = std::time::Instant::now();
 
@@ -35,12 +34,12 @@ fn cleanup_resources(state: &AppState) {
     state.process_mgr.stop_all();
     log::info!("[nexus] 清理: 服务进程已停止 ({:.0}ms)", start.elapsed().as_millis());
 
-    // 2. 停止内嵌 dsh web（Harness GUI；Job Object 仅兜底应用退出场景）
-    if let Ok(mut h) = state.harness_web.lock() {
-        if let Some(runtime) = h.as_mut() {
-            runtime.stop();
+    // 2. 停止 AI 会话（dsh web；Job Object 兜底应用崩溃场景）
+    if let Ok(mut h) = state.ai.lock() {
+        if let Some(mut s) = h.take() {
+            log::info!("[nexus] 清理: 停止 dsh web (pid={})", s.pid);
+            s.stop();
         }
-        *h = None;
     }
 
     // 3. 停止文件监听
@@ -49,8 +48,37 @@ fn cleanup_resources(state: &AppState) {
     log::info!("[nexus] 清理完成 (总耗时 {:.0}ms)", start.elapsed().as_millis());
 }
 
+/// WebView2 cookie 存储清理（Windows，必须在 WebView 创建前调用）。
+///
+/// 背景：dsh 每次会话签发新 cookie（名带随机串 `dsh-auth-<rand>`，Max-Age 30 天），
+/// localhost 域 cookie 只增不减 → 请求头膨胀 → dsh 服务器对插件 bundle 请求返回
+/// 431 (Request Header Fields Too Large) → 「failed to load plugins」永久错误。
+/// Nexus 自身不依赖任何 cookie（本地应用），每次启动清空无副作用。
+#[cfg(windows)]
+fn purge_webview_cookies() {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
+    let dir = std::path::PathBuf::from(local)
+        .join("com.nexus.app")
+        .join("EBWebView")
+        .join("Default")
+        .join("Network");
+    for name in ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"] {
+        let f = dir.join(name);
+        if f.exists() {
+            match std::fs::remove_file(&f) {
+                Ok(_) => log::info!("[nexus] 已清理 WebView2 cookie 存储: {}", name),
+                Err(e) => log::debug!("[nexus] 清理 cookie 失败（webview 可能运行中）: {}", e),
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebView 创建前清空 cookie 库（见 purge_webview_cookies 注释）
+    #[cfg(windows)]
+    purge_webview_cookies();
+
     let db = Database::try_new().unwrap_or_else(|e| {
         log::error!("数据库初始化失败: {}", e);
         panic!("数据库初始化失败: {}", e);
@@ -85,14 +113,10 @@ pub fn run() {
             process_mgr,
             file_watcher: FileWatcher::new(),
             project_root: std::sync::Mutex::new(None),
-            harness_web: std::sync::Mutex::new(None),
-            harness_epoch: std::sync::atomic::AtomicU64::new(0),
+            ai: std::sync::Mutex::new(None),
+            ai_epoch: std::sync::atomic::AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
-            commands::harness::harness_start,
-            commands::harness::harness_status,
-            commands::harness::harness_install,
-            commands::harness::harness_stop,
             commands::editor::read_file,
             commands::editor::write_file,
             commands::search::search_files,
@@ -144,6 +168,11 @@ pub fn run() {
             commands::layout::save_layout,
             commands::layout::load_layout,
             commands::editor::set_project_root,
+            commands::ai::ai_status,
+            commands::ai::ai_start,
+            commands::ai::ai_stop,
+            commands::ai::ai_check_update,
+            commands::ai::ai_upgrade_dsh,
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

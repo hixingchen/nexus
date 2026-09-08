@@ -7,6 +7,7 @@ import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
+import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
 import { ServiceTreeEntry } from './ServiceTreeEntry';
@@ -25,8 +26,8 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
-import { useHarnessStore } from '../../stores/harnessStore';
-import { RobotIcon } from '../ai/HarnessEmbed';
+import { useAiStore } from '../../stores/aiStore';
+import { RobotIcon } from '../ai/RobotIcon';
 import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 
@@ -199,36 +200,40 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       {/* 主区域：代码查看器 / 空状态。
           padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow） */}
       <div className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
-        {viewingLog ? (
-          <LogViewer
-            serviceKey={viewingLog}
-            serviceName={services.find(s => s.id === viewingLog)?.name}
-            fill
-            onClose={() => setViewingLog(null)}
-          />
-        ) : activeTab ? (
-          <>
-            <EditorTabs />
-            <div className="flex-1 overflow-hidden">
-              {activeTab.viewerType === 'image' ? (
-                <ImageViewer path={activeTab.path} name={activeTab.name} />
-              ) : activeTab.viewerType === 'hex' ? (
-                <HexViewer path={activeTab.path} />
-              ) : activeTab.viewerType === 'jar' ? (
-                <JarViewer path={activeTab.path} />
-              ) : (
-                <CodeViewer
-                  filePath={activeTab.path}
-                  content={fileContent ?? ''}
-                  editable={!activeTab.readonly}
-                  onChange={(content) => useEditorStore.getState().updateDraft(content)}
-                />
-              )}
-            </div>
-          </>
-        ) : (
-          <EmptyState name={project.name} path={project.path} />
-        )}
+        {/* ErrorBoundary：CodeMirror/各查看器任何渲染异常都不击穿应用白屏。
+            key 随内容变化 → 出错后切文件/日志即自动重置（新内容重试） */}
+        <ErrorBoundary key={viewingLog ?? activeTab?.path ?? 'empty'}>
+          {viewingLog ? (
+            <LogViewer
+              serviceKey={viewingLog}
+              serviceName={services.find(s => s.id === viewingLog)?.name}
+              fill
+              onClose={() => setViewingLog(null)}
+            />
+          ) : activeTab ? (
+            <>
+              <EditorTabs />
+              <div className="flex-1 overflow-hidden">
+                {activeTab.viewerType === 'image' ? (
+                  <ImageViewer path={activeTab.path} name={activeTab.name} />
+                ) : activeTab.viewerType === 'hex' ? (
+                  <HexViewer path={activeTab.path} />
+                ) : activeTab.viewerType === 'jar' ? (
+                  <JarViewer path={activeTab.path} />
+                ) : (
+                  <CodeViewer
+                    filePath={activeTab.path}
+                    content={fileContent ?? ''}
+                    editable={!activeTab.readonly}
+                    onChange={(content) => useEditorStore.getState().updateDraft(content)}
+                  />
+                )}
+              </div>
+            </>
+          ) : (
+            <EmptyState name={project.name} path={project.path} />
+          )}
+        </ErrorBoundary>
 
         {editingService && (
           <ServiceEditPanel
@@ -452,8 +457,11 @@ function CollapsedView({
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
 }) {
-  const aiOpen = useHarnessStore(s => s.panelOpen);
-  const toggleAi = () => useHarnessStore.getState().togglePanel();
+  // 图标亮 = 本项目的 AI 会话活跃（进程 running 且归属本项目——物理进程
+  // 跨项目单例，须用 sessionCwd 判别，进程在别的项目时不误亮）
+  const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
+  const aiPanelOpen = useAiStore(s => s.panelOpen);
+  const toggleAi = () => useAiStore.getState().togglePanel();
   return (
     <div className="flex flex-col h-full w-full">
       {/* 顶部：展开服务列表在上，AI 开关在它下方（收起态依旧可点） */}
@@ -468,8 +476,8 @@ function CollapsedView({
           </svg>
         </button>
         <button
-          className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (aiOpen ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:bg-nexus-hover/40 hover:text-nexus-text')}
-          title={aiOpen ? '关闭 AI 助手' : '打开 AI 助手'}
+          className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (aiRunning ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:bg-nexus-hover/40 hover:text-nexus-text')}
+          title={aiRunning ? `AI 助手（运行中）${aiPanelOpen ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
           onClick={toggleAi}
         >
           <RobotIcon size={13} />
@@ -598,8 +606,10 @@ function ServiceSection({
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
-  const aiOpen = useHarnessStore(s => s.panelOpen);
-  const toggleAi = () => useHarnessStore.getState().togglePanel();
+  // 图标亮 = 本项目的 AI 会话活跃（进程归属判别见 CollapsedView 说明）
+  const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
+  const aiPanelOpen = useAiStore(s => s.panelOpen);
+  const toggleAi = () => useAiStore.getState().togglePanel();
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
   const sensors = useSensors(
@@ -626,8 +636,8 @@ function ServiceSection({
         </div>
         <div className="flex items-center gap-1">
           <button
-            className={'p-1.5 rounded-md flex-shrink-0 transition-colors ' + (aiOpen ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50')}
-            title={aiOpen ? '关闭 AI 助手' : '打开 AI 助手'}
+            className={'p-1.5 rounded-md flex-shrink-0 transition-colors ' + (aiRunning ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50')}
+            title={aiRunning ? `AI 助手（运行中）${aiPanelOpen ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
             onClick={toggleAi}
           >
             <RobotIcon size={15} />

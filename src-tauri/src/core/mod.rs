@@ -1,7 +1,7 @@
+pub mod ai;
 pub mod classfile;
 pub mod decompiler;
 pub mod file_watcher;
-pub mod harness_web;
 pub mod jarfile;
 pub mod process;
 #[cfg(windows)]
