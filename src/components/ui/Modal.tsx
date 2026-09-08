@@ -27,6 +27,9 @@ export function Modal({ open, title, onClose, children, width = '420px', closeOn
   return (
     <div
       ref={overlayRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
       className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50"
       onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
       onMouseUp={(e) => {

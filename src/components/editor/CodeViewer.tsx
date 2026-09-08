@@ -588,6 +588,9 @@ function createEditorState(
   onChange: (content: string) => void,
   onMatchMarks: (marks: MatchMarks | null) => void,
 ) {
+  // 上次扫描的选中文本：updateListener 据此跳过重复全文档扫描
+  let lastMarkText: string | null = null;
+
   const extensions = [
     lineNumbers(),
     highlightActiveLine(),
@@ -602,7 +605,10 @@ function createEditorState(
     search({ createPanel: createSearchPanel }),
     // 选中文字 → 高亮文档中所有相同匹配（VS Code 风格，选区变化自动更新）
     highlightSelectionMatches({ minSelectionLength: 2 }),
-    // 选区变化 → 计算匹配行集合（滚动条标记用，按行聚合：一行多个匹配只算一个）
+    // 选区变化 → 计算匹配行集合（滚动条标记用，按行聚合：一行多个匹配只算一个）。
+    // 性能护栏：文档 >5MB 跳过；选中文本未变且文档未变时复用上次结果（原实现每次
+    // 选区移动都全文档逐行扫描，数万行文件光标拖动即卡顿）；命中 500 行提前终止
+    //（MatchMarksOverlay 最多也只渲染 500 个，多余扫描纯浪费）
     EditorView.updateListener.of(update => {
       if (!update.selectionSet && !update.docChanged) return;
       const sel = update.state.selection.main;
@@ -612,16 +618,20 @@ function createEditorState(
         sel.to - sel.from < 2 || sel.to - sel.from > 200 ||
         doc.length > MAX_MARK_DOC
       ) {
+        lastMarkText = null;
         onMatchMarks(null);
         return;
       }
       const text = update.state.sliceDoc(sel.from, sel.to);
       if (text.includes('\n')) {
+        lastMarkText = null;
         onMatchMarks(null);
         return;
       }
+      if (!update.docChanged && lastMarkText === text) return; // 内容没变，标记仍有效
+      lastMarkText = text;
       const lines = new Set<number>();
-      for (let n = 1; n <= doc.lines; n++) {
+      for (let n = 1; n <= doc.lines && lines.size < 500; n++) {
         if (doc.line(n).text.includes(text)) lines.add(n);
       }
       onMatchMarks({ lines, total: doc.lines });
@@ -642,10 +652,11 @@ function createEditorState(
       { key: 'Mod-f', run: (view) => {
         openSearchPanel(view);
         requestAnimationFrame(() => {
-          const input = view.dom.querySelector('input[placeholder="查找"]') as HTMLInputElement | null;
-          if (input) {
-            input.focus();
-            input.select();
+          // instanceof 运行时检查：querySelector 结果不保证是 input（占位符可能被改）
+          const el = view.dom.querySelector('input[placeholder="查找"]');
+          if (el instanceof HTMLInputElement) {
+            el.focus();
+            el.select();
           }
         });
         return true;
