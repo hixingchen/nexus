@@ -203,3 +203,176 @@ pub async fn ai_upgrade_dsh(app: AppHandle) -> Result<String, String> {
     .await
     .map_err(|e| format!("升级 dsh 任务失败: {}", e))?
 }
+
+/// 创建 AI 面板的内嵌子 WebView（带文档创建时注入的焦点记忆/恢复脚本）。
+///
+/// 与 JS 侧 `new Webview(...)`（plugin:webview|create_webview，unstable）等价，
+/// 额外用 initialization_script 安装页面内焦点恢复器（scripts/ai_focus_restore.js）。
+/// 为什么必须 Rust 侧：@tauri-apps/api 的 Webview 类没有 eval/initializationScript
+/// 入口，注入只能走 Rust。
+#[tauri::command]
+pub async fn create_ai_panel_webview(
+    app: AppHandle,
+    window_label: String,
+    label: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let window = app
+        .get_window(&window_label)
+        .ok_or_else(|| format!("窗口不存在: {}", window_label))?;
+    let url = tauri::WebviewUrl::External(
+        url.parse().map_err(|e| format!("URL 解析失败 ({}): {}", url, e))?,
+    );
+    let builder = tauri::webview::WebviewBuilder::new(label, url)
+        // HTML5 drag and drop（与 JS 创建时 dragDropEnabled: false 同义）
+        .disable_drag_drop_handler()
+        // 文档创建时注入焦点记忆/恢复脚本（每次导航重新执行，幂等）
+        .initialization_script(include_str!("../scripts/ai_focus_restore.js"));
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(x, y),
+            tauri::LogicalSize::new(width, height),
+        )
+        .map_err(|e| format!("创建 AI 面板 WebView 失败: {}", e))?;
+    Ok(())
+}
+
+/// Alt+Tab 切回后把系统键盘焦点交给 AI 面板子 WebView。
+///
+/// 为什么不用 tauri/wry 的 set_focus：其 Windows 底层是
+/// CoreWebView2Controller::MoveFocus(Programmatic)——语义是「页面内 Tab 焦点循环
+/// 移动」而非「交键盘焦点给控件」，实测破坏输入。正确做法：定位 WebView2 控件
+/// 窗口（窗口类 "Chrome_WidgetWin_0"，探测确认与面板槽位矩形一致、属于应用进程
+/// 主线程，SetFocus 合法）后调用 Win32 SetFocus。控件获得焦点后页面触发
+/// window focus 事件 → 注入脚本自动恢复输入框（双保险）。
+#[tauri::command]
+#[cfg(windows)]
+pub async fn ai_panel_focus(app: AppHandle, window_label: String, label: String) -> Result<(), String> {
+    let window = app
+        .get_window(&window_label)
+        .ok_or_else(|| format!("窗口不存在: {}", window_label))?;
+    let webview = app.get_webview(&label).ok_or_else(|| format!("AI 面板 WebView 不存在: {}", label))?;
+    let w2 = window.clone();
+    let wv2 = webview.clone();
+    // run_on_main_thread：EnumChildWindows/SetFocus 的窗口属于 UI 线程，
+    // SetFocus 要求调用线程与目标窗口同线程（或附加输入队列）——必须在主线程执行
+    window
+        .run_on_main_thread(move || {
+            let res = do_panel_focus(&w2, &wv2);
+            match &res {
+                Ok(()) => log::info!("[ai] 系统焦点已交给 dsh 面板"),
+                Err(e) => log::warn!("[ai] 恢复 dsh 系统焦点失败: {}", e),
+            }
+        })
+        .map_err(|e| format!("主线程调度失败: {}", e))
+}
+
+#[cfg(windows)]
+fn do_panel_focus(window: &tauri::Window, webview: &tauri::Webview) -> Result<(), String> {
+    unsafe {
+        // 1. 主窗口句柄 + 客户区屏幕原点（webview 的 position 相对客户区）
+        let handle = match window.hwnd() {
+            Ok(h) => h,
+            Err(e) => return Err(format!("获取主窗口句柄失败: {}", e)),
+        };
+        let hwnd = handle.0 as isize;
+        let mut pt = POINT { x: 0, y: 0 };
+        ClientToScreen(hwnd, &mut pt);
+
+        let wpos = webview
+            .position()
+            .map_err(|e| format!("获取 WebView 位置失败: {}", e))?;
+        let wsize = webview
+            .size()
+            .map_err(|e| format!("获取 WebView 尺寸失败: {}", e))?;
+        let target = (
+            pt.x + wpos.x,
+            pt.y + wpos.y,
+            pt.x + wpos.x + wsize.width as i32,
+            pt.y + wpos.y + wsize.height as i32,
+        );
+
+        // 2. 枚举主窗口子窗口，按矩形精确匹配 WebView2 控件窗口（±2px 容差）
+        let mut ctx = EnumCtx { target, found: 0 };
+        EnumChildWindows(hwnd, Some(enum_proc), &mut ctx as *mut _ as isize);
+        if ctx.found == 0 {
+            return Err(format!("未找到 AI 面板 WebView 控件窗口 (target={:?})", target));
+        }
+
+        // 3. 键盘焦点交给控件（同线程队列，合法且是标准做法）
+        let _prev = SetFocus(ctx.found);
+        log::debug!("[ai] SetFocus hwnd={} (prev focus={:?})", ctx.found, _prev);
+        Ok(())
+    }
+}
+
+/// WebView2 控件窗口类名（Windows 内部实现细节，类名多年稳定）
+#[cfg(windows)]
+const WEBVIEW2_CONTROL_CLASS: &str = "Chrome_WidgetWin_0";
+
+#[cfg(windows)]
+#[repr(C)]
+struct RECT {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct POINT {
+    x: i32,
+    y: i32,
+}
+
+#[cfg(windows)]
+struct EnumCtx {
+    target: (i32, i32, i32, i32),
+    found: isize,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_proc(hwnd: isize, l_param: isize) -> i32 {
+    let ctx = &mut *(l_param as *mut EnumCtx);
+    let mut buf = [0u16; 64];
+    let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+    if n <= 0 {
+        return 1;
+    }
+    let name = String::from_utf16_lossy(&buf[..n as usize]);
+    if name != WEBVIEW2_CONTROL_CLASS {
+        return 1;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if GetWindowRect(hwnd, &mut r) == 0 {
+        return 1;
+    }
+    let (tl, tt, tr, tb) = ctx.target;
+    if (r.left - tl).abs() <= 2
+        && (r.top - tt).abs() <= 2
+        && (r.right - tr).abs() <= 2
+        && (r.bottom - tb).abs() <= 2
+    {
+        ctx.found = hwnd;
+    }
+    1
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn EnumChildWindows(
+        hwnd_parent: isize,
+        lp_enum_func: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+        l_param: isize,
+    ) -> i32;
+    fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+    fn GetWindowRect(hwnd: isize, lp_rect: *mut RECT) -> i32;
+    fn ClientToScreen(hwnd: isize, lp_point: *mut POINT) -> i32;
+    fn SetFocus(hwnd: isize) -> isize;
+}

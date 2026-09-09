@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Webview } from '@tauri-apps/api/webview';
+import { invoke } from '@tauri-apps/api/core';
+import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
 import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -33,6 +34,21 @@ const nextWvLabel = () => `ai-panel-${++wvSeq}`;
  * 单实例组件（全局仅一个 AiPanel），模块级安全。
  */
 let modalPause = false;
+
+/**
+ * 父页面最近一次交互时间戳（模块级：createEmbeddedWebview 回调与组件共享）。
+ * 窗口重新聚焦时据此判定「用户最后是否在主界面」：2 秒内有交互 → 不把系统焦点
+ * 交给 dsh（保护主界面输入）；否则认为用户最后在 dsh 面板，执行焦点恢复。
+ * 单实例组件（全局仅一个 AiPanel），模块级安全。
+ */
+let lastParentFocusAt = 0;
+
+/**
+ * 焦点恢复命令节流（模块级）：窗口聚焦事件理论上一次触发一次，但 SetFocus 后
+ * WebView2 的焦点流转可能连带窗口焦点事件再次派发——500ms 窗口内去重，
+ * 防止恢复逻辑循环执行（反复重置焦点会打断中文输入法候选，见 ai_focus_restore.js）
+ */
+let lastFocusCmdAt = 0;
 
 interface Bounds { x: number; y: number; width: number; height: number }
 
@@ -150,10 +166,16 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     setWvError(null);
   };
 
-  // 挂载引导：恢复宽度 + 载入 per-project 记忆缓存（切换项目零闪烁的前提）
+  // 挂载引导：恢复宽度 + 载入 per-project 记忆缓存（切换项目零闪烁的前提）；
+  // 同时记录父页面交互时间（焦点保护判定用，见 lastParentFocusAt）
   useEffect(() => {
     void useAiStore.getState().bootstrap();
-    return () => { destroyWv(); };
+    const onParentFocusIn = () => { lastParentFocusAt = Date.now(); };
+    document.addEventListener('focusin', onParentFocusIn);
+    return () => {
+      document.removeEventListener('focusin', onParentFocusIn);
+      destroyWv();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -534,23 +556,21 @@ function RetryButton({ onClick, children }: { onClick: () => void; children: Rea
 async function createEmbeddedWebview(url: string, slot: HTMLElement) {
   const appWindow = getCurrentWindow();
   const b = boundsFromSlot(slot);
-  const wv = new Webview(appWindow, nextWvLabel(), {
+  // 经 Rust 命令创建（带 initialization_script：dsh 页面焦点记忆/恢复脚本安装——
+  // JS 侧 new Webview() 无注入脚本入口，原因与实现见 src-tauri/src/commands/ai.rs）
+  const label = nextWvLabel();
+  await invoke('create_ai_panel_webview', {
+    windowLabel: appWindow.label,
+    label,
     url,
     x: b?.x ?? 0,
     y: b?.y ?? 0,
     width: b?.width ?? 1,
     height: b?.height ?? 1,
-    dragDropEnabled: false,
   });
-  await new Promise<void>((resolve, reject) => {
-    const onCreated = () => resolve();
-    const onError = (e: unknown) => {
-      const p = (e as { payload?: unknown })?.payload;
-      reject(new Error(typeof p === 'string' ? p : 'WebView 创建失败'));
-    };
-    void wv.once('tauri://created', onCreated);
-    void wv.once('tauri://error', onError);
-  });
+  const all = await getAllWebviews();
+  const wv = all.find((w) => w.label === label);
+  if (!wv) throw new Error('AI 面板 WebView 创建后未找到实例');
   const sync = createBoundsSync(wv);
   // 三路事件都触发重贴：resize 覆盖窗口缩放/最小化恢复，moved 覆盖跨屏移动，
   // focus 兜底最小化恢复（部分 Windows 组合下恢复不派发 resize，仅焦点回归）。
@@ -563,10 +583,22 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
   const unlistens: UnlistenFn[] = [];
   unlistens.push(await appWindow.onResized(relayoutNow));
   unlistens.push(await appWindow.onMoved(relayoutNow));
-  // focus 恢复（true）与失去（false）都进来，guardedRelayout 内部守卫过滤无效写入
-  // 注意：不要在获得焦点时调用 wv.setFocus()——实测会破坏输入（见 git 记录），
-  // 焦点交给 WebView2 控件与主窗口存在竞争，导致光标/输入异常
-  unlistens.push(await appWindow.onFocusChanged(() => relayoutNow()));
+  // focus 恢复（true）与失去（false）都进来，guardedRelayout 内部守卫过滤无效写入。
+  // 切回窗口时条件恢复 dsh 输入焦点（延迟等窗口焦点流转完成）：
+  // - 保护：父页面最近 2 秒内有交互（用户正在主界面输入）→ 不抢焦点；
+  // - 否则：调 Rust 命令对子 WebView 的 WebView2 控件窗口 SetFocus（正确语义的
+  //   系统焦点交接，见 commands/ai.rs::ai_panel_focus——wry 的 set_focus 底层是
+  //   MoveFocus，语义错误会破坏输入，刻意不用）+ 页面内 DOM 恢复脚本自动兜底
+  unlistens.push(await appWindow.onFocusChanged(({ payload: focused }) => {
+    relayoutNow();
+    if (!focused) return;
+    setTimeout(() => {
+      if (Date.now() - lastFocusCmdAt < 500) return; // 节流：防焦点流转链重复触发
+      lastFocusCmdAt = Date.now();
+      if (Date.now() - lastParentFocusAt < 2000) return; // 主界面刚被操作，不抢
+      void invoke('ai_panel_focus', { windowLabel: appWindow.label, label }).catch((e) => console.error('恢复 dsh 焦点失败:', e));
+    }, 150);
+  }));
   return { wv, sync, unlistens };
 }
 

@@ -187,6 +187,8 @@ pub fn run() {
             commands::ai::ai_stop,
             commands::ai::ai_check_update,
             commands::ai::ai_upgrade_dsh,
+            commands::ai::create_ai_panel_webview,
+            commands::ai::ai_panel_focus,
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
