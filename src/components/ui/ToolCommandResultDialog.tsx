@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { ToolCommandResult } from '../../services/service';
+import { useUiStore } from '../../stores/uiStore';
 
 // 常见退出码 → 中文含义（Unix 约定），未识别返回 null
 function describeExitCode(code: number | null): string | null {
@@ -36,6 +37,13 @@ export function ToolCommandResultDialog({ open, commandName, result, logs, loadi
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
   }, [result, logs]);
+
+  // 全屏遮罩弹窗：打开期间通知全局（AI 面板子 WebView 移出屏幕，防弹窗期间仍可点击）
+  useEffect(() => {
+    if (!open) return;
+    useUiStore.getState().pushModal();
+    return () => useUiStore.getState().popModal();
+  }, [open]);
 
   if (!open) return null;
 

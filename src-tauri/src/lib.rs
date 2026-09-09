@@ -104,7 +104,21 @@ pub fn run() {
         }
     }
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // 单实例（仅打包版/release 注册）：重复启动（双击 .exe / 再次运行）不开第二个窗口——
+    // 第二进程在插件 setup 阶段被拦截退出，第一实例收到回调把窗口唤起到前台。
+    // 回调在第一实例主线程执行，window 操作安全；无需往第二进程传参（无协议关联）。
+    // debug（tauri dev）不注册：开发阶段不做单实例限制，也不会与已运行的打包版互相拦截。
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let app = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())

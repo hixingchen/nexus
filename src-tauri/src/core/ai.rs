@@ -1,10 +1,12 @@
 //! AI 助手会话进程（dsh web GUI）
 //!
-//! iframe 内嵌前提：dsh 会话 cookie 为 SameSite=Strict，仅同站（同 scheme +
-//! host）可种可发。开发形态父页面跑在 http://localhost:1420（vite dev），
-//! 因此会话 URL 的 host 必须规范为 localhost —— 127.0.0.1 与其跨站，cookie
-//! 会被浏览器拒绝（实测 401）。dsh 服务本身绑 127.0.0.1（IPv4 单栈稳定），
-//! localhost 访问经浏览器双栈回退可达。
+//! 内嵌宿主必须是「原生子 WebView」（前端 AiPanel 创建，顶层导航），**不能用
+//! iframe**：打包后父页 origin 是 tauri.localhost，与 dsh 的 localhost 跨站——
+//! ① 父页 CSP（default-src 'self'，无 frame-src）直接拦截帧（报「已阻止此内容」）；
+//! ② dsh 会话 cookie 为 SameSite=Strict，跨站 iframe 内不收不发 → 握手后 401。
+//! 子 WebView 顶层导航不受父页 CSP 约束，Strict cookie 正常携带（dev/打包一致）。
+//! URL host 规范为 localhost 仅是顺带对齐（dsh 绑 127.0.0.1，localhost 可达），
+//! 对顶层导航无功能影响，保留以免 127.0.0.1 双栈怪癖。
 
 use std::cmp::Ordering;
 use std::io::BufRead;
@@ -260,7 +262,7 @@ pub fn ensure_workspace_active(dir: &str, title: Option<&str>) {
 pub struct AiSession {
     child: Child,
     pub pid: u32,
-    /// 已规范为 localhost 的会话 URL（iframe src；null 未就绪）
+    /// 已规范为 localhost 的会话 URL（子 WebView 导航目标）
     pub url: String,
     /// 会话工作目录（前端据此判断归属项目）
     pub cwd: Option<String>,
@@ -449,7 +451,7 @@ pub fn upgrade_dsh(app: &tauri::AppHandle) -> Result<String, String> {
     Ok(query_dsh_version(app).unwrap_or_default())
 }
 
-/// 会话 URL host 规范为 localhost（iframe 同站前提，见模块注释）
+/// 会话 URL host 规范为 localhost（无功能依赖，仅统一展示/导航目标，见模块注释）
 fn to_localhost(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("http://127.0.0.1") {
         format!("http://localhost{}", rest)
@@ -574,7 +576,7 @@ pub fn spawn_dsh_web(
         }
     };
 
-    // 插件 bundle 就绪探测：iframe 过早导航会让 loader 永久报 failed to load
+    // 插件 bundle 就绪探测：过早导航会让 loader 永久报 failed to load
     // （冷启动竞态，stop 后立即重开最易触发）。探测失败仅告警，不阻塞启动
     if let (Some(port), Some(token)) = (parse_port(&url), parse_token(&url)) {
         wait_plugins_ready(port, &token);
@@ -643,7 +645,7 @@ fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, 
 }
 
 /// 探测 dsh 插件 bundle 服务是否就绪：dsh 打印 URL 时 HTTP 已监听，但插件
-/// 模块服务注册在其后 —— iframe 过早导航会让页面 loader 报
+/// 模块服务注册在其后 —— 过早导航会让页面 loader 报
 /// 「bundle script ... failed to load」（永久错误，需整页刷新）。
 /// 流程：token 握手拿会话 cookie → GET / 解析 loader 的 bundle URL/rev →
 /// 轮询该 URL 直到 200。超时只告警不失败（让前端重试路径兜底）。

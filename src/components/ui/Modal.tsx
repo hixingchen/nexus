@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useUiStore } from '../../stores/uiStore';
 
 interface ModalProps {
   open: boolean;
@@ -20,6 +21,15 @@ export function Modal({ open, title, onClose, children, width = '420px', closeOn
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [open, onClose]);
+
+  // 全局弹窗计数：打开期间通知 AiPanel 移走原生子 WebView（原生层不受 DOM
+  // 遮罩约束，不移走则弹窗打开时 dsh 页面仍可点击）；关闭后恢复原位。
+  // 多个弹窗叠加计数，全部关闭才恢复。
+  useEffect(() => {
+    if (!open) return;
+    useUiStore.getState().pushModal();
+    return () => useUiStore.getState().popModal();
+  }, [open]);
 
   if (!open) return null;
 

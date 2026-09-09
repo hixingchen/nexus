@@ -24,7 +24,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 #[serde(rename_all = "camelCase")]
 pub struct AiStatus {
     pub running: bool,
-    /// iframe 导航目标（host 已规范为 localhost，见 core::ai）
+    /// 子 WebView 导航目标（host 已规范为 localhost，见 core::ai）
     pub url: Option<String>,
     pub pid: Option<u32>,
     pub cwd: Option<String>,

@@ -48,7 +48,7 @@ interface AiState {
   panelWidth: number;
   /** dsh 会话进程是否在运行（物理真相，跨项目单例） */
   running: boolean;
-  /** 会话 URL（iframe src） */
+  /** 会话 URL（子 WebView 导航目标） */
   url: string | null;
   /** 会话进程归属的目录（判断图标亮暗：亮 = running 且 sessionCwd == 当前项目） */
   sessionCwd: string | null;

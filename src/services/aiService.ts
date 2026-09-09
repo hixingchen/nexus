@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 /** 会话状态快照（字段与后端 AiStatus 对齐，serde camelCase） */
 export interface AiStatus {
   running: boolean;
-  /** iframe 导航目标（后端已把 host 规范为 localhost，与 dev 父页同站） */
+  /** 子 WebView 导航目标（后端已把 host 规范为 localhost；打包环境不受父页 CSP/cookie 同站限制） */
   url: string | null;
   pid: number | null;
   /** 会话工作目录 */

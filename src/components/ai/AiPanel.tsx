@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
+import { Webview } from '@tauri-apps/api/webview';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import { useAiStore, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
+import { useUiStore } from '../../stores/uiStore';
 import { aiService } from '../../services/aiService';
 import { showNotification } from '../ui/Toast';
 import { RobotIcon } from './RobotIcon';
@@ -17,16 +22,73 @@ const SPLIT_W = 6;
 /** Dock 头部高度（DOM） */
 const HEADER_H = 36;
 
+/** 子 WebView 唯一标签源（模块级递增：组件重挂载/旧标签未释放也不会撞名报 already exists） */
+let wvSeq = 0;
+const nextWvLabel = () => `ai-panel-${++wvSeq}`;
+
+/**
+ * 全局弹窗打开期间子 WebView 的暂停标志（模块级：guardedRelayout 等模块函数共用）。
+ * true 时一切重贴短路——WebView 应停留在屏外，防止窗口 resize/moved/focus 事件
+ * 在弹窗打开期间把它贴回可见区（原生层不受 DOM 遮罩约束）。
+ * 单实例组件（全局仅一个 AiPanel），模块级安全。
+ */
+let modalPause = false;
+
+interface Bounds { x: number; y: number; width: number; height: number }
+
+/**
+ * WebView 铺位同步器：高频调用（拖拽 60fps）下的 IPC 合入器。
+ * - 一次至多一发在途 setPosition/setSize（串行，防堆积）
+ * - 期间新目标只记最新（尾随合并）——上一发完成后自动补发，**最新矩形必达**
+ * - dispose 后全部短路：销毁后任何迟到的 relayout/retry 都不会再把已关 WebView
+ *   贴回可见区（防「关闭后页面复活」）
+ */
+interface BoundsSync { readonly disposed: boolean; apply(b: Bounds): void; dispose(): void }
+
+function createBoundsSync(wv: Webview): BoundsSync {
+  let inflight = false;
+  let pending: Bounds | null = null;
+  let disposed = false;
+  const pump = async () => {
+    if (inflight || pending === null) return;
+    inflight = true;
+    const b = pending;
+    pending = null;
+    try {
+      await wv.setPosition(new LogicalPosition(b.x, b.y));
+      await wv.setSize(new LogicalSize(b.width, b.height));
+    } catch {
+      /* 窗口/WebView 已销毁等瞬态：忽略 */
+    }
+    inflight = false;
+    if (pending !== null) void pump(); // 在途期间又有新目标 → 补发最新
+  };
+  return {
+    get disposed() { return disposed; },
+    apply(b) {
+      if (disposed) return;
+      pending = b;
+      void pump();
+    },
+    dispose() {
+      disposed = true;
+      pending = null;
+    },
+  };
+}
+
 /**
  * AI 助手停靠面板：以 flex 布局的一列存在（主内容区自动让出宽度，不遮挡任何区域），
- * 点击机器人头开关。dsh web（DeepSeek Harness GUI）以 <iframe> 内嵌：
- * - 会话 cookie 为 SameSite=Strict，iframe 必须与父页同站 → 开发形态父页是
- *   http://localhost:1420（vite），后端已把会话 URL host 规范为 localhost
- * - 会话生命周期由 aiStore 管理：打开启动/切项目重启/关闭隐藏保留/停止关面板
- * - 左缘分隔条拖拽调宽（rAF 帧合并；拖拽期间 iframe 置 pointer-events:none，
- *   否则鼠标进入 iframe 文档后父窗口收不到事件）
- * - 显示状态机不闪帧：面板打开瞬间（starting 未及置位）一律落 spinner，
- *   绝不先渲染错误/引导卡再跳 spinner
+ * 点击机器人头开关。dsh web（DeepSeek Harness GUI）以「原生子 WebView」内嵌：
+ * - 为什么不用 iframe：打包后父页 origin 是 tauri.localhost，与 dsh 的 localhost
+ *   跨站——父页 CSP（default-src 'self'，无 frame-src）直接拦截帧，且 dsh 会话
+ *   cookie 为 SameSite=Strict，跨站 iframe 内不收不发 → 401。子 WebView 对 dsh
+ *   是顶层导航：不受父页 CSP 约束，Strict cookie 正常携带（dev/打包同一路径）
+ * - 会话生命周期由 aiStore 管理：打开启动/切项目重启/关闭隐藏保留/停止关面板；
+ *   WebView 本体随「本项目会话在跑 && 面板展开」创建/销毁。原生层不参与 DOM
+ *   裁切，关闭时先移出屏幕再 close——close 即使异步/失败也无残留画面
+ * - 宽度单一事实来源：静止期 = store.panelWidth（持久化）；拖拽期 = 手动宽度 ref。
+ *   React 渲染统一从 ref 取「当前事实」，任何中间渲染都不会用手动宽度打架
  */
 export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const panelOpen = useAiStore((s) => s.panelOpen);
@@ -39,21 +101,60 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   /** 本项目的会话是否活跃（进程 running 且归属本项目 —— 物理进程跨项目单例，
    *  展示层必须用 sessionCwd 判别，避免「进程在别的项目」时误亮/误显示） */
   const runningHere = useAiStore((s) => s.running && s.sessionCwd === s.currentCwd);
+  /** 是否有全局弹窗打开（添加服务/工具库/更新等）——打开时子 WebView 移出屏幕 */
+  const anyModalOpen = useUiStore((s) => s.modalCount > 0);
 
   const dockRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<{ x: number; w: number } | null>(null);
   /** 拖拽排队帧 + 最新鼠标 X（rAF 帧合并：一帧最多一次布局，避免高频 reflow 卡顿） */
   const rafRef = useRef<number | null>(null);
   const pendingXRef = useRef(0);
-  /** dsh iframe（拖拽期间置 pointer-events:none —— iframe 是独立文档，会吞掉
-   *  父窗口的 mousemove/mouseup，导致拖拽进入其区域即失效） */
-  const frameRef = useRef<HTMLIFrameElement | null>(null);
-  /** 刷新计数：头部刷新按钮 → key 重建 iframe 重载页面 */
+  /** 拖拽期的实时宽度（DOM 手动宽度的事实来源，防 React 渲染回跳）；非拖拽期 null */
+  const manualWRef = useRef<number | null>(null);
+
+  // ── 子 WebView 生命周期（原生控件层，铺在内容区 DOM 槽的真实矩形上）──
+  const wvRef = useRef<Webview | null>(null);
+  /** 当前 WebView 的铺位同步器（dispose 后一切迟到写入短路） */
+  const syncRef = useRef<BoundsSync | null>(null);
+  const createLockRef = useRef<Promise<void> | null>(null);
+  /** 窗口事件监听集合（resize/moved/focus）：恢复最小化/移动/缩放后都触发重贴 */
+  const unlistenWinRef = useRef<UnlistenFn[]>([]);
+  /** 内容区 DOM 槽：WebView 以它的真实矩形定位铺位（与头部无错位、随布局变化） */
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const [wvReady, setWvReady] = useState(false);
+  const [wvError, setWvError] = useState<string | null>(null);
+  /** 当前 WebView 对应内容键（url#nonce）与「本 effect 想要的内容键」：
+   *  在途创建完成时对照——键不一致 = 创建期间已被关闭/切换/刷新 → 自毁 */
+  const createdForRef = useRef('');
+  const desiredKeyRef = useRef('');
+  /** 刷新计数：头部刷新按钮 → 重建 WebView 重载页面 */
   const [refreshNonce, setRefreshNonce] = useState(0);
+
+  const destroyWv = () => {
+    const sync = syncRef.current;
+    syncRef.current = null;
+    if (sync) sync.dispose(); // 先短路：迟到的 relayout/retry 一律不再写入
+    const wv = wvRef.current;
+    wvRef.current = null;
+    createdForRef.current = '';
+    desiredKeyRef.current = '';
+    if (wv) {
+      // 先移出可视区再 close：close 是异步的（且可能失败/卡顿），
+      // 移屏保证「关闭」在视觉上立即成立，残留只可能是屏外无感句柄
+      void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+      void wv.close().catch(() => {});
+    }
+    for (const un of unlistenWinRef.current) un();
+    unlistenWinRef.current = [];
+    setWvReady(false);
+    setWvError(null);
+  };
 
   // 挂载引导：恢复宽度 + 载入 per-project 记忆缓存（切换项目零闪烁的前提）
   useEffect(() => {
     void useAiStore.getState().bootstrap();
+    return () => { destroyWv(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 项目切换/挂载 → 应用该项目记忆的 AI 状态（开→自动恢复会话；关→面板收起）。
@@ -71,8 +172,89 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     }
   }, [panelOpen, runningHere, url, cwd, lastError, starting, projectName]);
 
+  // 关闭兜底：无论什么状态（含 installing 撑宽分支/拖拽残留），关闭必达——
+  // 以 DOM 为最终裁决强制收 0，杜绝「点了关闭面板还在」
+  useEffect(() => {
+    if (!panelOpen) {
+      manualWRef.current = null;
+      if (dockRef.current) dockRef.current.style.width = '0px';
+    }
+  }, [panelOpen]);
+
   // 仅当进程归属本项目时才展示其页面（sessionCwd 判别）
   const showFrame = runningHere && !!url;
+
+  // WebView 生命周期：本项目会话在跑 && 面板展开 → 创建/重建（url 或刷新键变化）；
+  // 收起（panelOpen=false）或会话不属于本项目（showFrame=false）→ 销毁。
+  // 销毁不伤会话：dsh 进程与 cookie 保留，重开/切回时重建即秒载
+  useEffect(() => {
+    const key = url ? `${url}#${refreshNonce}` : '';
+    desiredKeyRef.current = key;
+    if (!panelOpen || !showFrame || !url) {
+      destroyWv();
+      return;
+    }
+    if (wvRef.current) {
+      if (createdForRef.current === key) return; // 已就绪且内容没变
+      destroyWv(); // url/刷新键变化 → 先销毁再重建
+    }
+    if (createLockRef.current) return; // 上一次创建仍在途，等它完成（其自查会自毁）
+    const slot = slotRef.current;
+    if (!slot) return;
+    setWvError(null);
+    createLockRef.current = (async () => {
+      try {
+        const { wv, sync, unlistens } = await createEmbeddedWebview(url, slot);
+        if (desiredKeyRef.current !== key || !useAiStore.getState().panelOpen) {
+          // 创建期间被收起/切项目/刷新 → 不展示过期页面，自毁
+          sync.dispose();
+          for (const un of unlistens) un();
+          await wv.close().catch(() => {});
+          return;
+        }
+        wvRef.current = wv;
+        syncRef.current = sync;
+        createdForRef.current = key;
+        unlistenWinRef.current = unlistens;
+        // 弹窗打开期间创建的 WebView：创建后立即贴屏外（初始定位会瞬时可见，
+        // 创建完成即移走；弹窗期间的重建场景极少，可接受）
+        if (modalPause) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+        setWvReady(true);
+      } catch (e) {
+        setWvError(e instanceof Error ? e.message : String(e));
+      } finally {
+        createLockRef.current = null;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelOpen, showFrame, url, refreshNonce]);
+
+  // 全局弹窗打开：子 WebView 移出屏幕——原生子 WebView 不受 DOM 遮罩（z-index）
+  // 约束，不移走则弹窗打开期间 dsh 页面仍可点击操作。纯移动不销毁：会话进程与
+  // 页面状态保留（聊天记录/生成中内容不受影响），弹窗全部关闭后两帧重贴回槽位。
+  // modalPause 同步暂停一切重贴，防窗口事件在弹窗期间把它贴回可见区。
+  useEffect(() => {
+    modalPause = anyModalOpen;
+    if (anyModalOpen) {
+      const wv = wvRef.current;
+      if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+    } else {
+      const sync = syncRef.current;
+      const slot = slotRef.current;
+      if (sync && slot && !sync.disposed) {
+        // 等两帧让 DOM 布局稳定后再贴回（与 relayoutNow 同策略）
+        requestAnimationFrame(() => requestAnimationFrame(() => void guardedRelayout(sync, slot)));
+      }
+    }
+  }, [anyModalOpen]);
+
+  // 面板宽度变化（拖拽松手落 store）→ WebView 重贴槽位（守卫版：窗口事件/低频率）
+  useEffect(() => {
+    if (panelOpen && wvReady && syncRef.current && slotRef.current) {
+      void guardedRelayout(syncRef.current, slotRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelOpen, wvReady, panelWidth]);
 
   /** 由鼠标 X 计算夹取后的宽度（主内容至少留 420px） */
   const clampWidth = (startX: number, startW: number, curX: number) => {
@@ -81,16 +263,14 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   };
 
   // 左缘分隔条拖拽调宽
-  // rAF 帧合并：mousemove 高频触发（可达 1000Hz），每帧至多应用一次宽度——
-  // 每次宽度变化都会让主内容区与内嵌 dsh 页面整体重排，不合并会明显卡顿
+  // rAF 帧合并：mousemove 高频触发（可达 1000Hz），每帧至多应用一次宽度。
+  // 拖拽期宽度只写 manualWRef + DOM（不经 store，避免每帧 React 渲染）；
+  // WebView 走同步器尾随合并，最新宽度必达且不堆积
   const onResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
     dragStartRef.current = { x: e.clientX, w: useAiStore.getState().panelWidth };
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-    // 鼠标拖入 iframe 区域后事件归 iframe 文档所有，父窗口收不到 → 拖拽失效。
-    // 期间让 iframe 对鼠标透明（事件穿透回父文档），松手恢复
-    if (frameRef.current) frameRef.current.style.pointerEvents = 'none';
 
     const onMove = (ev: MouseEvent) => {
       if (!dragStartRef.current) return;
@@ -100,7 +280,16 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
         rafRef.current = null;
         const d = dragStartRef.current;
         if (!d || !dockRef.current) return;
-        dockRef.current.style.width = clampWidth(d.x, d.w, pendingXRef.current) + 'px';
+        const w = clampWidth(d.x, d.w, pendingXRef.current);
+        manualWRef.current = w;
+        dockRef.current.style.width = w + 'px';
+        // WebView 同步跟随（原生层不随 DOM 重排；同步器保证拖拽中合入到最新值）
+        const sync = syncRef.current;
+        const slot = slotRef.current;
+        if (sync && slot && !sync.disposed) {
+          const b = boundsFromSlot(slot);
+          if (b) sync.apply(b);
+        }
       });
     };
 
@@ -109,14 +298,14 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
       dragStartRef.current = null;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
-      if (frameRef.current) frameRef.current.style.pointerEvents = '';
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
-      // 松手：用最终鼠标位置同步一次宽度并持久化（不依赖最后帧是否已执行）
+      // 松手：以最终鼠标位置落 store 并清除手动宽度（渲染回归 store 事实源）
       if (d && dockRef.current) {
         const finalW = clampWidth(d.x, d.w, pendingXRef.current);
+        manualWRef.current = null;
         dockRef.current.style.width = finalW + 'px';
         useAiStore.getState().setPanelWidth(finalW);
       }
@@ -128,8 +317,8 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     window.addEventListener('mouseup', onUp);
   };
 
-  /** 刷新/重启：后端幂等重启会话（崩溃自愈/切目录）→ URL 变化自动重载；
-   *  同时重建 iframe（页面 JS 崩了但进程在时也能恢复） */
+  /** 刷新/重启：后端幂等重启会话（崩溃自愈/切目录）→ URL 变化自动重建 WebView；
+   *  页面 JS 崩了但进程在时，刷新键递增同样重建页面 */
   const handleRefresh = () => {
     void useAiStore.getState().ensureRunning(cwd, projectName);
     setRefreshNonce((n) => n + 1);
@@ -138,8 +327,13 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   /** 停止本项目 AI 会话并关闭（图标转暗；再点机器人头重新启用） */
   const handleStop = () => { void useAiStore.getState().stop(); };
 
-  /** 关闭面板 = 隐藏（会话与进程保留，图标保持亮；真停止用方块按钮） */
-  const handleHide = () => useAiStore.getState().setPanelOpen(false);
+  /** 关闭面板 = 隐藏（会话与进程保留，图标保持亮；真停止用方块按钮）。
+   *  installing 期间也收（进度卡让位）：后端升级不可中断，完成后仍弹成功通知 */
+  const handleHide = () => {
+    const st = useAiStore.getState();
+    if (st.installing) st.setInstalling(false);
+    st.setPanelOpen(false);
+  };
 
   /** 未检测到 dsh（AI 引擎未安装）：错误卡换成「安装」引导而非终端命令提示 */
   const dshMissing = lastError != null && lastError.includes('未检测到 dsh');
@@ -176,17 +370,21 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     }
   };
 
+  // 宽度唯一事实来源：拖拽期 = manualWRef（DOM 已应用，React 渲染读到同一值，
+  // 不覆盖不跳变）；静止期 = store（持久化）。关闭/无面板 → 0
+  const widthFact = manualWRef.current ?? (panelOpen || installing ? panelWidth : 0);
+
   return (
     <div
       ref={dockRef}
       className="relative h-full flex flex-shrink-0 bg-nexus-surface overflow-hidden"
-      // 隐藏 = 宽度收成 0 而非卸载：iframe 保持挂载，dsh 页面（输入框/滚动/
-      // 会话状态）原样保留——重开只是一次 resize，秒回不闪。
-      // 真正卸载 iframe 会销毁页面文档，重开需整页重载（重 SPA，明显闪烁）
-      // 安装 dsh 期间即使面板被 stop 收起也保持展开：进度 spinner 不能没地方显示
-      style={{ width: panelOpen || installing ? panelWidth : 0 }}
+      // 隐藏 = 宽度收成 0 而非卸载：DOM 头部/状态卡保持挂载；内容区的原生
+      // WebView 已被生命周期 effect 移出屏幕并 close（原生层不受 overflow 裁切）。
+      // 会话进程保留，重开秒载。安装 dsh 期间即使面板被 stop 收起也保持展开：
+      // 进度 spinner 不能没地方显示（点 X 可随时放弃进度显示，见 handleHide）
+      style={{ width: widthFact }}
     >
-      {/* ── 左缘细分隔条：整高可见，按住可拖拽调宽 ── */}
+      {/* ── 左缘细分隔条：整高可见（在 WebView 之外，可直接拖拽调宽） ── */}
       <div
         className="relative h-full flex-shrink-0 cursor-col-resize select-none group flex flex-col items-center"
         style={{ width: SPLIT_W }}
@@ -245,8 +443,10 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
              分支顺序即防闪烁策略：lastError → 会话内容 → 项目引导 → spinner。
              打开面板瞬间（ensure 未及置位）running/starting 均为 false——
              此时若按旧顺序会命中「未检测到 dsh」等引导分支闪一帧再跳 spinner，
-             故一切「未就绪但有项目」的状态一律落 spinner */}
-        <div className="relative flex-1 min-h-0 overflow-hidden bg-nexus-editor">
+             故一切「未就绪但有项目」的状态一律落 spinner。
+             会话内容分支：原生 WebView 铺满整个槽位（slotRef）；未创建成功前
+             显示 DOM 覆盖层（WebView 是原生层，一旦创建就盖在 DOM 之上） */}
+        <div ref={slotRef} className="relative flex-1 min-h-0 overflow-hidden bg-nexus-editor">
           {installing ? (
             <div className="h-full flex flex-col items-center justify-center gap-3 text-nexus-muted">
               <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
@@ -265,12 +465,22 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
               )}
             />
           ) : showFrame ? (
-            <SessionFrame
-              key={url + '#' + refreshNonce}  // 会话/刷新变化 → 重挂载 → loaded 复位（无帧序闪）
-              url={url}
-              width={panelWidth - SPLIT_W}
-              frameRef={frameRef}
-            />
+            <>
+              {wvError ? (
+                <PanelMessage
+                  title="AI 会话加载失败"
+                  detail={wvError}
+                  action={<RetryButton onClick={handleRefresh}>重试</RetryButton>}
+                />
+              ) : !wvReady && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-nexus-muted pointer-events-none">
+                  <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
+                  {/* 文案不随 starting 跳变：打开瞬间第一帧 starting 未置位，
+                      与启动中显示同一句话，避免文字闪变 */}
+                  <p className="text-[12px] select-none">正在启动 AI 会话…</p>
+                </div>
+              )}
+            </>
           ) : cwd == null ? (
             <PanelMessage
               title="先打开一个项目"
@@ -279,61 +489,12 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           ) : (
             <div className="h-full flex flex-col items-center justify-center gap-3 text-nexus-muted">
               <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
-              {/* 文案不随 starting 跳变：打开瞬间第一帧 starting 未置位，
-                  与启动中显示同一句话，避免文字闪变 */}
               <p className="text-[12px] select-none">正在启动 AI 会话…</p>
             </div>
           )}
         </div>
       </div>
     </div>
-  );
-}
-
-/**
- * 会话 iframe + 加载遮罩。作为独立组件用 key 驱动：
- * url/刷新变化 → 组件重挂载 → loaded 初始 false → 遮罩与 iframe 同帧出现，
- * 不存在「新文档已开始加载但遮罩尚未复位」的帧序漏洞。
- * iframe 宽度固定为面板内容宽（px）：面板隐藏时父容器宽 0 只做裁切，
- * iframe 本身不被压缩 —— dsh 页面不重排、合成帧保留，恢复显示零闪烁
- */
-function SessionFrame({
-  url, width, frameRef,
-}: {
-  url: string;
-  width: number;
-  frameRef: React.Ref<HTMLIFrameElement>;
-}) {
-  /** 文档是否已加载完成；onLoad 后延迟 250ms 再揭开（等 dsh SPA 首屏稳定） */
-  const [loaded, setLoaded] = useState(false);
-  const revealTimer = useRef<number | null>(null);
-
-  useEffect(() => () => {
-    if (revealTimer.current !== null) clearTimeout(revealTimer.current);
-  }, []);
-
-  const onLoad = () => {
-    if (revealTimer.current !== null) clearTimeout(revealTimer.current);
-    revealTimer.current = window.setTimeout(() => setLoaded(true), 250);
-  };
-
-  return (
-    <>
-      {!loaded && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-nexus-muted pointer-events-none bg-nexus-editor">
-          <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
-          <p className="text-[12px] select-none">正在启动 AI 会话…</p>
-        </div>
-      )}
-      <iframe
-        ref={frameRef}
-        src={url}
-        title="AI 助手会话"
-        className="h-full border-0 bg-nexus-editor"
-        style={{ width }}
-        onLoad={onLoad}
-      />
-    </>
   );
 }
 
@@ -362,4 +523,91 @@ function RetryButton({ onClick, children }: { onClick: () => void; children: Rea
       onClick={onClick}
     >{children}</button>
   );
+}
+
+/**
+ * 创建并定位子 WebView（以内容区 DOM 槽的真实矩形为准，与头部/分隔条无错位）；
+ * 返回实例 + 铺位同步器 + 窗口事件监听（resize/moved/focus 三路触发重贴，
+ * 低频路径走守卫版 relayout：最小化/无效矩形不写入，错位值进不来）。
+ * WebView 对 dsh 是顶层导航，不受父页 CSP 帧策略约束，SameSite=Strict cookie 正常携带
+ */
+async function createEmbeddedWebview(url: string, slot: HTMLElement) {
+  const appWindow = getCurrentWindow();
+  const b = boundsFromSlot(slot);
+  const wv = new Webview(appWindow, nextWvLabel(), {
+    url,
+    x: b?.x ?? 0,
+    y: b?.y ?? 0,
+    width: b?.width ?? 1,
+    height: b?.height ?? 1,
+    dragDropEnabled: false,
+  });
+  await new Promise<void>((resolve, reject) => {
+    const onCreated = () => resolve();
+    const onError = (e: unknown) => {
+      const p = (e as { payload?: unknown })?.payload;
+      reject(new Error(typeof p === 'string' ? p : 'WebView 创建失败'));
+    };
+    void wv.once('tauri://created', onCreated);
+    void wv.once('tauri://error', onError);
+  });
+  const sync = createBoundsSync(wv);
+  // 三路事件都触发重贴：resize 覆盖窗口缩放/最小化恢复，moved 覆盖跨屏移动，
+  // focus 兜底最小化恢复（部分 Windows 组合下恢复不派发 resize，仅焦点回归）。
+  // 每路先等两帧让 DOM 布局跟随窗口变化；守卫版 relayout 无效矩形不写入
+  const relayoutNow = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => void guardedRelayout(sync, slot));
+    });
+  };
+  const unlistens: UnlistenFn[] = [];
+  unlistens.push(await appWindow.onResized(relayoutNow));
+  unlistens.push(await appWindow.onMoved(relayoutNow));
+  // focus 恢复（true）与失去（false）都进来，guardedRelayout 内部守卫过滤无效写入
+  // 注意：不要在获得焦点时调用 wv.setFocus()——实测会破坏输入（见 git 记录），
+  // 焦点交给 WebView2 控件与主窗口存在竞争，导致光标/输入异常
+  unlistens.push(await appWindow.onFocusChanged(() => relayoutNow()));
+  return { wv, sync, unlistens };
+}
+
+/**
+ * 守卫版重贴（窗口事件/低频路径）：窗口最小化中或槽位矩形无效（<40px，
+ * 最小化过渡期 DOM 布局未就绪会读到 0）→ 跳过并稍后重试——绝不写坏矩形。
+ * dispose 后短路（destroyWv 先 dispose，迟到的重试不会复活已关页面）
+ */
+async function guardedRelayout(sync: BoundsSync, slot: HTMLElement, retries = 4) {
+  if (sync.disposed) return;
+  if (modalPause) return; // 全局弹窗打开期间禁止重贴（WebView 应停留在屏外）
+  const appWindow = getCurrentWindow();
+  let minimized = false;
+  try {
+    minimized = await appWindow.isMinimized();
+  } catch {
+    /* 窗口已关闭等瞬态，按未最小化处理让下方 bounds 校验兜底 */
+  }
+  if (minimized) return;
+  const b = boundsFromSlot(slot);
+  if (b === null) {
+    // 布局未就绪（恢复过渡/隐藏中）：稍后重试，不写入坏值
+    if (retries > 0) {
+      setTimeout(() => void guardedRelayout(sync, slot, retries - 1), 80);
+    }
+    return;
+  }
+  sync.apply(b);
+}
+
+/**
+ * 读取内容区 DOM 槽的真实矩形（CSS 像素 = 逻辑像素），作为原生 WebView 的铺位。
+ * 宽或高 < 40px 视为无效（面板收起/窗口最小化过渡期）→ null，调用方跳过写入
+ */
+function boundsFromSlot(slot: HTMLElement): Bounds | null {
+  const r = slot.getBoundingClientRect();
+  if (r.width < 40 || r.height < 40) return null;
+  return {
+    x: Math.round(r.left),
+    y: Math.round(r.top),
+    width: Math.round(r.width),
+    height: Math.round(r.height),
+  };
 }
