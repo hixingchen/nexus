@@ -8,6 +8,32 @@ export interface ToolCommand {
   timeout_secs?: number;
 }
 
+/**
+ * 解析 `tool_commands` 这个 TEXT 列（DB → JSON 串 → 结构体数组）。
+ *
+ * 为什么需要校验而不能直接 `as ToolCommand[]`：DB 里的字符串是**不受信数据**
+ * （手改过 DB、旧 schema、写到一半），`JSON.parse` 只保证"是合法 JSON"。
+ * 一个 `{"a":1}` 或 `[1,2]` 会产出 `id`/`name`/`command` 全为 undefined 的条目，
+ * 右键菜单渲染出无名项，运行它会把 `commandId: undefined` 送进 `run_tool_command`。
+ * 这里逐项校验并丢弃非法条目，是全项目唯一真实的"不受信数据跨边界"点。
+ */
+export function parseToolCommands(raw: string | null | undefined): ToolCommand[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((it): it is ToolCommand => {
+    if (typeof it !== 'object' || it === null) return false;
+    const o = it as Record<string, unknown>;
+    return typeof o.id === 'string' && typeof o.name === 'string' && typeof o.command === 'string'
+      && (o.timeout_secs === undefined || typeof o.timeout_secs === 'number');
+  });
+}
+
 export interface Service {
   id: string;
   project_id: string;
@@ -253,9 +279,9 @@ export const processApi = {
   startProject: (projectId: string) =>
     invoke<string[]>('start_project_services', { projectId }),
 
-  /** 停止项目所有服务 */
+  /** 停止项目所有服务；返回逐个服务的失败清单（空数组 = 全部成功） */
   stopProject: (projectId: string) =>
-    invoke<void>('stop_project_services', { projectId }),
+    invoke<string[]>('stop_project_services', { projectId }),
 
   /** 获取运行状态总览（运行中 + 意外失败） */
   getRunning: () => invoke<ProcessStatus>('get_running'),

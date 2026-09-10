@@ -14,6 +14,21 @@ use crate::AppState;
 const MAX_COPY_DEPTH: usize = 64;
 /// 单次粘贴复制的条目总数上限（防巨量文件耗尽时间与磁盘）
 const MAX_COPY_ENTRIES: usize = 200_000;
+/// 同名去重的最多尝试次数（超过即判定无法落位，报为该源的失败）
+const MAX_DEST_ATTEMPTS: usize = 1000;
+
+/// 粘贴结果：`created` 为已落盘路径，`failed` 为逐个源的失败原因。
+///
+/// 为什么不能只返回 `Vec<String>` 或直接 `Err`：多源粘贴时部分成功是常态
+/// （某个源被占用/权限不足）。原实现一旦中途失败就整体返回 `Err`，
+/// 此时**前面的源已经在磁盘上了**，调用方却拿不到这个清单，于是按"全部失败"
+/// 刷新界面，用户看到文件明明在、界面却说没成功。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteFilesResult {
+    pub created: Vec<String>,
+    pub failed: Vec<String>,
+}
 
 /// 复制文件/文件夹到系统剪贴板（在资源管理器中 Ctrl+V 可粘贴）
 #[tauri::command]
@@ -46,7 +61,7 @@ pub fn copy_files_to_clipboard(state: State<AppState>, paths: Vec<String>) -> Re
 
 /// 从系统剪贴板读取文件列表并复制到目标目录，返回新建的路径列表（供前端刷新树）
 #[tauri::command]
-pub async fn paste_files(state: State<'_, AppState>, target_dir: String) -> Result<Vec<String>, String> {
+pub async fn paste_files(state: State<'_, AppState>, target_dir: String) -> Result<PasteFilesResult, String> {
     // 多根白名单校验（项目根 + 各服务/模板工作目录），与其余路径类命令同口径；
     // 校验内部不跨 await 持锁，future 仍是 Send
     check_path_allowed(&state, &target_dir)?;
@@ -70,7 +85,7 @@ pub async fn paste_files(state: State<'_, AppState>, target_dir: String) -> Resu
 }
 
 #[cfg(windows)]
-fn paste_files_windows(target: &Path) -> Result<Vec<String>, String> {
+fn paste_files_windows(target: &Path) -> Result<PasteFilesResult, String> {
     use clipboard_win::formats::FileList;
 
     let sources: Vec<String> = clipboard_win::get_clipboard(FileList)
@@ -81,32 +96,44 @@ fn paste_files_windows(target: &Path) -> Result<Vec<String>, String> {
     let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
 
     let mut created: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     let mut entries = 0usize;
     for src_str in &sources {
         let src = PathBuf::from(src_str);
         if !src.exists() {
             log::warn!("[nexus] 剪贴板中的源文件不存在，跳过: {}", src_str);
+            failed.push(format!("{}: 源文件不存在", src_str));
             continue;
         }
         // 源在目标目录内（或等于目标）→ 跳过，防止复制到自身
         let src_canon = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
         if src_canon.starts_with(&target_canon) {
             log::warn!("[nexus] 源位于目标目录内，跳过: {}", src_str);
+            failed.push(format!("{}: 源位于目标目录内", src_str));
             continue;
         }
         let name = match src.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue, // 非 UTF-8 文件名（极罕见），跳过
         };
-        let dst = unique_dest_path(target, &name);
-        copy_recursive(&src, &dst, &mut entries).map_err(|e| format!("复制 {} 失败: {}", name, e))?;
-        created.push(dst.to_string_lossy().replace('\\', "/"));
+        // 单个源失败不中断整批：继续处理其余源，最后连同已创建清单一起上报
+        let Some(dst) = unique_dest_path(target, &name) else {
+            failed.push(format!("{}: 同名文件过多，无法确定目标名", name));
+            continue;
+        };
+        match copy_recursive(&src, &dst, &mut entries) {
+            Ok(()) => created.push(dst.to_string_lossy().replace('\\', "/")),
+            Err(e) => {
+                log::warn!("[nexus] 粘贴 {} 失败: {}", name, e);
+                failed.push(format!("{}: {}", name, e));
+            }
+        }
     }
-    if created.is_empty() {
+    if created.is_empty() && failed.is_empty() {
         return Err("没有可粘贴的项目".into());
     }
-    log::info!("[nexus] 粘贴 {} 个项目到 {}", created.len(), target.display());
-    Ok(created)
+    log::info!("[nexus] 粘贴完成：成功 {} 个，失败 {} 个 → {}", created.len(), failed.len(), target.display());
+    Ok(PasteFilesResult { created, failed })
 }
 
 /// 递归复制文件/目录（同步，仅在阻塞线程池中调用）
@@ -147,23 +174,25 @@ fn copy_recursive_at(src: &Path, dst: &Path, entries: &mut usize, depth: usize) 
 
 /// 目标路径去重：已存在同名时自动追加 " (2)"、" (3)"…（与资源管理器同文件惯例一致）。
 /// 扩展名拆分为后缀（"a.txt" → stem "a" + ext ".txt"）；".gitignore" 这类以点开头的整体作为主名。
-fn unique_dest_path(target: &Path, name: &str) -> PathBuf {
+///
+/// 重名探测有上限：目标目录被其它进程持续写入时，原实现的无界 `loop` 会一直自增下去。
+/// 超过上限返回 None，由调用方作为该源的失败上报（而不是静默丢弃或无限循环）。
+fn unique_dest_path(target: &Path, name: &str) -> Option<PathBuf> {
     let candidate = target.join(name);
     if !candidate.exists() {
-        return candidate;
+        return Some(candidate);
     }
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{}", e)),
         _ => (name, String::new()),
     };
-    let mut i = 2;
-    loop {
+    for i in 2..MAX_DEST_ATTEMPTS {
         let candidate = target.join(format!("{} ({}){}", stem, i, ext));
         if !candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
-        i += 1;
     }
+    None
 }
 
 // ─── Tests ──────────────────────────────────────────────────
@@ -176,7 +205,7 @@ mod tests {
     fn test_unique_dest_path_no_conflict() {
         let dir = std::env::temp_dir();
         let name = format!("nexus_ut_{}", std::process::id());
-        let dst = unique_dest_path(&dir, &name);
+        let dst = unique_dest_path(&dir, &name).expect("应能确定目标路径");
         assert_eq!(dst, dir.join(&name)); // 无同名 → 原样
     }
 
@@ -187,7 +216,7 @@ mod tests {
         let name = format!("nexus_ut_ext_{}.txt", std::process::id());
         let existing = dir.join(&name);
         std::fs::write(&existing, "x").unwrap();
-        let dst = unique_dest_path(&dir, &name);
+        let dst = unique_dest_path(&dir, &name).expect("应能确定目标路径");
         std::fs::remove_file(&existing).unwrap();
         // 主名带后缀、扩展名保留
         assert_eq!(dst.file_name().unwrap().to_string_lossy(), format!("{} (2).txt", name.trim_end_matches(".txt")));
@@ -199,8 +228,23 @@ mod tests {
         // ".gitignore" 不带点开头拆分 → 保持整体
         let dir = std::env::temp_dir();
         let name = ".gitignore";
-        let dst = unique_dest_path(&dir, name);
+        let dst = unique_dest_path(&dir, name).expect("应能确定目标路径");
         assert_eq!(dst, dir.join(".gitignore"));
+    }
+
+    /// 重名探测有上限：目标目录被占满时返回 None，而不是无限自增
+    #[test]
+    fn test_unique_dest_path_bounded_returns_none() {
+        let dir = std::env::temp_dir().join(format!("nexus_ut_full_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "a.txt";
+        // 占满全部候选名（原名 + (2)...(MAX_DEST_ATTEMPTS-1)）
+        for i in 1..MAX_DEST_ATTEMPTS {
+            let p = if i == 1 { dir.join(name) } else { dir.join(format!("a ({}).txt", i)) };
+            std::fs::write(&p, "x").unwrap();
+        }
+        assert!(unique_dest_path(&dir, name).is_none(), "候选名用尽应返回 None");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 普通目录树照常复制（回归：加了 depth/entries 参数后基本功能不变）

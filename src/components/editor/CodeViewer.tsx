@@ -91,8 +91,10 @@ function cacheKey(filePath: string, editable: boolean, openSeq: number): string 
  * CodeMirror 的 keymap 只在编辑器聚焦时接收键盘事件——用户切回文件后焦点
  * 常在标签栏/文件树上，Ctrl+Z 无反应（内容未撤销却以为撤销了，dirty 提示"保存"
  * 让人困惑）。焦点在编辑器或输入框时放行（CodeMirror/浏览器自己处理）
+ *
+ * 仅本文件使用（模块级单例，供全局 Ctrl+Z 转发定位活动编辑器），故不导出。
  */
-export let activeEditorView: EditorView | null = null;
+let activeEditorView: EditorView | null = null;
 
 // ── 双击选中代码块（IDEA 风格，全语言通用） ────────────────
 
@@ -873,11 +875,12 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
+    // 自己刚输入的回声先判：store 回写的就是编辑器内容，此时 `content` 与文档必然相等，
+    // 无需再 `doc.toString()`（全文档序列化）。原实现把这个便宜的判断放在了**昂贵操作之后**，
+    // 于是每次按键都要白白物化一次整篇文档。
+    if (content === lastEmittedRef.current) return;
     const doc = view.state.doc.toString();
     if (doc === content) return;
-    // 自己刚输入的回声：store 回写的就是编辑器内容，无需（也不能）再 dispatch，
-    // 否则每敲一个字符都会重置撤销栈
-    if (content === lastEmittedRef.current) return;
     view.dispatch({ changes: { from: 0, to: doc.length, insert: content } });
     // 缓存同步更新：否则切走再切回会因 doc 与内容不一致而重建（撤销历史丢失）
     stateCacheSet(cacheKey(filePath, editable, openSeq), view.state);

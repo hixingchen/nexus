@@ -96,9 +96,14 @@ export function useProjectList() {
     setActingId(id);
     try {
       // stop_project_services 后端同时停止进程与项目级文件监听（总开关）
-      await processApi.stopProject(id);
+      // 返回逐个服务的失败清单；有失败时不能报"所有服务已停止"
+      const errors = await processApi.stopProject(id);
       await useRunningStore.getState().refresh();
-      showNotification({ variant: 'info', title: `「${name}」已停止`, description: '所有服务已停止' });
+      if (errors.length > 0) {
+        showNotification({ variant: 'error', title: `「${name}」部分服务停止失败`, description: errors.join(', ') });
+      } else {
+        showNotification({ variant: 'info', title: `「${name}」已停止`, description: '所有服务已停止' });
+      }
     } catch (err: unknown) {
       showNotification({ variant: 'error', title: String(err) });
     }
@@ -109,21 +114,27 @@ export function useProjectList() {
 
   const toggleSvcExpand = useCallback((e: React.MouseEvent, projectId: string, serviceId: string) => {
     e.stopPropagation();
-    const next = new Set(expandedSvc);
     const key = `${projectId}:${serviceId}`;
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    setExpandedSvc(next);
-  }, [expandedSvc]);
+    // 函数式更新：用捕获的 expandedSvc 计算会让同一 tick 内的两次切换互相覆盖
+    // （第二次拿到的仍是旧集合，结果表现为"点两下只生效一次"）
+    setExpandedSvc(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   const toggleExpand = useCallback(async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
     if (expanded.has(projectId)) {
-      const next = new Set(expanded);
-      next.delete(projectId);
       // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）
       useSvcCacheStore.getState().invalidate(projectId);
-      setExpanded(next);
+      setExpanded(prev => {
+        const next = new Set(prev);
+        next.delete(projectId);
+        return next;
+      });
       return;
     }
     // 展开：先亮加载态，拉到服务列表后才真正展开——期间不展开可避免空缓存被渲染成
@@ -143,7 +154,6 @@ export function useProjectList() {
       if (seq === expandSeqRef.current) setExpandingId(null);
     }
   }, [expanded]);
-
   return {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,

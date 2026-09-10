@@ -155,7 +155,11 @@ export function useProjectDetail(projectId: string) {
     if (!detail) return;
     try {
       // 后端 stop_project_services 同时停止所有进程和项目级文件监听（总开关）
-      await processApi.stopProject(detail.project.id);
+      // 返回逐个服务的失败清单（后端不再把失败吞掉报成"已停止"）
+      const errors = await processApi.stopProject(detail.project.id);
+      if (errors.length > 0) {
+        showNotification({ variant: 'error', title: '部分服务停止失败', description: errors.join(', ') });
+      }
       // 全部停止 = 主动关闭：清空本项目所有服务日志（含失败服务的日志）
       for (const s of detail.services) {
         useLogStore.getState().clearLogs(s.id);

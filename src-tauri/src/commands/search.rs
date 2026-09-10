@@ -212,8 +212,7 @@ fn search_file(path: &Path, q: &str, case_sensitive: bool, limit: usize) -> Opti
                 lb.windows(qb.len()).position(|w| w.eq_ignore_ascii_case(qb))
             }
         } else {
-            let hay = line.to_lowercase();
-            hay.find(q).map(|p| hay[..p].chars().count())
+            find_ci_char_idx(line, q)
         };
         if let Some(char_idx) = char_idx {
             let start_char = char_idx.saturating_sub(SNIPPET_MARGIN);
@@ -229,4 +228,61 @@ fn search_file(path: &Path, q: &str, case_sensitive: bool, limit: usize) -> Opti
         }
     }
     if hits.is_empty() { None } else { Some(hits) }
+}
+
+/// 在 `line` 中做 Unicode 大小写不敏感查找，返回命中起点在**原行**里的字符下标。
+///
+/// 为什么不能"在小写副本上 find，再把位置用回原行"：Unicode 小写化会改变字符数
+/// （`İ`(1 字符) → `i̇`(2 字符)、`ẞ` → `ß` 等），小写副本里的字符下标与原始行不再一一对应，
+/// 片段会整体错位（原实现正是如此）。这里逐字符小写化并记录每个小写字符的来源下标，
+/// 从而把命中位置准确地映射回原行的字符网格。
+fn find_ci_char_idx(line: &str, query_lower: &str) -> Option<usize> {
+    let mut lower = String::with_capacity(line.len());
+    // origin[i] = 小写串第 i 个字符来自原行的第几个字符
+    let mut origin: Vec<usize> = Vec::with_capacity(line.len());
+    for (oi, ch) in line.chars().enumerate() {
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
+            origin.push(oi);
+        }
+    }
+    let byte_pos = lower.find(query_lower)?;
+    let ch_pos = lower[..byte_pos].chars().count();
+    origin.get(ch_pos).copied()
+}
+
+/* ---- Tests ---- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_ci_char_idx_ascii() {
+        // ASCII 行：下标与字节一致
+        assert_eq!(find_ci_char_idx("hello WORLD", "world"), Some(6));
+        assert_eq!(find_ci_char_idx("hello", "zzz"), None);
+    }
+
+    #[test]
+    fn test_find_ci_char_idx_unicode_prefix_shifts() {
+        // 回归：`İ` 小写化后变成 2 个字符（i + U+0307 组合点），于是小写副本里
+        // "target" 的字符下标是 4，而它在**原行**里只是第 3 个字符。
+        // 原实现直接把小写副本的下标用到原行 → 片段从 "arget" 开始（整体错位 1）。
+        let line = "İ  target";
+        let idx = find_ci_char_idx(line, "target").expect("应命中");
+        assert_eq!(idx, 3, "命中位置应映射回原行的第 3 个字符");
+        let got: String = line.chars().skip(idx).take(6).collect();
+        assert_eq!(got, "target", "按映射后的下标切片应取到原文");
+    }
+
+    #[test]
+    fn test_find_ci_char_idx_after_cjk_prefix() {
+        // 非膨胀的 Unicode 前缀（CJK 逐字符小写化不变）：下标照常等于原行字符序号
+        let line = "中文 target 结尾";
+        let idx = find_ci_char_idx(line, "target").expect("应命中");
+        assert_eq!(idx, 3);
+        let got: String = line.chars().skip(idx).take(6).collect();
+        assert_eq!(got, "target");
+    }
 }

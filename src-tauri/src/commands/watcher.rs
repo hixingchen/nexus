@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager};
 use crate::AppState;
 use crate::core::file_watcher::{FileChangeEvent, ServiceWatchConfig};
 
@@ -110,52 +110,61 @@ fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) 
 ///
 /// - `service_id` 为空：启动项目级监听（所有 restart_mode>0 的服务）
 /// - `service_id` 非空：追加该服务到监听（与已有监听合并）
+///
+/// 异步 + spawn_blocking：内部 `start_watching` 会先 `stop_watching`（**join 监听线程**，
+/// 最长约 200ms）再对每个路径调 `notify::watch`（Windows 递归监听要枚举目录树）。
+/// 同步执行时这段工作内联在 IPC 请求路径上。
 #[tauri::command]
-pub fn start_watching(app: AppHandle, state: State<AppState>, project_id: String, service_id: Option<String>) -> Result<(), String> {
+pub async fn start_watching(app: AppHandle, project_id: String, service_id: Option<String>) -> Result<(), String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    let project_name: String = state.db.with_conn(|conn| {
-        conn.query_row("SELECT name FROM projects WHERE id=?1", [&project_id],
-            |row| row.get(0)
-        ).map_err(|e| format!("项目不存在: {}", e))
-    })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let project_name: String = state.db.with_conn(|conn| {
+            conn.query_row("SELECT name FROM projects WHERE id=?1", [&project_id],
+                |row| row.get(0)
+            ).map_err(|e| format!("项目不存在: {}", e))
+        })?;
 
-    let new_services = if let Some(sid) = service_id.as_deref() {
-        // 单服务模式：只启动该服务的监听
-        match load_service_watch_config(&state.db, &project_id, sid)? {
-            Some(cfg) => vec![cfg],
-            None => {
-                // 返回 Ok 但没有任何路径进入监听：显式记录，避免"点了监听什么都没发生"
-                log::warn!("[nexus] 服务 {} 未进入文件监听：不属于项目 {}、未开启监听模式或未配置监听路径", sid, project_id);
-                return Ok(());
+        let new_services = if let Some(sid) = service_id.as_deref() {
+            // 单服务模式：只启动该服务的监听
+            match load_service_watch_config(&state.db, &project_id, sid)? {
+                Some(cfg) => vec![cfg],
+                None => {
+                    // 返回 Ok 但没有任何路径进入监听：显式记录，避免"点了监听什么都没发生"
+                    log::warn!("[nexus] 服务 {} 未进入文件监听：不属于项目 {}、未开启监听模式或未配置监听路径", sid, project_id);
+                    return Ok(());
+                }
             }
-        }
-    } else {
-        // 项目模式：启动所有启用监听的服务
-        load_project_watch_configs(&state.db, &project_id)?
-    };
+        } else {
+            // 项目模式：启动所有启用监听的服务
+            load_project_watch_configs(&state.db, &project_id)?
+        };
 
-    // 合并已有监听：取现有服务 + 新服务，去重（以 service id 为准）
-    let mut merged: Vec<ServiceWatchConfig> = new_services;
-    if service_id.is_some() {
-        // 追加模式：保留已有服务中不在新增列表里的
-        if let Some(existing) = state.file_watcher.get_watched_services(&project_id) {
-            let new_ids: std::collections::HashSet<String> = merged.iter().map(|s| s.id.clone()).collect();
-            for svc in existing {
-                if !new_ids.contains(&svc.id) {
-                    merged.push(svc);
+        // 合并已有监听：取现有服务 + 新服务，去重（以 service id 为准）
+        let mut merged: Vec<ServiceWatchConfig> = new_services;
+        if service_id.is_some() {
+            // 追加模式：保留已有服务中不在新增列表里的
+            if let Some(existing) = state.file_watcher.get_watched_services(&project_id) {
+                let new_ids: std::collections::HashSet<String> = merged.iter().map(|s| s.id.clone()).collect();
+                for svc in existing {
+                    if !new_ids.contains(&svc.id) {
+                        merged.push(svc);
+                    }
                 }
             }
         }
-    }
 
-    state.file_watcher.start_watching(
-        &project_id,
-        &project_name,
-        &merged,
-        move |event: FileChangeEvent| {
-            let _ = app.emit("file-changed", event);
-        },
-    )
+        // 事件回调需要拥有 AppHandle：`state` 借用了 app，不能把 app 本身移进闭包
+        let emit_app = app.clone();
+        state.file_watcher.start_watching(
+            &project_id,
+            &project_name,
+            &merged,
+            move |event: FileChangeEvent| {
+                let _ = emit_app.emit("file-changed", event);
+            },
+        )
+    }).await.map_err(|e| format!("启动文件监听任务失败: {}", e))?
 }
 
 /// 从项目监听中移除单服务；无剩余服务时停止整个项目监听。
@@ -230,12 +239,18 @@ pub(crate) fn refresh_service_watch(
 ///
 /// - `service_id` 为空：停止整个项目的监听
 /// - `service_id` 非空：仅移除该服务，剩余服务继续监听
+///
+/// 异步 + spawn_blocking：`stop_watching` 要 join 监听线程，`remove_service_watch`
+/// 还可能重建 notify watcher（同上，Windows 下是目录树枚举 + 系统调用）。
 #[tauri::command]
-pub fn stop_watching(app: AppHandle, state: State<AppState>, project_id: String, service_id: Option<String>) -> Result<(), String> {
+pub async fn stop_watching(app: AppHandle, project_id: String, service_id: Option<String>) -> Result<(), String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-
-    match service_id {
-        None => state.file_watcher.stop_watching(&project_id),
-        Some(sid) => remove_service_watch(app, &state, &project_id, &sid),
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        match service_id {
+            None => state.file_watcher.stop_watching(&project_id),
+            // 同理：state 借用了 app，这里传一份克隆
+            Some(sid) => remove_service_watch(app.clone(), &state, &project_id, &sid),
+        }
+    }).await.map_err(|e| format!("停止文件监听任务失败: {}", e))?
 }

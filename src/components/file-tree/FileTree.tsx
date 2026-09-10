@@ -12,6 +12,39 @@ import { getDirColorClass } from '../../utils/fileColors';
 import type { FileEntry } from '../../types/file';
 
 const getExtension = (name: string) => (name.split('.').pop() ?? '').toLowerCase();
+
+/** 粘贴结果：created 为已落盘路径，failed 为逐个源的失败原因（空数组 = 全部成功） */
+interface PasteFilesResult {
+  created: string[];
+  failed: string[];
+}
+
+/**
+ * 粘贴系统剪贴板文件到目标目录，随后刷新。
+ *
+ * 抽出来是因为两处入口（目录右键 / 空白区右键到项目根）此前各写一遍，
+ * 且都把"部分成功"报成"已粘贴 N 个项目"——后端现在会回传失败清单，这里统一处理。
+ */
+async function pasteInto(targetDir: string, refresh: () => void) {
+  try {
+    const res = await invoke<PasteFilesResult>('paste_files', { targetDir });
+    if (res.failed.length > 0) {
+      showNotification({
+        variant: 'error',
+        title: res.created.length > 0
+          ? `已粘贴 ${res.created.length} 个，${res.failed.length} 个失败`
+          : `粘贴失败（${res.failed.length} 个）`,
+        description: res.failed.join('; '),
+      });
+    } else {
+      showNotification({ variant: 'success', title: `已粘贴 ${res.created.length} 个项目` });
+    }
+    refresh();
+  } catch (err) {
+    console.error('粘贴失败:', err);
+    showNotification({ variant: 'error', title: String(err) });
+  }
+}
 const INDENT_STEP = 14;
 const BASE_PADDING = 18;
 /** 目录展开时初始渲染条数，超出后显示"加载更多" */
@@ -19,8 +52,27 @@ const INITIAL_RENDER_LIMIT = 200;
 
 /* ---- jar 虚拟节点（树内展开 jar 条目） ---- */
 
-/** jar 内目录节点的预构建子树缓存：合成目录路径（以 / 结尾）→ 子节点列表 */
+/**
+ * jar 内目录节点的预构建子树缓存：合成目录路径（以 / 结尾）→ 子节点列表。
+ *
+ * **必须有上限**：这是模块级 Map，跨组件卸载活到进程结束。一个 3 万条目的 fat jar
+ * 会产生数千个目录键，反复浏览不同的 jar 时只增不减（真实内存泄漏）。
+ * 按插入顺序淘汰最旧的键（Map 保持插入顺序），上限远大于"同时展开的目录数"。
+ * 淘汰后若用户再展开该目录，展开逻辑会重新列出承载它的 jar 并重建缓存（见 Entry 展开分支）。
+ */
+const JAR_TREE_CACHE_MAX = 512;
 const jarTreeCache = new Map<string, FileEntry[]>();
+
+function jarTreeCacheSet(key: string, value: FileEntry[]) {
+  // 重新写入的键要移到队尾，否则"刚用过"的目录会被优先淘汰
+  jarTreeCache.delete(key);
+  jarTreeCache.set(key, value);
+  while (jarTreeCache.size > JAR_TREE_CACHE_MAX) {
+    const oldest = jarTreeCache.keys().next();
+    if (oldest.done) break;
+    jarTreeCache.delete(oldest.value);
+  }
+}
 
 /** 路径段树节点 */
 interface JarTreeNode {
@@ -53,7 +105,7 @@ function buildJarTree(realPath: string, nested: string[], entries: JarEntryInfo[
       const childPath = `${dirPath}${name}`;
       if (node.children) {
         const dirPathWithSlash = `${childPath}/`;
-        jarTreeCache.set(dirPathWithSlash, walk(node.children, dirPathWithSlash));
+        jarTreeCacheSet(dirPathWithSlash, walk(node.children, dirPathWithSlash));
         dirs.push({ name, path: dirPathWithSlash, is_dir: true, size: 0, extension: null });
       } else {
         const e = node.entry!;
@@ -134,7 +186,17 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     try {
       if (isJarPath) {
         // jar 内目录：展开构建时预缓存的子树
-        const cached = jarTreeCache.get(e.path);
+        let cached = jarTreeCache.get(e.path);
+        if (!cached) {
+          // 缓存未命中（被 LRU 淘汰，或首次进入）：重新列出**承载它的那一层**并重建虚拟树，
+          // 重建过程会把整棵子树的目录都回填进缓存。不能落到下面的"按嵌套 jar 处理"分支——
+          // 那会把普通目录当成嵌套 jar 去打开，必然失败。
+          const { jarPath, nested } = parseJarVirtualPath(e.path);
+          const list = await listJar(jarPath, nested);
+          if (seq !== toggleSeqRef.current) return;
+          buildJarTree(jarPath, nested, list);
+          cached = jarTreeCache.get(e.path);
+        }
         if (cached) {
           if (seq !== toggleSeqRef.current) return;
           setKids(cached);
@@ -219,7 +281,9 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
       await navigator.clipboard.writeText(e.path);
       showNotification({ variant: 'success', title: '路径已复制' });
     } catch (err) {
+      // 剪贴板受权限门控，失败必须告知：原实现只写 console，用户点了"复制"却什么都没发生
       console.error('复制路径失败:', err);
+      showNotification({ variant: 'error', title: '复制路径失败', description: String(err) });
     }
   };
 
@@ -231,6 +295,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
       showNotification({ variant: 'success', title: '文件名已复制' });
     } catch (err) {
       console.error('复制文件名失败:', err);
+      showNotification({ variant: 'error', title: '复制文件名失败', description: String(err) });
     }
   };
 
@@ -255,14 +320,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
   // 粘贴系统剪贴板中的文件到当前目录（成功后刷新目录）
   const handlePaste = async () => {
     setContextMenu(null);
-    try {
-      const created = await invoke<string[]>('paste_files', { targetDir: e.path });
-      showNotification({ variant: 'success', title: `已粘贴 ${created.length} 个项目` });
-      reloadDir();
-    } catch (err) {
-      console.error('粘贴失败:', err);
-      showNotification({ variant: 'error', title: String(err) });
-    }
+    await pasteInto(e.path, reloadDir);
   };
 
   // 右键菜单
@@ -541,14 +599,7 @@ export function FileTree({ rootPath, embedded }: {
   const handlePasteToRoot = async () => {
     setRootMenu(null);
     if (!rootPath) return;
-    try {
-      const created = await invoke<string[]>('paste_files', { targetDir: rootPath });
-      showNotification({ variant: 'success', title: `已粘贴 ${created.length} 个项目` });
-      loadRoot();
-    } catch (err) {
-      console.error('粘贴失败:', err);
-      showNotification({ variant: 'error', title: String(err) });
-    }
+    await pasteInto(rootPath, loadRoot);
   };
 
   const basePadding = embedded ? 4 : BASE_PADDING;

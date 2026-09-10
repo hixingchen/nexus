@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { serviceApi, type Service, type ToolCommand } from '../../services/service';
+import { serviceApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useToolStore } from '../../stores/toolStore';
 import { ToolsManagerModal } from './ToolsManagerModal';
@@ -41,14 +41,10 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // 工具命令状态
-  const [toolCommands, setToolCommands] = useState<ToolCommand[]>(() => {
-    try {
-      return JSON.parse(service.tool_commands || '[]');
-    } catch {
-      return [];
-    }
-  });
+  // 工具命令状态（DB 里的 TEXT 列属不受信数据，用带校验的解析器而不是裸 JSON.parse）
+  const [toolCommands, setToolCommands] = useState<ToolCommand[]>(
+    () => parseToolCommands(service.tool_commands),
+  );
   const [editingToolCmd, setEditingToolCmd] = useState<ToolCommand | null>(null);
   const [showToolCmdForm, setShowToolCmdForm] = useState(false);
   const [showToolManager, setShowToolManager] = useState(false);

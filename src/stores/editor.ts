@@ -96,8 +96,15 @@ export function parseJarVirtualPath(path: string): { jarPath: string; nested: st
   return { jarPath, nested, name };
 }
 
-/** 每文件的原始字节特征（换行风格 + 编码）：保存时按此写回，保证字节保真 */
-const fileMetaCache = new Map<string, { lineEnding: 'lf' | 'crlf' | 'cr'; encoding: 'utf8' | 'gb18030' }>();
+/** 每文件的原始字节特征（换行风格 + 编码 + 读取时 mtime）：保存时按此写回，保证字节保真；
+ *  mtime 用于保存前检测"文件已被外部改动"，避免静默覆盖 IDE/git 改过的版本 */
+interface FileMeta {
+  lineEnding: 'lf' | 'crlf' | 'cr';
+  encoding: 'utf8' | 'gb18030';
+  /** 读取/上次写入后的修改时间（毫秒）；null = 未知（新建或读不到） */
+  modified: number | null;
+}
+const fileMetaCache = new Map<string, FileMeta>();
 
 /** 读取文本内容：jar 内条目走 jar 读取，.class 走 CFR/字节码视图，其余走 read_file（二进制抛 BINARY） */
 async function fetchTextContent(path: string): Promise<{ content: string; size: number }> {
@@ -112,7 +119,8 @@ async function fetchTextContent(path: string): Promise<{ content: string; size: 
   }
   const res = await editorService.readFile(path);
   if (res.is_binary) throw new Error('BINARY');
-  fileMetaCache.set(path, { lineEnding: res.lineEnding, encoding: res.encoding });
+  // jar 内条目/class 无磁盘 mtime 概念：清掉旧值，避免把上一个同名文件的 mtime 带过来
+  fileMetaCache.set(path, { lineEnding: res.lineEnding, encoding: res.encoding, modified: res.modified });
   return { content: res.content, size: res.size };
 }
 
@@ -478,7 +486,13 @@ export async function locateFile(path: string, name: string, line: number, query
 /**
  * 保存当前活动标签（Ctrl+S / 保存按钮），成功返回 true
  * 保存后清 dirty 并同步更新缓存
+ *
+ * 保存期间禁止重入：连按两次 Ctrl+S 会对同一路径发起两个并发写入，
+ * 后到的 rename 失败并把"保存文件失败"报给用户，而文件其实已写成功、
+ * dirty 标记却因为走了错误分支而清不掉（用户看到"保存失败 + 未保存"的双重误导）。
  */
+let savingInFlight = false;
+
 export async function saveActiveFile(): Promise<boolean> {
   const { tabs, activeTabId, fileContent } = useEditorStore.getState();
   if (!activeTabId) return false;
@@ -493,6 +507,8 @@ export async function saveActiveFile(): Promise<boolean> {
     showNotification({ variant: 'error', title: '文件内容未加载，已取消保存' });
     return false;
   }
+  if (savingInFlight) return false;
+  savingInFlight = true;
   try {
     // 写盘前捕获快照：markClean 的基线必须等于实际写入磁盘的内容，
     // 不能用 await 后的 fileContent（保存期间用户可能已继续编辑）
@@ -501,19 +517,35 @@ export async function saveActiveFile(): Promise<boolean> {
     // "编辑→撤销→保存"后的字节与原始文件不同（git 误报变更）
     const meta = fileMetaCache.get(tab.path);
     const bytesToWrite = meta ? toOriginalEnding(contentToSave, meta.lineEnding) : contentToSave;
-    await editorService.writeFile(tab.path, bytesToWrite, meta?.encoding);
+    // 回传打开时的 mtime：磁盘已被外部改动时后端拒绝写入，不再静默覆盖（P0-1）
+    const newModified = await editorService.writeFile(tab.path, bytesToWrite, meta?.encoding, meta?.modified ?? null);
     // 保存期间标签可能已被关闭：此时不再写缓存与基线（markClean 内部也会校验）
     if (useEditorStore.getState().tabs.some(t => t.id === activeTabId)) {
       // 缓存与基线存编辑器内容（不转换），切换标签/撤销比较都在编辑器内容维度
       setCacheContent(tab.path, contentToSave);
+      // 刷新 mtime 基线：否则下一次保存会拿打开时的旧值比对，被自己的上次写入判成冲突
+      if (meta) meta.modified = newModified;
       useEditorStore.getState().markClean(activeTabId, contentToSave);
     }
     showNotification({ title: `已保存「${tab.name}」` });
     return true;
   } catch (e) {
     console.error('保存文件失败:', e);
-    showNotification({ variant: 'error', title: '保存文件失败', description: String(e) });
+    // 冲突单独提示：这是"文件被别的工具改过"，用户需要重新加载而不是反复重试
+    const msg = String(e);
+    if (msg.includes('已被外部修改')) {
+      showNotification({
+        variant: 'warning',
+        title: '文件已被其他程序修改，未保存',
+        description: '请关闭标签后重新打开以载入磁盘上的最新内容（如需保留当前修改，请先复制）',
+        duration: 8000,
+      });
+    } else {
+      showNotification({ variant: 'error', title: '保存文件失败', description: msg });
+    }
     return false;
+  } finally {
+    savingInFlight = false;
   }
 }
 

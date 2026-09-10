@@ -33,7 +33,7 @@ pub struct AiStatus {
 }
 
 /// 组装状态快照（不持锁调用 dsh 检测）
-fn snapshot(state: &AppState) -> AiStatus {
+fn snapshot(state: &AppState, app: &AppHandle) -> AiStatus {
     let (running, url, pid, cwd) = match state.ai.lock() {
         Ok(mut h) => match h.as_mut() {
             Some(s) => {
@@ -52,7 +52,7 @@ fn snapshot(state: &AppState) -> AiStatus {
             (false, None, None, None)
         }
     };
-    let dsh_found = if running { true } else { crate::core::ai::dsh_available() };
+    let dsh_found = if running { true } else { crate::core::ai::dsh_available(app) };
     AiStatus { running, url, pid, cwd, dsh_found }
 }
 
@@ -61,7 +61,7 @@ fn snapshot(state: &AppState) -> AiStatus {
 pub async fn ai_status(app: AppHandle) -> Result<AiStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        Ok(snapshot(&state))
+        Ok(snapshot(&state, &app))
     }).await.map_err(|e| format!("查询 AI 会话状态任务失败: {}", e))?
 }
 
@@ -82,7 +82,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         }
 
         // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
-        if !crate::core::ai::dsh_available() {
+        if !crate::core::ai::dsh_available(&app) {
             return Err("未检测到 dsh（DeepSeek Harness CLI），请先安装：npm i -g @deepseek-ai/dsh，然后重试".into());
         }
 
@@ -143,7 +143,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             return Err("已取消：会话被更新的请求取代".into());
         }
 
-        let status = snapshot(&state);
+        let status = snapshot(&state, &app);
         log::info!("[ai] dsh web 就绪 (pid={})", status.pid.unwrap_or(0));
         Ok(status)
     }).await.map_err(|e| format!("启动 AI 会话任务失败: {}", e))?
@@ -191,7 +191,7 @@ pub struct DshVersionInfo {
 #[tauri::command]
 pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if !crate::core::ai::dsh_available() {
+        if !crate::core::ai::dsh_available(&app) {
             // 未安装：无需联网查，UI 直接给「安装」入口
             return Ok(DshVersionInfo { dsh_found: false, current: None, latest: None, outdated: false });
         }

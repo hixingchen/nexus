@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, processApi, watchApi, type Service, type ToolCommand } from '../../services/service';
+import { openToolsApi, processApi, watchApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
 import { useToolStore } from '../../stores/toolStore';
 import { showNotification } from '../ui/Toast';
@@ -48,14 +48,11 @@ export function ServiceTreeEntry({
   const openTools = useToolStore(s => s.openTools);
   const boundTool = openTools.find(t => t.id === boundToolId);
 
-  // 解析工具命令
-  const toolCommands = useMemo(() => {
-    try {
-      return JSON.parse(service.tool_commands || '[]') as ToolCommand[];
-    } catch {
-      return [];
-    }
-  }, [service.tool_commands]);
+  // 解析工具命令（DB 里的 TEXT 列属不受信数据，用带校验的解析器而不是裸 as 断言）
+  const toolCommands = useMemo(
+    () => parseToolCommands(service.tool_commands),
+    [service.tool_commands],
+  );
 
   const handleAction = async (e: React.MouseEvent, action: 'start' | 'stop' | 'restart') => {
     e.stopPropagation();
@@ -256,11 +253,14 @@ const ContextMenu = ({ x, y, cwd, openToolName, toolCommands, onOpenWithTool, on
   }, [onClose]);
   // 计算菜单位置，确保不超出屏幕
   const menuStyle = useMemo(() => {
-    const menuWidth = 200;
-    // 工具分组（33px）+ 资源管理器/终端组 + 工具命令组 + 删除组
+    // 常量必须与下面 JSX 里的 `w-[180px]` 一致：原实现写 200 而实际渲染 180，
+    // 水平夹取乐观了 20px，菜单最后一项可能落到屏幕外点不到
+    const menuWidth = 180;
+    const menuEdgeGap = 8;
+    /** 菜单项高度（px）：工具分组 33 + 其余每组 36，末尾固定留白 80 */
     const menuHeight = (openToolName ? 33 : 0) + toolCommands.length * 36 + 80;
-    const maxX = window.innerWidth - menuWidth - 8;
-    const maxY = window.innerHeight - menuHeight - 8;
+    const maxX = window.innerWidth - menuWidth - menuEdgeGap;
+    const maxY = window.innerHeight - menuHeight - menuEdgeGap;
     return {
       left: Math.min(x, maxX),
       top: Math.min(y, maxY),

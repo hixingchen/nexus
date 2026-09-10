@@ -12,12 +12,23 @@ use crate::core::file_watcher::FileWatcher;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
 
+/// 允许根解析缓存：(原始根字符串列表, 已 canonicalize 的 PathBuf 列表)。
+/// 键为原始列表 → DB 增删服务/模板后自动失效，无需在写入点手动清缓存。
+pub type AllowedRootsCache =
+    std::sync::Mutex<Option<(Vec<String>, std::sync::Arc<Vec<std::path::PathBuf>>)>>;
+
 pub struct AppState {
     pub db: Database,
     pub process_mgr: ProcessManager,
     pub file_watcher: FileWatcher,
     // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
     pub project_root: std::sync::Mutex<Option<String>>,
+    /// 允许访问根目录的解析缓存（见 `AllowedRootsCache`）。
+    ///
+    /// 为什么按"原始列表"做缓存键而不是手动失效：漏一处失效调用就会出现
+    /// "新加的服务目录打不开文件"。canonicalize 是这条热路径上真正的开销
+    /// （每个根一次文件系统路径解析），而 SQL 只查一张小表且有索引。
+    pub allowed_roots_cache: AllowedRootsCache,
     /// 内嵌 dsh web（AI 助手 iframe 会话）；None = 未运行
     pub ai: std::sync::Mutex<Option<AiSession>>,
     /// 会话代数：每次 start/stop 递增，启动中的进程据此识别「被取代」并自杀
@@ -143,6 +154,7 @@ pub fn run() {
             process_mgr,
             file_watcher: FileWatcher::new(),
             project_root: std::sync::Mutex::new(None),
+            allowed_roots_cache: std::sync::Mutex::new(None),
             ai: std::sync::Mutex::new(None),
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
         })

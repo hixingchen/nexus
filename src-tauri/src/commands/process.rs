@@ -52,6 +52,17 @@ impl Drop for RunTableGuard {
     }
 }
 
+/// 早退路径的统一收尾：终止并**回收**已 spawn 的子进程，然后返回该错误。
+///
+/// 为什么需要：`RunTableGuard` 只清运行表项，不负责进程生命周期。spawn 之后的
+/// 任一 `?` 早退（取管道失败、读取线程创建失败）会让 `child` 直接 drop——
+/// 进程变成"存活但已从运行表摘除"，`stop_tool_command` 再也找不到它。
+/// 服务进程路径在同样失败时会 `kill_process_tree`，这里此前没有对应处理。
+fn kill_then<T>(child: &mut std::process::Child, msg: String) -> Result<T, String> {
+    crate::core::process::kill_and_reap(child, Duration::from_millis(2000));
+    Err(msg)
+}
+
 /// 查询服务信息（name, command, cwd, project_id, env_vars）
 fn get_service_info(db: &crate::database::Database, service_id: &str) -> Result<(String, String, String, String, String), String> {
     db.with_conn(|conn| {
@@ -96,15 +107,23 @@ pub struct ProcessStatus {
 
 // ─── Tauri Commands ───────────────────────────────────────────
 
+/// 启动单个服务。
+///
+/// 异步 + spawn_blocking：spawn 进程、绑定 Job Object、建 2 个 reader 线程都是阻塞操作，
+/// 且 `start()` 的 TOCTOU 分支可能进入 `cleanup_process`（taskkill + 最长 2s + 2×1s）。
+/// 同族的 stop/restart/get_running 早已隔离，只有"启动"这一侧此前遗漏。
 #[tauri::command]
-pub fn start_service(state: State<AppState>, app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
+pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
-    let envs = crate::core::process::parse_env_vars(&env_vars)?;
-    state.process_mgr.start(crate::core::process::ServiceSpawn {
-        project_id: &project_id, service_id: &service_id, name: &name,
-        command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app_handle,
-    }).map_err(|e| format!("服务「{}」{}", name, e))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
+        let envs = crate::core::process::parse_env_vars(&env_vars)?;
+        state.process_mgr.start(crate::core::process::ServiceSpawn {
+            project_id: &project_id, service_id: &service_id, name: &name,
+            command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app_handle,
+        }).map_err(|e| format!("服务「{}」{}", name, e))
+    }).await.map_err(|e| format!("启动服务任务失败: {}", e))?
 }
 
 /// 停止服务（清理含 taskkill + 等待 reader 线程，最长数秒 → 异步执行避免阻塞 IPC）
@@ -132,44 +151,53 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
 
+/// 一键启动项目全部已启用服务。
+///
+/// 异步 + spawn_blocking：本命令会**串行** spawn 每个服务，并且先调 `running()`
+/// 为已退出进程收尸（taskkill + 最长 2s + 2×1s per 进程）。同步执行时这段工作
+/// 内联在 IPC 请求路径上，会与所有其他 invoke（含 3 秒轮询 get_running）排队，
+/// 前端点"全部启动"后整体失去响应。同族的 stop_project_services 早就隔离了。
 #[tauri::command]
-pub fn start_project_services(state: State<AppState>, app_handle: tauri::AppHandle, project_id: String) -> Result<Vec<String>, String> {
+pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: String) -> Result<Vec<String>, String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    let services = state.db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, command, cwd, env_vars FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
-        ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
-        let rows = stmt.query_map([&project_id], |row| {
-            Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?, row.get::<_,String>(4)?))
-        }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
-        let mut svcs = Vec::new();
-        for r in rows { svcs.push(r.map_err(|e| format!("解析项目服务数据失败: {}", e))?); }
-        Ok::<_, String>(svcs)
-    })?;
-    let mut errors = Vec::new();
-    // 已在运行的服务跳过（start 对已运行返回"已在运行中"，混在 errors 里会误报启动失败）
-    let running_ids: std::collections::HashSet<String> = state.process_mgr.running()
-        .into_iter().map(|(_, service_id)| service_id).collect();
-    for (id, name, cmd, cwd, env_vars) in &services {
-        if running_ids.contains(id) { continue; }
-        // 环境变量非法同样计入本次批量启动的失败列表（原实现解析失败会静默忽略该服务）
-        let envs = match crate::core::process::parse_env_vars(env_vars) {
-            Ok(v) => v,
-            Err(e) => { errors.push(format!("{}: {}", name, e)); continue; }
-        };
-        if let Err(e) = state.process_mgr.start(crate::core::process::ServiceSpawn {
-            project_id: &project_id, service_id: id, name, command: cmd, cwd,
-            env_vars: &envs, app_handle: &app_handle,
-        }) {
-            errors.push(format!("{}: {}", name, e));
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        let services = state.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, command, cwd, env_vars FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
+            ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
+            let rows = stmt.query_map([&project_id], |row| {
+                Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?, row.get::<_,String>(4)?))
+            }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
+            let mut svcs = Vec::new();
+            for r in rows { svcs.push(r.map_err(|e| format!("解析项目服务数据失败: {}", e))?); }
+            Ok::<_, String>(svcs)
+        })?;
+        let mut errors = Vec::new();
+        // 已在运行的服务跳过（start 对已运行返回"已在运行中"，混在 errors 里会误报启动失败）
+        let running_ids: std::collections::HashSet<String> = state.process_mgr.running()
+            .into_iter().map(|(_, service_id)| service_id).collect();
+        for (id, name, cmd, cwd, env_vars) in &services {
+            if running_ids.contains(id) { continue; }
+            // 环境变量非法同样计入本次批量启动的失败列表（原实现解析失败会静默忽略该服务）
+            let envs = match crate::core::process::parse_env_vars(env_vars) {
+                Ok(v) => v,
+                Err(e) => { errors.push(format!("{}: {}", name, e)); continue; }
+            };
+            if let Err(e) = state.process_mgr.start(crate::core::process::ServiceSpawn {
+                project_id: &project_id, service_id: id, name, command: cmd, cwd,
+                env_vars: &envs, app_handle: &app_handle,
+            }) {
+                errors.push(format!("{}: {}", name, e));
+            }
         }
-    }
-    Ok(errors)
+        Ok(errors)
+    }).await.map_err(|e| format!("启动项目服务任务失败: {}", e))?
 }
 
 /// 停止项目全部服务（每服务清理最长数秒 × N → 异步执行避免阻塞 IPC）
 #[tauri::command]
-pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) -> Result<(), String> {
+pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) -> Result<Vec<String>, String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -183,12 +211,21 @@ pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) ->
             for r in rows { ids.push(r.map_err(|e| format!("解析项目服务失败: {}", e))?); }
             Ok::<_, String>(ids)
         })?;
+        // 逐个停止并**收集失败**：原实现 `let _ = stop(id)` 丢弃错误，命令恒返回成功，
+        // 用户看到"已停止"而进程还在跑（与 start_project_services 返回失败列表对齐）
+        let mut errors = Vec::new();
         for id in &ids {
-            let _ = state.process_mgr.stop(id);
+            if let Err(e) = state.process_mgr.stop(id) {
+                log::warn!("[nexus] 停止服务 {} 失败: {}", id, e);
+                errors.push(format!("{}: {}", id, e));
+            }
         }
         // 停止项目级文件监听（项目停止 = 总开关，所有服务监听一并关闭）
-        let _ = state.file_watcher.stop_watching(&project_id);
-        Ok(())
+        if let Err(e) = state.file_watcher.stop_watching(&project_id) {
+            log::warn!("[nexus] 停止项目文件监听失败: {}", e);
+            errors.push(format!("文件监听: {}", e));
+        }
+        Ok(errors)
     }).await.map_err(|e| format!("停止项目服务任务失败: {}", e))?
 }
 
@@ -209,10 +246,18 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
     }).await.map_err(|e| format!("获取运行状态任务失败: {}", e))?
 }
 
+/// 读取服务的日志快照。
+///
+/// 异步 + spawn_blocking：`get_logs` 会在日志锁内克隆最多 2000 条 `LogLine`
+/// （每行 3 个 String，最坏约 16MB）并参与 IPC 序列化。同步执行时这段工作内联在
+/// IPC 请求路径上，与日志面板的轮询/切换叠加会造成可感的卡顿。
 #[tauri::command]
-pub fn get_service_logs(state: State<AppState>, service_key: String) -> Result<Vec<LogLine>, String> {
+pub async fn get_service_logs(app: tauri::AppHandle, service_key: String) -> Result<Vec<LogLine>, String> {
     if service_key.trim().is_empty() { return Err("服务标识不能为空".into()); }
-    Ok(state.process_mgr.get_logs(&service_key))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(state.process_mgr.get_logs(&service_key))
+    }).await.map_err(|e| format!("读取服务日志任务失败: {}", e))?
 }
 
 /// 执行工具命令（流式输出 + 结束返回完整结果）
@@ -301,8 +346,14 @@ pub async fn run_tool_command(
                 job.assign_child(&child);
             }
 
-            let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
-            let stderr = child.stderr.take().ok_or("无法获取 stderr")?;
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => return kill_then(&mut child, "无法获取 stdout".to_string()),
+            };
+            let stderr = match child.stderr.take() {
+                Some(s) => s,
+                None => return kill_then(&mut child, "无法获取 stderr".to_string()),
+            };
 
             // stdout/stderr 各起一个读取线程：逐行 emit 事件 + 收集 (序号, 行)
             // 序号为全局递增计数，结束时按序号合并，还原两流的真实交错顺序
@@ -339,8 +390,14 @@ pub async fn run_tool_command(
                         .map_err(|e| format!("创建{stream}读取线程失败: {}", e))
                 }
             };
-            let stdout_handle = spawn_reader("stdout", Box::new(stdout))?;
-            let stderr_handle = spawn_reader("stderr", Box::new(stderr))?;
+            let stdout_handle = match spawn_reader("stdout", Box::new(stdout)) {
+                Ok(h) => h,
+                Err(e) => return kill_then(&mut child, e),
+            };
+            let stderr_handle = match spawn_reader("stderr", Box::new(stderr)) {
+                Ok(h) => h,
+                Err(e) => return kill_then(&mut child, e),
+            };
 
             let status = child.wait().map_err(|e| format!("等待命令退出失败: {}", e))?;
             let mut all: Vec<_> = stdout_handle.join().map_err(|_| "stdout 读取线程异常".to_string())?

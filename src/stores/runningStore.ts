@@ -11,10 +11,12 @@ let intervalId: ReturnType<typeof setInterval> | null = null;
 
 /**
  * 比对两组运行/失败列表是否等价（逐字段、按下标）。
- * 抽到模块级供 refresh 与 setRunning 共用：后端每次返回的是新数组，
+ * 供 refresh 与 setRunning 共用：后端每次返回的是新数组，
  * 内容未变时照样 set 等于换引用，会把所有订阅方（项目行/服务面板/展开的目录树）全部重渲染。
+ *
+ * 仅供本 store 使用，故不导出（仅文件内使用的工具函数不对外暴露）。
  */
-export function sameStatus(a: RunningService[], b: RunningService[], af: FailedService[], bf: FailedService[]): boolean {
+function sameStatus(a: RunningService[], b: RunningService[], af: FailedService[], bf: FailedService[]): boolean {
   return a.length === b.length
     && af.length === bf.length
     && a.every((x, i) => {

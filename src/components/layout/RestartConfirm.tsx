@@ -26,7 +26,10 @@ export function RestartConfirm() {
   const cardRight = aiPanelVisible ? aiPanelWidth + 24 : 24;
 
   useEffect(() => {
-    const unlisten = listen<FileChangeEvent>('file-changed', (event) => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<FileChangeEvent>('file-changed', (event) => {
+      if (disposed) return;
       const { changes } = event.payload;
       for (const c of changes) {
         if (c.service_name === '(project)' || !c.service_id) continue;
@@ -65,8 +68,20 @@ export function RestartConfirm() {
           return next;
         });
       }
+    }).then(fn => {
+      if (disposed) { fn(); return; }
+      unlisten = fn;
+    }).catch((e) => {
+      // 订阅失败 = "改动文件后提示重启"整体失效，用户只会觉得"改了没反应"
+      console.error('订阅 file-changed 失败:', e);
+      showNotification({
+        variant: 'error',
+        title: '文件变更订阅失败',
+        description: '监听文件发生变化时将不再提示重启，请重启应用',
+        duration: 8000,
+      });
     });
-    return () => { unlisten.then(fn => fn()); };
+    return () => { disposed = true; unlisten?.(); };
   }, []);
 
   const handleRestart = useCallback(async (item: ConfirmItem) => {

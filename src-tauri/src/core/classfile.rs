@@ -641,8 +641,9 @@ enum Operand {
     U1,    // 单字节索引（iload/ldc 等）
     I1,    // 单字节有符号立即数（bipush）
     U2,    // 常量池/局部变量索引（getstatic/ldc_w 等）
-    I2,    // 双字节有符号偏移（ifeq/goto 等）
-    I4,    // 四字节有符号偏移（goto_w/jsr_w）
+    I2,    // 双字节有符号**分支偏移**（ifeq/goto 等）：目标 = opcode 地址 + offset
+    I4,    // 四字节有符号**分支偏移**（goto_w/jsr_w）：目标 = opcode 地址 + offset
+    I2Value, // 双字节有符号**立即数**（sipush）：值原样展示，不加任何基址
     U1I1,  // iinc
     I2U1,  // invokeinterface：index u2, count u1, 0
     U2Z1,  // invokedynamic：index u2, 0, 0
@@ -674,7 +675,7 @@ fn opcode_info(op: u8) -> (&'static str, Operand) {
         0x0e => ("dconst_0", None),
         0x0f => ("dconst_1", None),
         0x10 => ("bipush", I1),
-        0x11 => ("sipush", I2),
+        0x11 => ("sipush", I2Value),
         0x12 => ("ldc", U1),
         0x13 => ("ldc_w", U2),
         0x14 => ("ldc2_w", U2),
@@ -923,13 +924,13 @@ fn disassemble_code(
                     return Err("tableswitch 范围过大（疑似损坏/恶意 class）".into());
                 }
                 let n = span as usize;
-                let total = r.pos as i64 + (n as i64) * 4; // 指令结束位置（偏移表尚未读取）
                 push_line(lines, pc, format!("tableswitch {{ // {} to {}", low, high));
                 for k in 0..n {
                     let target = r.i4()?;
-                    lines.push(format!("{:>14}: {}", low + k as i32, total + target as i64));
+                    // JVMS：目标 = opcode 地址 + offset（不能用指令结束地址 total）
+                    lines.push(format!("{:>14}: {}", low + k as i32, pc + target as i64));
                 }
-                lines.push(format!("{:>14}: {}", "default", total + default as i64));
+                lines.push(format!("{:>14}: {}", "default", pc + default as i64));
                 continue;
             }
             Operand::LookupSwitch => {
@@ -941,14 +942,14 @@ fn disassemble_code(
                     return Err("lookupswitch 键值对数非法".into());
                 }
                 let n = npairs as usize;
-                let total = r.pos as i64 + (n as i64) * 8; // 指令结束位置（键值对表尚未读取）
                 push_line(lines, pc, format!("lookupswitch {{ // {} keys", n));
                 for _ in 0..n {
                     let key = r.i4()?;
                     let target = r.i4()?;
-                    lines.push(format!("{:>14}: {}", key, total + target as i64));
+                    // 同 tableswitch：目标 = opcode 地址 + offset
+                    lines.push(format!("{:>14}: {}", key, pc + target as i64));
                 }
-                lines.push(format!("{:>14}: {}", "default", total + default as i64));
+                lines.push(format!("{:>14}: {}", "default", pc + default as i64));
                 continue;
             }
             Operand::Wide => {
@@ -989,13 +990,20 @@ fn disassemble_code(
             }
             Operand::I2 => {
                 let off = r.i2()?;
-                let target = pc + 3 + off as i64; // 指令总长 3
+                // JVMS：分支偏移相对**该指令 opcode 的地址**，不是指令结束地址
+                // （原实现加指令长度，使每条分支目标都偏移 +3）
+                let target = pc + off as i64;
                 line.push_str(&format!(" {}", target));
             }
             Operand::I4 => {
                 let off = r.i4()?;
-                let target = pc + 5 + off as i64; // 指令总长 5
+                // 同上：目标 = opcode 地址 + offset（原实现多加 5）
+                let target = pc + off as i64;
                 line.push_str(&format!(" {}", target));
+            }
+            Operand::I2Value => {
+                let v = r.i2()?;
+                line.push_str(&format!(" {}", v));
             }
             Operand::U1I1 => {
                 let idx = r.u1()?;
@@ -1396,6 +1404,57 @@ mod tests {
         b
     }
 
+    /// 手工构造一个最小 class（Java 8）：单个 `public static int m()` 方法，方法体为给定字节码。
+    ///
+    /// 为什么单独需要一个 fixture：`minimal_class` 的字节码只有
+    /// `aload_0 / invokespecial / return`，**不含任何分支或 switch 指令**——
+    /// 这正是"11 个单测齐全、分支目标却整体偏移"能长期存活的原因。
+    fn class_with_code(code: &[u8]) -> Vec<u8> {
+        let mut b = vec![];
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        u2(0, &mut b); // minor
+        u2(52, &mut b); // major = Java 8
+        u2(15, &mut b); // constant_pool_count
+        utf8("Test", &mut b); // #1
+        utf8("java/lang/Object", &mut b); // #2
+        u1(TAG_CLASS, &mut b); u2(2, &mut b); // #3 Class #2
+        utf8("<init>", &mut b); // #4
+        utf8("()V", &mut b); // #5
+        utf8("Code", &mut b); // #6
+        u1(TAG_METHODREF, &mut b); u2(3, &mut b); u2(8, &mut b); // #7 Methodref #3.#8
+        u1(TAG_NAME_AND_TYPE, &mut b); u2(4, &mut b); u2(5, &mut b); // #8 NameAndType #4.#5
+        utf8("LineNumberTable", &mut b); // #9
+        utf8("Test.java", &mut b); // #10
+        utf8("SourceFile", &mut b); // #11
+        utf8("m", &mut b); // #12
+        utf8("()I", &mut b); // #13
+        u1(TAG_NAME_AND_TYPE, &mut b); u2(12, &mut b); u2(13, &mut b); // #14 NameAndType #12.#13
+        u2(0x0021, &mut b); // ACC_PUBLIC | ACC_SUPER
+        u2(1, &mut b); // this_class
+        u2(3, &mut b); // super_class
+        u2(0, &mut b); // interfaces_count
+        u2(0, &mut b); // fields_count
+        u2(1, &mut b); // methods_count
+        // method: public static int m()
+        u2(0x0009, &mut b); // ACC_PUBLIC | ACC_STATIC
+        u2(12, &mut b); u2(13, &mut b);
+        u2(1, &mut b); // attributes_count
+        let mut code_attr = vec![];
+        u2(2, &mut code_attr); // max_stack
+        u2(1, &mut code_attr); // max_locals
+        u4(code.len() as u32, &mut code_attr);
+        code_attr.extend_from_slice(code);
+        u2(0, &mut code_attr); // exception_table_length
+        u2(0, &mut code_attr); // Code attributes_count
+        attr(6, &code_attr, &mut b);
+        // class attributes: SourceFile
+        u2(1, &mut b);
+        let mut sf = vec![];
+        u2(10, &mut sf);
+        attr(11, &sf, &mut b);
+        b
+    }
+
     /// 手工构造一个注解类（ApiLog：@Target 类注解 + 枚举默认值成员）
     fn annotation_class() -> Vec<u8> {
         let mut b = vec![];
@@ -1462,6 +1521,55 @@ mod tests {
         assert!(out.contains("java/lang/Object.\"<init>\":()V"), "成员引用注释错误:\n{}", out);
         assert!(out.contains("LineNumberTable"), "缺少行号表:\n{}", out);
         assert!(out.contains("line 3: 0"), "行号映射错误:\n{}", out);
+    }
+
+    /// 回归：分支目标必须相对**该指令 opcode 的地址**（JVMS §6.5：goto/if* 等
+    /// "目标 = opcode 地址 + offset"），而 `sipush` 的操作数是**立即数**、不能加任何基址。
+    /// 原实现用 `pc + 指令长度 + offset`，使每条分支目标偏移 +3/+5。
+    #[test]
+    fn test_disassemble_branch_targets_relative_to_opcode() {
+        // 0: sipush 300 | 3: pop | 4: ifeq 11(+7) | 7: iconst_0 | 8: goto 11(+3) | 11: iconst_1 | 12: ireturn
+        let code = [
+            0x11, 0x01, 0x2C, // 0: sipush 300
+            0x57,             // 3: pop
+            0x99, 0x00, 0x07, // 4: ifeq 11   （偏移 +7）
+            0x03,             // 7: iconst_0
+            0xA7, 0x00, 0x03, // 8: goto 11   （偏移 +3）
+            0x04,             // 11: iconst_1
+            0xAC,             // 12: ireturn
+        ];
+        let out = disassemble_class(&class_with_code(&code)).unwrap();
+        assert!(out.contains("0: sipush 300"), "sipush 立即数被加了基址（应为 300）:\n{}", out);
+        assert!(!out.contains("sipush 303"), "sipush 立即数被加了指令长度:\n{}", out);
+        assert!(out.contains("4: ifeq 11"), "ifeq 目标应为 opcode 地址 + 偏移（11）:\n{}", out);
+        assert!(out.contains("8: goto 11"), "goto 目标应为 opcode 地址 + 偏移（11）:\n{}", out);
+        assert!(!out.contains("ifeq 14"), "ifeq 目标被多加了指称长度:\n{}", out);
+    }
+
+    /// 回归：tableswitch / lookupswitch 的目标同样相对 opcode 地址，
+    /// 不能用"指令结束地址"做基址（原实现使每个 case 目标多出整条指令长度）。
+    #[test]
+    fn test_disassemble_tableswitch_targets_relative_to_opcode() {
+        // pc0 的 tableswitch：padding = (4 - (0+1) % 4) % 4 = 3
+        // default=30, low=0, high=1, offsets=[26, 28]；偏移表读完时 r.pos = 24（指令结束）
+        let mut code = vec![0xAA];
+        code.extend_from_slice(&[0, 0, 0]); // 对齐填充
+        code.extend_from_slice(&30i32.to_be_bytes()); // default → 期望目标 30
+        code.extend_from_slice(&0i32.to_be_bytes()); // low
+        code.extend_from_slice(&1i32.to_be_bytes()); // high
+        code.extend_from_slice(&26i32.to_be_bytes()); // case 0 → 期望目标 26
+        code.extend_from_slice(&28i32.to_be_bytes()); // case 1 → 期望目标 28
+        code.extend_from_slice(&[
+            0x03, 0xAC, // 24: iconst_0; 25: ireturn
+            0x04, 0xAC, // 26: iconst_1; 27: ireturn
+            0x05, 0xAC, // 28: iconst_2; 29: ireturn
+            0x02, 0xAC, // 30: iconst_m1; 31: ireturn
+        ]);
+        let out = disassemble_class(&class_with_code(&code)).unwrap();
+        assert!(out.contains("0: 26"), "tableswitch case 0 目标应为 opcode 地址 + 偏移（26）:\n{}", out);
+        assert!(out.contains("1: 28"), "tableswitch case 1 目标应为 opcode 地址 + 偏移（28）:\n{}", out);
+        assert!(out.contains("default: 30"), "tableswitch default 目标应为 opcode 地址 + 偏移（30）:\n{}", out);
+        assert!(!out.contains("default: 54"), "default 被加了指令结束地址做基址:\n{}", out);
     }
 
     #[test]

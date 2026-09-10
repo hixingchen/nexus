@@ -20,11 +20,16 @@ export function HexViewer({ path }: { path: string }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [totalSize, setTotalSize] = useState<number | null>(null);
   const [pages, setPages] = useState<Map<number, number[]>>(new Map());
-  /** jar 内条目内存模式：整块字节数组（无后端分页） */
-  const [memoryBytes, setMemoryBytes] = useState<number[] | null>(null);
+  /** jar 内条目内存模式：整块字节数组（无后端分页）。
+   *  用 Uint8Array 而不是 `Array.from` 得到的 number[]：装箱数组约 8 字节/元素，
+   *  一个 50MB 条目会额外吃掉 400MB+；渲染时只按行（16 字节）转换。 */
+  const [memoryBytes, setMemoryBytes] = useState<Uint8Array | null>(null);
   const [err, setErr] = useState<string | null>(null);
   /** 在途页请求去重 */
   const inflight = useRef<Set<number>>(new Set());
+  /** 当前路径的实时值：在途分页请求返回时据此判断是否已切走 */
+  const pathRef = useRef(path);
+  pathRef.current = path;
 
   // 首屏加载：jar:// 条目一次性读入内存；磁盘文件分页加载页 0 并获得大小
   useEffect(() => {
@@ -33,13 +38,17 @@ export function HexViewer({ path }: { path: string }) {
     setPages(new Map());
     setMemoryBytes(null);
     setErr(null);
+    // 清在途标记：否则新文件的第 0 页会被旧文件的在途请求"占位"而永远不加载。
+    // 旧请求的响应由上面的 reqPath 判断丢弃，这里只负责解锁去重集合。
+    inflight.current.clear();
     if (path.startsWith('jar://')) {
       const { jarPath, nested, name } = parseJarVirtualPath(path);
       readJarEntryBytes(jarPath, nested, name)
         .then(({ bytes, size }) => {
           if (!alive) return;
           setTotalSize(size);
-          setMemoryBytes(Array.from(bytes));
+          // 直接持有 Uint8Array（readJarEntryBytes 已返回）；不转 number[]
+          setMemoryBytes(bytes);
         })
         .catch(e => {
           if (alive) setErr(String(e));
@@ -75,6 +84,10 @@ export function HexViewer({ path }: { path: string }) {
   // 可见行 → 所需页：缺失且不在途的才请求（内存模式无分页，跳过）
   useEffect(() => {
     if (totalSize === null || items.length === 0 || memoryBytes || path.startsWith('jar://')) return;
+    // 捕获本次 effect 对应的路径：在途请求返回时若 path 已变（用户切了文件），
+    // 结果必须丢弃——否则上一个文件的字节会被写进新文件的页表，
+    // 显示出来就是"另一个文件的内容"（只读查看器，无数据损失但内容是错的）。
+    const reqPath = path;
     const minPage = Math.floor((items[0].index * BYTES_PER_ROW) / PAGE_BYTES);
     const maxPage = Math.floor(
       ((items[items.length - 1].index + 1) * BYTES_PER_ROW - 1) / PAGE_BYTES
@@ -83,8 +96,11 @@ export function HexViewer({ path }: { path: string }) {
       if (pages.has(p) || inflight.current.has(p)) continue;
       inflight.current.add(p);
       readHexPage(path, p * PAGE_BYTES, ROWS_PER_PAGE)
-        .then(res => setPages(prev => new Map(prev).set(p, res.bytes)))
-        .catch((e) => console.error('读取 hex 分页失败:', path, p, e)) // 仅控制台留痕：该区域显示占位，滚动重试
+        .then(res => {
+          if (reqPath !== pathRef.current) return; // 已切走：丢弃过期响应
+          setPages(prev => new Map(prev).set(p, res.bytes));
+        })
+        .catch((e) => console.error('读取 hex 分页失败:', reqPath, p, e)) // 仅控制台留痕：该区域显示占位，滚动重试
         .finally(() => {
           inflight.current.delete(p);
         });
@@ -107,9 +123,9 @@ export function HexViewer({ path }: { path: string }) {
     const byteOffset = index * BYTES_PER_ROW;
     let bytes: number[] | null;
     if (memoryBytes) {
-      // 内存模式：直接从整块数组切片
+      // 内存模式：直接从整块数组切片；每行只转 16 个元素（整块转装箱数组代价过高）
       const slice = memoryBytes.slice(byteOffset, byteOffset + BYTES_PER_ROW);
-      bytes = slice.length > 0 ? slice : null;
+      bytes = slice.length > 0 ? Array.from(slice) : null;
     } else {
       const page = Math.floor(byteOffset / PAGE_BYTES);
       const data = pages.get(page);

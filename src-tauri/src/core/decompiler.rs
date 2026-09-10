@@ -22,40 +22,52 @@ const DECOMPILE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// CFR 相关文件的存放目录：应用私有目录。
+/// CFR 相关文件的存放目录：应用私有目录 `~/.nexus/bin`。
 ///
-/// 不放 `%TEMP%`：那里同用户的任意进程都能预置同名文件，而我们随后会用 `java -jar` 执行它
-/// （本次修复前还叠加了 check-then-write 竞态）。home 不可用时回退系统临时目录（功能优先）。
-fn cfr_dir() -> PathBuf {
+/// 不放 `%TEMP%`：那里同用户的任意进程都能预置同名文件，而我们随后会用 `java -jar`
+/// 执行它。主目录不可用时**失败关闭**（不再回退 `%TEMP%`）——反编译是可选功能，
+/// 宁可退化成字节码视图，也不把一个"可在世界可写目录被预置"的可执行文件路径交出去。
+fn cfr_dir() -> Result<PathBuf, String> {
     dirs::home_dir()
         .map(|home| home.join(".nexus").join("bin"))
-        .unwrap_or_else(std::env::temp_dir)
+        .ok_or_else(|| "无法定位用户主目录，已禁用 CFR 反编译（无法安全部署 CFR jar）".to_string())
 }
 
-/// 确保 CFR jar 已写入私有目录，返回其路径
+/// 确保 CFR jar 已写入私有目录且内容正确，返回其路径
 ///
-/// 原子部署：先写 `<name>.jar.tmp` 再 rename。原实现是 `try_exists` → `write`，
+/// 原子部署：先写临时文件再 rename。原实现是 `try_exists` → `write`，
 /// 两个并发反编译（同时打开两个 .class）会在存在性检查与写入之间交错，另一个 `java -jar`
 /// 可能读到半个 jar（表现为偶发 "Invalid or corrupt jarfile"）。rename 是原子替换，
 /// 读方只会看到旧的完整文件或新的完整文件。
+///
+/// **完整性校验**：只检查"文件存在"是不够的——这个文件随后会被 `java -jar` 执行，
+/// 只验存在等于把"同用户进程可预置任意 jar"直接变成代码执行。因此每次都把磁盘字节与
+/// 内嵌的 `CFR_JAR` 比对，不一致（被替换/截断/损坏）就重新部署。
+/// 2MB 的读取+比较相对启动 JVM 的开销可以忽略。
 async fn ensure_cfr_jar() -> Result<&'static PathBuf, String> {
-    let path = CFR_JAR_PATH.get_or_init(|| cfr_dir().join("cfr-0.152.jar"));
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
+    let dir = cfr_dir()?;
+    let path = CFR_JAR_PATH.get_or_init(|| dir.join("cfr-0.152.jar"));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| format!("创建 CFR 目录失败 {}: {}", dir.display(), e))?;
+            .map_err(|e| format!("创建 CFR 目录失败 {}", e))?;
     }
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(path);
+    if let Ok(on_disk) = tokio::fs::read(path).await {
+        if on_disk.as_slice() == CFR_JAR {
+            return Ok(path);
+        }
+        log::warn!("[nexus] CFR jar 与内嵌版本不一致，重新部署: {}", path.display());
     }
-    let tmp = path.with_extension("jar.tmp");
+    // 随机临时名：固定名会被并发部署互相覆盖，也可被预置同名符号链接
+    let tmp = dir.join(format!("cfr-0.152.jar.{}.tmp", uuid::Uuid::new_v4()));
     tokio::fs::write(&tmp, CFR_JAR).await.map_err(|e| format!("写入 CFR jar 失败: {}", e))?;
     if let Err(e) = tokio::fs::rename(&tmp, path).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        // 并发部署：另一个任务已抢先完成 rename → 目标存在即视为成功
-        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-            return Err(format!("部署 CFR jar 失败: {}", e));
-        }
+        // 并发部署：另一个任务已抢先完成 rename → 目标存在且内容正确即视为成功
+        return match tokio::fs::read(path).await {
+            Ok(b) if b.as_slice() == CFR_JAR => Ok(path),
+            _ => Err(format!("部署 CFR jar 失败: {}", e)),
+        };
     }
     Ok(path)
 }
@@ -66,7 +78,7 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
 
     // CFR 只能读文件路径，写临时 class 文件（同样放在私有目录；文件名随机，
     // 原实现用固定递增序号，多实例/并发下会互相覆盖且可被同用户进程预置）
-    let class_path = cfr_dir().join(format!("decompile-{}.class", uuid::Uuid::new_v4()));
+    let class_path = cfr_dir()?.join(format!("decompile-{}.class", uuid::Uuid::new_v4()));
     tokio::fs::write(&class_path, bytes).await.map_err(|e| format!("写入临时 class 失败: {}", e))?;
 
     let mut cmd = tokio::process::Command::new("java");

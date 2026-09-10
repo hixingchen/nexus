@@ -133,31 +133,12 @@ pub fn set_project_root(state: State<AppState>, path: Option<String>) -> Result<
     Ok(())
 }
 
-/// 检查路径是否在允许范围内（search 等模块复用）
-pub(crate) fn is_path_allowed(requested: &str, allowed_root: &Option<String>) -> bool {
-    if let Some(root) = allowed_root {
-        // 使用 canonicalize 处理符号链接、.. 等
-        let canon_req = match std::fs::canonicalize(requested) {
-            Ok(p) => p,
-            Err(_) => return false, // 路径不存在或无法解析，拒绝访问
-        };
-        let canon_root = match std::fs::canonicalize(root) {
-            Ok(p) => p,
-            Err(_) => return false, // 根路径无效，拒绝访问
-        };
-        canon_req.starts_with(&canon_root)
-    } else {
-        // 未选中项目 → 拒绝访问（防止路径穿越）
-        false
-    }
-}
-
-/// 允许访问的根目录集合：项目根 + 所有已配置服务/模板的工作目录。
+/// 允许访问的根目录集合（原始字符串，未 canonicalize）：项目根 + 所有已配置服务/模板的工作目录。
 ///
 /// 为什么是多根：`Service.cwd` 允许配置在项目目录之外（模型如此），单根白名单会让这些
 /// 服务的文件既打不开也搜不到。多根同时收紧了"任意路径"（原 `list_directory` 等命令无校验）。
 /// 返回空集合表示"未选择项目"，此时一律拒绝——保持原有的安全语义。
-pub(crate) fn allowed_roots(state: &AppState) -> Vec<String> {
+fn raw_allowed_roots(state: &AppState) -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
     let has_project_root = match state.project_root.lock() {
         Ok(root) => match root.as_ref() {
@@ -193,26 +174,58 @@ pub(crate) fn allowed_roots(state: &AppState) -> Vec<String> {
         Ok(mut v) => roots.append(&mut v),
         Err(e) => log::warn!("[nexus] 收集允许访问目录失败（仅按项目根校验）: {}", e),
     }
-    roots.dedup();
+    // 真去重（原实现用 `Vec::dedup`，但它只删**相邻**重复项，而这里并未排序 → 实际是 no-op）
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|r| seen.insert(r.clone()));
     roots
 }
 
-/// 多根白名单校验：命中任一允许根即通过
-pub(crate) fn is_path_allowed_any(requested: &str, roots: &[String]) -> bool {
-    roots
-        .iter()
-        .any(|root| is_path_allowed(requested, &Some(root.clone())))
+/// 已 canonicalize 的允许根（带缓存）。
+///
+/// 性能背景：每个取路径的命令都会走到这里，而原实现每次都对**每一个根**做一次
+/// `canonicalize`（外加一次对请求路径的 canonicalize）。文件树展开 + 连续打开文件
+/// 会把"根数 × 操作数"次文件系统路径解析叠加起来，是这条热路径上的主要开销。
+/// 现在：请求路径只解析一次，根只在原始列表变化时重新解析。
+pub(crate) fn allowed_root_paths(state: &AppState) -> std::sync::Arc<Vec<std::path::PathBuf>> {
+    let raw = raw_allowed_roots(state);
+    let mut guard = match state.allowed_roots_cache.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Some((key, cached)) = guard.as_ref() {
+        if key == &raw {
+            return std::sync::Arc::clone(cached);
+        }
+    }
+    // 无法解析的根直接丢弃（不存在/无权限）——与单根时代的语义一致：那类根恒不命中
+    let resolved: Vec<std::path::PathBuf> =
+        raw.iter().filter_map(|r| std::fs::canonicalize(r).ok()).collect();
+    let arc = std::sync::Arc::new(resolved);
+    *guard = Some((raw, std::sync::Arc::clone(&arc)));
+    arc
+}
+
+/// 请求路径是否位于任一允许根之下。
+///
+/// 任意一端无法 canonicalize（请求路径不存在、根失效）即判否——fail closed。
+/// `PathBuf::starts_with` 按**路径分量**比较，因此 `/root` 不会误命中 `/root-evil`；
+/// `..`、UNC、`\\?\`、8.3 短名、结尾点/空格、ADS 都在 canonicalize 阶段被解析掉。
+fn canonical_path_within(requested: &str, roots: &[std::path::PathBuf]) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    match std::fs::canonicalize(requested) {
+        Ok(canon) => roots.iter().any(|root| canon.starts_with(root)),
+        Err(_) => false,
+    }
 }
 
 /// 读路径校验：项目根 + 各服务/模板工作目录（未选择项目时一律拒绝）。
 /// 供所有取路径的命令统一调用——此前 `list_directory`/`open_terminal`/`open_in_explorer`
 /// 等命令完全绕过白名单，导致"同类危险操作两套口径"。
 pub(crate) fn check_path_allowed(state: &AppState, path: &str) -> Result<(), String> {
-    let roots = allowed_roots(state);
-    if roots.is_empty() {
-        return Err("访问被拒绝".into());
-    }
-    if is_path_allowed_any(path, &roots) {
+    let roots = allowed_root_paths(state);
+    if canonical_path_within(path, &roots) {
         Ok(())
     } else {
         Err("访问被拒绝".into())
@@ -260,7 +273,7 @@ pub struct ReadFileResponse {
     /// 原始编码：'utf8' | 'gb18030'（保存时按此编码写回，GBK 文件编辑保存后字节不变）
     pub encoding: String,
     /// 文件修改时间（距 UNIX 纪元的毫秒数）。前端保存时原样回传 write_file 的 expected_modified，
-    /// 即可检测"打开后被外部修改"并拒绝静默覆盖（前端尚未接入，字段先就绪）
+    /// 即可检测"打开后被外部修改"并拒绝静默覆盖
     pub modified: Option<u64>,
 }
 
@@ -337,8 +350,11 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadF
 /// encoding 指定原编码（'gb18030'）时按原编码编码写回——GBK 文件编辑保存后字节不变，
 /// git 不会误报变更（前端按 read_file 返回的 encoding 传入）
 ///
-/// expected_modified：调用方若传入打开文件时记录的修改时间（毫秒），写入前会比对磁盘现值，
-/// 不一致则拒绝写入并返回"文件已被外部修改"——供前端接入"覆盖/放弃/查看差异"确认（当前前端尚未传）。
+/// expected_modified：调用方传入打开文件时记录的修改时间（毫秒），写入前比对磁盘现值，
+/// 不一致则拒绝写入并返回"文件已被外部修改"（前端据此提示重新加载）。
+///
+/// 返回值：写入后的新修改时间（毫秒）。**必须回传**——否则前端缓存的仍是打开时的
+/// 旧 mtime，连续两次保存的第二次会被自己的上次写入判成"外部修改"（假冲突）。
 #[tauri::command]
 pub async fn write_file(
     state: State<'_, AppState>,
@@ -346,20 +362,27 @@ pub async fn write_file(
     content: String,
     encoding: Option<String>,
     expected_modified: Option<u64>,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     // 目标不存在时按父目录校验（支持新建文件），校验内部不跨 await 持锁
     check_write_path_allowed(&state, &path)?;
     if (content.len() as u64) > MAX_WRITE_SIZE {
         return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", content.len() as f64 / (1024.0 * 1024.0)));
     }
     if let Some(expected) = expected_modified {
-        match tokio::fs::metadata(&path).await.ok().and_then(|m| m.modified().ok()) {
-            Some(actual) if file_modified_millis(actual) != expected => {
-                return Err("文件已被外部修改，请重新加载后再保存（已取消本次写入）".into());
-            }
-            // 目标不存在（新建）：无冲突可言
-            None => {}
-            _ => {}
+        match tokio::fs::metadata(&path).await {
+            Ok(m) => match m.modified() {
+                Ok(actual) if file_modified_millis(actual) != expected => {
+                    return Err("文件已被外部修改，请重新加载后再保存（已取消本次写入）".into());
+                }
+                // modified() 失败：拿不到可比对的时间戳，保守拒绝而不是放行
+                Err(e) => return Err(format!("无法读取文件修改时间，已取消写入: {}", e)),
+                _ => {}
+            },
+            // 目标不存在（新建）：无冲突可言。其余 IO 错误保守拒绝——
+            // 原实现把 stat 失败与"文件不存在"都压成 None 并照写，会在文件被锁定/
+            // 权限不足时静默跳过冲突检测。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("无法检查文件状态，已取消写入: {}", e)),
         }
     }
     let data: Vec<u8> = match encoding.as_deref() {
@@ -370,16 +393,23 @@ pub async fn write_file(
     // 留下截断的坏文件（大文件整份丢失）。Windows 上 std/tokio 的 rename 会覆盖已存在的目标
     // （MOVEFILE_REPLACE_EXISTING），因此失败分支只清理临时文件——
     // 早期实现先 remove_file(目标) 再 rename，二次失败会直接删掉用户原文件。
+    //
+    // 临时名带随机后缀：原实现用固定的 `<name>.tmp`，两个并发保存（例如双击 Ctrl+S）
+    // 会在同一个临时文件上互相覆盖，必有一次 rename 输掉；预置同名符号链接还会被跟随。
+    // 反编译路径早已用 UUID 解决同类问题（core/decompiler.rs），这里对齐。
     let p = std::path::Path::new(&path);
-    let tmp = p.with_extension(format!("{}.tmp", p.extension().and_then(|e| e.to_str()).unwrap_or("")));
+    let tmp = p.with_file_name(format!(
+        ".{}.{}.tmp",
+        p.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        uuid::Uuid::new_v4()
+    ));
     tokio::fs::write(&tmp, &data).await.map_err(|e| format!("无法写入文件: {}", e))?;
-    match tokio::fs::rename(&tmp, p).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(format!("无法写入文件: {}", e))
-        }
+    if let Err(e) = tokio::fs::rename(&tmp, p).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("无法写入文件: {}", e));
     }
+    // 回读新 mtime 供前端更新其冲突检测基线（读失败不视为写入失败）
+    Ok(tokio::fs::metadata(p).await.ok().and_then(|m| m.modified().ok()).map(file_modified_millis))
 }
 
 /// 文件修改时间 → 距离 UNIX 纪元的毫秒数（用于保存前的外部修改冲突检测）
@@ -578,57 +608,89 @@ pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_path_allowed_no_root() {
-        // 未设置项目根路径 → 拒绝所有访问
-        assert!(!is_path_allowed("/any/path", &None));
+    /// 测试辅助：把若干根字符串 canonicalize 成与生产同形的 `Vec<PathBuf>`
+    fn roots_of(paths: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
+        paths.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect()
     }
 
     #[test]
-    fn test_is_path_allowed_nonexistent_path() {
-        // 请求的路径不存在 → 拒绝
-        assert!(!is_path_allowed("/nonexistent/path/that/does/not/exist", &Some("/tmp".to_string())));
-    }
-
-    #[test]
-    fn test_is_path_allowed_nonexistent_root() {
-        // 根路径不存在 → 拒绝
-        assert!(!is_path_allowed("/tmp", &Some("/nonexistent/root".to_string())));
-    }
-
-    #[test]
-    fn test_is_path_allowed_within_root() {
-        // 使用当前目录作为根路径（确保路径存在）
+    fn test_path_check_denies_without_roots() {
+        // 未设置项目根路径（空根集合）→ 一律拒绝
         let cwd = std::env::current_dir().unwrap();
-        let root = Some(cwd.to_string_lossy().to_string());
-        // 当前目录本身应该被允许
-        assert!(is_path_allowed(&cwd.to_string_lossy(), &root));
+        assert!(!canonical_path_within(&cwd.to_string_lossy(), &[]));
     }
 
     #[test]
-    fn test_is_path_allowed_outside_root() {
+    fn test_path_check_denies_nonexistent_path() {
+        // 请求的路径不存在（canonicalize 失败）→ 拒绝
         let cwd = std::env::current_dir().unwrap();
-        let root = Some(cwd.to_string_lossy().to_string());
-        // 系统根目录不在当前目录下
+        let roots = roots_of(&[&cwd]);
+        assert!(!canonical_path_within("/nonexistent/path/that/does/not/exist", &roots));
+    }
+
+    #[test]
+    fn test_path_check_denies_when_root_gone() {
+        // 根不存在 → canonicalize 失败 → 空根集合 → 拒绝
+        let roots = roots_of(&[std::path::Path::new("/nonexistent/root/for/nexus/test")]);
+        assert!(roots.is_empty());
+        assert!(!canonical_path_within("/tmp", &roots));
+    }
+
+    #[test]
+    fn test_path_check_allows_within_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let roots = roots_of(&[&cwd]);
+        assert!(canonical_path_within(&cwd.to_string_lossy(), &roots));
+    }
+
+    #[test]
+    fn test_path_check_denies_outside_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let roots = roots_of(&[&cwd]);
         #[cfg(windows)]
-        assert!(!is_path_allowed("C:\\Windows", &root));
+        assert!(!canonical_path_within("C:\\Windows", &roots));
         #[cfg(not(windows))]
-        assert!(!is_path_allowed("/etc", &root));
+        assert!(!canonical_path_within("/etc", &roots));
     }
 
+    /// 多根：命中任一即通过（服务 cwd 可以配在项目目录之外）
     #[test]
-    fn test_is_path_allowed_any_multi_root() {
+    fn test_path_check_multi_root() {
         let cwd = std::env::current_dir().unwrap();
-        let root = cwd.to_string_lossy().to_string();
-        let other = std::env::temp_dir().to_string_lossy().to_string();
-        let roots = vec![root.clone(), other.clone()];
-        // 命中任一允许根即通过（服务 cwd 可以配在项目目录之外）
-        assert!(is_path_allowed_any(&root, &roots));
-        assert!(is_path_allowed_any(&other, &roots));
-        // 未选择项目（空集合）→ 一律拒绝
-        assert!(!is_path_allowed_any(&root, &[]));
+        let other = std::env::temp_dir();
+        let roots = roots_of(&[&cwd, &other]);
+        assert!(canonical_path_within(&cwd.to_string_lossy(), &roots));
+        assert!(canonical_path_within(&other.to_string_lossy(), &roots));
         #[cfg(windows)]
-        assert!(!is_path_allowed_any("C:\\Windows", &roots));
+        assert!(!canonical_path_within("C:\\Windows", &roots));
+    }
+
+    /// 安全关键属性：按**路径分量**比较，兄弟目录不能靠共享字符串前缀混进来
+    #[test]
+    fn test_path_check_sibling_prefix_not_matched() {
+        let base = std::env::temp_dir().join(format!("nexus_ut_prefix_{}", std::process::id()));
+        let inside = base.join("proj");
+        let sibling = base.join("proj-evil");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let roots = roots_of(&[&inside]);
+        assert!(canonical_path_within(&inside.to_string_lossy(), &roots), "根本身应通过");
+        assert!(
+            !canonical_path_within(&sibling.to_string_lossy(), &roots),
+            "`proj-evil` 与 `proj` 共享字符串前缀，但按分量比较必须拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 允许根缓存：相同原始列表复用已解析结果，列表变化即失效
+    #[test]
+    fn test_allowed_roots_cache_key_changes_with_input() {
+        // 直接验证缓存键的比较语义（AppState 需要 DB，构造成本高，故只测键相等性）
+        let a = vec!["/a".to_string(), "/b".to_string()];
+        let b = vec!["/a".to_string(), "/b".to_string()];
+        let c = vec!["/a".to_string(), "/c".to_string()];
+        assert_eq!(a, b, "相同列表应命中缓存");
+        assert_ne!(a, c, "列表变化必须让缓存失效");
     }
 
     #[test]

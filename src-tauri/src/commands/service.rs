@@ -104,56 +104,62 @@ pub fn add_service(
     })
 }
 
-/// 更新服务配置
+/// 更新服务配置。
+///
+/// 异步 + spawn_blocking：DB 写入之后会 `refresh_service_watch`，它要
+/// `stop_watching`（**join 监听线程**，最长约 200ms）并按路径重新 `notify::watch`。
+/// 同步执行时这段工作内联在 IPC 请求路径上，保存配置会出现可感的停顿。
 #[tauri::command]
-pub fn update_service(
-    state: State<AppState>,
+pub async fn update_service(
     app: tauri::AppHandle,
     params: UpdateServiceParams,
 ) -> Result<(), String> {
     if params.id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    let cwd = params.cwd.replace('\\', "/");
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
     if !params.tool_commands.trim().is_empty() {
         serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
             .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
     }
-    let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
-    let project_id = state.db.with_conn(|conn| {
-        let en = if params.enabled { 1 } else { 0 };
-        let sft = if params.show_file_tree { 1 } else { 0 };
-        // 监听路径跟随工作目录（兜底，覆盖任意保存入口）：
-        // watch_paths 为空/[]，或仍等于旧 cwd（默认跟随状态）→ 自动更新为新 cwd
-        let old: (String, String, String) = conn.query_row(
-            "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
-            [&params.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).map_err(|e| format!("查询服务失败: {}", e))?;
-        let default_old = serde_json::to_string(&vec![old.0]).unwrap_or_default();
-        let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
-            if cwd.is_empty() { "[]".to_string() } else {
-                serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
-            }
-        } else if params.watch_paths.trim() == default_old {
-            // 监听路径仍等于"旧 cwd 拼接值" → 跟随新工作目录更新
-            serde_json::to_string(&vec![cwd.clone()]).unwrap_or(params.watch_paths)
-        } else {
-            params.watch_paths
-        };
-        let affected = conn.execute(
-            "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
-        ).map_err(|e| format!("更新服务失败: {}", e))?;
-        if affected == 0 { return Err("服务不存在".into()); }
-        Ok(old.2)
-    })?;
-    // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）；
-    // 失败只告警不阻塞保存（保存已成功，监听下次项目级启停时自然重建）
-    if let Err(e) = crate::commands::watcher::refresh_service_watch(app, &state, &project_id, &params.id) {
-        log::warn!("更新服务后刷新文件监听失败: {}", e);
-    }
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let cwd = params.cwd.replace('\\', "/");
+        let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
+        let project_id = state.db.with_conn(|conn| {
+            let en = if params.enabled { 1 } else { 0 };
+            let sft = if params.show_file_tree { 1 } else { 0 };
+            // 监听路径跟随工作目录（兜底，覆盖任意保存入口）：
+            // watch_paths 为空/[]，或仍等于旧 cwd（默认跟随状态）→ 自动更新为新 cwd
+            let old: (String, String, String) = conn.query_row(
+                "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
+                [&params.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).map_err(|e| format!("查询服务失败: {}", e))?;
+            let default_old = serde_json::to_string(&vec![old.0]).unwrap_or_default();
+            let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
+                if cwd.is_empty() { "[]".to_string() } else {
+                    serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
+                }
+            } else if params.watch_paths.trim() == default_old {
+                // 监听路径仍等于"旧 cwd 拼接值" → 跟随新工作目录更新
+                serde_json::to_string(&vec![cwd.clone()]).unwrap_or(params.watch_paths)
+            } else {
+                params.watch_paths
+            };
+            let affected = conn.execute(
+                "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
+                rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
+            ).map_err(|e| format!("更新服务失败: {}", e))?;
+            if affected == 0 { return Err("服务不存在".into()); }
+            Ok(old.2)
+        })?;
+        // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）；
+        // 失败只告警不阻塞保存（保存已成功，监听下次项目级启停时自然重建）
+        if let Err(e) = crate::commands::watcher::refresh_service_watch(app.clone(), &state, &project_id, &params.id) {
+            log::warn!("更新服务后刷新文件监听失败: {}", e);
+        }
+        Ok(())
+    }).await.map_err(|e| format!("更新服务任务失败: {}", e))?
 }
 
 /// 重排项目服务顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）

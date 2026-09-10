@@ -11,9 +11,19 @@ export function TitleBar({ projectName }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
-    appWindow.isMaximized().then(setIsMaximized);
-    const u = appWindow.onResized(() => { appWindow.isMaximized().then(setIsMaximized); });
-    return () => { u.then(fn => fn()); };
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    // 最大化状态查询失败不影响使用（保持默认 false），但必须消费掉 rejection——
+    // 裸 .then 会抛未处理的 rejection，且窗口尺寸变化后状态会一直不同步
+    const syncMaximized = () => {
+      appWindow.isMaximized().then(v => { if (!disposed) setIsMaximized(v); })
+        .catch(e => console.error('查询窗口最大化状态失败:', e));
+    };
+    syncMaximized();
+    appWindow.onResized(syncMaximized)
+      .then(fn => { if (disposed) { fn(); return; } unlisten = fn; })
+      .catch(e => console.error('订阅窗口尺寸变化失败:', e));
+    return () => { disposed = true; unlisten?.(); };
   }, [appWindow]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {

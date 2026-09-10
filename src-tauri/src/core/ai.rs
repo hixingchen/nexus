@@ -291,26 +291,18 @@ impl AiSession {
 
     /// 终止进程树并限时等待退出（超时由 Job Object 在应用退出时兜底）
     pub fn stop(&mut self) {
-        crate::core::process::kill_process_tree(self.pid);
-        let deadline = Instant::now() + Duration::from_millis(2000);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => break,
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(_) => break,
-            }
-        }
+        // kill_and_reap 内部保证 kill 后一定 wait 一次（回收句柄）
+        crate::core::process::kill_and_reap(&mut self.child, Duration::from_millis(2000));
     }
 }
 
 /// dsh CLI 是否可用（`dsh --version` 能否成功退出）
-pub fn dsh_available() -> bool {
-    let mut cmd = build_command("dsh --version");
-    match cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(mut c) => c.wait().map(|s| s.success()).unwrap_or(false),
-        Err(_) => false,
-    }
+///
+/// 走 `run_captured` 而不是手写 `spawn + wait`：后者**没有超时**（CLI 挂起会
+/// 永久占用一个阻塞线程，AI 面板再也拿不到状态），也**没有把子进程加入 Job Object**
+/// （应用异常退出后该进程可残留）。`run_captured` 两者都具备。
+pub fn dsh_available(app: &tauri::AppHandle) -> bool {
+    run_captured(app, "dsh --version", Duration::from_secs(10)).is_ok()
 }
 
 // ─── dsh 版本检查 / 升级（面板「检查更新」） ─────────────────────
@@ -348,7 +340,7 @@ fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Res
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    crate::core::process::kill_process_tree(child.id());
+                    crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
                     return Err(format!("命令超时（超过 {} 秒），已终止：{}", timeout.as_secs(), command));
                 }
                 std::thread::sleep(Duration::from_millis(80));
@@ -542,7 +534,7 @@ pub fn spawn_dsh_web(
                 }
             })
             .map_err(|e| {
-                crate::core::process::kill_process_tree(pid);
+                crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
                 format!("创建 dsh web stderr 读取线程失败: {}", e)
             })?;
     }
@@ -581,7 +573,7 @@ pub fn spawn_dsh_web(
                 }
             })
             .map_err(|e| {
-                crate::core::process::kill_process_tree(pid);
+                crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
                 format!("创建 dsh web stdout 读取线程失败: {}", e)
             })?;
     }
@@ -590,11 +582,11 @@ pub fn spawn_dsh_web(
     let url = match rx.recv_timeout(timeout) {
         Ok(u) if !u.is_empty() => u,
         Ok(_) => {
-            crate::core::process::kill_process_tree(pid);
+            crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
             return Err(format!("dsh web 启动失败：进程提前退出。{}", stderr_summary(&stderr_tail)));
         }
         Err(_) => {
-            crate::core::process::kill_process_tree(pid);
+            crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
             return Err(format!("等待 dsh web 启动超时（{} 秒）。{}", timeout.as_secs(), stderr_summary(&stderr_tail)));
         }
     };
