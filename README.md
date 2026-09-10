@@ -111,8 +111,7 @@ nexus/
 │   │   └── logger.rs             # 控制台 + 文件双写日志
 │   └── Cargo.toml
 ├── docs/
-│   ├── REVIEW_STANDARD.md        # 项目审查标准
-│   └── AUDIT_REPORT.md           # 审计报告（当前未修复问题清单）
+│   └── AUDIT_REPORT.md           # 待处理问题清单（代码审计遗留项）
 ├── tailwind.config.js
 ├── vite.config.ts
 └── package.json
