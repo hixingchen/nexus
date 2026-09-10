@@ -26,7 +26,6 @@ export function useProjectDetail(projectId: string) {
 
   // 请求序号：项目切换时旧请求的响应被丢弃，避免错项目数据
   const loadSeqRef = useRef(0);
-  const mountedRef = useRef(true);
   /** 最近一次活动标签 id（打开/切换文件时若在日志面板则自动关闭——文件内容优先） */
   const lastTabIdRef = useRef<string | null>(null);
   // running 首次加载成功后才允许 pruneInactive，避免挂载瞬间误清日志
@@ -49,7 +48,7 @@ export function useProjectDetail(projectId: string) {
       ]);
       if (seq !== loadSeqRef.current) return; // 已被更新的请求取代，丢弃过期响应
       // 并行刷新打开工具绑定（服务增删后右键"用 XX 打开"显示才准）
-      useToolStore.getState().loadProject(projectId).catch(() => {});
+      useToolStore.getState().loadProject(projectId).catch((e) => console.error('加载项目工具绑定失败:', e));
       // 同步左侧展开列表缓存：右侧增删改后左侧保持展开的项目即时一致
       useSvcCacheStore.getState().setCache(projectId, d.services);
       setDetail(d);
@@ -63,11 +62,9 @@ export function useProjectDetail(projectId: string) {
   }, [projectId]);
 
   useEffect(() => {
-    mountedRef.current = true;
     load();
     setEditingService(null);
     setViewingLog(null);
-    return () => { mountedRef.current = false; };
   }, [load]);
 
   // 运行状态由全局 runningStore 轮询；首次加载成功后置位 runningLoadedRef

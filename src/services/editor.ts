@@ -11,15 +11,24 @@ export interface ReadFileResponse {
   encoding: 'utf8' | 'gb18030';
 }
 
+/** read_file 的原始返回（Rust 侧无 rename_all，字段为 snake_case） */
+interface RawReadFileResponse {
+  content: string;
+  is_binary: boolean;
+  size: number;
+  line_ending: 'lf' | 'crlf' | 'cr';
+  encoding: 'utf8' | 'gb18030';
+}
+
 /** 读取文件内容（Tauri 2 返回值保持 Rust snake_case 字段名，这里统一映射为 camelCase） */
 export async function readFile(path: string): Promise<ReadFileResponse> {
-  const res = await invoke('read_file', { path }) as ReadFileResponse & { line_ending?: string };
+  const res = await invoke<RawReadFileResponse>('read_file', { path });
   return {
     content: res.content,
     is_binary: res.is_binary,
     size: res.size,
-    lineEnding: (res.lineEnding ?? res.line_ending ?? 'lf') as 'lf' | 'crlf' | 'cr',
-    encoding: (res.encoding ?? 'utf8') as 'utf8' | 'gb18030',
+    lineEnding: res.line_ending,
+    encoding: res.encoding,
   };
 }
 

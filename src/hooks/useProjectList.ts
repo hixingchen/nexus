@@ -76,11 +76,15 @@ export function useProjectList() {
     e.stopPropagation();
     setActingId(id);
     try {
-      await processApi.startProject(id);
+      const errors = await processApi.startProject(id);
       // 与详情页 handleStartAll 对齐：项目启动 → 开启项目级文件监听（restart_mode>0 且 enabled=1 的服务）
       watchApi.start(id).catch((err) => console.error('启动文件监听失败:', err));
       await useRunningStore.getState().refresh();
-      showNotification({ title: `「${name}」已启动`, description: '所有已启用的服务已启动' });
+      if (errors.length > 0) {
+        showNotification({ variant: 'error', title: '部分服务启动失败', description: errors.join(', ') });
+      } else {
+        showNotification({ title: `「${name}」已启动`, description: '所有已启用的服务已启动' });
+      }
     } catch (err: unknown) {
       showNotification({ variant: 'error', title: String(err) });
     }

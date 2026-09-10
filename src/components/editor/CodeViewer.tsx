@@ -810,6 +810,8 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
   onChangeRef.current = onChange;
   const contentRef = useRef(content);
   contentRef.current = content;
+  /** 最近一次由本编辑器 emit 出去的内容：用于把"自己刚输入的回声"与"外部内容变化"区分开 */
+  const lastEmittedRef = useRef<string | null>(null);
 
   const locate = useEditorStore(s => s.locate);
   const clearLocate = useEditorStore(s => s.clearLocate);
@@ -830,13 +832,12 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
       state = cached;
     } else {
       // 内容变化（外部刷新/首次打开）→ 重建并更新缓存
-      // 记录会话起点（= 撤销历史锚点）：Ctrl+Z 撤销回该内容时不算未保存
-      useEditorStore.getState().markSessionStart(currentContent);
       state = createEditorState(
         currentContent,
         filePath,
         editable,
         (doc) => {
+          lastEmittedRef.current = doc;
           onChangeRef.current?.(doc);
           // EditorState 不可变：每次编辑产生新 state 对象，缓存里的引用会过期
           // （doc 对比失败 → 切换回来重建 → 撤销历史丢失）。编辑后把最新
@@ -859,6 +860,28 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
       viewRef.current?.destroy();
     };
   }, [filePath, editable, openSeq]);
+
+  /**
+   * 外部内容晚到 → 覆盖式同步文档。
+   *
+   * 编辑器只在 filePath/editable/openSeq 变化时消费 `content`（编辑中不重建，避免丢光标与撤销栈），
+   * 但切换标签时若内容缓存未命中，store 会先切 activeTabId、读盘完成后才 setFileContent：
+   * 那一次 await 期间编辑器已按新的 filePath 建好，文档里却是**上一个文件的内容**，
+   * 此后 content 变化不再触发任何更新 —— 用户看到的是错文件内容，敲一个键就会把它
+   * 记到当前标签的草稿上，Ctrl+S 直接写进当前文件。这里补上显式同步。
+   */
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const doc = view.state.doc.toString();
+    if (doc === content) return;
+    // 自己刚输入的回声：store 回写的就是编辑器内容，无需（也不能）再 dispatch，
+    // 否则每敲一个字符都会重置撤销栈
+    if (content === lastEmittedRef.current) return;
+    view.dispatch({ changes: { from: 0, to: doc.length, insert: content } });
+    // 缓存同步更新：否则切走再切回会因 doc 与内容不一致而重建（撤销历史丢失）
+    stateCacheSet(cacheKey(filePath, editable, openSeq), view.state);
+  }, [content, filePath, editable, openSeq]);
 
   // 全局 Ctrl+F：焦点在搜索框 → 全选其内容（keymap 收不到搜索框的按键——
   // 输入框在 .cm-editor 内但在 .cm-content 外，再按 Ctrl+F 也全选，直接输入即替换）；

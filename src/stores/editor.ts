@@ -35,7 +35,6 @@ interface EditorStore {
   setFileContent: (content: string | null) => void;
   /** 编辑器内容变更：写入草稿并标记当前标签未保存 */
   updateDraft: (content: string) => void;
-  markDirty: (id: string) => void;
   markClean: (id: string, content?: string) => void;
   setLocate: (locate: { path: string; line: number; query: string }) => void;
   clearLocate: () => void;
@@ -47,8 +46,6 @@ interface EditorStore {
   markRevealConsumed: () => void;
   /** 清除定位标记（用户主动切换文件/选中树节点时调用，避免定位高亮残留） */
   clearReveal: () => void;
-  /** 记录当前标签的编辑器会话起点内容（CodeViewer 创建/重建编辑器时调用）：撤销回会话起点不算未保存 */
-  markSessionStart: (content: string) => void;
 }
 
 /**
@@ -57,6 +54,12 @@ interface EditorStore {
  */
 const MAX_CACHE_SIZE = 50;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
+/**
+ * 单条内容入缓存的上限。超过则不入缓存（切回时重新读盘）：
+ * 原实现的淘汰是"腾空到装得下"，一条 40MB 文件会瞬间清空整个缓存，
+ * 之后所有标签切换都变成缓存未命中（并触发重新读盘 + 内容晚到）。
+ */
+const MAX_CACHE_ENTRY_BYTES = 8 * 1024 * 1024;
 const fileCache = new Map<string, string>();
 let cacheBytes = 0;
 
@@ -122,33 +125,29 @@ function toOriginalEnding(text: string, lineEnding: 'lf' | 'crlf' | 'cr'): strin
 
 /** 打开新标签（读取期间可能已被其他调用打开：已有标签则切换过去，恢复其未保存草稿） */
 function openLoadedTab(tab: FileTab, content: string) {
+  const normalized = normalizeEOL(content);
   const already = useEditorStore.getState().tabs.find(t => t.path === tab.path);
   if (already) {
-    setCacheContent(tab.path, content);
+    setCacheContent(tab.path, normalized);
     const draft = drafts.get(already.id);
-    useEditorStore.getState().setFileContent(draft ?? content);
+    useEditorStore.getState().setFileContent(draft ?? normalized);
     useEditorStore.getState().setActiveTabId(already.id);
   } else {
-    useEditorStore.getState().openTab(tab, content);
+    useEditorStore.getState().openTab(tab, normalized);
   }
 }
 
 /**
- * 每标签：已打开/最后保存的基线内容（用于 dirty 推导）。
- * 编辑后内容与基线一致（如撤销回原样）→ 不算未保存
+ * 每标签：最后保存（或打开）的基线内容，是"未保存"判定的**唯一**依据。
+ *
+ * 历史教训：这里曾并行维护四张 Map（baselines / openedContents / sessionStarts / drafts），
+ * dirty 判定要求与其中任意一张相等即为"干净"。而 sessionStarts 记录的是"编辑器会话起点"，
+ * 其内容可能是未保存草稿（切回标签重建编辑器时传入的就是当前缓冲区）——于是"撤销回该锚点"
+ * 会把草稿删掉并清掉未保存标记，用户改动无声消失；openedContents 同理会造成
+ * "保存后改回打开时内容 → 显示已保存而磁盘是另一版本"。现统一为只与基线比较：
+ * 任何"看起来干净但其实没保存"的情况都不再可能，代价只是保守地把这类状态显示为未保存。
  */
 const baselines = new Map<string, string>();
-/**
- * 每标签：最初打开时（openTab）的内容，用于 dirty 推导。
- * 撤销越过保存点回到最初打开版本（内容等于打开时内容但已保存过）→ 不算未保存
- */
-const openedContents = new Map<string, string>();
-/**
- * 每标签：编辑器会话起点内容（CodeViewer 创建/重建编辑器时的内容 = 撤销历史锚点）。
- * 树点击重开（openSeq++）或编辑器重建时锚点可能是草稿等中间内容——
- * 撤销回该锚点（用户眼中的"最初版本"）也不算未保存
- */
-const sessionStarts = new Map<string, string>();
 /**
  * 每标签：未保存的草稿内容。切换到该标签时优先用草稿恢复，
  * 否则草稿只存在 store.fileContent（活动标签）里，切换标签会丢失
@@ -171,6 +170,8 @@ function setCacheContent(path: string, content: string): void {
     cacheBytes -= prev.length * 2;
     fileCache.delete(path);
   }
+  // 超大文件不入缓存：否则"腾空到装得下"会把其它标签的缓存全部挤掉（见 MAX_CACHE_ENTRY_BYTES 注释）
+  if (bytes > MAX_CACHE_ENTRY_BYTES) return;
   // 按总字节数或文件数上限淘汰最久未使用的条目
   while (fileCache.size > 0 && (cacheBytes + bytes > MAX_CACHE_BYTES || fileCache.size >= MAX_CACHE_SIZE)) {
     const firstKey = fileCache.keys().next().value;
@@ -205,13 +206,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   openTab: (tab, content) => {
     const { tabs } = get();
-    setCacheContent(tab.path, content);
-    baselines.set(tab.id, normalizeEOL(content));
-    openedContents.set(tab.id, normalizeEOL(content));
+    // 全链路统一存归一化内容（\n）：CodeMirror 建 doc 时也做同样归一，缓存/基线/展示三者一致
+    // 才能命中 stateCache（否则 CRLF 文件每次切回都重建、撤销历史与光标丢失）；
+    // 写盘时由 saveActiveFile 按 read_file 返回的原换行风格还原
+    const normalized = normalizeEOL(content);
+    setCacheContent(tab.path, normalized);
+    baselines.set(tab.id, normalized);
     set({
       tabs: [...tabs, tab],
       activeTabId: tab.id,
-      fileContent: content,
+      fileContent: normalized,
     });
   },
 
@@ -222,8 +226,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const newDirty = dirtyIds.filter(d => d !== id);
     baselines.delete(id);
     drafts.delete(id);
-    openedContents.delete(id);
-    sessionStarts.delete(id);
 
     if (closedTab && !newTabs.some(t => t.path === closedTab.path)) {
       removeCacheForPath(closedTab.path);
@@ -277,16 +279,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const { activeTabId, dirtyIds } = get();
     if (!activeTabId) return;
     set({ fileContent: content });
-    // 与基线（最后保存版本）一致（如 Ctrl+Z 撤销回保存点）、与最初打开版本一致
-    // （撤销越过保存点回到打开时内容）或与编辑器会话起点一致（撤销回重建时的草稿等）
-    // → 草稿作废并清 dirty；否则存草稿（切换标签时可恢复）并标 dirty。
-    // 快照在写入时已统一换行符（normalizeEOL 存储），此处只需归一当前内容一次；
-    // 早前实现对每个快照重复 normalize（每次键击 3~4 趟全量扫描，大文件卡顿）
+    // dirty 判定只与"最后保存/打开的基线"比较（单一真相，见 baselines 注释）。
+    // 归一化在写入基线时已做过，这里只归一当前内容一次
     const normalized = normalizeEOL(content);
-    const opened = openedContents.get(activeTabId);
-    const baseline = baselines.get(activeTabId);
-    const sessionStart = sessionStarts.get(activeTabId);
-    if (normalized === opened || normalized === sessionStart || normalized === baseline) {
+    if (normalized === baselines.get(activeTabId)) {
       drafts.delete(activeTabId);
       if (dirtyIds.includes(activeTabId)) {
         set({ dirtyIds: dirtyIds.filter(d => d !== activeTabId) });
@@ -299,13 +295,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
-  markDirty: (id) => {
-    const { dirtyIds } = get();
-    if (!dirtyIds.includes(id)) set({ dirtyIds: [...dirtyIds, id] });
-  },
-
   markClean: (id, content?: string) => {
-    const { dirtyIds, fileContent } = get();
+    const { dirtyIds, fileContent, tabs } = get();
+    // 标签可能在保存的 await 期间被关闭：此时不再写基线，避免留下孤儿状态
+    if (!tabs.some(t => t.id === id)) return;
     // 保存成功后：实际写入磁盘的内容成为新基线，草稿作废。
     // content 由调用方传写盘快照——避免 await 期间用户又编辑导致
     // fileContent 已是新内容、baseline 错位（撤销到保存点时 dirty 无法清除）
@@ -338,12 +331,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   clearReveal: () => {
     set({ revealPath: null });
-  },
-
-  markSessionStart: (content) => {
-    const { activeTabId } = get();
-    if (!activeTabId) return;
-    sessionStarts.set(activeTabId, normalizeEOL(content));
   },
 }));
 
@@ -427,7 +414,12 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
       console.error('读取文件内容失败:', e);
       showNotification({ variant: 'error', title: '读取文件内容失败' });
       const already = useEditorStore.getState().tabs.find(t => t.path === path);
-      if (!already) useEditorStore.getState().openTab(tab, '');
+      if (!already) {
+        // 必须只读：空内容 + 可编辑 ⇒ 用户按 Ctrl+S 会把空内容写回磁盘，原文件被截断
+        // （后端对 >50MB 文件直接拒绝读取，打开大文件必然走这条 catch）
+        tab.readonly = true;
+        useEditorStore.getState().openTab(tab, '');
+      }
     }
   })();
   pendingLoads.set(path, p);
@@ -496,18 +488,26 @@ export async function saveActiveFile(): Promise<boolean> {
     showNotification({ variant: 'warning', title: '文件过大，仅支持查看（超过 10 MB 不能编辑）' });
     return false;
   }
+  // 内容从未成功加载（读取失败/仍在加载中）：写盘会把磁盘上的原文件覆盖成空内容
+  if (fileContent === null) {
+    showNotification({ variant: 'error', title: '文件内容未加载，已取消保存' });
+    return false;
+  }
   try {
     // 写盘前捕获快照：markClean 的基线必须等于实际写入磁盘的内容，
     // 不能用 await 后的 fileContent（保存期间用户可能已继续编辑）
-    const contentToSave = fileContent ?? '';
+    const contentToSave = fileContent;
     // 按原文件换行风格/编码写回：CodeMirror 规范化换行 + UTF-8 写回会让
     // "编辑→撤销→保存"后的字节与原始文件不同（git 误报变更）
     const meta = fileMetaCache.get(tab.path);
     const bytesToWrite = meta ? toOriginalEnding(contentToSave, meta.lineEnding) : contentToSave;
     await editorService.writeFile(tab.path, bytesToWrite, meta?.encoding);
-    // 缓存与基线存编辑器内容（不转换），切换标签/撤销比较都在编辑器内容维度
-    setCacheContent(tab.path, contentToSave);
-    useEditorStore.getState().markClean(activeTabId, contentToSave);
+    // 保存期间标签可能已被关闭：此时不再写缓存与基线（markClean 内部也会校验）
+    if (useEditorStore.getState().tabs.some(t => t.id === activeTabId)) {
+      // 缓存与基线存编辑器内容（不转换），切换标签/撤销比较都在编辑器内容维度
+      setCacheContent(tab.path, contentToSave);
+      useEditorStore.getState().markClean(activeTabId, contentToSave);
+    }
     showNotification({ title: `已保存「${tab.name}」` });
     return true;
   } catch (e) {
@@ -545,11 +545,15 @@ async function loadContentInto(id: string, knownPath?: string): Promise<void> {
     return;
   }
   try {
+    // 先清空活动内容：编辑器只在 filePath/openSeq 变化时消费 content，若沿用上一个文件的
+    // 内容建文档，读盘期间它会显示成新文件的内容（并可被 Ctrl+S 写回错误文件）
+    setFileContent(null);
     const { content } = await fetchTextContent(path);
     // 读取期间用户可能已切换到其他标签，此时丢弃结果避免内容错位
     if (useEditorStore.getState().activeTabId !== id) return;
-    setCacheContent(path, content);
-    setFileContent(content);
+    const normalized = normalizeEOL(content);
+    setCacheContent(path, normalized);
+    setFileContent(normalized);
   } catch (e) {
     if (useEditorStore.getState().activeTabId !== id) return;
     console.error('读取文件内容失败:', e);

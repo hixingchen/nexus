@@ -560,7 +560,7 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
   const [name, setName] = useState(initial?.name ?? '');
   const [cmd, setCmd] = useState(initial?.command ?? '');
   /** 超时（秒）文本：空 = 默认 60；0 = 不限制；正数 = 该秒数 */
-  const [timeoutSecs, setTimeoutSecs] = useState(
+  const [timeoutSecs, setTimeoutInput] = useState(
     initial?.timeout_secs != null ? String(initial.timeout_secs) : ''
   );
 
@@ -612,7 +612,7 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
         <input
           className={inputCls}
           value={timeoutSecs}
-          onChange={e => setTimeoutSecs(e.target.value)}
+          onChange={e => setTimeoutInput(e.target.value)}
           placeholder="留空 = 默认 60；0 = 不限制（打包/构建类建议 1800）"
           inputMode="numeric"
         />

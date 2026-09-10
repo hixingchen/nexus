@@ -329,7 +329,13 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
+    /** 结束标记：mouseup / blur / 卸载 任一先到即拆监听，重复调用安全 */
+    let finished = false;
+
     const onMove = (ev: MouseEvent) => {
+      // 无按键的移动 = 松手事件丢失（在窗口外或原生子 WebView 上松手收不到 mouseup），
+      // 按松手处理——否则后续无按键移动会继续改宽
+      if (ev.buttons === 0) { onUp(); return; }
       if (!dragStartRef.current) return;
       pendingXRef.current = ev.clientX; // 只记最新坐标
       if (rafRef.current !== null) return; // 已有排队帧，等下一帧
@@ -351,27 +357,40 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     };
 
     const onUp = () => {
-      const d = dragStartRef.current;
-      dragStartRef.current = null;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
+      if (finished) return;
+      finished = true;
+      try {
+        const d = dragStartRef.current;
+        dragStartRef.current = null;
+        if (rafRef.current !== null) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+        // 松手：以最终鼠标位置落 store 并清除手动宽度（渲染回归 store 事实源）
+        if (d && dockRef.current) {
+          const finalW = clampWidth(d.x, d.w, pendingXRef.current);
+          manualWRef.current = null;
+          dockRef.current.style.width = finalW + 'px';
+          useAiStore.getState().setPanelWidth(finalW);
+        }
+      } finally {
+        // 单出口：无论正常松手还是兜底结束，都恢复 body 样式并拆监听
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        removeListeners();
       }
-      // 松手：以最终鼠标位置落 store 并清除手动宽度（渲染回归 store 事实源）
-      if (d && dockRef.current) {
-        const finalW = clampWidth(d.x, d.w, pendingXRef.current);
-        manualWRef.current = null;
-        dockRef.current.style.width = finalW + 'px';
-        useAiStore.getState().setPanelWidth(finalW);
-      }
+    };
+
+    const removeListeners = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
     };
 
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    // 拖拽中切走窗口（alt-tab）收不到 mouseup，用 blur 兜底结束
+    window.addEventListener('blur', onUp);
   };
 
   /** 刷新/重启：后端幂等重启会话（崩溃自愈/切目录）→ URL 变化自动重建 WebView；

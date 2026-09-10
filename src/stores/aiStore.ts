@@ -99,7 +99,6 @@ interface AiState {
   /** 确保会话运行在指定目录（后端幂等：同目录复用/目录变重启/崩溃自愈） */
   ensureRunning: (cwd: string | null, projectName?: string | null) => Promise<void>;
   setInstalling: (v: boolean) => void;
-  clearError: () => void;
 }
 
 export const useAiStore = create<AiState>((set, get) => ({
@@ -188,14 +187,17 @@ export const useAiStore = create<AiState>((set, get) => ({
 
   stop: async () => {
     const { currentCwd } = get();
-    rememberAiOn(currentCwd, false);
     // 不设 starting 守卫：启动在途时停止 = 取消启动（后端 epoch 自杀，Err「已取消」当正常路径）
-    set({ panelOpen: false, running: false, url: null, sessionCwd: null, lastError: null });
+    // 先 await 后端停止、成功才落状态：乐观清空会让 UI 显示"会话已停止"而 dsh 进程其实还在跑
     try {
       await aiService.stop();
     } catch (e) {
       console.error('停止 dsh 会话失败:', e);
+      return;
     }
+    // 记忆标记也只在成功后写：失败时保持"本项目启用过 AI"，避免下次切回来不再自动启动
+    rememberAiOn(currentCwd, false);
+    set({ panelOpen: false, running: false, url: null, sessionCwd: null, lastError: null });
   },
 
   setPanelWidth: (width) => {
@@ -240,6 +242,4 @@ export const useAiStore = create<AiState>((set, get) => ({
   },
 
   setInstalling: (v) => set({ installing: v }),
-
-  clearError: () => set({ lastError: null }),
 }));

@@ -71,31 +71,50 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     if (!dragging) return;
     let rafId: number | null = null;
     let pendingEvent: MouseEvent | null = null;
+    /** 结束标记：mouseup / blur / 卸载 任一先到即拆监听，重复调用安全 */
+    let finished = false;
 
     const flush = () => {
-      if (!pendingEvent || !dragStateRef.current) { rafId = null; return; }
+      rafId = null;
+      if (!pendingEvent || !dragStateRef.current) return;
       const { startY, startHeight } = dragStateRef.current;
       setPanelHeight(Math.max(PANEL_MIN_HEIGHT, Math.min(PANEL_MAX_HEIGHT(), startHeight + (startY - pendingEvent.clientY))));
       pendingEvent = null;
-      rafId = null;
+    };
+
+    const handleUp = () => {
+      if (finished) return;
+      finished = true;
+      try {
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        dragStateRef.current = null;
+        setDragging(false);
+      } finally {
+        removeListeners();
+      }
     };
 
     const handleMove = (e: MouseEvent) => {
+      // 无按键的移动 = 松手事件丢失（在窗口外松手），按松手处理
+      if (e.buttons === 0) { handleUp(); return; }
       pendingEvent = e;
       if (rafId === null) rafId = requestAnimationFrame(flush);
     };
-    const handleUp = () => {
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      dragStateRef.current = null;
-      setDragging(false);
+
+    const removeListeners = () => {
+      document.removeEventListener('mousemove', handleMove);
+      document.removeEventListener('mouseup', handleUp);
+      window.removeEventListener('blur', handleUp);
     };
 
     document.addEventListener('mousemove', handleMove);
     document.addEventListener('mouseup', handleUp);
+    // 拖拽中切走窗口（alt-tab）收不到 mouseup，用 blur 兜底结束
+    window.addEventListener('blur', handleUp);
     return () => {
+      finished = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      document.removeEventListener('mousemove', handleMove);
-      document.removeEventListener('mouseup', handleUp);
+      removeListeners();
     };
   }, [dragging]);
 

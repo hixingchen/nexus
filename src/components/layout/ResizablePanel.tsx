@@ -44,9 +44,12 @@ export function ResizablePanel({
 
     let rafId: number | null = null;
     let pendingEvent: MouseEvent | null = null;
+    /** 结束标记：mouseup / blur / 卸载 任一先到即拆监听，重复调用安全 */
+    let finished = false;
 
-    const flush = () => {
-      if (!pendingEvent || !containerRef.current) { rafId = null; return; }
+    const flush = (): number | null => {
+      rafId = null;
+      if (!pendingEvent || !containerRef.current) return null;
       const e = pendingEvent;
       pendingEvent = null;
 
@@ -61,32 +64,47 @@ export function ResizablePanel({
 
       newSize = Math.max(minWidth, Math.min(maxWidth, newSize));
       setSize(newSize);
-      rafId = null;
+      return newSize;
+    };
+
+    const handleMouseUp = () => {
+      if (finished) return;
+      finished = true;
+      try {
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        // 冲刷排队帧：否则松手位置被丢弃，面板停在光标之前
+        const flushed = flush();
+        setIsDragging(false);
+        onResize?.(flushed ?? sizeRef.current);
+      } finally {
+        removeListeners();
+      }
     };
 
     const handleMouseMove = (e: MouseEvent) => {
+      // 无按键的移动 = 松手事件丢失（在窗口外/原生子 WebView 上松手），按松手处理
+      if (e.buttons === 0) { handleMouseUp(); return; }
       pendingEvent = e;
       if (rafId === null) {
         rafId = requestAnimationFrame(flush);
       }
     };
 
-    const handleMouseUp = () => {
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
-      }
-      setIsDragging(false);
-      onResize?.(sizeRef.current);
+    const removeListeners = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      window.removeEventListener('blur', handleMouseUp);
     };
 
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
+    // 拖拽中切走窗口（alt-tab）收不到 mouseup，用 blur 兜底结束
+    window.addEventListener('blur', handleMouseUp);
 
     return () => {
+      finished = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
+      removeListeners();
     };
   }, [isDragging, direction, minWidth, maxWidth]);
 

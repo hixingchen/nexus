@@ -80,7 +80,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     loadTemplates();
     layoutApi.load().then(l => {
       if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
-    }).catch(() => {});
+    }).catch((e) => console.error('加载布局失败:', e));
   }, [loadTemplates]);
 
   // 防抖保存上半区高度（对齐 MainLayout 的布局保存模式）

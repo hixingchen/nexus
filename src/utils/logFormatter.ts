@@ -158,7 +158,9 @@ function smartColorize(text: string): string {
 
   result = escapeHtml(result);
   for (const { id, html } of placeholders) {
-    result = result.replace(id, html);
+    // 用 split/join 做字面替换：String.replace 会把替换串里的 $& / $` / $' 当替换模式解释，
+    // 日志内容（如 echo 出来的 sed/regex 命令）含 $ 时会被破坏，且只替换首个匹配
+    result = result.split(id).join(html);
   }
 
   return result;
@@ -192,6 +194,7 @@ export function renderLine(line: string, searchTerm: string): string {
   });
   let html = marked.includes('\x1b[') ? ansiToHtml(marked) : smartColorize(marked);
   for (const { id, html: h } of marks) {
+    // 同上：字面替换，避免搜索词/日志内容里的 $ 模式污染
     html = html.split(id).join(h);
   }
   return html;

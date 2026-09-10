@@ -10,7 +10,6 @@ interface LogStore {
   version: Record<string, number>;
   /** 累计新增行数（只增不减，\r 刷新帧不计）。暂停时显示"新增 N 行"的依据 */
   totalAdded: Record<string, number>;
-  appendLog: (serviceKey: string, stream: LogStream, data: string) => void;
   bulkAppend: (items: Array<{ serviceKey: string; stream: LogStream; data: string; timestamp?: string }>) => void;
   /** 同步设置跟随数据源（由组件调用 service 后传入；不影响暂停视图） */
   setLogs: (serviceKey: string, lines: ServiceLogLine[]) => void;
@@ -48,27 +47,6 @@ export const useLogStore = create<LogStore>((set) => ({
   pausedLogs: {},
   version: {},
   totalAdded: {},
-
-  appendLog: (serviceKey, stream: LogStream, data) => {
-    const now = new Date().toISOString();
-    const line: ServiceLogLine = { timestamp: now, stream, text: data };
-    set((state) => {
-      const existing = state.logs[serviceKey] ?? [];
-      const updated = trimLines(existing.concat([line]));
-      // 暂停视图：未满 2000 行继续接收；满后冻结（\r 刷新帧仍替换最后一行）
-      let pausedUpdated = state.pausedLogs[serviceKey];
-      if (pausedUpdated !== undefined && pausedUpdated.length < MAX_LINES) {
-        pausedUpdated = pausedUpdated.concat([line]);
-        pausedUpdated = trimLines(pausedUpdated);
-      }
-      return {
-        logs: { ...state.logs, [serviceKey]: updated },
-        pausedLogs: pausedUpdated !== undefined ? { ...state.pausedLogs, [serviceKey]: pausedUpdated } : state.pausedLogs,
-        version: { ...state.version, [serviceKey]: (state.version[serviceKey] ?? 0) + 1 },
-        totalAdded: { ...state.totalAdded, [serviceKey]: (state.totalAdded[serviceKey] ?? 0) + 1 },
-      };
-    });
-  },
 
   bulkAppend: (items) => {
     if (items.length === 0) return;
@@ -130,8 +108,8 @@ export const useLogStore = create<LogStore>((set) => ({
 
   setLogs: (serviceKey, lines) => {
     set((state) => ({
-      // 只更新跟随数据源（不影响暂停视图）
-      logs: { ...state.logs, [serviceKey]: lines },
+      // 只更新跟随数据源（不影响暂停视图）；同样走 trimLines：后端快照也不能突破行数/字节上限
+      logs: { ...state.logs, [serviceKey]: trimLines(lines) },
       version: { ...state.version, [serviceKey]: (state.version[serviceKey] ?? 0) + 1 },
       // 快照是初始状态，不是"新"日志——重置累计器
       totalAdded: { ...state.totalAdded, [serviceKey]: 0 },

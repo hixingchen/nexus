@@ -7,11 +7,9 @@ interface ModalProps {
   onClose: () => void;
   children: React.ReactNode;
   width?: string;
-  /** 点击遮罩是否关闭（默认 true；搜索弹窗等防误触场景传 false） */
-  closeOnOverlay?: boolean;
 }
 
-export function Modal({ open, title, onClose, children, width = '420px', closeOnOverlay = true }: ModalProps) {
+export function Modal({ open, title, onClose, children, width = '420px' }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const mouseDownTarget = useRef<EventTarget | null>(null);
 
@@ -43,7 +41,8 @@ export function Modal({ open, title, onClose, children, width = '420px', closeOn
       className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50"
       onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
       onMouseUp={(e) => {
-        if (closeOnOverlay && mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) {
+        // 仅在遮罩自身上下都按下+抬起时才关闭：拖拽选中文字后在遮罩上松手不算点击遮罩
+        if (mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) {
           onClose();
         }
         mouseDownTarget.current = null;

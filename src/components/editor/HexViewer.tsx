@@ -84,7 +84,7 @@ export function HexViewer({ path }: { path: string }) {
       inflight.current.add(p);
       readHexPage(path, p * PAGE_BYTES, ROWS_PER_PAGE)
         .then(res => setPages(prev => new Map(prev).set(p, res.bytes)))
-        .catch(() => {}) // 单页失败静默：该区域显示占位，滚动重试
+        .catch((e) => console.error('读取 hex 分页失败:', path, p, e)) // 仅控制台留痕：该区域显示占位，滚动重试
         .finally(() => {
           inflight.current.delete(p);
         });
