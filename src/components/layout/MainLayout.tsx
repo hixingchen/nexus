@@ -7,6 +7,7 @@ import { ProjectList } from './ProjectList';
 import { ProjectDetail } from './ProjectDetail';
 import { RestartConfirm } from './RestartConfirm';
 import { AiPanel } from '../ai/AiPanel';
+import { ProjectRail } from './ProjectRail';
 import { layoutApi, securityApi, projectApi } from '../../services/service';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
@@ -18,6 +19,7 @@ export function MainLayout() {
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
   const [leftPanelWidth, setLeftPanelWidth] = useState(260);
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
   const [ready, setReady] = useState(false);
 
@@ -49,6 +51,16 @@ export function MainLayout() {
     }).then(fn => {
       if (disposed) { fn(); return; }
       logListenerRef.current = { unlisten: fn };
+    }).catch((e) => {
+      // 订阅失败 = 所有服务日志静默停止显示（且 logListenerRef 保持 null、清理变空操作）。
+      // 原实现没有 catch：这里既会抛未处理的 rejection，又让用户完全无从察觉。
+      console.error('订阅 service-log 失败:', e);
+      showNotification({
+        variant: 'error',
+        title: '日志订阅失败',
+        description: '服务日志将无法实时显示，请重启应用',
+        duration: 8000,
+      });
     });
 
     return () => {
@@ -96,6 +108,7 @@ export function MainLayout() {
         }
       }
       if (layout.left_panel_width) setLeftPanelWidth(Number(layout.left_panel_width));
+      if (layout.left_panel_collapsed === '1') setLeftPanelCollapsed(true);
       if (layout.service_panel_collapsed === '1') setServicePanelCollapsed(true);
       setReady(true);
     }).catch(() => setReady(true));
@@ -112,6 +125,11 @@ export function MainLayout() {
     saveLayout({ service_panel_collapsed: servicePanelCollapsed ? '1' : '0' });
   }, [servicePanelCollapsed, ready, saveLayout]);
 
+  useEffect(() => {
+    if (!ready) return;
+    saveLayout({ left_panel_collapsed: leftPanelCollapsed ? '1' : '0' });
+  }, [leftPanelCollapsed, ready, saveLayout]);
+
   // 文件监听由 ProjectDetail 统一管理（服务配置变更时需重启监听）
 
   // 项目切换时设置文件访问白名单
@@ -125,6 +143,16 @@ export function MainLayout() {
       onSelect={(id) => { setSelectedProjectId(id); if (!id) { setSelectedProjectName(null); setSelectedProjectPath(null); } }}
       onProjectName={setSelectedProjectName}
       onProjectPath={setSelectedProjectPath}
+      onCollapse={() => setLeftPanelCollapsed(true)}
+    />
+  );
+
+  /** 收起后的项目列：32px 窄轨（含可点击的项目条目），与服务列收起态同构 */
+  const leftRail = (
+    <ProjectRail
+      selectedId={selectedProjectId}
+      onSelect={(p) => { setSelectedProjectId(p.id); setSelectedProjectName(p.name); setSelectedProjectPath(p.path); }}
+      onExpand={() => setLeftPanelCollapsed(false)}
     />
   );
 
@@ -155,7 +183,14 @@ export function MainLayout() {
     );
   }
 
-  const mainContent = (
+  // 收起态不复用 ResizablePanel：否则分隔条仍可拖动，会与"固定 32px 窄轨"的语义打架
+  // （拖出来的宽度无处可去，松手后窄轨不动、只有持久化值被改写）。展开时宽度保持不变。
+  const mainContent = leftPanelCollapsed ? (
+    <div className="flex h-full w-full overflow-hidden">
+      <div className="w-[32px] flex-shrink-0">{leftRail}</div>
+      <div className="flex-1 min-w-0 overflow-hidden">{detailPanel}</div>
+    </div>
+  ) : (
     <ResizablePanel
       left={leftPanel}
       right={detailPanel}

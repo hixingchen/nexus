@@ -18,7 +18,7 @@ interface Props {
   actingId: string | null;
   expandedSvc: Set<string>;
   onSelect: () => void;
-  /** 展开/收起服务目录树（双击卡片或单击箭头） */
+  /** 展开/收起服务目录树（双击卡片；卡片上不再有箭头按钮） */
   onToggleExpand: (e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onStart: (e: React.MouseEvent) => void;
@@ -63,23 +63,14 @@ export function ProjectListItem({
         onContextMenu={onContextMenu}
       >
         <div className="flex items-start gap-2">
-          {/* 展开箭头：目录树入口的可见提示（单击切换，双击卡片同效）。
-              固定槽位垂直居中，加载中换成 spinner —— 否则双击到数据回来之间毫无反馈 */}
-          <span className="flex-shrink-0 -ml-1 w-3.5 h-[18px] flex items-center justify-center">
-            {expanding ? (
+          {/* 展开入口 = 双击卡片（见 onDoubleClick）。此处只保留"展开加载中"的反馈：
+              不渲染箭头图标（左侧留白反而更干净），未加载时不占位；
+              spinner 仍必须有——双击到数据回来之间若无反馈，用户会以为双击没生效而反复点 */}
+          {expanding && (
+            <span className="flex-shrink-0 -ml-1 w-3.5 h-[18px] flex items-center justify-center">
               <span className="w-[11px] h-[11px] border-[1.5px] border-nexus-success/30 border-t-nexus-success rounded-full animate-spin" />
-            ) : (
-              <button
-                className="w-full h-full flex items-center justify-center rounded text-nexus-muted/70 hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors"
-                title={isExpanded ? '收起服务目录树' : '展开服务目录树'}
-                onClick={(ev) => { ev.stopPropagation(); onToggleExpand(ev); }}
-              >
-                <svg className={`transition-transform ${isExpanded ? 'rotate-90' : ''}`} width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
-                  <polyline points="3,1 7,5 3,9" />
-                </svg>
-              </button>
-            )}
-          </span>
+            </span>
+          )}
           {/* 文件夹图标 */}
           <span className="flex-shrink-0 mt-px text-nexus-muted/60 group-hover:text-nexus-muted">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -239,6 +230,7 @@ export function ProjectListItem({
                 showNotification({ variant: 'success', title: '路径已复制' });
               } catch (err) {
                 console.error('复制路径失败:', err);
+                showNotification({ variant: 'error', title: '复制路径失败', description: String(err) });
               }
             }}
           >
@@ -258,6 +250,7 @@ export function ProjectListItem({
                 showNotification({ variant: 'success', title: '文件名已复制' });
               } catch (err) {
                 console.error('复制文件名失败:', err);
+                showNotification({ variant: 'error', title: '复制文件名失败', description: String(err) });
               }
             }}
           >

@@ -8,6 +8,7 @@ import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
+import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
 import { ServiceTreeEntry } from './ServiceTreeEntry';
@@ -120,15 +121,18 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const handleRunToolCommand = async (serviceId: string, commandId: string, commandName: string) => {
     const runId = crypto.randomUUID();
     setToolCommandState({ open: true, loading: true, commandName, runId, result: null, logs: [] });
-    const unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
-      if (event.payload.run_id !== runId) return;
-      setToolCommandState(prev => {
-        const logs = [...prev.logs, event.payload.data];
-        if (logs.length > MAX_TOOL_CMD_LOG_LINES) logs.splice(0, logs.length - MAX_TOOL_CMD_LOG_LINES);
-        return { ...prev, logs };
-      });
-    });
+    // 订阅放在 try 内：原实现把 `await listen(...)` 放在 try 之外且调用方丢弃 Promise，
+    // 一旦订阅失败就抛出未处理的 rejection 且弹窗永久停在 loading（只能重启应用）
+    let unlisten: (() => void) | null = null;
     try {
+      unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
+        if (event.payload.run_id !== runId) return;
+        setToolCommandState(prev => {
+          const logs = [...prev.logs, event.payload.data];
+          if (logs.length > MAX_TOOL_CMD_LOG_LINES) logs.splice(0, logs.length - MAX_TOOL_CMD_LOG_LINES);
+          return { ...prev, logs };
+        });
+      });
       const result = await processApi.runToolCommand(serviceId, commandId, runId);
       // 以完整结果兜底（含按序号合并的顺序，避免事件流微乱序；同为最新 N 行）
       const logs = result.output.split('\n').slice(-MAX_TOOL_CMD_LOG_LINES);
@@ -136,9 +140,10 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     } catch (err) {
       console.error('执行工具命令失败:', err);
       showNotification({ variant: 'error', title: '执行工具命令失败', description: String(err) });
+      // 失败也要让弹窗脱离 loading 态，否则用户看到的是"永远在等待执行"
       setToolCommandState(prev => ({ ...prev, loading: false }));
     } finally {
-      unlisten();
+      unlisten?.();
     }
   };
 
@@ -487,13 +492,11 @@ function CollapsedView({
       {/* 顶部：展开服务列表在上，AI 开关在它下方（收起态依旧可点） */}
       <div className="flex flex-col items-center py-1 gap-0.5 flex-shrink-0 border-b border-nexus-border/40">
         <button
-          className="w-6 h-6 flex items-center justify-center rounded-md hover:bg-nexus-hover/40 transition-colors"
+          className="w-6 h-6 flex items-center justify-center rounded-md text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/40 transition-colors"
           title="展开服务列表"
           onClick={onToggle}
         >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-nexus-muted">
-            <path d="M2 2.5h8M2 6h8M2 9.5h8"/>
-          </svg>
+          <PanelToggleIcon size={13} />
         </button>
         <button
           className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (
@@ -685,9 +688,7 @@ function ServiceSection({
             title="收起服务列表"
             onClick={onToggle}
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <polyline points="5,2 10,7 5,12" />
-            </svg>
+            <PanelToggleIcon />
           </button>
         </div>
       </div>

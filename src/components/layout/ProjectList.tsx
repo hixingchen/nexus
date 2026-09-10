@@ -6,15 +6,18 @@ import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
+import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 
 interface Props {
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onProjectName?: (name: string) => void;
   onProjectPath?: (path: string) => void;
+  /** 收起项目列（由 MainLayout 提供） */
+  onCollapse?: () => void;
 }
 
-export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath }: Props) {
+export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath, onCollapse }: Props) {
   const {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
@@ -46,8 +49,8 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
 
   return (
     <div className="h-full bg-nexus-surface flex flex-col select-none">
-      {/* 搜索 + 新建 */}
-      <SearchBar search={search} setSearch={setSearch} onNew={() => setShowNewModal(true)} />
+      {/* 搜索 + 新建 + 收起 */}
+      <SearchBar search={search} setSearch={setSearch} onNew={() => setShowNewModal(true)} onCollapse={onCollapse} />
 
       {/* 项目列表 */}
       <div className="flex-1 overflow-auto py-0.5">
@@ -148,14 +151,17 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
 
 // ── 子组件 ────────────────────────────────────────────────
 
-function SearchBar({ search, setSearch, onNew }: {
+function SearchBar({ search, setSearch, onNew, onCollapse }: {
   search: string;
   setSearch: (s: string) => void;
   onNew: () => void;
+  /** 收起项目列（由 MainLayout 提供；缺省时不渲染该按钮） */
+  onCollapse?: () => void;
 }) {
   return (
     <div className="flex items-center gap-2 px-3 py-2 flex-shrink-0">
-      <div className="flex-1 relative">
+      {/* min-w-0：flex 子项默认 min-width:auto，input 的固有宽度会让面板缩窄时溢出 */}
+      <div className="flex-1 min-w-0 relative">
         <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-nexus-muted" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="5" cy="5" r="3.5"/><line x1="8.5" y1="8.5" x2="11" y2="11"/></svg>
         <input className="w-full pl-7 pr-2 py-1 text-[12px] bg-nexus-bg border border-nexus-border rounded text-nexus-text placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent"
           placeholder="搜索项目..." value={search} onChange={e => setSearch(e.target.value)} />
@@ -167,6 +173,15 @@ function SearchBar({ search, setSearch, onNew }: {
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/></svg>
         新建
       </button>
+      {onCollapse && (
+        <button
+          className="flex-shrink-0 p-1 text-nexus-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50 transition-colors"
+          title="收起项目列表"
+          onClick={onCollapse}
+        >
+          <PanelToggleIcon />
+        </button>
+      )}
     </div>
   );
 }
