@@ -50,6 +50,13 @@ let lastParentFocusAt = 0;
  */
 let lastFocusCmdAt = 0;
 
+/**
+ * 面板收起（显隐模式：只移屏不销毁）期间的重贴暂停标志：WebView 保留在屏外
+ * （-20000,0），窗口事件/宽度变化触发的重贴一律短路，防把隐藏的 WebView 贴回
+ * 可见区。单实例组件，模块级安全。
+ */
+let wvHidden = false;
+
 interface Bounds { x: number; y: number; width: number; height: number }
 
 /**
@@ -150,6 +157,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     const sync = syncRef.current;
     syncRef.current = null;
     if (sync) sync.dispose(); // 先短路：迟到的 relayout/retry 一律不再写入
+    wvHidden = false;
     const wv = wvRef.current;
     wvRef.current = null;
     createdForRef.current = '';
@@ -164,6 +172,23 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     unlistenWinRef.current = [];
     setWvReady(false);
     setWvError(null);
+  };
+
+  /** 显隐模式的「隐藏」：只移屏保留实例（不 close 不销毁）——重开零重建零闪烁 */
+  const hideWv = () => {
+    wvHidden = true;
+    const wv = wvRef.current;
+    if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+  };
+
+  /** 显隐模式的「显示」：移回槽位（两帧后重贴，等面板宽度过渡布局稳定） */
+  const showWv = () => {
+    wvHidden = false;
+    const sync = syncRef.current;
+    const slot = slotRef.current;
+    if (sync && slot && !sync.disposed) {
+      requestAnimationFrame(() => requestAnimationFrame(() => void guardedRelayout(sync, slot)));
+    }
   };
 
   // 挂载引导：恢复宽度 + 载入 per-project 记忆缓存（切换项目零闪烁的前提）；
@@ -207,17 +232,26 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const showFrame = runningHere && !!url;
 
   // WebView 生命周期：本项目会话在跑 && 面板展开 → 创建/重建（url 或刷新键变化）；
-  // 收起（panelOpen=false）或会话不属于本项目（showFrame=false）→ 销毁。
-  // 销毁不伤会话：dsh 进程与 cookie 保留，重开/切回时重建即秒载
+  // 收起（panelOpen=false）或会话不属于本项目（showFrame=false）→ 显隐优先：
+  // 面板收起时只移屏保留 WebView（hideWv），重开直接移回（showWv）——不重建、
+  // 不重新加载，零闪烁；仅当内容键变化（会话切换/刷新/停止，页面已过期）才真正
+  // 销毁。销毁不伤会话：dsh 进程与 cookie 保留，重建时秒载
   useEffect(() => {
     const key = url ? `${url}#${refreshNonce}` : '';
     desiredKeyRef.current = key;
     if (!panelOpen || !showFrame || !url) {
-      destroyWv();
+      if (wvRef.current && createdForRef.current !== key) {
+        destroyWv(); // 内容键变化（会话切换/刷新/停止）→ 页面过期，真实销毁
+      } else if (wvRef.current) {
+        hideWv(); // 仅显隐：保留实例移屏，重开零重建
+      }
       return;
     }
     if (wvRef.current) {
-      if (createdForRef.current === key) return; // 已就绪且内容没变
+      if (createdForRef.current === key) {
+        showWv(); // 已保留的 WebView：移回原位，无需重建
+        return;
+      }
       destroyWv(); // url/刷新键变化 → 先销毁再重建
     }
     if (createLockRef.current) return; // 上一次创建仍在途，等它完成（其自查会自毁）
@@ -353,6 +387,10 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
    *  installing 期间也收（进度卡让位）：后端升级不可中断，完成后仍弹成功通知 */
   const handleHide = () => {
     const st = useAiStore.getState();
+    // 先移屏再收宽度：原生 WebView 盖在 DOM 之上，宽度收起的瞬间主内容区立即
+    // 扩展，若 WebView 还贴在原位置会短暂浮在扩展区上（闪烁）——先让它离开视线
+    const wv = wvRef.current;
+    if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
     if (st.installing) st.setInstalling(false);
     st.setPanelOpen(false);
   };
@@ -401,9 +439,11 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
       ref={dockRef}
       className="relative h-full flex flex-shrink-0 bg-nexus-surface overflow-hidden"
       // 隐藏 = 宽度收成 0 而非卸载：DOM 头部/状态卡保持挂载；内容区的原生
-      // WebView 已被生命周期 effect 移出屏幕并 close（原生层不受 overflow 裁切）。
-      // 会话进程保留，重开秒载。安装 dsh 期间即使面板被 stop 收起也保持展开：
-      // 进度 spinner 不能没地方显示（点 X 可随时放弃进度显示，见 handleHide）
+      // WebView 被移出屏幕（保留实例，见 hideWv，重开移回零重建）。
+      // 会话进程保留，重开秒显。安装 dsh 期间即使面板被 stop 收起也保持展开：
+      // 进度 spinner 不能没地方显示（点 X 可随时放弃进度显示，见 handleHide）。
+      // 注意：不做宽度过渡动画——原生子 WebView 与 CSS 动画天然不同步
+      // （重贴会写入过渡中间宽度导致错位）；显隐零闪烁由「保留实例」保证
       style={{ width: widthFact }}
     >
       {/* ── 左缘细分隔条：整高可见（在 WebView 之外，可直接拖拽调宽） ── */}
@@ -610,6 +650,7 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
 async function guardedRelayout(sync: BoundsSync, slot: HTMLElement, retries = 4) {
   if (sync.disposed) return;
   if (modalPause) return; // 全局弹窗打开期间禁止重贴（WebView 应停留在屏外）
+  if (wvHidden) return;   // 面板收起（显隐保留）期间禁止重贴（WebView 停留在屏外）
   const appWindow = getCurrentWindow();
   let minimized = false;
   try {
