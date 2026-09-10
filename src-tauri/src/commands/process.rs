@@ -6,10 +6,24 @@ use serde::Serialize;
 use crate::AppState;
 use crate::core::process::LogLine;
 
-/// 工具命令执行超时：防止长驻命令（npm run dev 等）永久占用线程池
+/// 工具命令默认执行超时（未配置 timeout_secs 时）：防止长驻命令（npm run dev 等）
+/// 永久占用线程池。构建类长任务应在命令上配置 timeout_secs（如 1800）或 0（不限）
 const TOOL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// 工具命令输出最多保留的行数（对齐服务日志上限，防止超长输出撑爆 IPC payload 和前端渲染）
 const TOOL_CMD_OUTPUT_MAX_LINES: usize = 2000;
+
+/// 运行中的工具命令表（run_id → pid）：供 stop_tool_command 按 run_id 终止进程树，
+/// 也是超时兜底杀进程的 pid 来源（不再用 oneshot 单次传递）
+fn running_tool_cmds() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 取出并移除运行表中的 pid（超时/结束时清理）
+fn take_running_pid(run_id: &str) -> Option<u32> {
+    running_tool_cmds().lock().ok().and_then(|mut m| m.remove(run_id))
+}
 
 /// 查询服务信息（name, command, cwd, project_id, env_vars）
 fn get_service_info(db: &crate::database::Database, service_id: &str) -> Result<(String, String, String, String, String), String> {
@@ -202,13 +216,20 @@ pub async fn run_tool_command(
         project_id, service_name, tool_cmd.name, tool_cmd.command, cwd);
 
     // 在线程池中执行命令，避免阻塞主线程（长命令如 npm run build 会冻结整个 UI）
-    // 带 60 秒超时：长驻命令（npm run dev 之类）不会永久占用线程池和前端等待
-    // 输出由双线程逐行读取并 emit（前端实时展示），主线程只等进程退出拿退出码
+    // 输出由双线程逐行读取并 emit（前端实时展示），主线程只等进程退出拿退出码。
+    // 超时按命令配置：缺省 60s（防长驻命令挂死）；0 = 不限制（长构建）；
+    // 正数 = 该秒数。超时/手动停止都走 kill_process_tree（见 stop_tool_command）
     let cmd_str = tool_cmd.command;
     let cwd_clone = cwd.clone();
-    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
-    let result = tokio::time::timeout(TOOL_COMMAND_TIMEOUT, async {
+    let timeout_dur = match tool_cmd.timeout_secs {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(TOOL_COMMAND_TIMEOUT),
+    };
+    let run_id_exec = run_id.clone(); // 闭包 move 用；外层 run_id 保留给超时/清理分支
+    let exec = async {
         tauri::async_runtime::spawn_blocking(move || {
+            let run_id = run_id_exec;
             let mut cmd = crate::core::process::build_command(&cmd_str);
             if !cwd_clone.is_empty() {
                 cmd.current_dir(&cwd_clone);
@@ -218,7 +239,10 @@ pub async fn run_tool_command(
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("执行命令失败: {}", e))?;
-            let _ = pid_tx.send(child.id());
+            // 注册到运行表：stop_tool_command / 超时兜底据此按 run_id 终止进程树
+            if let Ok(mut table) = running_tool_cmds().lock() {
+                table.insert(run_id.clone(), child.id());
+            }
 
             let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
             let stderr = child.stderr.take().ok_or("无法获取 stderr")?;
@@ -270,24 +294,33 @@ pub async fn run_tool_command(
             let output = all.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n");
             Ok::<_, String>((status, output))
         }).await.map_err(|e| format!("命令执行任务失败: {}", e))?
-    }).await;
+    };
+    // 可选超时：None（配置 0）= 不限制，等待命令自然结束
+    let result = match timeout_dur {
+        Some(d) => tokio::time::timeout(d, exec).await,
+        None => Ok(exec.await),
+    };
     let result = match result {
         Ok(inner) => inner?,
         Err(_) => {
             // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）。
-            // pid 由 spawn_blocking 任务 spawn 成功后上报：oneshot 等待非阻塞
-            // （原 50×100ms sleep 轮询会占用 tokio worker）。若任务仍在阻塞池排队
-            // 收不到 pid——命令随后仍会照常启动（无法拦截），如实告知而非谎报"已终止"
-            let pid = tokio::time::timeout(Duration::from_secs(5), pid_rx).await.ok().and_then(|r| r.ok());
+            // pid 取自运行表（spawn 成功即注册）；若命令仍在阻塞池排队（尚未 spawn）
+            // 则取不到 pid——命令随后仍会照常启动（无法拦截），如实告知而非谎报"已终止"
+            let pid = take_running_pid(&run_id);
+            let secs = timeout_dur.map(|d| d.as_secs()).unwrap_or(0);
             return match pid {
                 Some(p) => {
                     crate::core::process::kill_process_tree(p);
-                    Err("命令执行超时（60 秒），已终止".into())
+                    Err(format!("命令执行超时（{} 秒），已终止。长构建类命令请在工具命令上配置更长的超时（或 0 = 不限制）", secs))
                 }
-                None => Err("命令执行超时（60 秒），且未能取得进程 ID——命令可能仍在启动队列中，请留意是否残留运行".into()),
+                None => Err(format!("命令执行超时（{} 秒），且未能取得进程 ID——命令可能仍在启动队列中，请留意是否残留运行", secs)),
             };
         }
     };
+    // 正常结束：清理运行表
+    if let Ok(mut table) = running_tool_cmds().lock() {
+        table.remove(&run_id);
+    }
 
     let (status, output) = result;
     Ok(ToolCommandResult {
@@ -295,4 +328,26 @@ pub async fn run_tool_command(
         output,
         exit_code: status.code(),
     })
+}
+
+/// 停止正在执行的工具命令（按 run_id 终止其进程树）。
+/// 前端结果弹窗「停止」按钮调用；命令随后会以退出码正常返回（success=false）
+#[tauri::command]
+pub async fn stop_tool_command(run_id: String) -> Result<(), String> {
+    if run_id.trim().is_empty() {
+        return Err("run_id 不能为空".into());
+    }
+    let pid = running_tool_cmds()
+        .lock()
+        .map_err(|e| format!("工具命令运行表锁中毒: {}", e))?
+        .get(&run_id)
+        .copied();
+    match pid {
+        Some(p) => {
+            log::info!("[nexus] 停止工具命令 run_id={} pid={}", run_id, p);
+            crate::core::process::kill_process_tree(p);
+            Ok(())
+        }
+        None => Err("命令未在运行（可能已结束）".into()),
+    }
 }

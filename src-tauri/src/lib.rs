@@ -171,6 +171,7 @@ pub fn run() {
             commands::process::get_running,
             commands::process::get_service_logs,
             commands::process::run_tool_command,
+            commands::process::stop_tool_command,
             commands::watcher::start_watching,
             commands::watcher::stop_watching,
             commands::tools::list_open_tools,

@@ -4,6 +4,8 @@ export interface ToolCommand {
   id: string;
   name: string;
   command: string;
+  /** 执行超时（秒）：不填 = 默认 60；0 = 不限制（长构建类命令）；正数 = 该秒数 */
+  timeout_secs?: number;
 }
 
 export interface Service {
@@ -261,6 +263,9 @@ export const processApi = {
   /** 执行工具命令 */
   runToolCommand: (serviceId: string, commandId: string, runId: string) =>
     invoke<ToolCommandResult>('run_tool_command', { serviceId, commandId, runId }),
+
+  /** 停止正在执行的工具命令（按 run_id 终止其进程树） */
+  stopToolCommand: (runId: string) => invoke<void>('stop_tool_command', { runId }),
 };
 
 // ─── Watcher API ───────────────────────────────────────────

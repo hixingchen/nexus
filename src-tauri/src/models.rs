@@ -15,6 +15,10 @@ pub struct ToolCommand {
     pub id: String,
     pub name: String,
     pub command: String,
+    /// 执行超时（秒）：缺省 = 默认 60 秒；0 = 不限制（长构建类命令）；
+    /// 正数 = 该秒数。超时会终止进程树（见 commands::process::run_tool_command）
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// 外部打开工具（服务右键「用 XX 打开」）

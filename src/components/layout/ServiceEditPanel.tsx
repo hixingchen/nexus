@@ -559,6 +559,19 @@ interface ToolCommandFormProps {
 function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFormProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [cmd, setCmd] = useState(initial?.command ?? '');
+  /** 超时（秒）文本：空 = 默认 60；0 = 不限制；正数 = 该秒数 */
+  const [timeoutSecs, setTimeoutSecs] = useState(
+    initial?.timeout_secs != null ? String(initial.timeout_secs) : ''
+  );
+
+  /** 空 → undefined（默认）；非负整数 → 数值；非法输入 → undefined（按默认处理） */
+  const parseTimeout = (): number | undefined => {
+    const s = timeoutSecs.trim();
+    if (s === '') return undefined;
+    const n = Number(s);
+    if (!Number.isFinite(n) || n < 0) return undefined;
+    return Math.floor(n);
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -567,6 +580,7 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
       id: initial?.id ?? crypto.randomUUID(),
       name: name.trim(),
       command: cmd.trim(),
+      timeout_secs: parseTimeout(),
     });
   };
 
@@ -591,6 +605,16 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
           value={cmd}
           onChange={e => setCmd(e.target.value)}
           placeholder="mvn clean"
+        />
+      </div>
+      <div>
+        <label className="text-[11px] text-nexus-muted">超时（秒）</label>
+        <input
+          className={inputCls}
+          value={timeoutSecs}
+          onChange={e => setTimeoutSecs(e.target.value)}
+          placeholder="留空 = 默认 60；0 = 不限制（打包/构建类建议 1800）"
+          inputMode="numeric"
         />
       </div>
       <div className="flex items-center justify-between pt-1">

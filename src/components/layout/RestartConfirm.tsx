@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type FileChangeEvent } from '../../services/service';
 import { showNotification } from '../ui/Toast';
+import { useAiStore } from '../../stores/aiStore';
 
 type ConfirmItem = {
   serviceId: string;
@@ -18,6 +19,11 @@ export function RestartConfirm() {
   const [items, setItems] = useState<ConfirmItem[]>([]);
   /** 记录 2 秒内已自动重启过的服务，防止事件风暴触发连环重启 */
   const autoRestartCooldownRef = useRef(new Set<string>());
+  /** AI 面板占用右侧：卡片必须让位——原生子 WebView 盖在所有 DOM 之上，
+   *  卡片若落在面板区域内会既看不见也点不到（z-index 对原生层无效） */
+  const aiPanelVisible = useAiStore((s) => s.panelOpen || s.installing);
+  const aiPanelWidth = useAiStore((s) => s.panelWidth);
+  const cardRight = aiPanelVisible ? aiPanelWidth + 24 : 24;
 
   useEffect(() => {
     const unlisten = listen<FileChangeEvent>('file-changed', (event) => {
@@ -80,7 +86,11 @@ export function RestartConfirm() {
   if (items.length === 0) return null;
 
   return (
-    <div className="fixed bottom-10 right-6 z-[80] flex flex-col-reverse gap-3">
+    <div
+      className="fixed bottom-10 z-[80] flex flex-col-reverse gap-3"
+      // right 动态让位 AI 面板（见 aiPanelVisible 注释）：面板宽度可拖拽变化，订阅 store 自动跟随
+      style={{ right: cardRight }}
+    >
       {items.map(item => (
         <div key={item.serviceId}
           className="flex items-center gap-4 bg-nexus-surface border border-nexus-border rounded-xl shadow-2xl pl-5 pr-3 py-3.5 min-w-[340px] max-w-[420px]"
