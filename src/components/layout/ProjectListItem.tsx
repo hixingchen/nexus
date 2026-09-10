@@ -4,18 +4,22 @@ import { invoke } from '@tauri-apps/api/core';
 import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
 import { useSearchModalStore } from '../../stores/searchModal';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { showNotification } from '../ui/Toast';
 
 interface Props {
   project: Project;
   selected: boolean;
   isExpanded: boolean;
+  /** 正在拉服务列表（箭头槽位显示 spinner） */
+  expanding: boolean;
   services: Service[];
   isRunning: boolean;
   actingId: string | null;
   expandedSvc: Set<string>;
   onSelect: () => void;
-  onDoubleClick: (e: React.MouseEvent) => void;
+  /** 展开/收起服务目录树（双击卡片或单击箭头） */
+  onToggleExpand: (e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onStart: (e: React.MouseEvent) => void;
   onStop: (e: React.MouseEvent) => void;
@@ -24,8 +28,8 @@ interface Props {
 }
 
 export function ProjectListItem({
-  project, selected, isExpanded, services, isRunning, actingId, expandedSvc,
-  onSelect, onDoubleClick, onContextMenu, onStart, onStop, onTogglePin, onToggleSvcExpand,
+  project, selected, isExpanded, expanding, services, isRunning, actingId, expandedSvc,
+  onSelect, onToggleExpand, onContextMenu, onStart, onStop, onTogglePin, onToggleSvcExpand,
 }: Props) {
   const showTreeServices = services.filter(s => s.show_file_tree && s.cwd);
   const openSearch = useSearchModalStore(s => s.openSearch);
@@ -33,6 +37,8 @@ export function ProjectListItem({
   // 服务行右键菜单（搜索文件内容）
   const [svcMenu, setSvcMenu] = useState<{ x: number; y: number; svc: Service } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  /** 服务行右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  const svcMenuPos = useContextMenuPosition(menuRef, svcMenu);
 
   useEffect(() => {
     if (!svcMenu) return;
@@ -53,10 +59,27 @@ export function ProjectListItem({
             : 'bg-nexus-bg/30 border border-nexus-border hover:bg-nexus-hover hover:border-nexus-muted'
         }`}
         onClick={onSelect}
-        onDoubleClick={onDoubleClick}
+        onDoubleClick={onToggleExpand}
         onContextMenu={onContextMenu}
       >
         <div className="flex items-start gap-2">
+          {/* 展开箭头：目录树入口的可见提示（单击切换，双击卡片同效）。
+              固定槽位垂直居中，加载中换成 spinner —— 否则双击到数据回来之间毫无反馈 */}
+          <span className="flex-shrink-0 -ml-1 w-3.5 h-[18px] flex items-center justify-center">
+            {expanding ? (
+              <span className="w-[11px] h-[11px] border-[1.5px] border-nexus-success/30 border-t-nexus-success rounded-full animate-spin" />
+            ) : (
+              <button
+                className="w-full h-full flex items-center justify-center rounded text-nexus-muted/70 hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors"
+                title={isExpanded ? '收起服务目录树' : '展开服务目录树'}
+                onClick={(ev) => { ev.stopPropagation(); onToggleExpand(ev); }}
+              >
+                <svg className={`transition-transform ${isExpanded ? 'rotate-90' : ''}`} width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                  <polyline points="3,1 7,5 3,9" />
+                </svg>
+              </button>
+            )}
+          </span>
           {/* 文件夹图标 */}
           <span className="flex-shrink-0 mt-px text-nexus-muted/60 group-hover:text-nexus-muted">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -83,13 +106,15 @@ export function ProjectListItem({
             </button>
           ) : (
             <button
-              className="flex-shrink-0 p-1 rounded text-nexus-success/70 hover:text-nexus-success hover:bg-nexus-success/10 disabled:opacity-30"
+              /* 不带 disabled:opacity-30：启动中要显示 spinner，压暗会让它看不清 */
+              className="flex-shrink-0 p-1 rounded text-nexus-success/70 hover:text-nexus-success hover:bg-nexus-success/10"
               disabled={actingId === project.id}
               onClick={onStart}
               title="启动"
             >
               {actingId === project.id ? (
-                <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="6" cy="6" r="4"/></svg>
+                /* 启动中：真转的 spinner（原来是个静态圆环，看着像"停止"） */
+                <span className="w-[13px] h-[13px] border-[1.5px] border-nexus-success/30 border-t-nexus-success rounded-full animate-spin" />
               ) : (
                 <svg width="14" height="14" viewBox="0 0 12 12" fill="currentColor"><polygon points="3,1.5 10.5,6 3,10.5"/></svg>
               )}
@@ -166,10 +191,7 @@ export function ProjectListItem({
       <div
         ref={menuRef}
         className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-        style={{
-          left: Math.min(svcMenu.x, window.innerWidth - 188),
-          top: Math.min(svcMenu.y, window.innerHeight - 200),
-        }}
+        style={svcMenuPos}
       >
         {/* 搜索文件内容 */}
         <div className="py-1.5 px-1.5">

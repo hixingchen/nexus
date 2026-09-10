@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { ProjectListItem } from './ProjectListItem';
 import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProjectModal } from './ProjectModals';
 import { useProjectList } from '../../hooks/useProjectList';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
 import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
@@ -16,7 +17,7 @@ interface Props {
 export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath }: Props) {
   const {
     projects, search, setSearch,
-    expanded, expandedSvc, svcCache,
+    expanded, expandedSvc, svcCache, expandingId,
     actingId,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,
@@ -59,12 +60,13 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
             project={p}
             selected={selectedId === p.id}
             isExpanded={expanded.has(p.id)}
+            expanding={expandingId === p.id}
             services={svcCache[p.id] || []}
             isRunning={isProjectRunning(p.id)}
             actingId={actingId}
             expandedSvc={expandedSvc}
             onSelect={() => { onSelect(p.id); onProjectName?.(p.name); onProjectPath?.(p.path); }}
-            onDoubleClick={e => toggleExpand(e, p.id)}
+            onToggleExpand={e => toggleExpand(e, p.id)}
             onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setCtxMenu({ id: p.id, name: p.name, path: p.path, x: e.clientX, y: e.clientY }); }}
             onStart={e => handleStart(e, p.id, p.name)}
             onStop={e => handleStop(e, p.id, p.name)}
@@ -190,18 +192,15 @@ function EmptyState({ search, onNew }: { search: string; onNew: () => void }) {
 
 function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplicate, onEdit, onDelete }: {
   ctx: { id: string; name: string; path: string; x: number; y: number };
-  menuRef: React.Ref<HTMLDivElement>;
+  menuRef: React.MutableRefObject<HTMLDivElement | null>;
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
   onDuplicate: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  // 计算菜单位置，确保不超出屏幕
-  const menuStyle = {
-    left: Math.min(ctx.x, window.innerWidth - 188),
-    top: Math.min(ctx.y, window.innerHeight - 260),
-  };
+  // 菜单位置：按点击点渲染后实测自身尺寸再夹进窗口（条目数会变，固定高度估算会切掉底部条目）
+  const menuStyle = useContextMenuPosition(menuRef, ctx);
 
   return (
     <div

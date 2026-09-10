@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { projectApi, type Project } from '../../services/service';
 import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
+import { isSubmitEnter } from '../../utils/keyboard';
 
 interface CreateModalProps {
   open: boolean;
@@ -56,7 +57,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
             placeholder="例如: my-web-app"
             value={name}
             onChange={e => setName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
+            onKeyDown={e => { if (isSubmitEnter(e)) handleCreate(); }}
           />
         </div>
         <div>
@@ -67,7 +68,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
               placeholder="/path/to/project"
               value={path}
               onChange={e => setPath(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
+              onKeyDown={e => { if (isSubmitEnter(e)) handleCreate(); }}
             />
             <button
               className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
@@ -151,7 +152,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
             placeholder="例如: my-web-app"
             value={name}
             onChange={e => setName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') handleSave(); }}
+            onKeyDown={e => { if (isSubmitEnter(e)) handleSave(); }}
           />
         </div>
         <div>
@@ -162,7 +163,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
               placeholder="/path/to/project"
               value={path}
               onChange={e => setPath(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') handleSave(); }}
+              onKeyDown={e => { if (isSubmitEnter(e)) handleSave(); }}
             />
             <button
               className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"

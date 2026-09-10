@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { projectApi, processApi, watchApi, type Project } from '../services/service';
 import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
@@ -13,6 +13,10 @@ export function useProjectList() {
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [expandedSvc, setExpandedSvc] = useState<Set<string>>(new Set());
+  /** 正在拉服务列表的项目（卡片箭头槽位显示 spinner，给双击一个即时反馈） */
+  const [expandingId, setExpandingId] = useState<string | null>(null);
+  /** 展开请求序号：连点不同项目时丢弃过期响应，避免先点的项目后到反而生效 */
+  const expandSeqRef = useRef(0);
   // 项目服务缓存共享 store：详情页 load 每次写入，保持左侧展开与服务编辑即时一致
   const svcCache = useSvcCacheStore(s => s.cache);
   // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
@@ -110,28 +114,35 @@ export function useProjectList() {
 
   const toggleExpand = useCallback(async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
-    const next = new Set(expanded);
-    if (next.has(projectId)) {
+    if (expanded.has(projectId)) {
+      const next = new Set(expanded);
       next.delete(projectId);
       // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）
       useSvcCacheStore.getState().invalidate(projectId);
-    } else {
-      next.clear();
-      next.add(projectId);
-      try {
-        const detail = await projectApi.getDetail(projectId);
-        useSvcCacheStore.getState().setCache(projectId, detail.services);
-      } catch (e) {
-        console.error('加载服务列表失败:', e);
-        showNotification({ variant: 'error', title: '加载服务列表失败' });
-      }
+      setExpanded(next);
+      return;
     }
-    setExpanded(next);
+    // 展开：先亮加载态，拉到服务列表后才真正展开——期间不展开可避免空缓存被渲染成
+    // 「暂无开启目录树的服务」（那是加载失败，不是没有服务）；失败则不展开，重试 = 再点一次
+    const seq = ++expandSeqRef.current;
+    setExpandingId(projectId);
+    try {
+      const detail = await projectApi.getDetail(projectId);
+      if (seq !== expandSeqRef.current) return; // 过期响应：用户已点了别的项目
+      useSvcCacheStore.getState().setCache(projectId, detail.services);
+      setExpanded(new Set([projectId])); // 单开（同一时间只展开一个项目）
+    } catch (err) {
+      if (seq !== expandSeqRef.current) return;
+      console.error('加载服务列表失败:', err);
+      showNotification({ variant: 'error', title: '加载服务列表失败' });
+    } finally {
+      if (seq === expandSeqRef.current) setExpandingId(null);
+    }
   }, [expanded]);
 
   return {
     projects, search, setSearch,
-    expanded, expandedSvc, svcCache,
+    expanded, expandedSvc, svcCache, expandingId,
     running, actingId,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,

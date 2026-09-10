@@ -5,6 +5,7 @@ import { showNotification } from '../ui/Toast';
 import { SvgIcon } from '../ui/SvgIcon';
 import { getIconSvg } from '../file-tree/FileIcons';
 import { useEditorStore, switchToTab, saveActiveFile } from '../../stores/editor';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import type { FileTab } from '../../types/editor';
 
 export function EditorTabs() {
@@ -21,6 +22,8 @@ export function EditorTabs() {
   /** 批量关闭确认（含未保存标签时） */
   const [confirmMany, setConfirmMany] = useState<{ title: string; ids: string[]; note: string } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  /** 标签右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  const tabMenuPos = useContextMenuPosition(menuRef, tabMenu);
   /** 标签滚动区（超出宽度时出现左右滚动按钮） */
   const tabsScrollRef = useRef<HTMLDivElement | null>(null);
   /** 内容溢出（标题栏容不下标签）→ 显示滚动按钮；常驻不随滚动位置消失 */
@@ -237,11 +240,10 @@ export function EditorTabs() {
       {tabMenu && createPortal(
         <div
           ref={menuRef}
+          // z-[200] 刻意高于其它右键菜单（z-[70]）与弹窗（z-[65]/[80]）：
+          // 菜单从编辑器标签展开，必须盖住 CodeMirror 的高层级浮层（补全/tooltip）
           className="fixed z-[200] w-[170px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-          style={{
-            left: Math.min(tabMenu.x, window.innerWidth - 178),
-            top: Math.min(tabMenu.y, window.innerHeight - 220),
-          }}
+          style={tabMenuPos}
         >
           {/* 在目录树中定位（主操作，独立一组） */}
           <div className="py-1.5 px-1.5">

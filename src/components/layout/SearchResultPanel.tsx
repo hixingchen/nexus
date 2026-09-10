@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { searchFiles, type SearchResultItem } from '../../services/editor';
 import { locateFile, useEditorStore } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
+import { isSubmitEnter } from '../../utils/keyboard';
 
 /** 命中片段中的高亮区间 */
 function renderSnippet(snippet: string, query: string) {
@@ -25,14 +26,23 @@ function renderSnippet(snippet: string, query: string) {
     : <span key={i}>{p.text}</span>);
 }
 
-/** 搜索面板默认高度（可拖拽调整，挤压编辑器区域） */
+/** 搜索面板默认高度（浮层，可拖拽调整；不占布局空间、不挤压编辑器/日志） */
 const DEFAULT_PANEL_HEIGHT = 220;
 /** 面板高度拖拽范围 */
 const PANEL_MIN_HEIGHT = 100;
 const PANEL_MAX_HEIGHT = () => window.innerHeight - 200;
 
-/** 底部搜索结果面板：显示在文本区（编辑器）下方，右键服务/目录树节点触发 */
-export function SearchResultPanel() {
+interface Props {
+  /** 右侧让位（px）= 服务列宽度：浮层覆盖在内容区上，需与服务列左缘对齐 */
+  rightOffset?: number;
+  /** 日志视图打开中：日志优先完整占据区域，搜索面板让位（不渲染，等同被日志挡住）。
+   *  open 状态与搜索结果保留——关闭日志后自动恢复显示 */
+  blocked?: boolean;
+}
+
+/** 底部搜索结果面板（浮层）：覆盖在编辑器之上，不改变其高度布局；
+ *  右键服务/目录树节点触发 */
+export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
   const { open, root, title, closeSearch } = useSearchModalStore();
   const [query, setQuery] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -151,10 +161,18 @@ export function SearchResultPanel() {
   // 相对搜索 root 的路径（完整绝对路径放 title 悬停查看）
   const relPath = (p: string) => p.startsWith(root + '/') ? p.slice(root.length + 1) : p;
 
-  if (!open) return null;
+  // 日志视图打开时让位（日志优先完整占据区域，搜索面板等同被日志挡住）；
+  // open/查询结果保留，关闭日志后自动恢复
+  if (!open || blocked) return null;
 
   return (
-    <div className="flex-shrink-0 flex flex-col bg-nexus-surface" style={{ height: panelHeight }}>
+    <div
+      // 浮层（absolute 覆盖）：不占文档流高度——否则与日志/编辑器争空间，
+      // 表现为「先开搜索把日志顶上去、先开日志又把搜索挤出可视区」两种不一致
+      // z-[55]：低于编辑面板 z-[60]、模态遮罩 z-[65]、右键菜单 z-[70]
+      className="absolute left-0 bottom-0 z-[55] flex flex-col bg-nexus-surface border-t border-nexus-border shadow-2xl overflow-hidden"
+      style={{ height: panelHeight, right: rightOffset }}
+    >
       {/* 拖拽条：上下调整面板高度 */}
       <div
         className={`flex-shrink-0 cursor-row-resize transition-colors ${dragging ? 'bg-nexus-accent' : 'bg-nexus-border hover:bg-nexus-accent'}`}
@@ -162,8 +180,10 @@ export function SearchResultPanel() {
         onMouseDown={handleDragStart}
         title="拖拽调整高度"
       />
-      {/* 头部：范围 + 输入 + 搜索 + 选项 + 关闭 */}
-      <div className="flex items-center gap-2 px-3 h-[38px] border-b border-nexus-border flex-shrink-0">
+      {/* 头部：范围 + 输入 + 搜索 + 选项 + 关闭。
+          可换行 + min-h：AI 面板/服务列同开时主区可能只剩几百像素，
+          单行不换行会把扩展名框和「关闭」挤出可视区（都是 flex-shrink-0） */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 min-h-[38px] py-1 border-b border-nexus-border flex-shrink-0">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-nexus-muted flex-shrink-0">
           <circle cx="5" cy="5" r="3.5"/><line x1="7.8" y1="7.8" x2="10.5" y2="10.5"/>
         </svg>
@@ -172,11 +192,11 @@ export function SearchResultPanel() {
         </span>
         <input
           ref={inputRef}
-          className="flex-1 min-w-0 px-2.5 py-1.5 text-[12px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
+          className="flex-1 min-w-[120px] px-2.5 py-1.5 text-[12px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
           placeholder="输入内容，回车搜索"
           value={query}
           onChange={e => setQuery(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') triggerSearch(); }}
+          onKeyDown={e => { if (isSubmitEnter(e)) triggerSearch(); }}
         />
         <button
           className="flex-shrink-0 px-3 py-1.5 text-[12px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"

@@ -1,39 +1,34 @@
-import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
+import { isSubmitEnter } from '../../utils/keyboard';
 import type { ServiceLogLine } from '../../services/logService';
 
 interface LogViewerProps { serviceKey: string; serviceName?: string; maxHeight?: string; fill?: boolean; onClose?: () => void; }
 
-/** 渲染上限 = 数据缓冲上限（只保留最新 2000 行，数据与 DOM 一致） */
-const RENDER_CAP = 2000;
 /** 空数组常量（避免选择器每次返回新引用导致无谓重渲染） */
 const EMPTY_LINES: ServiceLogLine[] = [];
-/** 搜索结果渲染上限（超出只渲染尾部，防止逐字输入/大日志下全量 innerHTML 卡顿） */
-const SEARCH_RENDER_CAP = 500;
+/** 行高估算值（13px × leading-relaxed 1.625 ≈ 21px）；真实行高由 ResizeObserver 实测回填（长行换行更高） */
+const ESTIMATED_ROW_H = 21;
+/** 视口外预渲染行数：滚动留白兜底，同时限定「拖拽改宽时必须重新断行的行数」 */
+const OVERSCAN = 12;
+/** 日志上下内边距（交给 virtualizer 的 paddingStart/End，贴底计算与真实滚动高度同一口径） */
+const PAD_Y = 12;
 /** 搜索输入防抖间隔 */
 const SEARCH_DEBOUNCE_MS = 200;
 
+/**
+ * 服务日志面板：虚拟滚动渲染（只挂载视口内约 30~50 行）。
+ * 数据侧仍是「最多 2000 行」的滑动窗口，DOM 侧不再与之等量——
+ * 日志再多也不会让拖拽分隔条时逐帧重排上千行文本（原实现为整块 <pre> innerHTML，
+ * 宽度一变就要重新断行 2000 行，是拖拽卡顿的主因）。
+ */
 export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight, fill, onClose }: LogViewerProps) {
-  const preRef = useRef<HTMLPreElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  const lastVersionRef = useRef(-1);
-  const renderedCountRef = useRef(0);
-  const pausedRef = useRef(false);
-  /** 搜索态是否渲染过搜索结果（退出搜索时用于强制全量重建） */
-  const searchRenderedRef = useRef(false);
-  /** 上次渲染时数据头部行的引用：变化 = 滑动窗口滚动（满 5000 行后行号增量失效）→ 全量重建 */
-  const lastHeadRef = useRef<ServiceLogLine | null>(null);
-  /** 高频日志窗口滑动时的全量重建节流：排程合并多次 flush，到期用最新数据一次重建 */
-  const fullTimerRef = useRef<number | undefined>(undefined);
-  const fullLinesRef = useRef<ServiceLogLine[]>([]);
-  /** 上次渲染时数据最后一条的文本：变化（\r 单行刷新合并，行数不变）→ 更新 DOM 最后一行 */
-  const lastTextRef = useRef<string | null>(null);
-  /** 上一次的暂停状态：从暂停恢复时强制全量重建（直接渲染最新 2000 行） */
-  const lastPausedRef = useRef(false);
   /** 暂停开始时的累计新增行数（差值 = 暂停期间新增 N 行） */
   const baseAddedRef = useRef(0);
 
@@ -88,123 +83,64 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
 
   // ── 搜索 ──────────────────────────────────────────────────
 
-  // 输入防抖：逐字输入不触发全量匹配 + 全量渲染
+  // 输入防抖：逐字输入不触发全量匹配
   const [debouncedTerm, setDebouncedTerm] = useState('');
   useEffect(() => {
     const t = setTimeout(() => setDebouncedTerm(searchTerm), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
   }, [searchTerm]);
 
+  // 搜索态渲染匹配行（虚拟滚动下无需再截断尾部：任意匹配都可达、可定位）
   const searchActive = debouncedTerm.trim().length > 0;
-  const filteredLines = useMemo(() => {
-    if (!searchActive) return null;
-    return lines.filter(l => l.text.toLowerCase().includes(debouncedTerm.toLowerCase()));
+  const rows = useMemo(() => {
+    if (!searchActive) return lines;
+    const term = debouncedTerm.toLowerCase();
+    return lines.filter(l => l.text.toLowerCase().includes(term));
   }, [lines, searchActive, debouncedTerm]);
-  const searchMatches = filteredLines?.length ?? 0;
+  const searchMatches = searchActive ? rows.length : 0;
+  /** 传给行组件的搜索词：非搜索态为空串（与旧的整块渲染同口径） */
+  const rowTerm = searchActive ? debouncedTerm : '';
 
-  // ── 切换服务：重置 ────────────────────────────────────────
+  // ── 虚拟列表 ──────────────────────────────────────────────
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ESTIMATED_ROW_H,
+    overscan: OVERSCAN,
+    // 贴底语义：行高实测值变化（长行换行 / 拖拽改宽）时按总高差补偿滚动位置，
+    // 保证「始终看着最新一行」不被重排或窗口滑动打断
+    anchorTo: 'end',
+    paddingStart: PAD_Y,
+    paddingEnd: PAD_Y,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+
+  // 切换服务：清空行高实测缓存（缓存以索引为键，会被新服务的行错误复用）并回到顶部；
+  // 声明在贴底 effect 之前——layout effect 按声明顺序执行，先归零再贴底，最终落在最新一行
+  useLayoutEffect(() => {
+    virtualizer.measure();
+    virtualizer.scrollToOffset(0);
+    // 切换服务：清理上个服务的暂停状态
+    useLogStore.getState().resumeLogs(serviceKey);
+    // 打开面板：无条件以后端缓冲为准同步（后端清空过则本地缓存一并清掉）
+    syncLogsFromBackend();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceKey, syncLogsFromBackend]);
 
   // 卸载时清理暂停视图（释放暂停期间保留的数据）
   useEffect(() => () => {
     useLogStore.getState().resumeLogs(serviceKey);
   }, [serviceKey]);
 
-  useEffect(() => {
-    lastVersionRef.current = -1;
-    renderedCountRef.current = 0;
-    if (preRef.current) preRef.current.innerHTML = '';
-    if (scrollRef.current) scrollRef.current.scrollTop = 0;
-    // 切换服务：清理上个服务的暂停状态
-    useLogStore.getState().resumeLogs(serviceKey);
-    // 打开面板：无条件以后端缓冲为准同步（后端清空过则本地缓存一并清掉）
-    syncLogsFromBackend();
-  }, [serviceKey, syncLogsFromBackend]);
-
-  // ── 搜索渲染（独立 effect）：只按搜索词重建，不随日志增量刷新 ──
-
-  useEffect(() => {
-    if (!searchActive) return;
-    const pre = preRef.current;
-    if (!pre) return;
-    searchRenderedRef.current = true;
-    renderSearchResults(pre, filteredLines, debouncedTerm, lastVersionRef, renderedCountRef);
-  }, [searchActive, debouncedTerm, filteredLines]);
-
-  // ── DOM 渲染：version 检测 + 增量追加（搜索激活时跳过）────
-
-  useEffect(() => {
-    const pre = preRef.current;
-    if (!pre) return;
-
-    // 与 state 同步（handlePause 已同步更新过，此处保证所有渲染路径一致）
-    pausedRef.current = paused;
-
-    if (searchActive) {
-      // 搜索视图由上方独立 effect 渲染；此处避免高频日志触发全量重建
-      searchRenderedRef.current = true;
-      return;
-    }
-
-    // 从暂停恢复：直接全量渲染最新 2000 行（跟随数据源一直在后台维护）
-    // 注意：必须在任何提前 return 之前更新 lastPausedRef，否则恢复判断失效
-    const justResumed = lastPausedRef.current && !paused;
-    lastPausedRef.current = paused;
-
-    // 退出搜索后强制全量重建一次，恢复完整日志视图
-    const justExitedSearch = searchRenderedRef.current;
-    searchRenderedRef.current = false;
-
-    const prevVer = lastVersionRef.current;
-    lastVersionRef.current = version;
-
-    // 数据头部引用变化 = 滑动窗口已滚动（2000 行满后旧行被顶掉、新行进来，
-    // 数组长度不变导致按行号增量失效）→ 必须全量重建
-    const headLine = lines[0] ?? null;
-    const headChanged = headLine !== lastHeadRef.current;
-    lastHeadRef.current = headLine;
-
-    // 数据最后一条文本变化（\r 单行刷新合并：行数不变但内容更新）→ 更新 DOM 最后一行
-    const lastLine = lines[lines.length - 1];
-    const lastTextChanged = lastLine !== undefined && lastLine.text !== lastTextRef.current;
-    lastTextRef.current = lastLine?.text ?? null;
-
-    // 首次渲染 / 退出搜索 / 日志被裁剪或清空 / 窗口滑动 / 从暂停恢复 → 全量重建；否则增量追加
-    const needFull = prevVer < 0 || lines.length < renderedCountRef.current || justExitedSearch || headChanged || justResumed;
-
-    if (needFull) {
-      const urgent = prevVer < 0 || lines.length < renderedCountRef.current || justExitedSearch || justResumed;
-      if (urgent) {
-        // 首次/清空/搜索退出/暂停恢复：必须立即重建
-        if (fullTimerRef.current !== undefined) {
-          window.clearTimeout(fullTimerRef.current);
-          fullTimerRef.current = undefined;
-        }
-        renderFull(pre, lines, renderedCountRef);
-      } else {
-        // 高频输出下窗口滑动几乎每 50ms flush 触发一次 headChanged：
-        // 每次全量重建 2000 行 innerHTML 既费 CPU 又打断文本选择——
-        // 排程合并，到期以最新数据一次重建（中间行短暂缺省，数据不丢）
-        fullLinesRef.current = lines;
-        if (fullTimerRef.current === undefined) {
-          fullTimerRef.current = window.setTimeout(() => {
-            fullTimerRef.current = undefined;
-            const host = preRef.current;
-            if (host && !searchRenderedRef.current) {
-              renderFull(host, fullLinesRef.current, renderedCountRef);
-            }
-          }, 200);
-        }
-      }
-    } else {
-      renderIncremental(pre, lines, renderedCountRef);
-      if (lastTextChanged && lastLine && pre.lastElementChild) {
-        // \r 刷新行合并：同步更新 DOM 最后一行
-        pre.lastElementChild.innerHTML = lineHtml(lastLine);
-      }
-    }
-
-    scrollToBottom(pausedRef, scrollRef);
-  }, [lines, version, searchActive, paused]);
+  // 跟随模式：每次数据更新后贴底（等价旧实现的 scrollTop = scrollHeight）。
+  // 用 layout effect 让新行与目标滚动位置同帧提交，避免先看到旧位置再跳到底部；
+  // 暂停 / 搜索态不贴底（与旧实现一致：暂停冻结视图、搜索时定位由 goMatch 接管）
+  useLayoutEffect(() => {
+    if (paused || searchActive) return;
+    virtualizer.scrollToEnd();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [version, rows.length, paused, searchActive]);
 
   // ── 暂停 ──────────────────────────────────────────────────
   // 暂停 = 快照当前跟随数据源为暂停视图（独立数据源，满 2000 行后冻结，不会再滚动）；
@@ -212,9 +148,6 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
 
   const handlePause = useCallback(() => {
     const next = !paused;
-    // 同步更新 ref（不等 React 提交/effect）：排队的 rAF 回调在下一帧绘制前执行，
-    // 若 ref 更新滞后，点击暂停的瞬间仍会滚到底部
-    pausedRef.current = next;
     setPaused(next);
     if (next) {
       useLogStore.getState().pauseLogs(serviceKey);
@@ -223,32 +156,15 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
     }
   }, [paused, serviceKey]);
 
-  // pausedRef 与 state 同步（在渲染提交后的 effect 中，不在 setState updater 里做 DOM 副作用）
-  // 恢复跟随时跳到底部：effect 在渲染提交后执行，scrollHeight 是最新 DOM 高度，
-  // 避免在 updater 中同步读取旧 scrollHeight 导致"关闭重开才看到最新"的问题
-  useEffect(() => {
-    if (!paused && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [paused]);
-
-
   // ── 搜索导航 ──────────────────────────────────────────────
 
   const goMatch = useCallback((dir: 1 | -1) => {
-    if (!filteredLines || filteredLines.length === 0) return;
-    const next = ((searchIdx + dir) % filteredLines.length + filteredLines.length) % filteredLines.length;
+    if (rows.length === 0) return;
+    const next = ((searchIdx + dir) % rows.length + rows.length) % rows.length;
     setSearchIdx(next);
-    // 滚动到匹配行（仅当该行在渲染范围内；超出渲染上限的旧匹配无法定位）
-    const pre = preRef.current;
-    if (pre) {
-      const offset = filteredLines.length > SEARCH_RENDER_CAP ? filteredLines.length - SEARCH_RENDER_CAP : 0;
-      const rel = next - offset;
-      if (rel >= 0) {
-        pre.querySelector(`[data-match-idx="${rel}"]`)?.scrollIntoView({ block: 'nearest' });
-      }
-    }
-  }, [searchIdx, filteredLines]);
+    // 目标行滚到视口中央（虚拟列表任意行都可达，不再受渲染截断限制）
+    virtualizer.scrollToIndex(next, { align: 'center' });
+  }, [searchIdx, rows.length, virtualizer]);
 
   // ── 快捷键 ────────────────────────────────────────────────
 
@@ -289,45 +205,52 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
         newSincePause={newSincePause}
         onClear={() => {
           useLogStore.getState().clearLogs(serviceKey);
-          if (preRef.current) preRef.current.innerHTML = '';
-          lastVersionRef.current = -1;
+          virtualizer.measure(); // 清空行高实测缓存：重新运行后索引 0..N 的行与旧日志无关
         }}
       />
 
-      <div ref={scrollRef} className={`overflow-auto bg-[#0d1117] ${fill ? 'flex-1' : ''}`}
+      {/* 文本样式（字体/字号/行高/换行）放在滚动容器上由行继承，与旧 <pre> 的表现一致；
+          行高实测值依赖这里的 leading-relaxed，改动需同步 ESTIMATED_ROW_H */}
+      <div ref={scrollRef}
+        className={`overflow-auto bg-[#0d1117] font-mono text-[13px] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
         style={fill ? undefined : { maxHeight: maxHeight ?? '220px' }}>
-        <pre ref={preRef} className="font-mono text-[13px] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 py-3 m-0 min-h-full"/>
+        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          {virtualItems.map(vi => {
+            const line = rows[vi.index];
+            if (!line) return null;
+            return (
+              <div
+                key={vi.key}
+                data-index={vi.index}
+                ref={virtualizer.measureElement}
+                className="absolute left-0 top-0 w-full"
+                style={{ transform: `translateY(${vi.start}px)` }}
+              >
+                <LogRow line={line} searchTerm={rowTerm} />
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
 }
 
-// ── 渲染辅助函数 ──────────────────────────────────────────
+// ── 行渲染 ────────────────────────────────────────────────
 
-function renderSearchResults(
-  pre: HTMLPreElement,
-  filteredLines: ServiceLogLine[] | null,
-  searchTerm: string,
-  lastVersionRef: React.MutableRefObject<number>,
-  renderedCountRef: React.MutableRefObject<number>,
-) {
-  if (!filteredLines) return;
-  const display = filteredLines.length > SEARCH_RENDER_CAP
-    ? filteredLines.slice(-SEARCH_RENDER_CAP)
-    : filteredLines;
-  // 行上带 data-match-idx（相对索引），供导航滚动定位
-  pre.innerHTML = display.map((l, i) =>
-    `<div class="log-line search-match" data-match-idx="${i}"><span class="log-ts">${fmtTime(l.timestamp)}</span>${renderLine(l.text, searchTerm)}</div>`
-  ).join('\n');
-  lastVersionRef.current = -1; // 搜索态不参与增量渲染
-  renderedCountRef.current = 0;
-}
-
-/** 单行日志的 DOM 结构（span + display:block，便于按行裁剪）；system 行（生命周期标记）独立样式 */
-function lineHtml(l: ServiceLogLine): string {
-  const cls = l.stream === 'system' ? 'log-line log-line-system' : 'log-line';
-  return `<span class="${cls}"><span class="log-ts">${fmtTime(l.timestamp)}</span>${renderLine(l.text, '')}</span>`;
-}
+/**
+ * 单行日志（与原 innerHTML 渲染同一套结构与样式：时间戳 span + renderLine 着色）。
+ * memo：滚动、拖拽、窗口滑动都不重建行 DOM，只有该行内容或搜索词变化才重渲染
+ */
+const LogRow = memo(function LogRow({ line, searchTerm }: { line: ServiceLogLine; searchTerm: string }) {
+  const cls = line.stream === 'system' ? 'log-line log-line-system' : 'log-line';
+  return (
+    <div
+      className={cls}
+      dangerouslySetInnerHTML={{ __html: `<span class="log-ts">${fmtTime(line.timestamp)}</span>${renderLine(line.text, searchTerm)}` }}
+    />
+  );
+});
 
 /** 时间戳显示为本地 HH:MM:SS */
 function fmtTime(ts: string): string {
@@ -338,48 +261,6 @@ function fmtTime(ts: string): string {
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   return `${hh}:${mm}:${ss}`;
-}
-
-function renderFull(
-  pre: HTMLPreElement,
-  lines: ServiceLogLine[],
-  renderedCountRef: React.MutableRefObject<number>,
-) {
-  const display = lines.length > RENDER_CAP ? lines.slice(-RENDER_CAP) : lines;
-  // 一次性重建（不做 rAF 分批——批次与下一次 flush 的清空交错会导致内容损坏）
-  pre.innerHTML = display.map(lineHtml).join('');
-  renderedCountRef.current = lines.length;
-}
-
-function renderIncremental(
-  pre: HTMLPreElement,
-  lines: ServiceLogLine[],
-  renderedCountRef: React.MutableRefObject<number>,
-) {
-  const newLines = lines.slice(renderedCountRef.current);
-  if (newLines.length > 0) {
-    pre.insertAdjacentHTML('beforeend', newLines.map(lineHtml).join(''));
-  }
-  // DOM 只保留尾部 RENDER_CAP 行，避免无限增长
-  while (pre.children.length > RENDER_CAP) {
-    pre.removeChild(pre.firstElementChild!);
-  }
-  renderedCountRef.current = lines.length;
-}
-
-function scrollToBottom(
-  pausedRef: React.MutableRefObject<boolean>,
-  scrollRef: React.RefObject<HTMLDivElement | null>,
-) {
-  if (!pausedRef.current && scrollRef.current) {
-    requestAnimationFrame(() => {
-      // 回调执行时用户可能已点击暂停（排队期间状态变了）：
-      // 再次检查，避免"点击暂停的瞬间仍然滚到底部"
-      if (!pausedRef.current && scrollRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }
-    });
-  }
 }
 
 // ── 头部组件 ──────────────────────────────────────────────
@@ -436,13 +317,10 @@ function LogHeader({
         <input ref={searchRef as React.Ref<HTMLInputElement>} className="w-[130px] bg-transparent text-[12px] text-[#c9d1d9] outline-none placeholder:text-[#484f58] font-mono"
           placeholder="查找…" value={searchTerm}
           onChange={e => { setSearchTerm(e.target.value); setSearchIdx(() => 0); }}
-          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); onGoMatch(e.shiftKey ? -1 : 1); } }}/>
+          onKeyDown={e => { if (isSubmitEnter(e)) { e.preventDefault(); onGoMatch(e.shiftKey ? -1 : 1); } }}/>
         {searchActive && (
           <>
             <span className="text-[11px] text-[#8b949e] font-mono tabular-nums w-[32px] text-right">{searchMatches > 0 ? `${Math.min(searchIdx + 1, searchMatches)}/${searchMatches}` : '0/0'}</span>
-            {searchMatches > SEARCH_RENDER_CAP && (
-              <span className="text-[10px] text-[#8b949e]/60 flex-shrink-0">仅显示尾部 {SEARCH_RENDER_CAP} 条</span>
-            )}
             <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" onClick={() => onGoMatch(-1)}>▲</button>
             <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" onClick={() => onGoMatch(1)}>▼</button>
           </>

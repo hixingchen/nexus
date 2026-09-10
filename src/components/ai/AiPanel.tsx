@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { useAiStore, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
@@ -383,6 +384,20 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   /** 停止本项目 AI 会话并关闭（图标转暗；再点机器人头重新启用） */
   const handleStop = () => { void useAiStore.getState().stop(); };
 
+  /**
+   * 在系统默认浏览器中打开当前会话。
+   * 会话 URL 形如 http://localhost:<port>/?token=…，token 由浏览器自己握手换成
+   * 会话 cookie（内嵌 WebView 走的是同一条路），因此外链同样直接登录；
+   * 与内嵌面板是同一个 dsh 会话，两边可同时开着。URL 未就绪时为空操作。
+   */
+  const handleOpenInBrowser = () => {
+    const target = useAiStore.getState().url;
+    if (!target) return;
+    openUrl(target).catch((e) => {
+      showNotification({ variant: 'error', title: '在浏览器中打开失败', description: String(e), duration: 5000 });
+    });
+  };
+
   /** 关闭面板 = 隐藏（会话与进程保留，图标保持亮；真停止用方块按钮）。
    *  installing 期间也收（进度卡让位）：后端升级不可中断，完成后仍弹成功通知 */
   const handleHide = () => {
@@ -479,6 +494,19 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           </button>
           {/* 检查更新（dsh 引擎版本）：确认升级后由 onInstall 统一走面板主体进度 */}
           <UpdateControl onInstall={() => void handleInstallDsh()} />
+          {/* 在系统浏览器中打开当前会话（URL 自带 token，握手后即登录）：
+              无会话时点击为空操作、title 说明原因（不用 disabled，Chromium 对 disabled 元素不弹 title） */}
+          <button
+            className="w-6 h-6 flex items-center justify-center rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/60"
+            title={url ? '在浏览器中打开' : 'AI 会话未启动，暂无可打开的页面'}
+            onClick={handleOpenInBrowser}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M9 7v2.5a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1H5" />
+              <polyline points="7.5,1.5 10.5,1.5 10.5,4.5" />
+              <line x1="5.2" y1="6.8" x2="10.5" y2="1.5" />
+            </svg>
+          </button>
           {/* 不用 disabled（Chromium 对 disabled 元素不触发 title 提示）：
               无会话时点击为空操作，守卫写在 onClick 内 */}
           <button

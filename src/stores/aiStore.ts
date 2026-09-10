@@ -14,8 +14,14 @@ const AI_ON_KEY_PREFIX = 'ai_on_';
 // 记忆**不落盘**：本次运行内点过机器人头启用 → 切走再切回自动恢复；
 // 重启后一律回到未启用——「上次开着」不构成下次自动开的理由，
 // 用户没点过机器人头，面板就不该自己弹出来。
+//
+// 两条记忆分开存（会话归属 ≠ 面板显隐）：
+// - aiOnCache：本项目是否占用 AI 会话（全局唯一占用制，决定切回是否重启/接管会话）
+// - aiPanelCache：本项目面板上次是开着还是关着（关面板只是隐藏，会话照跑，但
+//   "关着"也要跟着项目走——关掉面板再切走，切回来不该自己弹开）
 
 const aiOnCache = new Map<string, boolean>();
+const aiPanelCache = new Map<string, boolean>();
 
 /** 同步读某项目记忆（本次运行内未启用过 → false） */
 function aiOnOf(cwd: string): boolean {
@@ -28,10 +34,22 @@ function rememberAiOn(cwd: string | null, on: boolean) {
   aiOnCache.set(cwd, on);
 }
 
+/** 同步读某项目上次的面板显隐（本次运行内没开过 → false） */
+function aiPanelWasOpen(cwd: string): boolean {
+  return aiPanelCache.get(cwd) ?? false;
+}
+
+/** 同步记面板显隐记忆（仅内存，不持久化；当前项目以 cwd 为键） */
+function rememberPanelOpen(cwd: string | null, open: boolean) {
+  if (!cwd) return;
+  aiPanelCache.set(cwd, open);
+}
+
 /**
  * AI 会话全局唯一「占用制」：启用项目 X 时，把所有其它项目的开启记忆清零。
  * 语义：一个项目用 AI 图标打开 = 占用会话，其它项目随之关闭（进程被停，
  * 记忆也被清）——切回它们时面板关闭、图标熄灭，需再点图标才启用。
+ * 只清「会话占用」记忆，不动各项目的面板显隐偏好（那是用户自己的开关心意）。
  * 记忆仅本次运行内有效（缓存驱动），启动时缓存为空 = 全部未启用
  */
 function occupyAiOn(cwd: string) {
@@ -67,11 +85,12 @@ interface AiState {
 
   /** 挂载引导：载入上次拖拽宽度 + 清理旧版本遗留的 AI 记忆行（记忆本身仅本次运行内） */
   bootstrap: () => Promise<void>;
-  /** 切换项目：应用目标项目记忆（本次运行内启用过 → 面板自动恢复；否 → 面板关）——同步判定 */
+  /** 切换项目：应用目标项目记忆——本项目占用会话且上次面板是开着的 → 自动恢复；
+      否则面板关（同步判定，无异步窗口） */
   switchProject: (cwd: string | null, name: string | null) => void;
-  /** 机器人头按钮：开→启用本项目 AI；关→隐藏面板（会话保留，图标仍亮） */
+  /** 机器人头按钮：开→启用本项目 AI；关→隐藏面板（会话保留，图标仍亮；记下"关着"） */
   togglePanel: () => void;
-  /** 打开/隐藏面板（只动可见性；隐藏保留会话与记忆） */
+  /** 打开/隐藏面板（只动可见性并记下该项目的显隐；隐藏保留会话与记忆） */
   setPanelOpen: (open: boolean) => void;
   /** 停止本项目 AI 会话并关闭（记忆写 0，图标转暗） */
   stop: () => Promise<void>;
@@ -126,10 +145,12 @@ export const useAiStore = create<AiState>((set, get) => ({
       set({ panelOpen: false, lastError: null });
       return;
     }
-    if (aiOnOf(cwd)) {
+    if (aiOnOf(cwd) && aiPanelWasOpen(cwd)) {
       set({ panelOpen: true, lastError: null });
       void get().ensureRunning(cwd, nextName);
     } else {
+      // 未占用会话，或上次离开时面板是关着的 → 面板保持关（不覆盖显隐记忆：
+      // 记忆只由用户动作改写，切项目本身不该改偏好）
       set({ panelOpen: false, lastError: null });
     }
   },
@@ -137,11 +158,13 @@ export const useAiStore = create<AiState>((set, get) => ({
   togglePanel: () => {
     const { panelOpen, currentCwd, currentName } = get();
     if (panelOpen) {
-      // 关闭 = 隐藏：会话与进程保留（图标仍亮），记忆保持启用
+      // 关闭 = 隐藏：会话与进程保留（图标仍亮），占用记忆保持；只记下"本项目面板关着"
+      rememberPanelOpen(currentCwd, false);
       set({ panelOpen: false });
     } else {
       if (!currentCwd) return; // 未选项目不启用
       occupyAiOn(currentCwd); // 占用：清其它项目记忆 + 写本项目
+      rememberPanelOpen(currentCwd, true);
       set({ panelOpen: true, lastError: null });
       void get().ensureRunning(currentCwd, currentName);
     }
@@ -153,10 +176,12 @@ export const useAiStore = create<AiState>((set, get) => ({
     if (open) {
       if (!currentCwd) return;
       occupyAiOn(currentCwd); // 占用：清其它项目记忆 + 写本项目
+      rememberPanelOpen(currentCwd, true);
       set({ panelOpen: true, lastError: null });
       void get().ensureRunning(currentCwd, currentName);
     } else {
-      // 隐藏：会话与进程保留
+      // 隐藏：会话与进程保留；记下"本项目面板关着"，切走再切回不自动弹开
+      rememberPanelOpen(currentCwd, false);
       set({ panelOpen: false });
     }
   },

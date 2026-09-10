@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
 import { useEditorStore, loadAndOpenFile, parseJarVirtualPath } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { listJar, type JarEntryInfo } from '../../services/editor';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
@@ -287,6 +288,9 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     return () => document.removeEventListener('mousedown', handleClose);
   }, [contextMenu]);
 
+  /** 节点右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  const menuPos = useContextMenuPosition(menuRef, contextMenu);
+
   const iconSvg = e.is_dir
     ? (open ? FolderOpen : FolderClosed)
     : getIconSvg(getExtension(e.name));
@@ -327,10 +331,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
         <div
           ref={menuRef}
           className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-          style={{
-            left: Math.min(contextMenu.x, window.innerWidth - 188),
-            top: Math.min(contextMenu.y, window.innerHeight - 200),
-          }}
+          style={menuPos}
         >
           {/* 磁盘 jar：打开浏览器标签视图 */}
           {isJarFile && !isJarPath && (
@@ -495,11 +496,12 @@ export function FileTree({ rootPath, embedded }: {
     }
   }, [activeTabPath]);
 
-  // 用户手动点击树节点：同样以新选中为主，清除定位标记
-  const handleSelect = (path: string) => {
+  // 用户手动点击树节点：同样以新选中为主，清除定位标记。
+  // useCallback 稳定引用：Entry 是 memo 的，回调每次新身份会让整棵已展开子树白重渲染
+  const handleSelect = useCallback((path: string) => {
     setSelectedPath(path);
     useEditorStore.getState().clearReveal();
-  };
+  }, []);
   /** 根目录加载序号：快速切换目录时丢弃旧响应，避免显示错目录内容 */
   const rootSeqRef = useRef(0);
 
@@ -532,6 +534,9 @@ export function FileTree({ rootPath, embedded }: {
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
   }, [rootMenu]);
+
+  /** 空白右键菜单（粘贴到项目根）的位置：同样实测尺寸后夹进窗口 */
+  const rootMenuPos = useContextMenuPosition(rootMenuRef, rootMenu);
 
   const handlePasteToRoot = async () => {
     setRootMenu(null);
@@ -586,10 +591,7 @@ export function FileTree({ rootPath, embedded }: {
           <div
             ref={rootMenuRef}
             className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden py-1.5 px-1.5"
-            style={{
-              left: Math.min(rootMenu.x, window.innerWidth - 188),
-              top: Math.min(rootMenu.y, window.innerHeight - 200),
-            }}
+            style={rootMenuPos}
           >
             <button
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"

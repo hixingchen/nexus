@@ -56,9 +56,10 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     open: boolean;
     loading: boolean;
     commandName: string;
+    runId: string;
     result: ToolCommandResult | null;
     logs: string[];
-  }>({ open: false, loading: false, commandName: '', result: null, logs: [] });
+  }>({ open: false, loading: false, commandName: '', runId: '', result: null, logs: [] });
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -118,7 +119,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   // 执行工具命令（流式：先订阅 tool-command-log 事件实时追加，结束再取完整结果）
   const handleRunToolCommand = async (serviceId: string, commandId: string, commandName: string) => {
     const runId = crypto.randomUUID();
-    setToolCommandState({ open: true, loading: true, commandName, result: null, logs: [] });
+    setToolCommandState({ open: true, loading: true, commandName, runId, result: null, logs: [] });
     const unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
       if (event.payload.run_id !== runId) return;
       setToolCommandState(prev => {
@@ -138,6 +139,18 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       setToolCommandState(prev => ({ ...prev, loading: false }));
     } finally {
       unlisten();
+    }
+  };
+
+  /** 停止正在执行的工具命令（终止其进程树）：命令随后以失败退出码正常返回并展示 */
+  const handleStopToolCommand = async () => {
+    const { runId } = toolCommandState;
+    if (!runId) return;
+    try {
+      await processApi.stopToolCommand(runId);
+      showNotification({ title: '已停止工具命令', duration: 2000 });
+    } catch (e) {
+      showNotification({ variant: 'error', title: '停止失败', description: String(e) });
     }
   };
 
@@ -257,8 +270,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           />
         )}
 
-        {/* 底部搜索结果面板（编辑器下方，打开时挤压编辑器高度） */}
-        <SearchResultPanel />
+        {/* 底部搜索结果面板（浮层覆盖编辑器，不挤压其高度）；右侧让位服务列宽度；
+            日志视图打开时让位（日志优先完整显示，搜索面板等同被挡住，关日志后恢复） */}
+        <SearchResultPanel
+          rightOffset={servicePanelCollapsed ? 32 : 360}
+          blocked={!!viewingLog}
+        />
       </div>
 
       {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
@@ -356,6 +373,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         result={toolCommandState.result}
         logs={toolCommandState.logs}
         loading={toolCommandState.loading}
+        onStop={handleStopToolCommand}
         onClose={() => setToolCommandState(prev => ({ ...prev, open: false }))}
       />
     </div>
@@ -458,9 +476,11 @@ function CollapsedView({
   onViewLog: (svc: Service) => void;
 }) {
   // 图标亮 = 本项目的 AI 会话活跃（进程 running 且归属本项目——物理进程
-  // 跨项目单例，须用 sessionCwd 判别，进程在别的项目时不误亮）
+  // 跨项目单例，须用 sessionCwd 判别，进程在别的项目时不误亮）；
+  // 选中底色只表示「面板展开」：面板收起时会话照跑，此时只亮不选中（同满足两态会像被按下的开关）
   const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
-  const aiPanelOpen = useAiStore(s => s.panelOpen);
+  /** 面板是否真的显示（安装进度会强制撑开面板，与 RestartConfirm 判定同源） */
+  const aiPanelVisible = useAiStore(s => s.panelOpen || s.installing);
   const toggleAi = () => useAiStore.getState().togglePanel();
   return (
     <div className="flex flex-col h-full w-full">
@@ -476,8 +496,12 @@ function CollapsedView({
           </svg>
         </button>
         <button
-          className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (aiRunning ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:bg-nexus-hover/40 hover:text-nexus-text')}
-          title={aiRunning ? `AI 助手（运行中）${aiPanelOpen ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
+          className={'w-6 h-6 flex items-center justify-center rounded-md transition-colors ' + (
+            aiPanelVisible ? 'text-nexus-accent bg-nexus-accent/15'
+            : aiRunning ? 'text-nexus-accent hover:bg-nexus-hover/40'
+            : 'text-nexus-muted hover:bg-nexus-hover/40 hover:text-nexus-text'
+          )}
+          title={aiRunning ? `AI 助手（运行中）${aiPanelVisible ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
           onClick={toggleAi}
         >
           <RobotIcon size={13} />
@@ -606,9 +630,10 @@ function ServiceSection({
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
-  // 图标亮 = 本项目的 AI 会话活跃（进程归属判别见 CollapsedView 说明）
+  // 图标亮 = 本项目的 AI 会话活跃（进程归属判别见 CollapsedView 说明）；
+  // 选中底色只在面板展开时给，收起时会话照跑但只亮不选中
   const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
-  const aiPanelOpen = useAiStore(s => s.panelOpen);
+  const aiPanelVisible = useAiStore(s => s.panelOpen || s.installing);
   const toggleAi = () => useAiStore.getState().togglePanel();
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
@@ -636,8 +661,12 @@ function ServiceSection({
         </div>
         <div className="flex items-center gap-1">
           <button
-            className={'p-1.5 rounded-md flex-shrink-0 transition-colors ' + (aiRunning ? 'text-nexus-accent bg-nexus-accent/15' : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50')}
-            title={aiRunning ? `AI 助手（运行中）${aiPanelOpen ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
+            className={'p-1.5 rounded-md flex-shrink-0 transition-colors ' + (
+              aiPanelVisible ? 'text-nexus-accent bg-nexus-accent/15'
+              : aiRunning ? 'text-nexus-accent hover:bg-nexus-hover/50'
+              : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50'
+            )}
+            title={aiRunning ? `AI 助手（运行中）${aiPanelVisible ? ' · 点击隐藏' : ' · 点击显示'}` : 'AI 助手（未运行）'}
             onClick={toggleAi}
           >
             <RobotIcon size={15} />

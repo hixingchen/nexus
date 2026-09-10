@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { serviceApi } from '../../services/service';
 import { open } from '@tauri-apps/plugin-dialog';
 import { showNotification } from '../ui/Toast';
+import { isSubmitEnter } from '../../utils/keyboard';
 
 interface Props {
   projectId: string;
@@ -47,7 +48,7 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
           placeholder="例如: backend, frontend, api-server"
           value={name}
           onChange={e => setName(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }}
+          onKeyDown={e => { if (isSubmitEnter(e)) handleSubmit(); }}
         />
       </div>
       <div>
@@ -57,7 +58,7 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
           placeholder="npm run dev / cargo run / python main.py"
           value={command}
           onChange={e => setCommand(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }}
+          onKeyDown={e => { if (isSubmitEnter(e)) handleSubmit(); }}
         />
       </div>
       <div>
@@ -70,7 +71,7 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
             placeholder="/path/to/service"
             value={cwd}
             onChange={e => setCwd(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }}
+            onKeyDown={e => { if (isSubmitEnter(e)) handleSubmit(); }}
           />
           <button
             className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"

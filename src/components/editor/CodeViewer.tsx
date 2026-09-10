@@ -7,6 +7,7 @@ import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile } from '../../stores/editor';
+import { isSubmitEnter } from '../../utils/keyboard';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
@@ -392,7 +393,8 @@ function SearchPanelView({ view }: { view: EditorView }) {
         value={value}
         onChange={e => handleInput(e.target.value)}
         onKeyDown={e => {
-          if (e.key === 'Enter') { if (e.shiftKey) goPrev(); else goNext(); }
+          // 中文输入法回车确认候选词不应触发"跳到下一处"（isComposing 判断在 isSubmitEnter 内）
+          if (isSubmitEnter(e)) { if (e.shiftKey) goPrev(); else goNext(); }
           if (e.key === 'Escape') { closeSearchPanel(view); view.focus(); }
         }}
       />
