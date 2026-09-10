@@ -4,11 +4,14 @@ use std::sync::Mutex;
 use crate::models::Service;
 
 /// 数据库放在用户目录 ~/.nexus/ 下，避免 Tauri dev watcher 检测到项目目录中的文件变化导致无限重启
-fn db_path() -> PathBuf {
+fn db_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let nexus_dir = home.join(".nexus");
-    std::fs::create_dir_all(&nexus_dir).ok();
-    nexus_dir.join("nexus.db")
+    // 目录建不出来（无写权限/磁盘只读）时打开数据库必然失败，
+    // 这里直接上报真实原因，而不是让后续 open 报一句笼统的 "unable to open database file"
+    std::fs::create_dir_all(&nexus_dir)
+        .map_err(|e| format!("无法创建数据目录 {}: {}", nexus_dir.display(), e))?;
+    Ok(nexus_dir.join("nexus.db"))
 }
 
 pub struct Database {
@@ -18,19 +21,27 @@ pub struct Database {
 impl Database {
     /// 创建数据库实例，失败时返回错误而非 panic
     pub fn try_new() -> Result<Self, String> {
-        let conn = Connection::open(db_path()).map_err(|e| format!("无法打开数据库: {}", e))?;
+        let conn = Connection::open(db_path()?).map_err(|e| format!("无法打开数据库: {}", e))?;
         init_schema(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-        let conn = self.conn.lock().map_err(|e| format!("数据库连接锁获取失败: {}", e))?;
+        // 锁中毒（持锁线程 panic）继续使用内部连接：与 core/process.rs::stop_all 同策略。
+        // 此前直接返回错误 → 一次 panic 会让整个数据库功能永久不可用
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            log::error!("数据库连接锁已中毒，继续使用: {}", e);
+            e.into_inner()
+        });
         f(&conn)
     }
 
     /// 可变连接（事务等需要 &mut 的场景）
     pub fn with_conn_mut<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
-        let mut conn = self.conn.lock().map_err(|e| format!("数据库连接锁获取失败: {}", e))?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| {
+            log::error!("数据库连接锁已中毒，继续使用: {}", e);
+            e.into_inner()
+        });
         f(&mut conn)
     }
 }
@@ -126,6 +137,8 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         );
         -- 服务按项目过滤是主查询路径（列表/运行状态/启动全部），缺索引时全表扫描
         CREATE INDEX IF NOT EXISTS idx_services_project_id ON services(project_id);
+        -- 反向查询（某工具被哪些服务绑定）：删除工具前查引用、绑定列表展示都走此列
+        CREATE INDEX IF NOT EXISTS idx_service_open_tools_tool_id ON service_open_tools(tool_id);
     ").map_err(|e| format!("创建数据库表失败: {}", e))?;
 
     // 项目名唯一索引兜底（add/update 已做代码层查重；此处防未来新写入路径漏查）。

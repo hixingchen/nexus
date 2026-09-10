@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Manager, State};
 use serde::Deserialize;
 use crate::AppState;
 use crate::models::{Service, ServiceTemplate};
@@ -59,6 +59,12 @@ pub fn add_service(
     if params.project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
+    // 工具命令是前端直接提交的 JSON 文本：非法 JSON 只会在运行时解析失败，
+    // 在保存入口拦截；空串表示"未配置"，由下方统一归一为 []
+    if !params.tool_commands.trim().is_empty() {
+        serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
+            .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
+    }
     let cwd = params.cwd.replace('\\', "/");
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
     state.db.with_conn(|conn| {
@@ -109,6 +115,10 @@ pub fn update_service(
     let cwd = params.cwd.replace('\\', "/");
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
+    if !params.tool_commands.trim().is_empty() {
+        serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
+            .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
+    }
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
     let project_id = state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
@@ -126,7 +136,8 @@ pub fn update_service(
                 serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
             }
         } else if params.watch_paths.trim() == default_old {
-            serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| params.watch_paths)
+            // 监听路径仍等于"旧 cwd 拼接值" → 跟随新工作目录更新
+            serde_json::to_string(&vec![cwd.clone()]).unwrap_or(params.watch_paths)
         } else {
             params.watch_paths
         };
@@ -170,27 +181,34 @@ pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids:
 }
 
 /// 删除服务
+///
+/// 异步 + spawn_blocking：内部要停进程（taskkill + 超时等待，最坏数秒），
+/// 同步命令会跑在 IPC/事件循环线程上，导致界面在这期间完全无响应
 #[tauri::command]
-pub fn delete_service(state: State<AppState>, app: tauri::AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), String> {
     if id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    // 1. 查所属项目（文件监听以项目为维度；服务不存在时容忍跳过监听清理）
-    let project_id: Option<String> = state.db.with_conn(|conn| {
-        Ok(conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get(0)).ok())
-    })?;
-    // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
-    let _ = state.process_mgr.stop(&id);
-    // 3. 删除数据库记录
-    state.db.with_conn(|conn| {
-        conn.execute("DELETE FROM services WHERE id=?1", [&id]).map_err(|e| format!("删除服务失败: {}", e))?;
-        Ok(())
-    })?;
-    // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
-    if let Some(pid) = project_id {
-        if let Err(e) = crate::commands::watcher::remove_service_watch(app, &state, &pid, &id) {
-            log::warn!("删除服务后清理文件监听失败: {}", e);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 1. 查所属项目（文件监听以项目为维度；服务不存在时容忍跳过监听清理）
+        let project_id: Option<String> = state.db.with_conn(|conn| {
+            Ok(conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get(0)).ok())
+        })?;
+        // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
+        let _ = state.process_mgr.stop(&id);
+        // 3. 删除数据库记录
+        state.db.with_conn(|conn| {
+            conn.execute("DELETE FROM services WHERE id=?1", [&id]).map_err(|e| format!("删除服务失败: {}", e))?;
+            Ok(())
+        })?;
+        // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
+        if let Some(pid) = project_id {
+            // app 已被 state 借用，这里传克隆句柄（AppHandle 克隆是廉价的引用计数）
+            if let Err(e) = crate::commands::watcher::remove_service_watch(app.clone(), &state, &pid, &id) {
+                log::warn!("删除服务后清理文件监听失败: {}", e);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    }).await.map_err(|e| format!("删除服务任务失败: {}", e))?
 }
 
 // ─── 服务模板（跨项目复用） ─────────────────────────────────
@@ -217,6 +235,7 @@ pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTempla
 /// 把项目里的服务保存为模板（值拷贝，不关联原项目，可重复保存产生多个副本）
 #[tauri::command]
 pub fn save_service_as_template(state: State<AppState>, service_id: String) -> Result<ServiceTemplate, String> {
+    if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     state.db.with_conn(|conn| {
         let t = conn.query_row(
             "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands
@@ -244,11 +263,15 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)",
             rusqlite::params![id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, tool_commands, open_tool_id],
         ).map_err(|e| format!("保存模板失败: {}", e))?;
+        // 回读真实创建时间（原实现返回空串，与查询接口的返回不一致）
+        let created_at: String = conn
+            .query_row("SELECT created_at FROM service_templates WHERE id=?1", [&id], |r| r.get(0))
+            .unwrap_or_default();
         Ok(ServiceTemplate {
             id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, tool_commands,
             open_tool_id,
-            created_at: String::new(),
+            created_at,
         })
     })
 }
@@ -260,13 +283,16 @@ pub fn add_service_from_template(
     project_id: String,
     template_id: String,
 ) -> Result<Service, String> {
-    state.db.with_conn(|conn| {
-        let project_exists: bool = conn.query_row(
+    state.db.with_conn_mut(|conn| {
+        // 事务包裹：服务行 + 打开工具绑定必须原子写入——绑定插入失败（外键等）
+        // 若留下已建服务，用户看到的是"服务加进来了但工具绑定丢了"的半成品
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        let project_exists: bool = tx.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [&project_id], |r| r.get(0)
-        ).unwrap_or(false);
+        ).map_err(|e| format!("校验所属项目失败: {}", e))?;
         if !project_exists { return Err("所属项目不存在".into()); }
 
-        let t = conn.query_row(
+        let t = tx.query_row(
             "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id
              FROM service_templates WHERE id=?1",
             [&template_id],
@@ -280,29 +306,30 @@ pub fn add_service_from_template(
         let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let max_sort: i32 = conn.query_row(
+        let max_sort: i32 = tx.query_row(
             "SELECT COALESCE(MAX(sort_index), -1) FROM services WHERE project_id=?1",
             [&project_id], |r| r.get(0)
-        ).unwrap_or(-1);
+        ).map_err(|e| format!("读取服务排序失败: {}", e))?;
         let en = if enabled { 1 } else { 0 };
         let sft = if show_file_tree { 1 } else { 0 };
-        conn.execute(
+        tx.execute(
             "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, max_sort + 1, tool_commands],
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
         if !open_tool_id.is_empty() {
-            let tool_exists: bool = conn.query_row(
+            let tool_exists: bool = tx.query_row(
                 "SELECT COUNT(*) > 0 FROM open_tools WHERE id=?1", [&open_tool_id], |r| r.get(0)
-            ).unwrap_or(false);
+            ).map_err(|e| format!("校验打开工具失败: {}", e))?;
             if tool_exists {
-                conn.execute(
+                tx.execute(
                     "INSERT OR REPLACE INTO service_open_tools (service_id, tool_id) VALUES (?1,?2)",
                     rusqlite::params![id, open_tool_id],
                 ).map_err(|e| format!("复制模板打开工具失败: {}", e))?;
             }
         }
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
         Ok(Service {
             id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
@@ -372,6 +399,10 @@ pub fn update_service_template(
     let cwd = params.cwd.replace('\\', "/");
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
+    if !params.tool_commands.trim().is_empty() {
+        serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
+            .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
+    }
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
     state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };

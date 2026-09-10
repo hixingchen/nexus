@@ -40,7 +40,8 @@ pub fn list_entries(jar_bytes: &[u8]) -> Result<Vec<JarEntryInfo>, String> {
             compressed_size: f.compressed_size(),
         });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // 按名排序（大小写不敏感）：sort_by_key 每个条目只转换一次，避免比较时反复 to_lowercase
+    out.sort_by_key(|e| e.name.to_lowercase());
     Ok(out)
 }
 

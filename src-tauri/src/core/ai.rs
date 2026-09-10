@@ -140,6 +140,19 @@ fn atomic_write(file: &Path, content: &str) -> Result<(), String> {
     std::fs::rename(&tmp, file).map_err(|e| format!("替换 workspace.json 失败: {}", e))
 }
 
+/// 原子写二进制内容（同目录临时文件 + rename）。
+/// 用于会话文件（`session.jsonl.zstd`）这类用户数据：直接整份 `fs::write` 在写入中途
+/// 崩溃/断电/磁盘满时会留下截断文件，历史会话就此损坏。
+fn atomic_write_bytes(file: &Path, content: &[u8]) -> Result<(), String> {
+    let tmp = file.with_extension("tmp");
+    std::fs::write(&tmp, content).map_err(|e| format!("写临时文件失败: {}", e))?;
+    if let Err(e) = std::fs::rename(&tmp, file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换会话文件失败 {}: {}", file.display(), e));
+    }
+    Ok(())
+}
+
 // ─── 会话活动时间 bump（让 dsh GUI 初始选中本项目） ────────────
 // dsh GUI 初始工作区 = 「会话最近活动」的 workspace（recentWorkspace），会话
 // updatedAt = max(header.createdAt, metadata.lastPromptAt)。把目标项目某会话的
@@ -238,7 +251,9 @@ fn bump_session_activity(file: &Path) -> Result<(), String> {
     let mut buf = Vec::with_capacity(new_frame.len() + (raw.len() - e));
     buf.extend_from_slice(&new_frame);
     buf.extend_from_slice(&raw[e..]);
-    std::fs::write(file, buf).map_err(|e| format!("写会话文件失败: {}", e))
+    // 原子写：这是用户的会话历史文件，整份 std::fs::write 在写入中途崩溃/断电/磁盘满时
+    // 会留下截断文件。与 workspace.json 同样走"临时文件 + rename"
+    atomic_write_bytes(file, &buf)
 }
 
 /// 让 dsh GUI 打开时选中目标项目：注册 workspace（沿用注册逻辑）+
@@ -306,7 +321,7 @@ pub fn dsh_available() -> bool {
 /// 「检查/升级」按钮不能无限等待。子进程加入共享 Job Object（应用退出兜底清理）。
 /// 进程退出与 reader 线程刷盘有微小竞态，退出后短睡再读（诊断文本，无需精确）
 fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Result<String, String> {
-    log::info!("[ai] 执行命令: {}", command);
+    log::info!("[ai] 执行命令: {}", crate::core::process::mask_command(command));
     let mut cmd = build_command(command);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
@@ -539,23 +554,31 @@ pub fn spawn_dsh_web(
             .name(format!("nexus-ai-{}-stdout", pid))
             .spawn(move || {
                 let reader = std::io::BufReader::new(stdout);
+                let mut found = false;
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
                         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
                         Err(_) => break,
                     };
-                    if let Some(url) = parse_web_url(&line) {
-                        log::info!("[ai#{}] 解析到 dsh web URL", pid);
-                        let _ = tx.send(url);
-                        return;
+                    if !found {
+                        if let Some(url) = parse_web_url(&line) {
+                            log::info!("[ai#{}] 解析到 dsh web URL", pid);
+                            let _ = tx.send(url);
+                            found = true;
+                            // 找到 URL 后继续把 stdout 排空：直接 return 会 drop 读端 → 管道关闭 →
+                            // dsh 后续写 stdout 收到 EPIPE（Node 可能因此退出），同时丢失后续诊断输出
+                            continue;
+                        }
                     }
                     if !line.trim().is_empty() {
                         log::debug!("[ai#{}] stdout: {}", pid, line.trim());
                     }
                 }
-                log::warn!("[ai#{}] dsh web 在输出 URL 前退出", pid);
-                let _ = tx.send(String::new());
+                if !found {
+                    log::warn!("[ai#{}] dsh web 在输出 URL 前退出", pid);
+                    let _ = tx.send(String::new());
+                }
             })
             .map_err(|e| {
                 crate::core::process::kill_process_tree(pid);
@@ -650,7 +673,8 @@ fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, 
 /// 流程：token 握手拿会话 cookie → GET / 解析 loader 的 bundle URL/rev →
 /// 轮询该 URL 直到 200。超时只告警不失败（让前端重试路径兜底）。
 fn wait_plugins_ready(port: u16, token: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(8);
 
     // 1. 握手：GET /?token= → 303 + Set-Cookie
     let handshake = raw_get(port, &format!("/?token={}", token), None);
@@ -680,18 +704,24 @@ fn wait_plugins_ready(port: u16, token: &str) {
         return;
     };
 
-    // 3. 轮询 bundle 直到 200 / 超时
+    // 3. 轮询 bundle 直到 200 / 超时（退避：首测常在几百毫秒内就绪，固定 200ms 会白等）
+    let mut backoff = Duration::from_millis(50);
     loop {
         match cookie.as_ref().and_then(|c| raw_get(port, &bundle_path, Some(c))) {
             Some((200, _, _)) => {
-                log::info!("[ai] 插件 bundle 就绪（{}ms）", deadline.elapsed().as_millis());
+                // 用 start 时刻计时：deadline 是未来时刻，deadline.elapsed() 恒为 0
+                log::info!("[ai] 插件 bundle 就绪（{}ms）", started.elapsed().as_millis());
                 return;
             }
             _ if Instant::now() >= deadline => {
                 log::warn!("[ai] 插件 bundle 就绪探测超时（8s），仍返回（前端有刷新兜底）");
                 return;
             }
-            _ => std::thread::sleep(Duration::from_millis(200)),
+            _ => {
+                // 退避轮询：首测常在几百毫秒内就绪，固定 200ms 会白等
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, Duration::from_millis(400));
+            }
         }
     }
 }
@@ -825,7 +855,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ai-bump-test-{}", uuid::Uuid::new_v4()));
         let file = make_session_file(&dir, r"D:\work\GitProject\proj");
         let raw_before = std::fs::read(&file).unwrap();
-        let frames_before = find_magic(&raw_before, 4).map(|i| i).unwrap(); // 第二帧偏移存在
+        let frames_before = find_magic(&raw_before, 4).unwrap(); // 第二帧偏移存在
 
         bump_session_activity(&file).unwrap();
 
@@ -895,5 +925,28 @@ mod tests {
         assert_eq!(extract_version("dsh 1.2.3 (DeepSeek Harness)\n"), Some("1.2.3".to_string()));
         assert_eq!(extract_version(""), None);
         assert_eq!(extract_version("nothing here"), None);
+    }
+
+    // ── 会话 URL 解析（就绪探测依赖它，此前无测试）────────────
+
+    #[test]
+    fn test_parse_web_url_and_localhost_normalization() {
+        // 127.0.0.1 规范为 localhost（仅展示/导航统一，token 保留）
+        assert_eq!(
+            parse_web_url("dsh web listening on http://127.0.0.1:51234/?token=abc"),
+            Some("http://localhost:51234/?token=abc".to_string())
+        );
+        assert_eq!(parse_web_url("no url here"), None);
+        assert_eq!(parse_web_url(""), None);
+    }
+
+    #[test]
+    fn test_parse_port_and_token() {
+        let url = "http://localhost:51234/?token=xyz-123";
+        assert_eq!(parse_port(url), Some(51234));
+        assert_eq!(parse_token(url), Some("xyz-123".to_string()));
+        // 缺端口 / 缺 token
+        assert_eq!(parse_port("http://localhost/?token=a"), None);
+        assert_eq!(parse_token("http://localhost:51234/"), None);
     }
 }

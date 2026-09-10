@@ -3,13 +3,13 @@ use tauri::State;
 use crate::AppState;
 use crate::models::{OpenTool, ServiceOpenToolBinding};
 
-/// 外部打开工具（服务右键「用 XX 打开」）
-///
-/// 新模型：executable（程序路径）+ args（参数模板）。`{path}` 占位符以
-/// **独立参数**注入（不经过 shell 字符串拼接）——路径含空格/特殊字符天然安全。
-/// command 字段为历史遗留（整串 shell 命令），仅 executable 为空的历史行使用。
-///
-/// 安全边界：executable/args 来自用户自己的配置，与「工具命令」同一信任级别。
+// 外部打开工具（服务右键「用 XX 打开」）
+//
+// 新模型：executable（程序路径）+ args（参数模板）。`{path}` 占位符以
+// **独立参数**注入（不经过 shell 字符串拼接）——路径含空格/特殊字符天然安全。
+// command 字段为历史遗留（整串 shell 命令），仅 executable 为空的历史行使用。
+//
+// 安全边界：executable/args 来自用户自己的配置，与「工具命令」同一信任级别。
 
 // ─── CRUD ───────────────────────────────────────────────────
 
@@ -217,8 +217,11 @@ fn spawn_tool_program(executable: &str, args_template: &str, path: &str) -> Resu
         use std::os::windows::process::CommandExt;
         let lower = executable.to_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-            let mut parts = vec![format!("\"{}\"", executable)];
-            parts.extend(args.iter().map(|a| format!("\"{}\"", a)));
+            // cmd /C 只能吃整串命令，引号必须自己拼：内嵌双引号会截断参数造成注入，
+            // 与 render_legacy_command 对路径的清洗保持一致
+            let quote = |s: &str| format!("\"{}\"", s.replace('"', ""));
+            let mut parts = vec![quote(executable)];
+            parts.extend(args.iter().map(|a| quote(a)));
             std::process::Command::new("cmd")
                 .args(["/C", &parts.join(" ")])
                 .creation_flags(0x08000000)

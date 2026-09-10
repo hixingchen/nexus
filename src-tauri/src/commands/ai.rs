@@ -35,8 +35,16 @@ pub struct AiStatus {
 /// 组装状态快照（不持锁调用 dsh 检测）
 fn snapshot(state: &AppState) -> AiStatus {
     let (running, url, pid, cwd) = match state.ai.lock() {
-        Ok(h) => match h.as_ref() {
-            Some(s) => (true, Some(s.url.clone()), Some(s.pid), s.cwd.clone()),
+        Ok(mut h) => match h.as_mut() {
+            Some(s) => {
+                // alive() 现场探测子进程（try_wait）：只看槽里有没有会话，
+                // 会把已崩溃的 dsh 一直报成"运行中"（前端永远显示会话态）
+                let alive = s.alive();
+                if !alive {
+                    log::warn!("[ai] 会话进程已退出（pid={}），状态将报告为未运行", s.pid);
+                }
+                (alive, Some(s.url.clone()), Some(s.pid), s.cwd.clone())
+            }
             None => (false, None, None, None),
         },
         Err(e) => {
@@ -65,6 +73,13 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         let state = app.state::<AppState>();
         let cwd_norm: Option<String> = cwd.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let name_norm: Option<String> = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+        // 目录不存在时提前失败：否则 dsh 在无效工作目录里启动，报错信息指向不明
+        if let Some(dir) = cwd_norm.as_deref() {
+            if !std::path::Path::new(dir).is_dir() {
+                return Err(format!("项目目录不存在: {}", dir));
+            }
+        }
 
         // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
         if !crate::core::ai::dsh_available() {
@@ -210,6 +225,10 @@ pub async fn ai_upgrade_dsh(app: AppHandle) -> Result<String, String> {
 /// 额外用 initialization_script 安装页面内焦点恢复器（scripts/ai_focus_restore.js）。
 /// 为什么必须 Rust 侧：@tauri-apps/api 的 Webview 类没有 eval/initializationScript
 /// 入口，注入只能走 Rust。
+///
+/// 参数较多是 IPC 契约决定的：这些字段由前端 `invoke` 逐个传入，合并成结构体会同时改变
+/// 前端调用形状（属界面契约变更）。逐项豁免并说明理由，而不是全局关闭该 lint。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn create_ai_panel_webview(
     app: AppHandle,
@@ -224,9 +243,21 @@ pub async fn create_ai_panel_webview(
     let window = app
         .get_window(&window_label)
         .ok_or_else(|| format!("窗口不存在: {}", window_label))?;
-    let url = tauri::WebviewUrl::External(
-        url.parse().map_err(|e| format!("URL 解析失败 ({}): {}", url, e))?,
-    );
+    // URL 白名单：本命令在内嵌浏览器里加载任意 URL——不校验等于把"能渲染任意网页的
+    // 窗口"开放给调用方（钓鱼/本地服务探测）。用 tauri::Url 解析而非字符串前缀匹配：
+    // 前缀匹配挡不住 `http://localhost.evil.com`、`@` 用户信息段等写法。
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("URL 解析失败 ({}): {}", url, e))?;
+    let host_ok = matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
+    if !host_ok || !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("AI 面板 URL 不允许: {}", url));
+    }
+    let url = tauri::WebviewUrl::External(parsed);
+    // 几何值来自前端 invoke 参数：非有限值（NaN/±inf）与负坐标会让 WebView 创建失败
+    // 或落在屏幕外；尺寸下限 1px（0 尺寸同样创建失败）
+    let x = if x.is_finite() { x.max(0.0) } else { 0.0 };
+    let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
+    let width = if width.is_finite() { width.max(1.0) } else { 1.0 };
+    let height = if height.is_finite() { height.max(1.0) } else { 1.0 };
     let builder = tauri::webview::WebviewBuilder::new(label, url)
         // HTML5 drag and drop（与 JS 创建时 dragDropEnabled: false 同义）
         .disable_drag_drop_handler()
@@ -250,26 +281,38 @@ pub async fn create_ai_panel_webview(
 /// 窗口（窗口类 "Chrome_WidgetWin_0"，探测确认与面板槽位矩形一致、属于应用进程
 /// 主线程，SetFocus 合法）后调用 Win32 SetFocus。控件获得焦点后页面触发
 /// window focus 事件 → 注入脚本自动恢复输入框（双保险）。
+///
+/// 非 Windows 平台无对应实现：命令仍在注册表中（保持跨平台可编译），调用返回错误。
 #[tauri::command]
-#[cfg(windows)]
 pub async fn ai_panel_focus(app: AppHandle, window_label: String, label: String) -> Result<(), String> {
-    let window = app
-        .get_window(&window_label)
-        .ok_or_else(|| format!("窗口不存在: {}", window_label))?;
-    let webview = app.get_webview(&label).ok_or_else(|| format!("AI 面板 WebView 不存在: {}", label))?;
-    let w2 = window.clone();
-    let wv2 = webview.clone();
-    // run_on_main_thread：EnumChildWindows/SetFocus 的窗口属于 UI 线程，
-    // SetFocus 要求调用线程与目标窗口同线程（或附加输入队列）——必须在主线程执行
-    window
-        .run_on_main_thread(move || {
-            let res = do_panel_focus(&w2, &wv2);
-            match &res {
-                Ok(()) => log::info!("[ai] 系统焦点已交给 dsh 面板"),
-                Err(e) => log::warn!("[ai] 恢复 dsh 系统焦点失败: {}", e),
-            }
-        })
-        .map_err(|e| format!("主线程调度失败: {}", e))
+    // 命令本体不带 cfg：lib.rs 的 generate_handler! 无条件注册本命令，
+    // 函数被 cfg 掉会让非 Windows 目标整体编译失败。平台分支放在函数体内。
+    #[cfg(windows)]
+    {
+        let window = app
+            .get_window(&window_label)
+            .ok_or_else(|| format!("窗口不存在: {}", window_label))?;
+        let webview = app.get_webview(&label).ok_or_else(|| format!("AI 面板 WebView 不存在: {}", label))?;
+        let w2 = window.clone();
+        let wv2 = webview.clone();
+        // run_on_main_thread：EnumChildWindows/SetFocus 的窗口属于 UI 线程，
+        // SetFocus 要求调用线程与目标窗口同线程（或附加输入队列）——必须在主线程执行
+        window
+            .run_on_main_thread(move || {
+                let res = do_panel_focus(&w2, &wv2);
+                match &res {
+                    Ok(()) => log::info!("[ai] 系统焦点已交给 dsh 面板"),
+                    Err(e) => log::warn!("[ai] 恢复 dsh 系统焦点失败: {}", e),
+                }
+            })
+            .map_err(|e| format!("主线程调度失败: {}", e))
+    }
+    #[cfg(not(windows))]
+    {
+        // 其他平台没有 WebView2 控件窗口，也就没有 SetFocus 的等价做法
+        let _ = (app, window_label, label);
+        Err("系统焦点恢复仅 Windows 支持".into())
+    }
 }
 
 #[cfg(windows)]
@@ -281,7 +324,7 @@ fn do_panel_focus(window: &tauri::Window, webview: &tauri::Webview) -> Result<()
             Err(e) => return Err(format!("获取主窗口句柄失败: {}", e)),
         };
         let hwnd = handle.0 as isize;
-        let mut pt = POINT { x: 0, y: 0 };
+        let mut pt = Point { x: 0, y: 0 };
         ClientToScreen(hwnd, &mut pt);
 
         let wpos = webview
@@ -317,7 +360,7 @@ const WEBVIEW2_CONTROL_CLASS: &str = "Chrome_WidgetWin_0";
 
 #[cfg(windows)]
 #[repr(C)]
-struct RECT {
+struct Rect {
     left: i32,
     top: i32,
     right: i32,
@@ -326,7 +369,7 @@ struct RECT {
 
 #[cfg(windows)]
 #[repr(C)]
-struct POINT {
+struct Point {
     x: i32,
     y: i32,
 }
@@ -349,7 +392,7 @@ unsafe extern "system" fn enum_proc(hwnd: isize, l_param: isize) -> i32 {
     if name != WEBVIEW2_CONTROL_CLASS {
         return 1;
     }
-    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
     if GetWindowRect(hwnd, &mut r) == 0 {
         return 1;
     }
@@ -372,7 +415,7 @@ extern "system" {
         l_param: isize,
     ) -> i32;
     fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
-    fn GetWindowRect(hwnd: isize, lp_rect: *mut RECT) -> i32;
-    fn ClientToScreen(hwnd: isize, lp_point: *mut POINT) -> i32;
+    fn GetWindowRect(hwnd: isize, lp_rect: *mut Rect) -> i32;
+    fn ClientToScreen(hwnd: isize, lp_point: *mut Point) -> i32;
     fn SetFocus(hwnd: isize) -> isize;
 }

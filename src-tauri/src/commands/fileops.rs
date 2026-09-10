@@ -7,12 +7,21 @@
 use std::path::{Path, PathBuf};
 use tauri::State;
 
-use crate::commands::editor::is_path_allowed;
+use crate::commands::editor::check_path_allowed;
 use crate::AppState;
+
+/// 单次复制的目录层级上限（联接点/符号链接会让目录树成环，纯深度兜底）
+const MAX_COPY_DEPTH: usize = 64;
+/// 单次粘贴复制的条目总数上限（防巨量文件耗尽时间与磁盘）
+const MAX_COPY_ENTRIES: usize = 200_000;
 
 /// 复制文件/文件夹到系统剪贴板（在资源管理器中 Ctrl+V 可粘贴）
 #[tauri::command]
-pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
+pub fn copy_files_to_clipboard(state: State<AppState>, paths: Vec<String>) -> Result<(), String> {
+    // 白名单校验：写入系统剪贴板的路径允许被粘贴到任意位置，必须与读路径同口径
+    for p in &paths {
+        check_path_allowed(&state, p)?;
+    }
     #[cfg(windows)]
     {
         use clipboard_win::Clipboard;
@@ -38,13 +47,9 @@ pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
 /// 从系统剪贴板读取文件列表并复制到目标目录，返回新建的路径列表（供前端刷新树）
 #[tauri::command]
 pub async fn paste_files(state: State<'_, AppState>, target_dir: String) -> Result<Vec<String>, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&target_dir, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），与其余路径类命令同口径；
+    // 校验内部不跨 await 持锁，future 仍是 Send
+    check_path_allowed(&state, &target_dir)?;
     let target = PathBuf::from(&target_dir);
     if !target.is_dir() {
         return Err("目标不是目录".into());
@@ -76,6 +81,7 @@ fn paste_files_windows(target: &Path) -> Result<Vec<String>, String> {
     let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
 
     let mut created: Vec<String> = Vec::new();
+    let mut entries = 0usize;
     for src_str in &sources {
         let src = PathBuf::from(src_str);
         if !src.exists() {
@@ -93,7 +99,7 @@ fn paste_files_windows(target: &Path) -> Result<Vec<String>, String> {
             None => continue, // 非 UTF-8 文件名（极罕见），跳过
         };
         let dst = unique_dest_path(target, &name);
-        copy_recursive(&src, &dst).map_err(|e| format!("复制 {} 失败: {}", name, e))?;
+        copy_recursive(&src, &dst, &mut entries).map_err(|e| format!("复制 {} 失败: {}", name, e))?;
         created.push(dst.to_string_lossy().replace('\\', "/"));
     }
     if created.is_empty() {
@@ -104,12 +110,34 @@ fn paste_files_windows(target: &Path) -> Result<Vec<String>, String> {
 }
 
 /// 递归复制文件/目录（同步，仅在阻塞线程池中调用）
-fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
+///
+/// `entries` 由调用方在单次粘贴内共享，跨多个源累计，防止"每个源各自不超限、总量爆掉"。
+fn copy_recursive(src: &Path, dst: &Path, entries: &mut usize) -> std::io::Result<()> {
+    copy_recursive_at(src, dst, entries, 0)
+}
+
+/// 带层级的递归实现。
+///
+/// 不跟随符号链接/联接点：Windows 目录联接（junction）会让目录树成环，
+/// 原实现用 `src.is_dir()`（跟随链接）会无限递归并把磁盘写满。
+fn copy_recursive_at(src: &Path, dst: &Path, entries: &mut usize, depth: usize) -> std::io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "目录层级过深（疑似符号链接环）"));
+    }
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        log::warn!("[nexus] 跳过符号链接/联接点（不跟随复制）: {}", src.display());
+        return Ok(());
+    }
+    *entries += 1;
+    if *entries > MAX_COPY_ENTRIES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "复制的条目数超过上限"));
+    }
+    if meta.is_dir() {
         std::fs::create_dir_all(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_recursive_at(&entry.path(), &dst.join(entry.file_name()), entries, depth + 1)?;
         }
     } else {
         std::fs::copy(src, dst)?;
@@ -173,5 +201,69 @@ mod tests {
         let name = ".gitignore";
         let dst = unique_dest_path(&dir, name);
         assert_eq!(dst, dir.join(".gitignore"));
+    }
+
+    /// 普通目录树照常复制（回归：加了 depth/entries 参数后基本功能不变）
+    #[test]
+    fn test_copy_recursive_copies_tree() {
+        let base = std::env::temp_dir().join(format!("nexus_ut_copy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::write(src.join("a/b/f.txt"), "x").unwrap();
+        let mut entries = 0usize;
+        copy_recursive(&src, &base.join("dst"), &mut entries).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("dst/a/b/f.txt")).unwrap(), "x");
+        assert_eq!(entries, 4); // src、a、b 三个目录 + 1 个文件
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 目录层级超限时报错而不是无限递归（符号链接环的兜底防线）
+    #[test]
+    fn test_copy_recursive_depth_limit() {
+        // 单字符目录名：66 层嵌套仍在 Windows 260 字符路径上限内
+        let base = std::env::temp_dir().join(format!("nxut_depth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("s");
+        let mut deep = src.clone();
+        for _ in 0..(MAX_COPY_DEPTH + 2) {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let mut entries = 0usize;
+        let err = copy_recursive(&src, &base.join("o"), &mut entries).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 目录联接（junction）/符号链接被跳过且不跟随：不创建目标、不报错。
+    /// 这是本修复的核心场景——联接会让目录树成环，原实现（is_dir 跟随链接）无限递归写满磁盘。
+    /// Windows 用 `mklink /J` 建联接（无需管理员，符号链接需要）；建不出来则跳过断言。
+    #[test]
+    fn test_copy_recursive_skips_link() {
+        let base = std::env::temp_dir().join(format!("nxut_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("f.txt"), "x").unwrap();
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let link = src.join("link");
+        #[cfg(windows)]
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let created = std::os::unix::fs::symlink(&real, &link).is_ok();
+        if created {
+            let mut entries = 0usize;
+            copy_recursive(&src, &base.join("dst"), &mut entries).unwrap();
+            assert!(!base.join("dst/link").exists(), "目录联接/符号链接不应被跟随复制");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

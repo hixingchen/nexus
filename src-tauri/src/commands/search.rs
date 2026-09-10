@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::State;
 use crate::AppState;
-use crate::commands::editor::is_path_allowed;
+use crate::commands::editor::check_path_allowed;
 
 /// 单条搜索结果
 #[derive(Debug, Serialize)]
@@ -78,13 +78,8 @@ pub async fn search_files(
     if query.len() > 200 { return Err("搜索内容过长".into()); }
     let root = params.root.replace('\\', "/");
     if root.is_empty() { return Err("搜索目录不能为空".into()); }
-    // 路径白名单校验（在 await 前释放锁，确保 future 是 Send）
-    {
-        let project_root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&root, &project_root) {
-            return Err("访问被拒绝".into());
-        }
-    }
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &root)?;
 
     let exts: Vec<String> = params.extensions.iter()
         .map(|e| e.trim().trim_start_matches('.').to_lowercase())
@@ -92,7 +87,7 @@ pub async fn search_files(
         .collect();
     // 大小写不敏感时统一小写，行内匹配用同一规则
     let q = if params.case_sensitive { query } else { query.to_lowercase() };
-    let max_results = params.max_results.max(1).min(5000);
+    let max_results = params.max_results.clamp(1, 5000);
 
     // 同步遍历 + 读文件放 spawn_blocking，避免阻塞主线程
     tokio::task::spawn_blocking(move || {
@@ -139,12 +134,18 @@ fn search_in_dir(
         };
         let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
         for entry in entries.flatten() {
+            // file_type() 取自目录项本身（不额外 stat），并据此跳过符号链接/junction：
+            // 它们可能指向项目外（既泄漏白名单外内容，也让同一份内容被重复遍历）
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
                 if DEFAULT_EXCLUDE_DIRS.contains(&name.as_str()) { continue; }
                 subdirs.push((path, depth + 1));
-            } else if path.is_file() {
+            } else if file_type.is_file() {
                 scanned += 1;
                 if scanned > MAX_SCAN_FILES { truncated = true; break; }
                 if !file_is_searchable(&path, exts) { continue; }
@@ -196,12 +197,25 @@ fn search_file(path: &Path, q: &str, case_sensitive: bool, limit: usize) -> Opti
     let q_char_count = q.chars().count();
     for (idx, line) in content.lines().enumerate() {
         if hits.len() >= limit { break; }
-        let hay = if case_sensitive { line.to_string() } else { line.to_lowercase() };
-        if let Some(pos) = hay.find(q) {
-            // hay 与 line 的字节偏移可能不一致（to_lowercase 会改变个别字符的字节长度，
-            // 如 İ→i̇、ẞ→ß），直接用字节偏移切原行会落在字符中间 panic。
-            // 解法：用字符序号映射回原行，再按字符边界切片
-            let char_idx = hay[..pos].chars().count();
+        // 命中位置统一折算成**字符序号**（后续按字符切 snippet，字节偏移在非 ASCII 行上会切错）：
+        // - 大小写敏感：直接在原行匹配后把字节偏移折算成字符数
+        // - 不敏感且行/查询都是 ASCII：逐字节比较，零分配（大仓搜索时每行一次 to_lowercase 是主要开销）
+        // - 其余：回退到小写副本匹配（Unicode 小写化会改变字节长度，如 İ→i̇、ẞ→ß，必须再映射回原行）
+        let char_idx = if case_sensitive {
+            line.find(q).map(|p| line[..p].chars().count())
+        } else if line.is_ascii() && q.is_ascii() {
+            let lb = line.as_bytes();
+            let qb = q.as_bytes();
+            if qb.is_empty() || qb.len() > lb.len() {
+                None
+            } else {
+                lb.windows(qb.len()).position(|w| w.eq_ignore_ascii_case(qb))
+            }
+        } else {
+            let hay = line.to_lowercase();
+            hay.find(q).map(|p| hay[..p].chars().count())
+        };
+        if let Some(char_idx) = char_idx {
             let start_char = char_idx.saturating_sub(SNIPPET_MARGIN);
             let end_char = (char_idx + q_char_count + SNIPPET_MARGIN).min(line.chars().count());
             let mut snippet: String = line.chars().skip(start_char).take(end_char - start_char).collect();

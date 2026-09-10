@@ -59,28 +59,38 @@ impl FileWatcher {
         services: &[ServiceWatchConfig],
         on_change: impl Fn(FileChangeEvent) + Send + 'static,
     ) -> Result<(), String> {
-        let _ = self.stop_watching(project_id);
-
         let mut unique_paths: Vec<PathBuf> = Vec::new();
+        let mut invalid: Vec<String> = Vec::new();
         for svc in services {
             for p in &svc.paths {
                 let path = PathBuf::from(p);
-                if path.exists() && !unique_paths.contains(&path) {
-                    unique_paths.push(path);
+                if path.exists() {
+                    if !unique_paths.contains(&path) {
+                        unique_paths.push(path);
+                    }
+                } else {
+                    invalid.push(p.clone());
                 }
             }
         }
 
         if unique_paths.is_empty() {
-            // 静默跳过会表现为"改了文件什么都没发生"，显式记录无效路径便于诊断
-            let total: usize = services.iter().map(|s| s.paths.len()).sum();
-            let invalid: Vec<&str> = services.iter().flat_map(|s| s.paths.iter().map(|p| p.as_str()))
-                .filter(|p| !Path::new(p).exists()).collect();
-            log::warn!(
-                "文件监听未启动: 有效路径 0/{total}（无效路径 {:?}，可能路径不存在或全部服务未启用监听）",
-                invalid
-            );
-            return Ok(());
+            if invalid.is_empty() {
+                // 没有任何服务配置监听路径：正常情况（等价于关闭监听）
+                let _ = self.stop_watching(project_id);
+                return Ok(());
+            }
+            // 配置了监听路径但一个都不存在：必须报错。
+            // 原实现只 log::warn + Ok(()) → 前端显示"已监听"、用户改文件毫无反应，
+            // 而打包版连这条 warn 都看不到（日志只写 stderr）
+            return Err(format!(
+                "监听路径全部无效（{} 个）：{}",
+                invalid.len(),
+                invalid.join("、")
+            ));
+        }
+        if !invalid.is_empty() {
+            log::warn!("[nexus] 文件监听：{} 个路径无效已跳过: {:?}", invalid.len(), invalid);
         }
 
         // channel 用于接收文件事件和停止信号（有界：接收端慢时丢弃旧事件，避免无限堆积）
@@ -91,6 +101,10 @@ impl FileWatcher {
             let _ = event_tx.send(res);
         }).map_err(|e| format!("创建文件监听器失败: {}", e))?;
 
+        // 先把新 watcher 的路径全部注册成功，再替换旧监听：
+        // 原实现先 stop_watching 旧的再 watch，任一 watch 失败就直接返回 Err ——
+        // 旧监听已经没了、新监听也没建起来，整个项目的自动重启静默失效。
+        // 旧监听的停止与替换统一放在"新资源全部就绪之后"（见本函数末尾）
         for path in &unique_paths {
             watcher.watch(path, RecursiveMode::Recursive)
                 .map_err(|e| format!("监听路径失败 {}: {}", path.display(), e))?;
@@ -100,7 +114,10 @@ impl FileWatcher {
         let pname = project_name.to_string();
         let svc_map: Vec<ServiceWatchConfig> = services.to_vec();
 
-        let listener_handle = std::thread::spawn(move || {
+        // 线程命名：排障时能从线程名直接看出是哪个项目的监听
+        let listener_handle = std::thread::Builder::new()
+            .name(format!("nexus-watch-{}", project_id))
+            .spawn(move || {
             let debounce = Duration::from_millis(500);
             let mut pending: HashMap<String, String> = HashMap::new();
             let mut last_flush = Instant::now();
@@ -150,7 +167,11 @@ impl FileWatcher {
                     last_flush = Instant::now();
                 }
             }
-        });
+            })
+            .map_err(|e| format!("创建文件监听线程失败: {}", e))?;
+
+        // 到这里新旧资源都已就绪，才替换旧监听（先 stop 后建会让失败路径丢掉整个项目的监听）
+        let _ = self.stop_watching(project_id);
 
         self.watchers.lock().map_err(|e| format!("FileWatcher watchers 锁获取失败: {}", e))?
             .insert(project_id.to_string(), WatcherState { _watcher: watcher, stop_tx, listener_handle: Some(listener_handle), services: services.to_vec() });
@@ -320,6 +341,8 @@ fn match_changes(
             let in_watch = svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp)));
             if !in_watch { continue; }
             if !service_accepts(svc, path_str, &components) { continue; }
+            // 不 break：同一路径可能被多个服务同时监听，每个服务都应收到事件
+            // （原实现在第一个匹配处 break，导致服务 B 永不自动重启）
             changes.push(FileChange {
                 path: path_str.clone(),
                 service_name: svc.name.clone(),
@@ -328,7 +351,6 @@ fn match_changes(
                 restart_mode: svc.restart_mode,
             });
             matched = true;
-            break;
         }
         if !matched {
             changes.push(FileChange {

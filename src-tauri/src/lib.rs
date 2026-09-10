@@ -1,6 +1,7 @@
 mod commands;
 mod core;
 mod database;
+pub mod logger;
 mod models;
 
 use std::sync::Arc;
@@ -73,16 +74,31 @@ fn purge_webview_cookies() {
     }
 }
 
+/// 启动致命错误落盘（`~/.nexus/logs/startup-error.log`）后退出。
+///
+/// 打包版没有控制台，启动期 panic 的表现是"双击后闪退、没有任何线索"；
+/// 落盘 + 明确退出码让用户/支持者至少能拿到原因（日志文件在 `~/.nexus/logs/`）。
+fn fatal_startup_error(msg: String) -> ! {
+    log::error!("[nexus] 启动失败: {}", msg);
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".nexus").join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("startup-error.log"), format!("{}\n", msg));
+    }
+    eprintln!("[nexus] 启动失败: {}", msg);
+    std::process::exit(1);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebView 创建前清空 cookie 库（见 purge_webview_cookies 注释）
     #[cfg(windows)]
     purge_webview_cookies();
 
-    let db = Database::try_new().unwrap_or_else(|e| {
-        log::error!("数据库初始化失败: {}", e);
-        panic!("数据库初始化失败: {}", e);
-    });
+    let db = match Database::try_new() {
+        Ok(db) => db,
+        Err(e) => fatal_startup_error(format!("数据库初始化失败: {}", e)),
+    };
 
     // 创建共享的 Job Object（通过 Arc 在 ProcessManager 间共享）
     // 失败时降级运行：子进程不会在父进程退出时自动终止，但应用仍可正常使用
@@ -204,10 +220,7 @@ pub fn run() {
 
     let app = match app {
         Ok(app) => app,
-        Err(e) => {
-            log::error!("构建 Nexus 应用失败: {}", e);
-            panic!("构建 Nexus 应用失败: {}", e);
-        }
+        Err(e) => fatal_startup_error(format!("构建 Nexus 应用失败: {}", e)),
     };
 
     // Exit 是最后的安全网：确保所有资源被释放，子进程被终止
@@ -218,9 +231,18 @@ pub fn run() {
             if let Some(state) = app.try_state::<AppState>() {
                 cleanup_resources(&state);
             }
-            // 确保子进程真正退出后再退出进程
+            // 确保子进程真正退出后再退出进程：轮询而不是固定 sleep——
+            // 清理已完成（stop_all 后进程表为空）即可立刻结束，最多等 1500ms；
             // Job Object (KILL_ON_JOB_CLOSE) 是最终兜底
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            while std::time::Instant::now() < deadline {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if state.process_mgr.running().is_empty() {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             log::info!("[nexus] RunEvent::Exit → 完成");
         }
     });

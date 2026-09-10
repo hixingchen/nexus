@@ -4,8 +4,14 @@ use tauri::State;
 use crate::AppState;
 
 /// 在系统终端中打开路径（Windows: 新开 cmd 窗口并定位到目录）
+///
+/// 与文件读写同口径校验路径：此前该命令不校验，可在任意目录弹出终端
 #[tauri::command]
-pub fn open_terminal(path: String) -> Result<(), String> {
+pub fn open_terminal(state: State<AppState>, path: String) -> Result<(), String> {
+    check_path_allowed(&state, &path)?;
+    if !std::path::Path::new(&path).is_dir() {
+        return Err("路径不是目录".into());
+    }
     log::info!("[nexus] 打开终端: {}", path);
 
     #[cfg(target_os = "windows")]
@@ -39,8 +45,11 @@ pub fn open_terminal(path: String) -> Result<(), String> {
 }
 
 /// 在系统资源管理器中打开路径
+///
+/// 与文件读写同口径校验路径：此前该命令不校验，可打开任意路径（含把任意文件路径写进系统剪贴板场景）
 #[tauri::command]
-pub fn open_in_explorer(path: String) -> Result<(), String> {
+pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), String> {
+    check_path_allowed(&state, &path)?;
     let path_buf = PathBuf::from(&path);
 
     log::info!("[nexus] 打开资源管理器: {}", path);
@@ -104,9 +113,21 @@ pub(crate) struct FileEntry {
     pub extension: Option<String>,
 }
 
-/// 设置当前项目根路径（安全白名单）
+/// 设置当前项目根路径（安全白名单根之一：另加各服务/模板工作目录，见 allowed_roots）
 #[tauri::command]
 pub fn set_project_root(state: State<AppState>, path: Option<String>) -> Result<(), String> {
+    // 传入路径必须存在且为目录：否则 canonicalize 恒失败 → 所有文件命令被拒（现象与"打不开文件"一致但无解释）。
+    // 这里直接给出可诊断的错误，前端已 catch 并记录日志。
+    if let Some(root) = path.as_deref() {
+        let trimmed = root.trim();
+        if trimmed.is_empty() {
+            return Err("项目路径为空".into());
+        }
+        let p = std::path::Path::new(trimmed);
+        if !p.is_dir() {
+            return Err(format!("项目路径不存在或不是目录: {}", trimmed));
+        }
+    }
     let mut root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
     *root = path;
     Ok(())
@@ -131,6 +152,98 @@ pub(crate) fn is_path_allowed(requested: &str, allowed_root: &Option<String>) ->
     }
 }
 
+/// 允许访问的根目录集合：项目根 + 所有已配置服务/模板的工作目录。
+///
+/// 为什么是多根：`Service.cwd` 允许配置在项目目录之外（模型如此），单根白名单会让这些
+/// 服务的文件既打不开也搜不到。多根同时收紧了"任意路径"（原 `list_directory` 等命令无校验）。
+/// 返回空集合表示"未选择项目"，此时一律拒绝——保持原有的安全语义。
+pub(crate) fn allowed_roots(state: &AppState) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    let has_project_root = match state.project_root.lock() {
+        Ok(root) => match root.as_ref() {
+            Some(r) if !r.trim().is_empty() => {
+                roots.push(r.clone());
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if !has_project_root {
+        return Vec::new();
+    }
+    // 服务/模板工作目录：配置可能指向项目外，属合法访问范围
+    let dirs = state.db.with_conn(|conn| {
+        let mut out: Vec<String> = Vec::new();
+        let mut stmt = conn
+            .prepare("SELECT cwd FROM services UNION SELECT cwd FROM service_templates")
+            .map_err(|e| format!("查询可访问目录失败: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("读取可访问目录失败: {}", e))?;
+        for r in rows {
+            let cwd = r.map_err(|e| format!("解析可访问目录失败: {}", e))?;
+            if !cwd.trim().is_empty() {
+                out.push(cwd);
+            }
+        }
+        Ok::<Vec<String>, String>(out)
+    });
+    match dirs {
+        Ok(mut v) => roots.append(&mut v),
+        Err(e) => log::warn!("[nexus] 收集允许访问目录失败（仅按项目根校验）: {}", e),
+    }
+    roots.dedup();
+    roots
+}
+
+/// 多根白名单校验：命中任一允许根即通过
+pub(crate) fn is_path_allowed_any(requested: &str, roots: &[String]) -> bool {
+    roots
+        .iter()
+        .any(|root| is_path_allowed(requested, &Some(root.clone())))
+}
+
+/// 读路径校验：项目根 + 各服务/模板工作目录（未选择项目时一律拒绝）。
+/// 供所有取路径的命令统一调用——此前 `list_directory`/`open_terminal`/`open_in_explorer`
+/// 等命令完全绕过白名单，导致"同类危险操作两套口径"。
+pub(crate) fn check_path_allowed(state: &AppState, path: &str) -> Result<(), String> {
+    let roots = allowed_roots(state);
+    if roots.is_empty() {
+        return Err("访问被拒绝".into());
+    }
+    if is_path_allowed_any(path, &roots) {
+        Ok(())
+    } else {
+        Err("访问被拒绝".into())
+    }
+}
+
+/// 写路径校验：目标已存在时按读路径规则；不存在时校验**父目录**（支持新建文件）。
+/// 文件名必须为单一段（不含分隔符与 `.`/`..`），避免经由父目录校验绕过范围限制。
+pub(crate) fn check_write_path_allowed(state: &AppState, path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if p.exists() {
+        return check_path_allowed(state, path);
+    }
+    let name_ok = p
+        .file_name()
+        .map(|n| {
+            let s = n.to_string_lossy();
+            !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\')
+        })
+        .unwrap_or(false);
+    if !name_ok {
+        return Err("访问被拒绝".into());
+    }
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            check_path_allowed(state, &parent.to_string_lossy())
+        }
+        _ => Err("访问被拒绝".into()),
+    }
+}
+
 /// 读取文件大小上限：只读查看放宽到 50MB（大 SQL/日志/bundle 偶尔要看）
 const MAX_READ_SIZE: u64 = 50 * 1024 * 1024;
 /// 写入大小上限保持 10MB（编辑大文件内存压力大，且几乎无编辑需求）
@@ -146,6 +259,9 @@ pub struct ReadFileResponse {
     pub line_ending: String,
     /// 原始编码：'utf8' | 'gb18030'（保存时按此编码写回，GBK 文件编辑保存后字节不变）
     pub encoding: String,
+    /// 文件修改时间（距 UNIX 纪元的毫秒数）。前端保存时原样回传 write_file 的 expected_modified，
+    /// 即可检测"打开后被外部修改"并拒绝静默覆盖（前端尚未接入，字段先就绪）
+    pub modified: Option<u64>,
 }
 
 /// UTF-8 严格解码，失败回退 GB18030（GBK 超集，覆盖 Windows 中文环境老项目的 GBK 文件）。
@@ -176,18 +292,18 @@ fn detect_line_ending(bytes: &[u8]) -> &'static str {
 /// 读取文件内容
 #[tauri::command]
 pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadFileResponse, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
     let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
     if meta.len() > MAX_READ_SIZE {
         return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
     }
     let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // metadata 与 read 之间存在 TOCTOU（文件在两者之间变大）：读入后按实际长度复核一次
+    if bytes.len() as u64 > MAX_READ_SIZE {
+        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", bytes.len() as f64 / (1024.0 * 1024.0)));
+    }
+    let modified = meta.modified().ok().map(file_modified_millis);
 
     // 二进制嗅探：前 8KB 含 NUL 字节即视为二进制（与 git 同策略），
     // 前端收到 is_binary 后改用系统默认程序打开，不进入编辑器
@@ -199,6 +315,7 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadF
             size: meta.len(),
             line_ending: "lf".into(),
             encoding: "utf8".into(),
+            modified,
         });
     }
 
@@ -212,47 +329,84 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<ReadF
         size: meta.len(),
         line_ending: line_ending.into(),
         encoding: encoding.into(),
+        modified,
     })
 }
 
-/// 写入文件内容（与 read_file 同款安全校验：项目白名单 + 大小上限）。
+/// 写入文件内容（与 read_file 同款安全校验：多根白名单 + 大小上限）。
 /// encoding 指定原编码（'gb18030'）时按原编码编码写回——GBK 文件编辑保存后字节不变，
 /// git 不会误报变更（前端按 read_file 返回的 encoding 传入）
+///
+/// expected_modified：调用方若传入打开文件时记录的修改时间（毫秒），写入前会比对磁盘现值，
+/// 不一致则拒绝写入并返回"文件已被外部修改"——供前端接入"覆盖/放弃/查看差异"确认（当前前端尚未传）。
 #[tauri::command]
 pub async fn write_file(
     state: State<'_, AppState>,
     path: String,
     content: String,
     encoding: Option<String>,
+    expected_modified: Option<u64>,
 ) -> Result<(), String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
+    // 目标不存在时按父目录校验（支持新建文件），校验内部不跨 await 持锁
+    check_write_path_allowed(&state, &path)?;
     if (content.len() as u64) > MAX_WRITE_SIZE {
         return Err(format!("文件过大（{:.1} MB），超过 10 MB 上限", content.len() as f64 / (1024.0 * 1024.0)));
+    }
+    if let Some(expected) = expected_modified {
+        match tokio::fs::metadata(&path).await.ok().and_then(|m| m.modified().ok()) {
+            Some(actual) if file_modified_millis(actual) != expected => {
+                return Err("文件已被外部修改，请重新加载后再保存（已取消本次写入）".into());
+            }
+            // 目标不存在（新建）：无冲突可言
+            None => {}
+            _ => {}
+        }
     }
     let data: Vec<u8> = match encoding.as_deref() {
         Some("gb18030") => encoding_rs::GB18030.encode(&content).0.into_owned(),
         _ => content.into_bytes(),
     };
-    // 原子写：先写同目录临时文件再 rename——直接覆写会在写入中途崩溃/磁盘满时
-    // 留下截断的坏文件（大文件整份丢失）。rename 失败（Windows 目标已存在时
-    // rename 不覆盖）→ 先删目标再 rename（极小窗口，但主体损坏风险已消除）
+    // 原子写：先写同目录临时文件再 rename。直接覆写会在写入中途崩溃/磁盘满时
+    // 留下截断的坏文件（大文件整份丢失）。Windows 上 std/tokio 的 rename 会覆盖已存在的目标
+    // （MOVEFILE_REPLACE_EXISTING），因此失败分支只清理临时文件——
+    // 早期实现先 remove_file(目标) 再 rename，二次失败会直接删掉用户原文件。
     let p = std::path::Path::new(&path);
     let tmp = p.with_extension(format!("{}.tmp", p.extension().and_then(|e| e.to_str()).unwrap_or("")));
     tokio::fs::write(&tmp, &data).await.map_err(|e| format!("无法写入文件: {}", e))?;
     match tokio::fs::rename(&tmp, p).await {
         Ok(()) => Ok(()),
-        Err(_) => {
-            // Windows：目标已存在时 rename 报错（含 AlreadyExists 语义）
-            let _ = tokio::fs::remove_file(p).await;
-            tokio::fs::rename(&tmp, p).await.map_err(|e| format!("无法写入文件: {}", e))
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(format!("无法写入文件: {}", e))
         }
     }
+}
+
+/// 文件修改时间 → 距离 UNIX 纪元的毫秒数（用于保存前的外部修改冲突检测）
+fn file_modified_millis(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// 受限读取：metadata 预检 + 读入后按实际长度复核（消除 TOCTOU，统一错误文案）。
+/// 供图片预览 / 字节码视图 / 反编译 / jar 读取共用，避免四处重复同一段校验。
+async fn read_file_limited(path: &str, max: u64, what: &str) -> Result<Vec<u8>, String> {
+    let over = |len: u64| {
+        format!(
+            "{}过大（{:.1} MB），超过 {} MB 上限",
+            what,
+            len as f64 / (1024.0 * 1024.0),
+            max / (1024 * 1024)
+        )
+    };
+    let meta = tokio::fs::metadata(path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if meta.len() > max {
+        return Err(over(meta.len()));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    if bytes.len() as u64 > max {
+        return Err(over(bytes.len() as u64));
+    }
+    Ok(bytes)
 }
 
 /// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）
@@ -261,18 +415,9 @@ const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024;
 /// 读取图片为 base64（内建预览，前端拼 data URL）
 #[tauri::command]
 pub async fn read_image_data(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > MAX_IMAGE_SIZE {
-        return Err(format!("图片过大（{:.1} MB），超过 20 MB 预览上限", meta.len() as f64 / (1024.0 * 1024.0)));
-    }
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
+    let bytes = read_file_limited(&path, MAX_IMAGE_SIZE, "图片").await?;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     Ok(STANDARD.encode(&bytes))
 }
@@ -290,13 +435,8 @@ pub struct HexPage {
 /// 分页读取二进制内容（hex 视图按需加载，大文件不整体进内存/IPC）
 #[tauri::command]
 pub async fn read_hex_page(state: State<'_, AppState>, path: String, offset: u64, rows: u32) -> Result<HexPage, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
     let rows = rows.clamp(1, 1024);
     let mut file = tokio::fs::File::open(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
     let total_size = file.metadata().await.map_err(|e| format!("无法读取文件: {}", e))?.len();
@@ -311,36 +451,18 @@ pub async fn read_hex_page(state: State<'_, AppState>, path: String, offset: u64
 /// 读取 .class 文件为字节码视图文本（javap 风格，只读）
 #[tauri::command]
 pub async fn read_class_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > MAX_READ_SIZE {
-        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
-    }
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
+    let bytes = read_file_limited(&path, MAX_READ_SIZE, "文件").await?;
     crate::core::classfile::disassemble_class(&bytes)
 }
 
 /// 反编译 .class 文件为 Java 源码（捆绑 CFR，失败由前端回退字节码视图）
 #[tauri::command]
 pub async fn decompile_class(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > MAX_READ_SIZE {
-        return Err(format!("文件过大（{:.1} MB），超过 50 MB 查看上限", meta.len() as f64 / (1024.0 * 1024.0)));
-    }
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
+    let bytes = read_file_limited(&path, MAX_READ_SIZE, "文件").await?;
     crate::core::decompiler::decompile_class_bytes(&bytes).await
 }
 
@@ -351,18 +473,9 @@ pub async fn list_jar(
     path: String,
     nested: Vec<String>,
 ) -> Result<Vec<crate::core::jarfile::JarEntryInfo>, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > crate::core::jarfile::MAX_JAR_SIZE {
-        return Err(format!("jar 过大（{:.1} MB），超过 100 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
-    }
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
+    let bytes = read_file_limited(&path, crate::core::jarfile::MAX_JAR_SIZE, "jar").await?;
     let inner = crate::core::jarfile::innermost_archive(&bytes, &nested)?;
     crate::core::jarfile::list_entries(&inner)
 }
@@ -383,18 +496,9 @@ pub async fn read_jar_entry(
     nested: Vec<String>,
     name: String,
 ) -> Result<JarEntryContent, String> {
-    // 在 await 前释放锁，确保 future 是 Send
-    {
-        let root = state.project_root.lock().map_err(|e| format!("获取项目根路径锁失败: {}", e))?;
-        if !is_path_allowed(&path, &root) {
-            return Err("访问被拒绝".into());
-        }
-    }
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
-    if meta.len() > crate::core::jarfile::MAX_JAR_SIZE {
-        return Err(format!("jar 过大（{:.1} MB），超过 100 MB 上限", meta.len() as f64 / (1024.0 * 1024.0)));
-    }
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("无法读取文件: {}", e))?;
+    // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
+    check_path_allowed(&state, &path)?;
+    let bytes = read_file_limited(&path, crate::core::jarfile::MAX_JAR_SIZE, "jar").await?;
     let entry = crate::core::jarfile::read_entry(&bytes, &nested, &name)?;
 
     if name.to_ascii_lowercase().ends_with(".class") {
@@ -416,13 +520,17 @@ pub async fn read_jar_entry(
     }
 }
 
-/// 列出目录内容（允许浏览任意路径，供 FilePicker/FileTree 使用）
+/// 目录条目数上限：超大目录一次性进内存/IPC 会拖垮渲染，超限直接报错而非静默截断
+const MAX_DIR_ENTRIES: usize = 20_000;
+
+/// 列出目录内容（受多根白名单约束：项目根 + 各服务/模板工作目录）
 ///
-/// 安全设计：不限制读取范围，因为 FilePicker 需要浏览整个文件系统来选择项目目录。
-/// 路径穿越防护由 `read_file` 的 `is_path_allowed()` 负责。
-/// `list_directory` 仅返回文件元数据（名称、大小、类型），不暴露文件内容。
+/// 历史：本命令曾以"FilePicker 需要浏览整个文件系统"为由不限制读取范围，但目录选择现已改用
+/// 系统原生对话框（`@tauri-apps/plugin-dialog`），该豁免失去依据，于是任意路径的目录结构与
+/// 文件名可被枚举（而 `read_file` 有白名单）——同类危险操作两套口径。现已统一走白名单。
 #[tauri::command]
-pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<Vec<FileEntry>, String> {
+    check_path_allowed(&state, &path)?;
     let dir = PathBuf::from(&path);
     if !dir.is_dir() {
         return Err("路径不是目录".to_string());
@@ -432,6 +540,9 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let mut read_dir = tokio::fs::read_dir(&dir).await.map_err(|e| format!("读取目录失败: {}", e))?;
 
     while let Some(entry) = read_dir.next_entry().await.map_err(|e| format!("读取条目失败: {}", e))? {
+        if entries.len() >= MAX_DIR_ENTRIES {
+            return Err(format!("目录条目过多（超过 {} 条），请改用更具体的目录", MAX_DIR_ENTRIES));
+        }
         let metadata = entry.metadata().await.map_err(|e| format!("读取元数据失败: {}", e))?;
         let name = entry.file_name().to_string_lossy().to_string();
 
@@ -503,5 +614,30 @@ mod tests {
         assert!(!is_path_allowed("C:\\Windows", &root));
         #[cfg(not(windows))]
         assert!(!is_path_allowed("/etc", &root));
+    }
+
+    #[test]
+    fn test_is_path_allowed_any_multi_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = cwd.to_string_lossy().to_string();
+        let other = std::env::temp_dir().to_string_lossy().to_string();
+        let roots = vec![root.clone(), other.clone()];
+        // 命中任一允许根即通过（服务 cwd 可以配在项目目录之外）
+        assert!(is_path_allowed_any(&root, &roots));
+        assert!(is_path_allowed_any(&other, &roots));
+        // 未选择项目（空集合）→ 一律拒绝
+        assert!(!is_path_allowed_any(&root, &[]));
+        #[cfg(windows)]
+        assert!(!is_path_allowed_any("C:\\Windows", &roots));
+    }
+
+    #[test]
+    fn test_detect_line_ending() {
+        assert_eq!(detect_line_ending(b""), "lf"); // 空文件/单行默认 lf
+        assert_eq!(detect_line_ending(b"a\nb\n"), "lf");
+        assert_eq!(detect_line_ending(b"a\r\nb\r\n"), "crlf");
+        assert_eq!(detect_line_ending(b"a\rb\r"), "cr");
+        // 混合：取占比最大者
+        assert_eq!(detect_line_ending(b"a\r\nb\r\nc\n"), "crlf");
     }
 }

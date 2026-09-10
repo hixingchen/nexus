@@ -56,16 +56,17 @@ pub fn add_project(state: State<AppState>, name: String, path: String) -> Result
         return Err("项目路径不存在或不是目录".into());
     }
     state.db.with_conn(|conn| {
+        // 查重失败（DB 错误）不能当作"不存在"：那会放进一个重名项目
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE name=?1",
             [name.trim()], |r| r.get(0)
-        ).unwrap_or(false);
+        ).map_err(|e| format!("查询项目名是否重复失败: {}", e))?;
         if exists { return Err(format!("项目「{}」已存在", name.trim())); }
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = conn.query_row(
             "SELECT COALESCE(MAX(sort_index), -1) FROM projects", [], |r| r.get(0)
-        ).unwrap_or(-1);
+        ).map_err(|e| format!("查询项目排序失败: {}", e))?;
         conn.execute(
             "INSERT INTO projects (id, name, path, pinned, sort_index) VALUES (?1,?2,?3,0,?4)",
             rusqlite::params![id, name.trim(), path, max_sort + 1],
@@ -88,10 +89,11 @@ pub fn update_project(state: State<AppState>, id: String, name: String, path: St
         return Err("项目路径不存在或不是目录".into());
     }
     state.db.with_conn(|conn| {
+        // 同名查重失败必须上报，不能静默按"无重名"继续写
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE name=?1 AND id!=?2",
             rusqlite::params![name.trim(), id], |r| r.get(0)
-        ).unwrap_or(false);
+        ).map_err(|e| format!("查询项目名是否重复失败: {}", e))?;
         if exists { return Err(format!("项目「{}」已存在", name.trim())); }
 
         let affected = conn.execute(
@@ -157,7 +159,7 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
             let exists: bool = tx.query_row(
                 "SELECT COUNT(*) > 0 FROM projects WHERE name=?1",
                 [&new_name], |r| r.get(0)
-            ).unwrap_or(false);
+            ).map_err(|e| format!("查询项目名是否重复失败: {}", e))?;
             if !exists { break; }
             new_name = format!("{}_copy{}", src.name.trim(), n);
             n += 1;
@@ -169,7 +171,7 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
         let new_id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = tx.query_row(
             "SELECT COALESCE(MAX(sort_index), -1) FROM projects", [], |r| r.get(0)
-        ).unwrap_or(-1);
+        ).map_err(|e| format!("查询项目排序失败: {}", e))?;
         tx.execute(
             "INSERT INTO projects (id, name, path, pinned, sort_index) VALUES (?1,?2,?3,0,?4)",
             rusqlite::params![new_id, new_name, src.path, max_sort + 1],
@@ -184,6 +186,13 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 rusqlite::params![svc_id, new_id, svc.name, svc.command, svc.cwd, svc.watch_paths, svc.watch_include, svc.watch_exclude, svc.env_vars, svc.restart_mode, en, sft, svc.sort_index, svc.tool_commands],
             ).map_err(|e| format!("复制服务配置失败: {}", e))?;
+            // 打开工具绑定随服务一起复制：service_open_tools 以 service_id 为主键，
+            // 用 INSERT...SELECT 直接换主键（原服务没有绑定时插入 0 行，无需先查）
+            tx.execute(
+                "INSERT OR REPLACE INTO service_open_tools (service_id, tool_id)
+                 SELECT ?1, tool_id FROM service_open_tools WHERE service_id=?2",
+                rusqlite::params![svc_id, svc.id],
+            ).map_err(|e| format!("复制服务打开工具绑定失败: {}", e))?;
         }
         tx.commit().map_err(|e| format!("提交复制项目事务失败: {}", e))?;
 

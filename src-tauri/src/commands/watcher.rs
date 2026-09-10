@@ -2,16 +2,36 @@ use tauri::{AppHandle, Emitter, State};
 use crate::AppState;
 use crate::core::file_watcher::{FileChangeEvent, ServiceWatchConfig};
 
+/// 记录「配置了但磁盘上不存在」的监听路径。
+///
+/// 核心层只在**全部**路径无效时告警；部分无效会被静默丢弃（该服务实际少监听了目录，
+/// 表现为"改了某个目录下的文件没反应"），故在这一层把无效清单显式打出来。
+fn warn_invalid_paths(service_name: &str, paths: &[String]) {
+    let invalid: Vec<&str> = paths
+        .iter()
+        .map(|p| p.as_str())
+        .filter(|p| !std::path::Path::new(p).exists())
+        .collect();
+    if !invalid.is_empty() {
+        log::warn!(
+            "[nexus] 服务「{}」有 {} 个监听路径不存在，将被忽略: {:?}",
+            service_name, invalid.len(), invalid
+        );
+    }
+}
+
 /// 从数据库读取单个服务的监听配置
 ///
 /// restart_mode=0（关闭监听）的服务不返回——与项目级加载（restart_mode>0）语义一致：
 /// 任何入口都不得让"关闭监听"的服务实际监听文件。
-fn load_service_watch_config(db: &crate::database::Database, service_id: &str) -> Result<Option<ServiceWatchConfig>, String> {
+/// 同时限定 project_id：服务 id 全局唯一，但监听是项目维度资源，
+/// 跨项目绑定会让 stop/refresh 落在错误的项目监听上。
+fn load_service_watch_config(db: &crate::database::Database, project_id: &str, service_id: &str) -> Result<Option<ServiceWatchConfig>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1 AND restart_mode>0"
+            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1 AND project_id=?2 AND restart_mode>0"
         ).map_err(|e| format!("查询服务失败: {}", e))?;
-        let mut rows = stmt.query_map([service_id], |row| {
+        let mut rows = stmt.query_map(rusqlite::params![service_id, project_id], |row| {
             Ok((
                 row.get::<_,String>(0)?,
                 row.get::<_,String>(1)?,
@@ -31,6 +51,7 @@ fn load_service_watch_config(db: &crate::database::Database, service_id: &str) -
                         .map_err(|e| format!("服务「{}」的监听路径配置格式错误: {}", name, e))?
                 };
                 if paths.is_empty() { return Ok(None); }
+                warn_invalid_paths(&name, &paths);
                 Ok(Some(ServiceWatchConfig {
                     id, name, paths,
                     include: include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
@@ -72,6 +93,7 @@ fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) 
                     .map_err(|e| format!("服务「{}」的监听路径配置格式错误: {}", name, e))?
             };
             if !paths.is_empty() {
+                warn_invalid_paths(&name, &paths);
                 svcs.push(ServiceWatchConfig {
                     id, name, paths,
                     include: include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
@@ -99,9 +121,13 @@ pub fn start_watching(app: AppHandle, state: State<AppState>, project_id: String
 
     let new_services = if let Some(sid) = service_id.as_deref() {
         // 单服务模式：只启动该服务的监听
-        match load_service_watch_config(&state.db, sid)? {
+        match load_service_watch_config(&state.db, &project_id, sid)? {
             Some(cfg) => vec![cfg],
-            None => return Ok(()), // 服务不存在或无监听路径，忽略
+            None => {
+                // 返回 Ok 但没有任何路径进入监听：显式记录，避免"点了监听什么都没发生"
+                log::warn!("[nexus] 服务 {} 未进入文件监听：不属于项目 {}、未开启监听模式或未配置监听路径", sid, project_id);
+                return Ok(());
+            }
         }
     } else {
         // 项目模式：启动所有启用监听的服务
@@ -179,7 +205,7 @@ pub(crate) fn refresh_service_watch(
     }
     let mut updated = existing;
     updated.retain(|s| s.id != service_id);
-    if let Some(cfg) = load_service_watch_config(&state.db, service_id)? {
+    if let Some(cfg) = load_service_watch_config(&state.db, project_id, service_id)? {
         updated.push(cfg);
     }
     if updated.is_empty() {

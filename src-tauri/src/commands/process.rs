@@ -20,9 +20,36 @@ fn running_tool_cmds() -> &'static std::sync::Mutex<std::collections::HashMap<St
     TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 取出并移除运行表中的 pid（超时/结束时清理）
-fn take_running_pid(run_id: &str) -> Option<u32> {
-    running_tool_cmds().lock().ok().and_then(|mut m| m.remove(run_id))
+/// 读取运行表中的 pid（不移除）。超时分支只在阻塞任务真正结束前需要它，
+/// 表项的移除交给 RunTableGuard，避免"提前取走 pid → 任务结束时无项可清"
+fn peek_running_pid(run_id: &str) -> Option<u32> {
+    running_tool_cmds().lock().ok().and_then(|m| m.get(run_id).copied())
+}
+
+/// 运行表生命周期守卫：正常结束、任一早退（`?`）、甚至 panic 都会移除本 run_id 的表项。
+///
+/// 原实现只在"正常结束"与"超时"两条路径清理，任何 `?` 早退（拿 stdout/stderr 失败、
+/// 线程创建失败、wait 失败）都会留下 stale pid；而 `stop_tool_command` 取到 pid 后无存活校验
+/// 直接 taskkill —— 过期 PID 一旦被系统回收就会误杀无关进程树。
+struct RunTableGuard {
+    run_id: String,
+}
+
+impl RunTableGuard {
+    fn register(run_id: &str, pid: u32) -> Self {
+        if let Ok(mut table) = running_tool_cmds().lock() {
+            table.insert(run_id.to_string(), pid);
+        }
+        Self { run_id: run_id.to_string() }
+    }
+}
+
+impl Drop for RunTableGuard {
+    fn drop(&mut self) {
+        if let Ok(mut table) = running_tool_cmds().lock() {
+            table.remove(&self.run_id);
+        }
+    }
 }
 
 /// 查询服务信息（name, command, cwd, project_id, env_vars）
@@ -73,9 +100,11 @@ pub struct ProcessStatus {
 pub fn start_service(state: State<AppState>, app_handle: tauri::AppHandle, service_id: String) -> Result<(), String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
-    let envs = crate::core::process::parse_env_vars(&env_vars);
-    state.process_mgr.start(&project_id, &service_id, &name, &command, &cwd, &envs, &app_handle)
-        .map_err(|e| format!("服务「{}」{}", name, e))
+    let envs = crate::core::process::parse_env_vars(&env_vars)?;
+    state.process_mgr.start(crate::core::process::ServiceSpawn {
+        project_id: &project_id, service_id: &service_id, name: &name,
+        command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app_handle,
+    }).map_err(|e| format!("服务「{}」{}", name, e))
 }
 
 /// 停止服务（清理含 taskkill + 等待 reader 线程，最长数秒 → 异步执行避免阻塞 IPC）
@@ -95,9 +124,11 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let (name, command, cwd, project_id, env_vars) = get_service_info(&state.db, &service_id)?;
-        let envs = crate::core::process::parse_env_vars(&env_vars);
-        state.process_mgr.restart(&project_id, &service_id, &name, &command, &cwd, &envs, &app)
-            .map_err(|e| format!("服务「{}」{}", name, e))
+        let envs = crate::core::process::parse_env_vars(&env_vars)?;
+        state.process_mgr.restart(crate::core::process::ServiceSpawn {
+            project_id: &project_id, service_id: &service_id, name: &name,
+            command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app,
+        }).map_err(|e| format!("服务「{}」{}", name, e))
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
 
@@ -121,8 +152,15 @@ pub fn start_project_services(state: State<AppState>, app_handle: tauri::AppHand
         .into_iter().map(|(_, service_id)| service_id).collect();
     for (id, name, cmd, cwd, env_vars) in &services {
         if running_ids.contains(id) { continue; }
-        let envs = crate::core::process::parse_env_vars(env_vars);
-        if let Err(e) = state.process_mgr.start(&project_id, id, name, cmd, cwd, &envs, &app_handle) {
+        // 环境变量非法同样计入本次批量启动的失败列表（原实现解析失败会静默忽略该服务）
+        let envs = match crate::core::process::parse_env_vars(env_vars) {
+            Ok(v) => v,
+            Err(e) => { errors.push(format!("{}: {}", name, e)); continue; }
+        };
+        if let Err(e) = state.process_mgr.start(crate::core::process::ServiceSpawn {
+            project_id: &project_id, service_id: id, name, command: cmd, cwd,
+            env_vars: &envs, app_handle: &app_handle,
+        }) {
             errors.push(format!("{}: {}", name, e));
         }
     }
@@ -154,14 +192,21 @@ pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) ->
     }).await.map_err(|e| format!("停止项目服务任务失败: {}", e))?
 }
 
+/// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
+///
+/// 异步 + spawn_blocking：`running()` 会为已退出的服务收尸（taskkill + 超时等待，
+/// 最坏每进程约 4s），而前端每 3 秒轮询本命令；同步执行会冻结 IPC/事件循环线程。
 #[tauri::command]
-pub fn get_running(state: State<AppState>) -> Result<ProcessStatus, String> {
-    Ok(ProcessStatus {
-        running: state.process_mgr.running().into_iter()
-            .map(|(project_id, service_id)| RunningService { service_id, project_id })
-            .collect(),
-        failed: state.process_mgr.failed(),
-    })
+pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(ProcessStatus {
+            running: state.process_mgr.running().into_iter()
+                .map(|(project_id, service_id)| RunningService { service_id, project_id })
+                .collect(),
+            failed: state.process_mgr.failed(),
+        })
+    }).await.map_err(|e| format!("获取运行状态任务失败: {}", e))?
 }
 
 #[tauri::command]
@@ -185,6 +230,11 @@ pub async fn run_tool_command(
 ) -> Result<ToolCommandResult, String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     if command_id.trim().is_empty() { return Err("命令ID不能为空".into()); }
+    if run_id.trim().is_empty() { return Err("run_id 不能为空".into()); }
+    // run_id 是运行表的 key：重复会覆盖旧表项，令旧进程失去可终止句柄
+    if running_tool_cmds().lock().map(|m| m.contains_key(&run_id)).unwrap_or(false) {
+        return Err(format!("run_id 已被占用: {}", run_id));
+    }
 
     // 获取服务信息和工具命令
     let (service_name, _command, cwd, project_id, tool_commands_json) = state.db.with_conn(|conn| {
@@ -213,7 +263,7 @@ pub async fn run_tool_command(
         .clone();
 
     log::info!("[nexus] 执行工具命令: {}:{} -> {} (cmd={:?}, cwd={:?})",
-        project_id, service_name, tool_cmd.name, tool_cmd.command, cwd);
+        project_id, service_name, tool_cmd.name, crate::core::process::mask_command(&tool_cmd.command), cwd);
 
     // 在线程池中执行命令，避免阻塞主线程（长命令如 npm run build 会冻结整个 UI）
     // 输出由双线程逐行读取并 emit（前端实时展示），主线程只等进程退出拿退出码。
@@ -221,6 +271,9 @@ pub async fn run_tool_command(
     // 正数 = 该秒数。超时/手动停止都走 kill_process_tree（见 stop_tool_command）
     let cmd_str = tool_cmd.command;
     let cwd_clone = cwd.clone();
+    // Job Object 句柄：工具命令子进程也必须加入共享清理域，否则应用被强杀/崩溃时
+    // 长构建（timeout_secs=0/1800）会继续占用端口与 CPU（标准 §2.11：Windows 上所有子进程入 Job）
+    let job = state.process_mgr.job_arc();
     let timeout_dur = match tool_cmd.timeout_secs {
         Some(0) => None,
         Some(secs) => Some(Duration::from_secs(secs)),
@@ -239,9 +292,13 @@ pub async fn run_tool_command(
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("执行命令失败: {}", e))?;
-            // 注册到运行表：stop_tool_command / 超时兜底据此按 run_id 终止进程树
-            if let Ok(mut table) = running_tool_cmds().lock() {
-                table.insert(run_id.clone(), child.id());
+            let pid = child.id();
+            // 注册到运行表（stop_tool_command / 超时兜底据此按 run_id 终止进程树）；
+            // 守卫在闭包任意返回路径（含 `?` 早退）都会清理表项
+            let _run_guard = RunTableGuard::register(&run_id, pid);
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.assign_child(&child);
             }
 
             let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
@@ -288,7 +345,7 @@ pub async fn run_tool_command(
             let status = child.wait().map_err(|e| format!("等待命令退出失败: {}", e))?;
             let mut all: Vec<_> = stdout_handle.join().map_err(|_| "stdout 读取线程异常".to_string())?
                 .into_iter()
-                .chain(stderr_handle.join().map_err(|_| "stderr 读取线程异常".to_string())?.into_iter())
+                .chain(stderr_handle.join().map_err(|_| "stderr 读取线程异常".to_string())?)
                 .collect();
             all.sort_by_key(|(n, _)| *n);
             let output = all.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n");
@@ -306,7 +363,7 @@ pub async fn run_tool_command(
             // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）。
             // pid 取自运行表（spawn 成功即注册）；若命令仍在阻塞池排队（尚未 spawn）
             // 则取不到 pid——命令随后仍会照常启动（无法拦截），如实告知而非谎报"已终止"
-            let pid = take_running_pid(&run_id);
+            let pid = peek_running_pid(&run_id);
             let secs = timeout_dur.map(|d| d.as_secs()).unwrap_or(0);
             return match pid {
                 Some(p) => {
@@ -317,10 +374,7 @@ pub async fn run_tool_command(
             };
         }
     };
-    // 正常结束：清理运行表
-    if let Ok(mut table) = running_tool_cmds().lock() {
-        table.remove(&run_id);
-    }
+    // 正常结束：运行表由 RunTableGuard 在阻塞任务返回时清理（此处不再手动 remove）
 
     let (status, output) = result;
     Ok(ToolCommandResult {

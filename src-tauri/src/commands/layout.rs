@@ -5,24 +5,19 @@ use crate::AppState;
 /// 保存布局键值对（批量）
 #[tauri::command]
 pub fn save_layout(state: State<AppState>, items: HashMap<String, String>) -> Result<(), String> {
-    state.db.with_conn(|conn| {
-        // 事务：避免逐条自动提交（多次 fsync），中途失败时整体回滚
-        conn.execute_batch("BEGIN").map_err(|e| format!("开启事务失败: {}", e))?;
-        let result = (|| {
-            let mut stmt = conn.prepare("INSERT OR REPLACE INTO layout (key, value) VALUES (?1, ?2)")
+    state.db.with_conn_mut(|conn| {
+        // 事务：避免逐条自动提交（多次 fsync），中途失败时整体回滚。
+        // 用 rusqlite 事务而非手写 BEGIN/COMMIT：出错时由 Drop 自动 ROLLBACK
+        // （手写版在 COMMIT 失败时会把连接留在未提交事务里，后续语句全部报错）
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO layout (key, value) VALUES (?1, ?2)")
                 .map_err(|e| format!("准备布局保存语句失败: {}", e))?;
             for (k, v) in &items {
                 stmt.execute(rusqlite::params![k, v]).map_err(|e| format!("保存布局项 '{}' 失败: {}", k, e))?;
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT").map_err(|e| format!("提交事务失败: {}", e)),
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
         }
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))
     })
 }
 

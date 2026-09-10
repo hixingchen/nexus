@@ -251,7 +251,7 @@ impl TypeRegistry {
         for internal in &self.used {
             let dotted = internal.replace('/', ".");
             let short = internal.rsplit('/').next().unwrap_or(internal);
-            let conflicted = by_short.get(short).map_or(false, |v| v.len() > 1);
+            let conflicted = by_short.get(short).is_some_and(|v| v.len() > 1);
             if conflicted {
                 self.display.insert(internal.clone(), dotted.clone());
             } else {
@@ -321,9 +321,14 @@ fn display_type(reg: &TypeRegistry, desc: &str) -> String {
 }
 
 /// 解析一个类型描述符片段（s[i] 起），返回 (描述符片段, 消耗字节数)
+///
+/// 安全约束（输入是磁盘上任意 .class，属不可信数据）：
+/// - `b[i]` 越界必须返回 None 而非 panic（描述符形如 "[" / "([)V" 即可构造越界：i 会走到 s.len()）
+/// - 默认分支按 **字符** 边界推进：描述符含非 ASCII（损坏 class 经 `from_utf8_lossy` 会产生
+///   U+FFFD）时 `s[i..i+1]` 会 "byte index is not a char boundary" panic
 fn parse_type_desc(s: &str, i: usize) -> Option<(String, usize)> {
     let b = s.as_bytes();
-    match b[i] {
+    match *b.get(i)? {
         b'L' => {
             let end = s[i..].find(';')? + i;
             Some((s[i..=end].to_string(), end + 1 - i))
@@ -339,7 +344,10 @@ fn parse_type_desc(s: &str, i: usize) -> Option<(String, usize)> {
             let (t, n) = parse_type_desc(s, j)?;
             Some((format!("{}{}", "[".repeat(depth), t), n + depth))
         }
-        _ => Some((s[i..i + 1].to_string(), 1)),
+        _ => {
+            let ch = s[i..].chars().next()?;
+            Some((ch.to_string(), ch.len_utf8()))
+        }
     }
 }
 
@@ -494,7 +502,7 @@ struct Annotation {
     pairs: Vec<(String, ElementValue)>,
 }
 
-/// 解析 annotation 元素值；同时把引用类型登记进注册表
+// 解析 annotation 元素值；同时把引用类型登记进注册表
 
 /// 注解/元素值递归嵌套深度上限：class 输入不可信，超限视为恶意/损坏
 const MAX_ANNOTATION_DEPTH: usize = 64;
@@ -877,9 +885,22 @@ fn push_line(lines: &mut Vec<String>, pc: i64, line: String) {
 }
 
 /// 反汇编一段 Code 字节码（pc 即 Reader 位置，读取器推进即指令结束）
-fn disassemble_code(code: &[u8], pool: &[Option<CpEntry>], lines: &mut Vec<String>) -> Result<(), String> {
+/// 反汇编输出的总行数上限（跨方法累计）：单个 50MB class 可产出千万级指令行
+/// （放大到 GB 级文本并撑爆 IPC payload）；达到上限后以提示行收尾，不再继续放大内存。
+const MAX_DISASSEMBLE_LINES: usize = 200_000;
+
+fn disassemble_code(
+    code: &[u8],
+    pool: &[Option<CpEntry>],
+    lines: &mut Vec<String>,
+    max_lines: usize,
+) -> Result<(), String> {
     let mut r = Reader::new(code);
     while r.pos < code.len() {
+        if lines.len() >= max_lines {
+            lines.push("... 输出已达上限，其余指令省略".into());
+            return Ok(());
+        }
         let pc = r.pos as i64;
         let op = r.u1()?;
         let (mnemonic, operand) = opcode_info(op);
@@ -1021,11 +1042,17 @@ fn disassemble_code(code: &[u8], pool: &[Option<CpEntry>], lines: &mut Vec<Strin
 
 /* ---- 属性解析 ---- */
 
+/// Code 属性解析结果：(字节码, LineNumberTable, max_stack, max_locals)
+type CodeData = (Vec<u8>, Vec<(u16, u16)>, u16, u16);
+
+/// 字段解析结果：(access, name_idx, desc_idx, 常量值索引, 注解)
+type FieldEntry = (u16, u16, u16, Option<u16>, Vec<Annotation>);
+
 /// Code 属性数据（不含属性名与长度头）
 fn parse_code_data(
     data: &[u8],
     pool: &[Option<CpEntry>],
-) -> Result<(Vec<u8>, Vec<(u16, u16)>, u16, u16), String> {
+) -> Result<CodeData, String> {
     let mut inner = Reader::new(data);
     let max_stack = inner.u2()?;
     let max_locals = inner.u2()?;
@@ -1059,7 +1086,7 @@ fn parse_code_data(
 
 /// 方法属性解析结果
 struct MethodInfo {
-    code: Option<(Vec<u8>, Vec<(u16, u16)>, u16, u16)>,
+    code: Option<CodeData>,
     default_value: Option<ElementValue>,
     annotations: Vec<Annotation>,
 }
@@ -1127,7 +1154,7 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
     }
 
     let field_count = r.u2()?;
-    let fields: Vec<(u16, u16, u16, Option<u16>, Vec<Annotation>)> = (0..field_count)
+    let fields: Vec<FieldEntry> = (0..field_count)
         .map(|_| {
             let f_access = r.u2()?;
             let name_idx = r.u2()?;
@@ -1236,6 +1263,8 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
         writeln!(out, "  {}{} {}{};", prefix, t, cp_utf8(&pool, *name_idx), init).unwrap();
     }
 
+    // 字节码输出总预算（跨方法累计）：防止超大/畸形 class 把内存与 IPC payload 放大到失控
+    let mut emitted_lines: usize = 0;
     for (m_access, name_idx, desc_idx, info) in &methods {
         let raw_name = cp_utf8(&pool, *name_idx);
         // 构造器显示为类名（javap/IDE 同款）且无返回类型；<clinit> 保持原样
@@ -1272,8 +1301,14 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
         if let Some((code, line_table, max_stack, max_locals)) = &info.code {
             writeln!(out, "    Code:").unwrap();
             writeln!(out, "      stack={}, locals={}", max_stack, max_locals).unwrap();
+            let remaining = MAX_DISASSEMBLE_LINES.saturating_sub(emitted_lines);
+            if remaining == 0 {
+                writeln!(out, "      // 反汇编输出已达上限，其余方法内容省略").unwrap();
+                continue;
+            }
             let mut lines = vec![];
-            disassemble_code(code, &pool, &mut lines)?;
+            disassemble_code(code, &pool, &mut lines, remaining)?;
+            emitted_lines += lines.len();
             for l in &lines {
                 writeln!(out, "      {}", l).unwrap();
             }
@@ -1494,4 +1529,47 @@ mod tests {
         assert_eq!(opcode_info(0xff).0, "impdep2");
     }
 
+    // ── 描述符边界（回归：此前越界/非字符边界会 panic）──
+
+    #[test]
+    fn test_parse_type_desc_out_of_range_returns_none() {
+        // i 越界必须返回 None 而不是索引 panic
+        assert!(parse_type_desc("", 0).is_none());
+        assert!(parse_type_desc("[", 1).is_none());
+        assert!(parse_type_desc("I", 5).is_none());
+    }
+
+    #[test]
+    fn test_method_desc_parts_malformed_returns_none() {
+        let reg = TypeRegistry::new();
+        // "([)V"：参数段为 "["，递归会走到 s.len()（旧实现 b[i] 越界 panic）
+        assert!(method_desc_parts(&reg, "([)V").is_none());
+        // "([[)V"：剥完 '[' 后 j == len
+        assert!(method_desc_parts(&reg, "([[)V").is_none());
+        // 正常描述符不受影响
+        assert!(method_desc_parts(&reg, "(V)V").is_some());
+        assert!(method_desc_parts(&reg, "(I[[Ljava/lang/String;)V").is_some());
+    }
+
+    #[test]
+    fn test_parse_type_desc_non_ascii_advances_by_char_boundary() {
+        // 损坏/混淆 class 的描述符可能含非 ASCII（from_utf8_lossy 会产生 U+FFFD）：
+        // 必须按字符边界推进，旧实现 s[i..i+1] 会 "not a char boundary" panic
+        let (t, n) = parse_type_desc("中", 0).expect("非 ASCII 描述符应可解析");
+        assert_eq!(t, "中");
+        assert_eq!(n, '中'.len_utf8());
+        let (t2, n2) = parse_type_desc("\u{FFFD}V", 0).expect("替换字符应可解析");
+        assert_eq!(t2, "\u{FFFD}");
+        assert_eq!(n2, 3);
+    }
+
+    #[test]
+    fn test_disassemble_truncated_input_never_panics() {
+        // 截断/损坏输入只允许返回 Err，绝不允许 panic（panic 会让 Tauri 异步命令永不返回）
+        let full = minimal_class();
+        for cut in [1usize, 8, 16, 32, full.len() / 2, full.len() - 1] {
+            let _ = disassemble_class(&full[..cut]);
+        }
+        let _ = disassemble_class(&[]);
+    }
 }
