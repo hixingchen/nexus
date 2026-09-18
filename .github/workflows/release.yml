@@ -33,9 +33,9 @@ jobs:
             exit 1
           fi
 
+      # 不带 version：pnpm 版本由 package.json 的 `packageManager` 字段决定（单一来源），
+      # 两处都指定会被 action 拒绝（Multiple versions of pnpm specified）
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:

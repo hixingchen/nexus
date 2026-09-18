@@ -50,9 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 不带 version：pnpm 版本由 package.json 的 `packageManager` 字段决定（单一来源）。
+      # 两处都指定会被 action 直接拒绝（Multiple versions of pnpm specified），
+      # 而它一挂，后面所有步骤都被 skip——症状只是"CI 红"，看不出跟 pnpm 有关
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:
@@ -86,9 +87,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # 不带 version：pnpm 版本由 package.json 的 `packageManager` 字段决定（单一来源）。
+      # 两处都指定会被 action 直接拒绝（Multiple versions of pnpm specified），
+      # 而它一挂，后面所有步骤都被 skip——症状只是"CI 红"，看不出跟 pnpm 有关
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:
