@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::commands::editor::remember_confirmed_dir;
 
 /// 退出流程是否已启动（幂等：前端按钮可能连点、RunEvent::Exit 也可能兜底再来一次）
 static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
@@ -47,6 +46,23 @@ pub fn prepare_exit(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 目录选择器的**用途** → 对话框标题。
+///
+/// **标题由后端决定，不接受前端传入的字符串**（SEC-17）：原生对话框无法被网页伪造，
+/// 用户对它的信任天然高于网页元素——若标题可任意指定，被攻陷的 webview 就能弹出一个
+/// 标题写着「Nexus 需要访问 …\.ssh 才能继续」的**系统级**选择框，把信任锚从"用户确认"
+/// 降级为"被诱导点击"。前端因此只能传用途键；未知用途回落到通用文案，
+/// **绝不回落成前端传进来的字符串**（那等于把缺口原样还回去）。
+///
+/// 加新用途就在这里加一行——标题会出现在界面上，属于后端该管的文案。
+fn picker_title(purpose: Option<&str>) -> &'static str {
+    match purpose {
+        Some("projectDir") => "选择项目目录",
+        Some("serviceCwd") => "选择工作目录",
+        _ => "选择目录",
+    }
+}
+
 /// 原生目录选择器（Rust 侧弹框），并把用户选中的目录记为"已确认"。
 ///
 /// 为什么必须由 Rust 侧弹框：白名单收口要求"项目外的新目录只能由用户显式授权"。
@@ -55,18 +71,18 @@ pub fn prepare_exit(app: AppHandle) -> Result<(), String> {
 /// 授权点必须落在**用户亲手操作**的对话框上，且路径不经 IPC 传入。
 ///
 /// 返回用户选择的原始路径字符串（供表单展示与入库）；取消返回 None。
+///
+/// 参数 `purpose` 是**用途键**（`projectDir` / `serviceCwd`），不是显示文案——见 `picker_title`。
 #[tauri::command]
 pub async fn pick_directory(
     app: AppHandle,
-    title: Option<String>,
+    purpose: Option<String>,
     default_path: Option<String>,
 ) -> Result<Option<String>, String> {
+    let title = picker_title(purpose.as_deref());
     let picker = app.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
-        let mut builder = picker.dialog().file();
-        if let Some(t) = title.as_deref().filter(|t| !t.trim().is_empty()) {
-            builder = builder.set_title(t);
-        }
+        let mut builder = picker.dialog().file().set_title(title);
         if let Some(d) = default_path.as_deref().filter(|d| !d.trim().is_empty()) {
             if std::path::Path::new(d).is_dir() {
                 builder = builder.set_directory(d);
@@ -81,7 +97,30 @@ pub async fn pick_directory(
     let Some(file_path) = picked else { return Ok(None) };
     let dir = file_path.into_path().map_err(|e| format!("目录选择结果无法转为路径: {}", e))?;
     if let Some(state) = app.try_state::<crate::AppState>() {
-        remember_confirmed_dir(&state, &dir);
+        state.paths.remember_confirmed_dir(&dir);
     }
     Ok(Some(dir.to_string_lossy().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-17：对话框标题**永远来自后端这张表**，前端能传的只有用途键。
+    ///
+    /// 这条测试守的是"被攻陷的 webview 不能伪造原生对话框标题"——改成让前端传字符串时，
+    /// 最后一条断言会红（它故意用一句像钓鱼文案的输入）。
+    #[test]
+    fn test_picker_title_never_comes_from_frontend() {
+        assert_eq!(picker_title(Some("projectDir")), "选择项目目录");
+        assert_eq!(picker_title(Some("serviceCwd")), "选择工作目录");
+        // 未知用途 / 未传 → 通用文案（而不是回落到前端字符串）
+        assert_eq!(picker_title(None), "选择目录");
+        assert_eq!(picker_title(Some("whatever")), "选择目录");
+        // 钓鱼式输入必须原样被忽略
+        assert_eq!(
+            picker_title(Some("Nexus 需要访问 C:/Users/me/.ssh 才能继续")),
+            "选择目录"
+        );
+    }
 }

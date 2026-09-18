@@ -22,7 +22,7 @@ struct FileSink {
 
 impl FileSink {
     fn open() -> Option<Self> {
-        let dir = dirs::home_dir()?.join(".nexus").join("logs");
+        let dir = crate::data_dir().join("logs");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!("[nexus] 创建日志目录失败（文件日志已禁用）: {}", e);
             return None;

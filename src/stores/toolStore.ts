@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { openToolsApi, type OpenTool } from '../services/service';
+import { reportError } from '../utils/error';
 
 /**
  * 打开工具共享 store：全局工具库 + 当前项目的服务绑定。
@@ -34,7 +35,7 @@ export const useToolStore = create<ToolStore>((set, get) => ({
     try {
       set({ openTools: await openToolsApi.list() });
     } catch (e) {
-      console.error('加载打开工具列表失败:', e);
+      reportError('加载打开工具列表失败', e);
     }
   },
 
@@ -49,7 +50,7 @@ export const useToolStore = create<ToolStore>((set, get) => ({
       for (const b of list) bindings[b.service_id] = b.tool_id;
       set({ bindings });
     } catch (e) {
-      console.error('加载服务工具绑定失败:', e);
+      reportError('加载服务工具绑定失败', e);
       if (get().loadedProject === projectId) set({ bindings: {} });
     }
   },
@@ -68,7 +69,7 @@ export const useToolStore = create<ToolStore>((set, get) => ({
     try {
       set({ openTools: await openToolsApi.list() });
     } catch (e) {
-      console.error('刷新打开工具列表失败:', e);
+      reportError('刷新打开工具列表失败', e);
     }
   },
 }));

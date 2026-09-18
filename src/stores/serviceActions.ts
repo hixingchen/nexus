@@ -1,7 +1,7 @@
 import { processApi, watchApi, type Service } from '../services/service';
 import { useLogStore } from './logStore';
 import { useRunningStore } from './runningStore';
-import { showNotification } from '../components/ui/Toast';
+import { notify } from '../utils/notify';
 import { reportError } from '../utils/error';
 
 /**
@@ -47,13 +47,13 @@ export async function startProjectWithFeedback(
   try {
     const errors = await startProjectServices(projectId);
     if (errors.length > 0) {
-      showNotification({
+      notify({
         variant: 'error',
         title: `「${projectName}」部分服务启动失败`,
         description: errors.join(', '),
       });
     } else {
-      showNotification({ title: `「${projectName}」已启动`, description: '所有已启用的服务已启动' });
+      notify({ title: `「${projectName}」已启动`, description: '所有已启用的服务已启动' });
     }
   } catch (e) {
     reportError(`启动「${projectName}」失败`, e);
@@ -69,13 +69,13 @@ export async function stopProjectWithFeedback(
   try {
     const errors = await stopProjectServices(projectId, services);
     if (errors.length > 0) {
-      showNotification({
+      notify({
         variant: 'error',
         title: `「${projectName}」部分服务停止失败`,
         description: errors.join(', '),
       });
     } else {
-      showNotification({ variant: 'info', title: `「${projectName}」已停止`, description: '所有服务已停止' });
+      notify({ variant: 'info', title: `「${projectName}」已停止`, description: '所有服务已停止' });
     }
   } catch (e) {
     reportError(`停止「${projectName}」失败`, e);

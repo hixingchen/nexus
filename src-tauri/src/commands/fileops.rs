@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use tauri::State;
 
-use crate::commands::editor::check_path_allowed;
+
 use crate::AppState;
 
 /// 单次复制的目录层级上限（联接点/符号链接会让目录树成环，纯深度兜底）
@@ -34,7 +34,7 @@ pub struct PasteFilesResult {
 pub fn copy_files_to_clipboard(state: State<AppState>, paths: Vec<String>) -> Result<(), String> {
     // 白名单校验：写入系统剪贴板的路径允许被粘贴到任意位置，必须与读路径同口径
     for p in &paths {
-        check_path_allowed(&state, p)?;
+        state.paths.check_path_allowed(&state.db, p)?;
     }
     #[cfg(windows)]
     {
@@ -63,7 +63,7 @@ pub fn copy_files_to_clipboard(state: State<AppState>, paths: Vec<String>) -> Re
 pub async fn paste_files(state: State<'_, AppState>, target_dir: String) -> Result<PasteFilesResult, String> {
     // 多根白名单校验（项目根 + 各服务/模板工作目录），与其余路径类命令同口径；
     // 校验内部不跨 await 持锁，future 仍是 Send
-    check_path_allowed(&state, &target_dir)?;
+    state.paths.check_path_allowed(&state.db, &target_dir)?;
     let target = PathBuf::from(&target_dir);
     if !target.is_dir() {
         return Err("目标不是目录".into());

@@ -3,6 +3,7 @@ pub mod app;
 pub mod editor;
 pub mod fileops;
 pub mod layout;
+pub mod paths;
 pub mod process;
 pub mod project;
 pub mod search;

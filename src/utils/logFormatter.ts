@@ -56,6 +56,7 @@ function wrapWithStyles(text: string, styles: string[]): string {
 function ansiToHtml(text: string): string {
   if (!text.includes('\x1b[')) return smartColorize(text);
 
+  // eslint-disable-next-line no-control-regex -- ESC(\x1b) 就是 ANSI 转义序列的起始字节，不是笔误
   const ansiRegex = /\x1b\[([0-9;]*)m/g;
   let result = '';
   let lastIndex = 0;
@@ -123,6 +124,51 @@ function colorizeLogLevels(text: string, addPh: PlaceholderFn): string {
   );
 }
 
+/**
+ * 路径字符 / 单词字符判定（`file:line` 扫描用，避免正则回溯）。
+ *
+ * 注意 `\w` 只含字母数字下划线——**不含** `/` 与 `\`（这不是笔误：`isWordChar` 不能复用
+ * `isPathChar`）。差分模糊测试第一轮就抓到了这个错误：把 `/` `\` 也算进 `\w` 后，
+ * `/.Z.\:1\.90/\:` 这类输入会多匹配出一个 `Z.\:1`，与原正则不等价。
+ */
+const isPathChar = (c: string): boolean =>
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '/' || c === '\\';
+const isWordChar = (c: string): boolean =>
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '_';
+
+/**
+ * 高亮 `路径/文件.ext:行号`（如 `src/App.tsx:42`）。
+ *
+ * 为什么不用正则 `([a-zA-Z\/\\]+\.\w+:\d+)`：它在"一长串路径字符但不含点"上会退化——
+ * 贪婪的 `[a-zA-Z/\\]+` 在每个起始位置都要扫到行尾再回溯找 `\.`，实测 32KB 全字母输入
+ * 耗时 **2.2 秒**（日志单行上限 8KB 时约 140ms/行，足以让日志面板在搜索时卡死）。
+ * 手工扫描是严格线性的：只在遇到 `.` 时向左/向右看，左侧一旦定界就不再回退。
+ * 与正则的等价性由 `__tests__/logFormatter.test.ts` 的差分用例守住。
+ */
+function colorizeFileLineRefs(text: string, addPh: PlaceholderFn): string {
+  let out = '';
+  let copied = 0; // 已原样带出的前缀长度（也是左侧扫描的下界：已处理过的文本不参与新匹配）
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '.') { i++; continue; }
+    // 左：至少一个路径字符
+    let s = i;
+    while (s > copied && isPathChar(text[s - 1])) s--;
+    if (s === i) { i++; continue; }
+    // 右：\w+ 后必须紧跟 `:数字`
+    let j = i + 1;
+    while (j < text.length && isWordChar(text[j])) j++;
+    if (j === i + 1 || text[j] !== ':') { i++; continue; }
+    let k = j + 1;
+    while (k < text.length && text[k] >= '0' && text[k] <= '9') k++;
+    if (k === j + 1) { i++; continue; }
+    out += text.slice(copied, s) + addPh(`<span style="color:#c4b5fd">${escapeHtml(text.slice(s, k))}</span>`);
+    copied = k;
+    i = k;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+
 /** 匹配引号字符串、文件路径、括号并替换为带样式的占位符 */
 function colorizeSyntax(text: string, addPh: PlaceholderFn): string {
   let result = text;
@@ -131,22 +177,47 @@ function colorizeSyntax(text: string, addPh: PlaceholderFn): string {
     addPh(`<span style="color:#fcd34d">${escapeHtml(match)}</span>`));
   result = result.replace(/'[^'\\]*(?:\\.[^'\\]*)*'/g, match =>
     addPh(`<span style="color:#fcd34d">${escapeHtml(match)}</span>`));
-  result = result.replace(/([a-zA-Z\/\\]+\.\w+:\d+)/g, match =>
-    addPh(`<span style="color:#c4b5fd">${escapeHtml(match)}</span>`));
+  result = colorizeFileLineRefs(result, addPh);
   result = result.replace(/([{}[\]])/g, match =>
     addPh(`<span style="color:#64748b">${escapeHtml(match)}</span>`));
   return result;
+}
+
+/**
+ * 两种占位符各用一套前缀，**必须分开还原**：
+ * - `\0N\0`  着色内部（`smartColorize`）
+ * - `\x01N\x01` 搜索高亮（`renderLine`，由 renderLine 自己还原）
+ * 若共用一个正则，`smartColorize` 的还原会把搜索结果占位符也吃掉（索引串了数组）。
+ */
+// 哨兵选 \x00/\x01 是**设计**：它们不可能出现在日志文本里（读取管线会跳过含 NUL 的行），
+// 因此与日志内容天然不冲突——用普通字符串做哨兵就得处理"日志里恰好出现同一串"的逃逸问题
+/* eslint-disable no-control-regex -- 占位符哨兵用控制字符是设计，见上 */
+const COLOR_PLACEHOLDER_RE = /\x00(\d+)\x00/g;
+const MARK_PLACEHOLDER_RE = /\x01(\d+)\x01/g;
+/* eslint-enable no-control-regex */
+
+/**
+ * 单趟还原占位符。
+ *
+ * 为什么不是逐个 `split(id).join(html)`（原实现）：那是「匹配数 × 行长」——一行的匹配越多
+ * 越慢。实测单字符搜索词在 4KB 行上有 4000 个匹配 → **1.2 秒/行**，日志面板会直接卡死；
+ * 无搜索时的括号/URL 等着色同理（JSON dump 行有上千个括号）。单趟扫一遍即还原完。
+ *
+ * 用 `replace(正则, 函数)` 而非替换串：函数返回值按**字面**插入，不解释 `$&`/`` $` ``/`$'`
+ * ——日志内容（如 echo 出来的 sed 命令）含 `$` 时才不会被破坏，这也是原实现不敢用替换串的原因。
+ */
+function restorePlaceholders(html: string, out: string[], re: RegExp): string {
+  return html.replace(re, (m, idx: string) => out[Number(idx)] ?? m);
 }
 
 /** 无 ANSI 转义时的智能着色 */
 function smartColorize(text: string): string {
   if (!text.trim()) return escapeHtml(text);
 
-  const placeholders: { id: string; html: string }[] = [];
-  let counter = 0;
+  const placeholders: string[] = [];
   const addPh: PlaceholderFn = (html) => {
-    const id = `\0${counter++}\0`;
-    placeholders.push({ id, html });
+    const id = `\0${placeholders.length}\0`;
+    placeholders.push(html);
     return id;
   };
 
@@ -157,13 +228,7 @@ function smartColorize(text: string): string {
   result = colorizeSyntax(result, addPh);
 
   result = escapeHtml(result);
-  for (const { id, html } of placeholders) {
-    // 用 split/join 做字面替换：String.replace 会把替换串里的 $& / $` / $' 当替换模式解释，
-    // 日志内容（如 echo 出来的 sed/regex 命令）含 $ 时会被破坏，且只替换首个匹配
-    result = result.split(id).join(html);
-  }
-
-  return result;
+  return restorePlaceholders(result, placeholders, COLOR_PLACEHOLDER_RE);
 }
 
 const SEARCH_MARK_HTML = '<mark style="background:rgba(251,191,36,0.2);color:#fcd34d;padding:1px 3px;border-radius:3px;border:1px solid rgba(251,191,36,0.3)">';
@@ -185,17 +250,14 @@ export function renderLine(line: string, searchTerm: string): string {
     return line.includes('\x1b[') ? ansiToHtml(line) : smartColorize(line);
   }
   // 文本层高亮 → 占位符 → 着色 → 恢复 mark
-  const marks: { id: string; html: string }[] = [];
+  const marks: string[] = [];
   const re = new RegExp(escapeRegExp(searchTerm), 'gi');
   const marked = line.replace(re, (m) => {
     const id = `\x01${marks.length}\x01`;
-    marks.push({ id, html: `${SEARCH_MARK_HTML}${escapeHtml(m)}</mark>` });
+    marks.push(`${SEARCH_MARK_HTML}${escapeHtml(m)}</mark>`);
     return id;
   });
-  let html = marked.includes('\x1b[') ? ansiToHtml(marked) : smartColorize(marked);
-  for (const { id, html: h } of marks) {
-    // 同上：字面替换，避免搜索词/日志内容里的 $ 模式污染
-    html = html.split(id).join(h);
-  }
-  return html;
+  const html = marked.includes('\x1b[') ? ansiToHtml(marked) : smartColorize(marked);
+  // 单趟还原（同上：字面插入，避免搜索词/日志内容里的 $ 模式污染）
+  return restorePlaceholders(html, marks, MARK_PLACEHOLDER_RE);
 }

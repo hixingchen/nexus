@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { aiService } from '../services/aiService';
+import { reportError } from '../utils/error';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore, type LayoutKey } from './layoutStore';
 
 /** 面板宽度范围（逻辑像素） */
@@ -101,6 +102,28 @@ interface AiState {
   setInstalling: (v: boolean) => void;
 }
 
+/**
+ * 本项目 AI 会话是否活跃（图标亮 / 页面展示的判据）。
+ *
+ * 必须是 `sessionCwd === currentCwd` 而不是单看 running：dsh 物理进程跨项目单例，
+ * 进程在别的项目跑时 running 也是 true——用 running 会「在 A 项目点亮 B 项目的图标」。
+ * 这条判据原先在 AiPanel 与 ProjectDetail 里各推一遍（第 3 处变量名还不同），
+ * 改判据漏改任一处就是跨项目误亮的难复现缺陷，故收成选择器。
+ */
+export function selectAiRunningHere(s: AiState): boolean {
+  return s.running && s.sessionCwd === s.currentCwd;
+}
+
+/**
+ * AI 面板是否真的展开（安装进度会强制撑开面板，即使 stop 收过 panelOpen）。
+ *
+ * 与 AiPanel 的宽度事实源同口径：凡是「面板那一列是否占宽」的判断都必须一致，
+ * 否则浮层让位、图标选中态、面板宽度三处会各按各的理解走。
+ */
+export function selectAiPanelVisible(s: AiState): boolean {
+  return s.panelOpen || s.installing;
+}
+
 export const useAiStore = create<AiState>((set, get) => ({
   panelOpen: false,
   panelWidth: 560,
@@ -144,7 +167,8 @@ export const useAiStore = create<AiState>((set, get) => ({
         sessionCwd: s.cwd,
       });
     } catch (e) {
-      // 查询失败不阻塞启动：只是少一次对账，后续 ensureRunning 仍会按需启动
+      // 查询失败不阻塞启动：只是少一次对账，后续 ensureRunning 仍会按需启动。
+      // 只留控制台：这是自动对账（随面板可见性反复触发），失败可由下一次对账修复
       console.error('查询 AI 会话状态失败:', e);
     }
   },
@@ -206,7 +230,8 @@ export const useAiStore = create<AiState>((set, get) => ({
     try {
       await aiService.stop();
     } catch (e) {
-      console.error('停止 dsh 会话失败:', e);
+      // 会话没停成，界面必须如实说（否则用户以为已停止，进程仍在后台跑）
+      reportError('停止 AI 会话失败', e);
       return;
     }
     // 记忆标记也只在成功后写：失败时保持"本项目启用过 AI"，避免下次切回来不再自动启动

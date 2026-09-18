@@ -22,6 +22,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
   componentDidCatch(error: unknown, errorInfo: unknown) {
     // 详细原因进控制台（兜底 UI 只给用户可读提示）
+    // 只留控制台：这里已经渲染了降级界面（用户看得见），再弹 toast 是重复告知
     console.error('[ErrorBoundary] 渲染失败:', error, errorInfo);
   }
 

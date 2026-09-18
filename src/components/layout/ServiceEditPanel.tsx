@@ -7,10 +7,14 @@ import { readServiceDraft, serviceDraftKey, useServiceDraftStore } from '../../s
 import { ToolsManagerModal } from './ToolsManagerModal';
 import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
+import { useClickOutside } from '../../hooks/useClickOutside';
 
 const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
+
+/** 配置面板输入框统一样式（配置表单与工具命令表单各有一份，逐字相同——改一处漏一处会出现两种输入框） */
+const INPUT_CLS = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
 
 /**
  * 遮蔽环境变量文本里的**值**（保留键名与行结构，用户仍能看出配了哪些变量）。
@@ -139,25 +143,14 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
   const toolPickerRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    if (!toolPickerOpen) return;
-    // 外部点击 / 滚动 / Escape 时关闭（滚动容器非 window，需捕获阶段监听）。
-    // contains 判断：点在菜单内、或点的是触发器本身 → 不自动关（触发器走 click 显式 toggle），
-    // 否则会出现"mousedown 刚关掉、click 又打开"导致菜单关不掉
-    const inMenu = (e: Event) => toolPickerRef.current?.contains(e.target as Node) ?? false;
-    const inAnchor = (e: Event) => pickerAnchorRef.current?.contains(e.target as Node) ?? false;
-    const onMouseDown = (e: MouseEvent) => { if (!inMenu(e) && !inAnchor(e)) setToolPickerOpen(false); };
-    const onScroll = (e: Event) => { if (!inMenu(e)) setToolPickerOpen(false); };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setToolPickerOpen(false); };
-    document.addEventListener('mousedown', onMouseDown);
-    document.addEventListener('scroll', onScroll, true);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onMouseDown);
-      document.removeEventListener('scroll', onScroll, true);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [toolPickerOpen]);
+  // 外部点击 / 滚动 / Escape 时关闭。触发器（anchor）也算"内部"：点在触发器上由它自己的
+  // click 显式 toggle，否则会出现"mousedown 刚关掉、click 又打开"导致菜单关不掉。
+  // captureScroll：面板的滚动容器非 window，scroll 不冒泡，需捕获阶段监听
+  useClickOutside(toolPickerRef, () => setToolPickerOpen(false), {
+    refs: [pickerAnchorRef],
+    escape: true,
+    captureScroll: true,
+  });
 
   const openToolPicker = () => {
     const anchor = pickerAnchorRef.current;
@@ -204,7 +197,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
   const handleSelectCwd = async () => {
     // 走后端原生选择器：选中的目录会被记为"用户已确认"，项目外目录才允许配置
-    const selected = await pickDirectory({ title: '选择工作目录', defaultPath: cwd });
+    const selected = await pickDirectory({ purpose: 'serviceCwd', defaultPath: cwd });
     if (selected) applyCwd(selected);
   };
 
@@ -271,7 +264,6 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     setShowToolCmdForm(true);
   };
 
-  const inputCls = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
   const labelCls = "text-[11px] font-semibold text-nexus-muted uppercase tracking-wider";
   const cardCls = "bg-nexus-bg/30 border border-nexus-border/50 rounded-lg p-3.5";
 
@@ -303,17 +295,17 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           <div className="space-y-3">
             <div>
               <label className={labelCls}>名称</label>
-              <input className={inputCls} value={name} onChange={e => setName(e.target.value)} />
+              <input className={INPUT_CLS} value={name} onChange={e => setName(e.target.value)} />
             </div>
             <div>
               <label className={labelCls}>启动命令</label>
-              <textarea className={`${inputCls} font-mono resize-none`} rows={2} value={command}
+              <textarea className={`${INPUT_CLS} font-mono resize-none`} rows={2} value={command}
                 onChange={e => setCommand(e.target.value)} placeholder="npm run dev" />
             </div>
             <div>
               <label className={labelCls}>工作目录</label>
               <div className="relative mt-1">
-                <input className={`${inputCls} pr-8`} value={cwd}
+                <input className={`${INPUT_CLS} pr-8`} value={cwd}
                   onChange={e => applyCwd(e.target.value)} placeholder="/path/to/service" />
                 <button
                   className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
@@ -350,18 +342,18 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
             <div className="space-y-3">
               <div>
                 <label className={labelCls}>监听路径</label>
-                <input className={`${inputCls} font-mono mt-1`} value={watchPaths}
+                <input className={`${INPUT_CLS} font-mono mt-1`} value={watchPaths}
                   onChange={e => setWatchPaths(e.target.value)} placeholder='["./server", "./shared"]' />
               </div>
               <div>
                 <label className={labelCls}>包含文件</label>
-                <textarea className={`${inputCls} font-mono resize-none mt-1`} rows={3} value={watchInclude}
+                <textarea className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={3} value={watchInclude}
                   onChange={e => setWatchInclude(e.target.value)}
                   placeholder={'*\n*.ts\n*.tsx\n*.rs\n*.py'} />
               </div>
               <div>
                 <label className={labelCls}>排除</label>
-                <textarea className={`${inputCls} font-mono resize-none mt-1`} rows={4} value={watchExclude}
+                <textarea className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={4} value={watchExclude}
                   onChange={e => setWatchExclude(e.target.value)}
                   placeholder={'node_modules\n.git\ndist\ntarget'} />
               </div>
@@ -555,7 +547,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 >{showEnvValues ? '遮蔽值' : '显示值'}</button>
               </div>
               <textarea
-                className={`${inputCls} font-mono resize-none mt-1`}
+                className={`${INPUT_CLS} font-mono resize-none mt-1`}
                 rows={4}
                 value={showEnvValues ? envVars : maskEnvValues(envVars)}
                 // 遮蔽态只读：否则用户会在掩码文本上编辑，保存时把掩码写进配置
@@ -688,14 +680,12 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
     });
   };
 
-  const inputCls = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
-
   return (
     <form onSubmit={handleSubmit} className="mt-3 space-y-2 p-2.5 bg-nexus-bg/50 rounded-md border border-nexus-border/50">
       <div>
         <label className="text-[11px] text-nexus-muted">名称</label>
         <input
-          className={inputCls}
+          className={INPUT_CLS}
           value={name}
           onChange={e => setName(e.target.value)}
           placeholder="clean"
@@ -705,7 +695,7 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
       <div>
         <label className="text-[11px] text-nexus-muted">命令</label>
         <input
-          className={`${inputCls} font-mono`}
+          className={`${INPUT_CLS} font-mono`}
           value={cmd}
           onChange={e => setCmd(e.target.value)}
           placeholder="mvn clean"
@@ -714,7 +704,7 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
       <div>
         <label className="text-[11px] text-nexus-muted">超时（秒）</label>
         <input
-          className={inputCls}
+          className={INPUT_CLS}
           value={timeoutSecs}
           onChange={e => setTimeoutInput(e.target.value)}
           placeholder="留空 = 默认 60；0 = 不限制（打包/构建类建议 1800）"

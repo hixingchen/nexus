@@ -203,7 +203,18 @@ impl FileWatcher {
             })
             .map_err(|e| format!("创建文件监听线程失败: {}", e))?;
 
-        // 到这里新旧资源都已就绪，才替换旧监听（先 stop 后建会让失败路径丢掉整个项目的监听）
+        // ── 提交点 ──
+        //
+        // 本函数是 `WatcherState.services` 的**唯一**写入点，且写在"新线程已建好、旧线程即将
+        // 停止"这一刻。此前所有失败路径（路径全无效 / 建 watcher 失败 / watch 注册失败 /
+        // 线程 spawn 失败）都直接返回，**一个字都不改 map**——于是失败时 map 里仍是那份
+        // 精确描述"仍在运行的旧线程"的状态，`get_watched_services` 不会撒谎。
+        //
+        // 为什么必须这样（NEW-18）：线程持有的是启动那一刻的 `svc_map` 快照（见上），
+        // 若调用方先改 map 里的 `services` 再调本函数、而本函数失败了，就会出现
+        // "map 说 [T]、线程实际监听 [S,T]" 的永久分叉——此后改 S 的目录仍会 emit，
+        // 弹出"需要重启 S"，而 S 已被删除 → 点了必然失败。所以调用方**只读**地算剩余
+        // 列表（`get_watched_services` + 过滤），提交统一由这里完成，不留回滚逻辑。
         let _ = self.stop_watching(project_id);
 
         self.watchers.lock().map_err(|e| format!("FileWatcher watchers 锁获取失败: {}", e))?
@@ -229,23 +240,13 @@ impl FileWatcher {
     }
 
     /// 获取项目当前正在监听的服务列表
+    ///
+    /// **只读**：调用方要"移除某个服务"时应基于本方法的返回值过滤出剩余列表，
+    /// 再交给 `start_watching` 提交——不要提供直接改 `state.services` 的接口。
+    /// 理由见 `start_watching` 末尾的提交点注释（两份真相会永久分叉）。
     pub fn get_watched_services(&self, project_id: &str) -> Option<Vec<ServiceWatchConfig>> {
         let watchers = self.watchers.lock().ok()?;
         watchers.get(project_id).map(|s| s.services.clone())
-    }
-
-    /// 从项目监听中移除指定服务，返回剩余的服务列表
-    pub fn remove_service_from_watching(&self, project_id: &str, service_id: &str) -> Vec<ServiceWatchConfig> {
-        let mut watchers = match self.watchers.lock() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-        if let Some(state) = watchers.get_mut(project_id) {
-            state.services.retain(|s| s.id != service_id);
-            state.services.clone()
-        } else {
-            Vec::new()
-        }
     }
 
     pub fn stop_all(&self) {
@@ -588,6 +589,40 @@ mod tests {
         let changes = match_changes(&svcs, &paths);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].service_id, "B");
+    }
+
+    // ── start_watching 的提交语义（NEW-18 的修复依赖这条不变量）──
+
+    /// 失败的重建**不得**改动已有状态：`services` 只在成功的提交点写入。
+    ///
+    /// 调用方（`commands::watcher::remove_service_watch`）正是依赖这条不变量，才能
+    /// "只读取剩余列表 + 交给 start_watching 提交"而无需回滚逻辑。一旦这里退化成
+    /// "先改 map、失败后不回滚"，map 就不再等于"实际在监听什么"——改已删除服务的
+    /// 目录照样 emit，弹出点了必然失败的重启卡片。
+    ///
+    /// 注：本测试保护的是**不变量**，不是 NEW-18 的复现——预改 map 的代码在调用方，
+    /// 这里要挡住的是"将来有人把预改搬进核心层"。
+    #[test]
+    fn test_failed_start_watching_leaves_previous_state_intact() {
+        let dir = std::env::temp_dir().join(format!("nexus_ut_watcher_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let dir_s = dir.to_string_lossy().to_string();
+
+        let fw = FileWatcher::new();
+        let good = make_svc("S", vec![&dir_s], vec![], vec!["*"]);
+        fw.start_watching("p1", "P", &[good], |_| {}).expect("首次监听应成功");
+        assert_eq!(fw.get_watched_services("p1").expect("应在监听").len(), 1);
+
+        // 路径在磁盘上不存在 → 必须 Err。这正是 remove_service_watch 会撞上的失败路径
+        let bad = make_svc("T", vec!["/nonexistent/nexus/watcher/state/test"], vec![], vec!["*"]);
+        assert!(fw.start_watching("p1", "P", &[bad], |_| {}).is_err(), "监听路径全无效必须报错");
+
+        let after = fw.get_watched_services("p1").expect("失败不得顺手停掉已有监听");
+        assert_eq!(after.len(), 1, "失败的重建不得改动服务列表");
+        assert_eq!(after[0].id, "S", "map 必须仍精确描述运行中的监听线程");
+
+        fw.stop_all();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

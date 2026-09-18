@@ -27,7 +27,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
 
   const handleSelectPath = async () => {
     // 走后端原生选择器：路径会成为文件访问白名单的根，必须由用户亲手选择（见 utils/error 同层说明）
-    const selected = await pickDirectory({ title: '选择项目目录' });
+    const selected = await pickDirectory({ purpose: 'projectDir' });
     if (selected) setPath(selected);
   };
 
@@ -120,7 +120,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
   }, [project]);
 
   const handleSelectPath = async () => {
-    const selected = await pickDirectory({ title: '选择项目目录', defaultPath: path || project?.path });
+    const selected = await pickDirectory({ purpose: 'projectDir', defaultPath: path || project?.path });
     if (selected) setPath(selected);
   };
 

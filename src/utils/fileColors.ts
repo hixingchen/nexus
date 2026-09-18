@@ -32,5 +32,9 @@ const DIR_COLORS: Record<string, string> = {
 
 /** 目录名 → 颜色类名；不在规则内返回 null */
 export function getDirColorClass(name: string): string | null {
-  return DIR_COLORS[name] ?? null;
+  // 必须判「自有键」而不是直接取值：`DIR_COLORS[name]` 会沿原型链取到 Object 上的成员，
+  // 于是名为 `constructor`/`toString`/`valueOf`/`__proto__` 的目录拿到的是一个函数或
+  // Object.prototype（真值，`?? null` 兜不住），调用点把它当类名拼进 className。
+  // 这类目录名在真实工程里并不罕见（`hasOwnProperty.ts` 之类）。
+  return Object.prototype.hasOwnProperty.call(DIR_COLORS, name) ? DIR_COLORS[name] : null;
 }

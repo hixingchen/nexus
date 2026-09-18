@@ -55,7 +55,7 @@ export function useProjectDetail(projectId: string) {
       ]);
       if (seq !== loadSeqRef.current) return; // 已被更新的请求取代，丢弃过期响应
       // 并行刷新打开工具绑定（服务增删后右键"用 XX 打开"显示才准）
-      useToolStore.getState().loadProject(projectId).catch((e) => console.error('加载项目工具绑定失败:', e));
+      useToolStore.getState().loadProject(projectId).catch((e) => reportError('加载项目工具绑定失败', e));
       // 同步左侧展开列表缓存：右侧增删改后左侧保持展开的项目即时一致
       useSvcCacheStore.getState().setCache(projectId, d.services);
       // 服务已被删除时其编辑草稿没有意义（还会让关窗确认多算一项）；模板草稿由模板库加载时清理

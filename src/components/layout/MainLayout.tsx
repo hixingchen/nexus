@@ -14,7 +14,7 @@ import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../s
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import type { LogStream, ServiceLogBatchEvent } from '../../services/logService';
-import { showNotification } from '../ui/Toast';
+import { reportError } from '../../utils/error';
 
 export function MainLayout() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -61,12 +61,9 @@ export function MainLayout() {
     }).catch((e) => {
       // 订阅失败 = 所有服务日志静默停止显示（且 logListenerRef 保持 null、清理变空操作）。
       // 原实现没有 catch：这里既会抛未处理的 rejection，又让用户完全无从察觉。
-      console.error('订阅 service-log-batch 失败:', e);
-      showNotification({
-        variant: 'error',
+      reportError('订阅 service-log-batch 失败', e, {
         title: '日志订阅失败',
         description: '服务日志将无法实时显示，请重启应用',
-        duration: 8000,
       });
     });
 
@@ -135,7 +132,9 @@ export function MainLayout() {
 
   // 项目切换时设置文件访问白名单
   useEffect(() => {
-    securityApi.setProjectRoot(selectedProjectPath).catch((e) => console.error('setProjectRoot 失败:', e));
+    // 白名单根设置失败 = 之后所有文件命令都会被拒（现象是"打不开文件"，原因只在这里），
+    // 因此必须让用户看见，而不是留一行日志
+    securityApi.setProjectRoot(selectedProjectPath).catch((e) => reportError('设置项目根失败', e));
   }, [selectedProjectPath]);
 
   const leftPanel = (

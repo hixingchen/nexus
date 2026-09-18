@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::State;
 use crate::AppState;
-use crate::commands::editor::check_path_allowed;
+
 
 /// 单条搜索结果
 #[derive(Debug, Serialize)]
@@ -77,7 +77,7 @@ pub async fn search_files(
     let root = params.root.replace('\\', "/");
     if root.is_empty() { return Err("搜索目录不能为空".into()); }
     // 多根白名单校验（项目根 + 各服务/模板工作目录），内部不跨 await 持锁
-    check_path_allowed(&state, &root)?;
+    state.paths.check_path_allowed(&state.db, &root)?;
 
     let exts: Vec<String> = params.extensions.iter()
         .map(|e| e.trim().trim_start_matches('.').to_lowercase())
@@ -125,10 +125,12 @@ fn search_in_dir(
     };
     // 单文件搜索（目录树文件节点右键）：搜文件自身
     let root_path = PathBuf::from(root);
+    // 句柄复核基准只算一次（PERF-16）：root 在本次搜索期间是常量
+    let real_root = std::fs::canonicalize(&root_path).ok();
     if root_path.is_file() {
         let mut results = Vec::new();
         let truncated = false;
-        if let Some(bytes) = read_searchable(&root_path, &root_path, exts) {
+        if let Some(bytes) = read_searchable(real_root.as_deref(), &root_path, exts) {
             if let Some(hits) = search_bytes(&root_path, &bytes, q, case_sensitive, max_results) {
                 results.extend(hits);
             }
@@ -144,6 +146,10 @@ fn search_in_dir(
     let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(root), 0)];
     while let Some((dir, depth)) = stack.pop() {
         if results.len() >= max_results { truncated = true; break; }
+        // 被更新的搜索取代 → 整体退出。内层 for 里的同名检查只 `break` 当前目录的循环，
+        // 外层 while 仍会把剩余目录逐个 read_dir 走完——退化成"每个目录都进、文件都不读"，
+        // 与注释承诺的"提前返回"不符。这里再判一次，内层 break 后即在此处退出。
+        if superseded(scanned) { truncated = true; break; }
         if depth > MAX_DEPTH { continue; }
 
         let entries = match std::fs::read_dir(&dir) {
@@ -171,7 +177,7 @@ fn search_in_dir(
                 // 一次 open：候选判定（大小/扩展名/NUL 探测）与逐行搜索共用同一份字节，
                 // 原实现先 stat + open 读 8KB 探测、再 open 整读一遍——同一文件两次打开、
                 // 前 8KB 读两次（上限 2 万文件时最坏多出 2 万次 open）
-                if let Some(bytes) = read_searchable(&root_path, &path, exts) {
+                if let Some(bytes) = read_searchable(real_root.as_deref(), &path, exts) {
                     if let Some(hits) = search_bytes(&path, &bytes, q, case_sensitive, max_results - results.len()) {
                         results.extend(hits);
                     }
@@ -192,7 +198,12 @@ fn search_in_dir(
 /// 目录遍历与实际读取之间，项目内并发脚本可以把某个路径换成指向外面的 junction，
 /// 若不复核就会把白名单外文件的内容作为命中片段返回给界面）→ 整读（受大小上限约束）
 /// → 头部 NUL 探测。返回 `None` 表示跳过该文件（过大/非目标类型/二进制/读失败/越界）。
-fn read_searchable(root: &Path, path: &Path, exts: &[String]) -> Option<Vec<u8>> {
+///
+/// `real_root` 由调用方算好传入（PERF-16）：它是常量却被原实现在**每个候选文件**上
+/// 重算一次 `canonicalize`（Windows 下每次都是路径解析 + 若干系统调用）。顺带更稳：
+/// 基准在整个遍历期间固定，扫描中途 root 若被换成指向外部的 junction，经它解析出的
+/// 文件不会以旧 root 开头 → 一律拒绝（逐文件重算反而会跟着换后的 root 一起放行）。
+fn read_searchable(real_root: Option<&Path>, path: &Path, exts: &[String]) -> Option<Vec<u8>> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ext = Path::new(name).extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -204,10 +215,11 @@ fn read_searchable(root: &Path, path: &Path, exts: &[String]) -> Option<Vec<u8>>
     use std::io::Read;
     // 一次 open，后续读取都在这条已复核的句柄上
     let file = std::fs::File::open(path).ok()?;
-    let real = crate::commands::editor::final_path_of_handle(&file).ok()?;
-    // 复核基准同样取"内核解析后的根"，两边同为 verbatim 形式才能正确比较
-    let real_root = std::fs::canonicalize(root).ok()?;
-    if !real.starts_with(&real_root) { return None; }
+    let real = crate::commands::paths::final_path_of_handle(&file).ok()?;
+    // 复核基准同样取"内核解析后的根"，两边同为 verbatim 形式才能正确比较。
+    // 取不到基准（root 不存在/无权限）→ 无法复核 → 拒绝，与原先一致
+    let real_root = real_root?;
+    if !real.starts_with(real_root) { return None; }
 
     let metadata = file.metadata().ok()?;
     if metadata.len() == 0 || metadata.len() > MAX_SEARCH_FILE_SIZE { return None; }
@@ -326,5 +338,33 @@ mod tests {
         assert_eq!(idx, 3);
         let got: String = line.chars().skip(idx).take(6).collect();
         assert_eq!(got, "target");
+    }
+
+    // ── read_searchable 的句柄复核基准（PERF-16 把基准改为调用方传入）──
+
+    /// 基准取不到（root 不存在/无权限）→ **一律拒绝**，而不是"跳过复核"。
+    ///
+    /// 这是 PERF-16 改动的关键语义：基准从"每个候选文件各算一次 canonicalize"变成
+    /// "遍历前算一次"，于是它多出一条 `Option` 的失败路径——必须与原先"每个文件都
+    /// canonicalize 失败"的结论一致（拒绝），否则就成了静默放行。
+    /// 同时锁住 SEC-4 的越界拒绝（句柄解析出的真实目标不在基准之下）。
+    #[test]
+    fn test_read_searchable_root_baseline_semantics() {
+        let dir = std::env::temp_dir().join(format!("nexus_ut_search_{}", std::process::id()));
+        let outside = dir.join("sibling");
+        std::fs::create_dir_all(&outside).expect("建临时目录");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"hello").expect("写文件");
+
+        assert!(read_searchable(None, &file, &[]).is_none(), "取不到基准必须拒绝");
+
+        let real_root = std::fs::canonicalize(&dir).expect("canonicalize 根");
+        assert!(read_searchable(Some(&real_root), &file, &[]).is_some(), "根内文件应可读");
+
+        // 基准换成另一个目录（不含该文件）→ 越界，拒绝
+        let other_root = std::fs::canonicalize(&outside).expect("canonicalize 另一根");
+        assert!(read_searchable(Some(&other_root), &file, &[]).is_none(), "越界文件必须拒绝");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

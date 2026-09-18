@@ -66,10 +66,10 @@ pub fn add_service(
             .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
     }
     let cwd = params.cwd.replace('\\', "/");
-    // 工作目录/监听路径会进入文件访问白名单（见 editor.rs 的"配置路径收口"）：
+    // 工作目录/监听路径会进入文件访问白名单（见 commands/paths.rs 的"配置路径收口"）：
     // 必须存在、不是系统/用户敏感目录，且位于项目内或经用户显式选择过
-    crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
-    crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
+    state.paths.ensure_config_dir_allowed(&state.db, &cwd, "工作目录")?;
+    state.paths.ensure_watch_paths_allowed(&state.db, &params.watch_paths)?;
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
     insert_service_row(&state.db, &params, &cwd, &tool_commands)
 }
@@ -103,9 +103,20 @@ pub(crate) fn insert_service_row(
         let wi = "*";
         let wx = DEFAULT_WATCH_EXCLUDE;
         conn.execute(
-            "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,0,?11,?12)",
-            rusqlite::params![id, params.project_id, params.name.trim(), params.command, cwd, wp, wi, wx, params.env_vars, params.restart_mode, max_sort + 1, tool_commands],
+            &format!(
+                "INSERT INTO services ({}) VALUES ({})",
+                crate::database::SERVICE_COLUMNS,
+                crate::database::named_placeholders(crate::database::SERVICE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":id": id, ":project_id": params.project_id, ":name": params.name.trim(),
+                ":command": params.command, ":cwd": cwd, ":watch_paths": wp,
+                ":watch_include": wi, ":watch_exclude": wx, ":env_vars": params.env_vars,
+                ":restart_mode": params.restart_mode,
+                // 新服务的两个展示开关固定初值：启用、不显示文件树
+                ":enabled": 1, ":show_file_tree": 0,
+                ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
+            },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
             id, project_id: params.project_id.clone(), name: params.name.trim().to_string(), command: params.command.clone(),
@@ -139,11 +150,11 @@ pub async fn update_service(
         let state = app.state::<AppState>();
         let cwd = params.cwd.replace('\\', "/");
         // 同 add_service：配置目录会进入文件访问白名单，保存前必须过收口校验
-        crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
+        state.paths.ensure_config_dir_allowed(&state.db, &cwd, "工作目录")?;
         // 监听路径为"跟随工作目录"的兜底值时不校验（它由上面的 cwd 派生，且 cwd 已校验）
         let watch_follows_cwd = params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]";
         if !watch_follows_cwd {
-            crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
+            state.paths.ensure_watch_paths_allowed(&state.db, &params.watch_paths)?;
         }
         let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
         let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
@@ -186,8 +197,17 @@ pub(crate) fn write_service_update(
             params.watch_paths.clone()
         };
         let affected = conn.execute(
-            "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
+            &format!(
+                "UPDATE services SET {} WHERE id=:id",
+                crate::database::named_assignments(crate::database::SERVICE_UPDATABLE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":name": params.name.trim(), ":command": params.command, ":cwd": cwd,
+                ":watch_paths": wp, ":watch_include": params.watch_include,
+                ":watch_exclude": params.watch_exclude, ":env_vars": params.env_vars,
+                ":restart_mode": params.restart_mode, ":enabled": en,
+                ":show_file_tree": sft, ":tool_commands": tool_commands, ":id": params.id,
+            },
         ).map_err(|e| format!("更新服务失败: {}", e))?;
         if affected == 0 { return Err("服务不存在".into()); }
         Ok(old.2)
@@ -254,8 +274,12 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         let project_id: Option<String> = state.db.with_conn(|conn| {
             Ok(conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get(0)).ok())
         })?;
-        // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
-        let _ = state.process_mgr.stop(&id);
+        // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）。
+        // 失败留痕（同 delete_project）：静默丢弃会留下仍在跑的孤儿进程，而服务记录已删、
+        // UI 里再没有入口去停它。仍继续删除，残留进程由 Job Object 在应用退出时兜底。
+        if let Err(e) = state.process_mgr.stop(&id) {
+            log::warn!("删除服务 {} 时停止进程失败（进程可能残留至应用退出）：{}", id, e);
+        }
         // 3. 删除数据库记录
         delete_service_row(&state.db, &id)?;
         // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
@@ -358,16 +382,18 @@ pub fn add_service_from_template(
     project_id: String,
     template_id: String,
 ) -> Result<Service, String> {
-    state.db.with_conn_mut(|conn| {
-        // 事务包裹：服务行 + 打开工具绑定必须原子写入——绑定插入失败（外键等）
-        // 若留下已建服务，用户看到的是"服务加进来了但工具绑定丢了"的半成品
-        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
-        let project_exists: bool = tx.query_row(
-            "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [&project_id], |r| r.get(0)
-        ).map_err(|e| format!("校验所属项目失败: {}", e))?;
-        if !project_exists { return Err("所属项目不存在".into()); }
-
-        let t = tx.query_row(
+    // 取模板行 + 白名单收口，**必须在取 DB 锁之前**。
+    //
+    // 为什么不能放进下面的 `with_conn_mut` 闭包：`ensure_config_dir_allowed` 内部会调
+    // `registered_dirs` → `state.db.with_conn`，而 `Database::conn` 是不可重入的
+    // `std::sync::Mutex`——同一线程在闭包内再取同一把锁是**永久死锁**（不是报错），
+    // 且守卫永不释放 → 之后所有查库命令一起卡死、界面冻结，只能杀进程。
+    // 校验用的就是下面这组值，故收口与取值同源（不存在校验后被换掉的窗口）。
+    //
+    // 模板里的目录同样是"即将进入白名单的根"：套用同一套收口（历史模板值视为已授权，
+    // 但驱动器根/系统目录一律拒绝——模板可能是从别处导入或被写坏的）
+    let t = state.db.with_conn(|conn| {
+        conn.query_row(
             "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id
              FROM service_templates WHERE id=?1",
             [&template_id],
@@ -385,12 +411,20 @@ pub fn add_service_from_template(
                 row.get::<_, String>("tool_commands")?,
                 row.get::<_, String>("open_tool_id")?,
             )),
-        ).map_err(|e| format!("模板不存在: {}", e))?;
-        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
-        // 模板里的目录同样是"即将进入白名单的根"：套用同一套收口（历史模板值视为已授权，
-        // 但驱动器根/系统目录一律拒绝——模板可能是从别处导入或被写坏的）
-        crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
-        crate::commands::editor::ensure_watch_paths_allowed(&state, &watch_paths)?;
+        ).map_err(|e| format!("模板不存在: {}", e))
+    })?;
+    let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
+    state.paths.ensure_config_dir_allowed(&state.db, &cwd, "工作目录")?;
+    state.paths.ensure_watch_paths_allowed(&state.db, &watch_paths)?;
+
+    state.db.with_conn_mut(|conn| {
+        // 事务包裹：服务行 + 打开工具绑定必须原子写入——绑定插入失败（外键等）
+        // 若留下已建服务，用户看到的是"服务加进来了但工具绑定丢了"的半成品
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        let project_exists: bool = tx.query_row(
+            "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [&project_id], |r| r.get(0)
+        ).map_err(|e| format!("校验所属项目失败: {}", e))?;
+        if !project_exists { return Err("所属项目不存在".into()); }
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = tx.query_row(
@@ -400,9 +434,18 @@ pub fn add_service_from_template(
         let en = if enabled { 1 } else { 0 };
         let sft = if show_file_tree { 1 } else { 0 };
         tx.execute(
-            "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            rusqlite::params![id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, max_sort + 1, tool_commands],
+            &format!(
+                "INSERT INTO services ({}) VALUES ({})",
+                crate::database::SERVICE_COLUMNS,
+                crate::database::named_placeholders(crate::database::SERVICE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":id": id, ":project_id": project_id, ":name": name, ":command": command,
+                ":cwd": cwd, ":watch_paths": watch_paths, ":watch_include": watch_include,
+                ":watch_exclude": watch_exclude, ":env_vars": env_vars,
+                ":restart_mode": restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
+            },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
         if !open_tool_id.is_empty() {
@@ -490,9 +533,9 @@ pub fn update_service_template(
         serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
             .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
     }
-    // 模板目录同样进入白名单根集合：套用配置目录收口（见 editor.rs 的"配置路径收口"）
-    crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
-    crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
+    // 模板目录同样进入白名单根集合：套用配置目录收口（见 commands/paths.rs 的"配置路径收口"）
+    state.paths.ensure_config_dir_allowed(&state.db, &cwd, "工作目录")?;
+    state.paths.ensure_watch_paths_allowed(&state.db, &params.watch_paths)?;
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
     state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
@@ -510,7 +553,6 @@ pub fn update_service_template(
 mod tests {
     use super::*;
     use crate::database::{init_schema, Database};
-    use std::sync::Mutex;
 
     /// 内存库 + 一个项目行（ARCH-4：这几条 SQL 路径此前零测试）
     fn test_db() -> Database {
@@ -520,7 +562,7 @@ mod tests {
             "INSERT INTO projects (id, name, path, sort_index, created_at) VALUES ('p1','P','C:/p',0,'t')",
             [],
         ).expect("插入项目");
-        Database { conn: Mutex::new(conn) }
+        Database::from_connection(conn)
     }
 
     fn add_params(name: &str, cwd: &str) -> AddServiceParams {

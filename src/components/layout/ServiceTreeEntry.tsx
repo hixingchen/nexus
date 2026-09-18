@@ -7,7 +7,7 @@ import { openToolsApi, processApi, parseToolCommands, type Service, type ToolCom
 import { startSingleService, stopSingleService } from '../../stores/serviceActions';
 import { useToolStore } from '../../stores/toolStore';
 import { reportError } from '../../utils/error';
-import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
+import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 
 interface Props {
   service: Service;
@@ -187,7 +187,7 @@ export function ServiceTreeEntry({
           Portal 到 body：服务面板有 transform 容器（折叠动画），fixed 定位的菜单
           若留在其内会以 transform 容器为包含块，导致坐标错位被裁剪而不可见 */}
       {contextMenu && createPortal(
-        <ContextMenu
+        <ServiceContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
           cwd={service.cwd}
@@ -223,32 +223,6 @@ export function ServiceTreeEntry({
 
 // ── 右键菜单组件 ──────────────────────────────────────────
 
-/** 菜单条目的色调：只给图标与 Hover 底色着色，文案统一用正文色（与菜单既有条目同一套观感） */
-const MENU_TONE = {
-  info: { icon: 'text-nexus-info', hover: 'hover:bg-nexus-info/10' },
-  success: { icon: 'text-nexus-success', hover: 'hover:bg-nexus-success/10' },
-  warning: { icon: 'text-nexus-warning', hover: 'hover:bg-nexus-warning/10' },
-  danger: { icon: 'text-nexus-error', hover: 'hover:bg-nexus-error/10' },
-} as const;
-
-type MenuTone = keyof typeof MENU_TONE;
-
-/** 菜单条目：10×10 图标 + 文案（与下方既有条目同规格） */
-const MenuItem = ({ icon, label, tone, onClick }: {
-  icon: React.ReactNode;
-  label: string;
-  tone: MenuTone;
-  onClick: () => void;
-}) => (
-  <button
-    className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md transition-colors text-left ${MENU_TONE[tone].hover}`}
-    onClick={onClick}
-  >
-    <span className={`flex-shrink-0 ${MENU_TONE[tone].icon}`}>{icon}</span>
-    <span className="text-[12px] text-nexus-text truncate">{label}</span>
-  </button>
-);
-
 /** 查看日志：文档 + 折角（失败态复用同一图标，靠色调区分） */
 const LogIcon = () => (
   <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -278,7 +252,7 @@ const StopIcon = () => (
   </svg>
 );
 
-interface ContextMenuProps {
+interface ServiceContextMenuProps {
   x: number;
   y: number;
   cwd: string;
@@ -302,120 +276,89 @@ interface ContextMenuProps {
   onClose: () => void;
 }
 
-const ContextMenu = ({ x, y, cwd, running, failed, openToolName, toolCommands, onViewLog, onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
-  const menuRef = useRef<HTMLDivElement | null>(null);
-
-  // 点击外部关闭菜单
-  useEffect(() => {
-    const handleClose = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        onClose();
-      }
-    };
-    document.addEventListener('mousedown', handleClose);
-    return () => document.removeEventListener('mousedown', handleClose);
-  }, [onClose]);
-  // 计算菜单位置，确保不超出内容区
-  // 改用共享定位钩子（原实现手写「固定 180px 宽 + 估算高度」夹取，且只夹到窗口
-  // 边缘——服务列右缘紧邻 AI 面板时，菜单右半会被原生子 WebView 盖住点不到）。
-  // 钩子实测自身尺寸后夹进「窗口 − 面板占用宽度」，宽度常量也不必再与 JSX 同步
-  const anchor = useMemo(() => ({ x, y }), [x, y]);
-  const menuStyle = useContextMenuPosition(menuRef, anchor);
-
-  return (
-    <div
-      ref={menuRef}
-      className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-      style={menuStyle}
-    >
-      {/* 服务动作：与卡片 Hover 按钮一一对应（运行中=日志/重启/停止，失败=失败日志/重启，未运行=启动）。
-          卡片按钮只在 Hover 时出现，右键是同一批操作的第二入口，两处共用 runAction */}
-      <div className="border-b border-nexus-border/30 py-1.5 px-1.5">
-        {running ? (
-          <>
-            {onViewLog && <MenuItem icon={<LogIcon />} label="查看日志" tone="info" onClick={onViewLog} />}
-            <MenuItem icon={<RestartIcon />} label="重启服务" tone="warning" onClick={onRestart} />
-            <MenuItem icon={<StopIcon />} label="停止服务" tone="danger" onClick={onStop} />
-          </>
-        ) : failed ? (
-          <>
-            {onViewLog && <MenuItem icon={<LogIcon />} label="查看失败日志" tone="danger" onClick={onViewLog} />}
-            <MenuItem icon={<PlayIcon />} label="重新启动" tone="success" onClick={onStart} />
-          </>
-        ) : (
-          <MenuItem icon={<PlayIcon />} label="启动服务" tone="success" onClick={onStart} />
-        )}
-      </div>
-
-      {/* 用绑定的工具打开（服务设置中选择，如 IDEA / VS Code） */}
-      {openToolName && (
-        <div className="py-1.5 px-1.5">
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={onOpenWithTool}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M2 1h6a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1z"/><path d="M1.5 6.5h7M3.5 6.5V9"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text truncate">用 {openToolName} 打开</span>
-          </button>
-        </div>
+/** 服务条目的右键菜单：容器/定位/关闭与行按钮都走 ui/ContextMenu 原语，本组件只留条目编排 */
+const ServiceContextMenu = ({ x, y, cwd, running, failed, openToolName, toolCommands, onViewLog, onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ServiceContextMenuProps) => (
+  <ContextMenu x={x} y={y} onClose={onClose}>
+    {/* 服务动作：与卡片 Hover 按钮一一对应（运行中=日志/重启/停止，失败=失败日志/重启，未运行=启动）。
+        卡片按钮只在 Hover 时出现，右键是同一批操作的第二入口，两处共用 runAction */}
+    <div className="border-b border-nexus-border/30 py-1.5 px-1.5">
+      {running ? (
+        <>
+          {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看日志" tone="info" truncate onClick={onViewLog} />}
+          <ContextMenuItem icon={<RestartIcon />} label="重启服务" tone="warning" truncate onClick={onRestart} />
+          <ContextMenuItem icon={<StopIcon />} label="停止服务" tone="error" truncate onClick={onStop} />
+        </>
+      ) : failed ? (
+        <>
+          {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看失败日志" tone="error" truncate onClick={onViewLog} />}
+          <ContextMenuItem icon={<PlayIcon />} label="重新启动" tone="success" truncate onClick={onStart} />
+        </>
+      ) : (
+        <ContextMenuItem icon={<PlayIcon />} label="启动服务" tone="success" truncate onClick={onStart} />
       )}
-
-      {/* 打开资源管理器 / 打开终端 */}
-      {cwd && (
-        <div className="py-1.5 px-1.5">
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={onOpenInExplorer}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
-          </button>
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={onOpenTerminal}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">打开终端</span>
-          </button>
-        </div>
-      )}
-
-      {/* 工具命令 */}
-      {toolCommands.length > 0 && (
-        <div className={`py-1.5 px-1.5 ${cwd ? 'border-t border-nexus-border/30' : ''}`}>
-          {toolCommands.map(cmd => (
-            <button
-              key={cmd.id}
-              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-              onClick={() => onRunCommand(cmd)}
-            >
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-                <polygon points="3,1 3,9 9,5" fill="currentColor"/>
-              </svg>
-              <span className="text-[12px] text-nexus-text truncate">{cmd.name}</span>
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* 删除 */}
-      <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-        <button
-          className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-error/10 transition-colors group text-left"
-          onClick={onDelete}
-        >
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted group-hover:text-nexus-error flex-shrink-0">
-            <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
-          </svg>
-          <span className="text-[12px] text-nexus-muted group-hover:text-nexus-error">删除服务</span>
-        </button>
-      </div>
     </div>
-  );
-};
+
+    {/* 用绑定的工具打开（服务设置中选择，如 IDEA / VS Code） */}
+    {openToolName && (
+      <div className="py-1.5 px-1.5">
+        <ContextMenuItem
+          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M2 1h6a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1z"/><path d="M1.5 6.5h7M3.5 6.5V9"/>
+          </svg>}
+          label={`用 ${openToolName} 打开`}
+          truncate
+          onClick={onOpenWithTool}
+        />
+      </div>
+    )}
+
+    {/* 打开资源管理器 / 打开终端 */}
+    {cwd && (
+      <div className="py-1.5 px-1.5">
+        <ContextMenuItem
+          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
+          </svg>}
+          label="在资源管理器中打开"
+          onClick={onOpenInExplorer}
+        />
+        <ContextMenuItem
+          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+          </svg>}
+          label="打开终端"
+          onClick={onOpenTerminal}
+        />
+      </div>
+    )}
+
+    {/* 工具命令 */}
+    {toolCommands.length > 0 && (
+      <div className={`py-1.5 px-1.5 ${cwd ? 'border-t border-nexus-border/30' : ''}`}>
+        {toolCommands.map(cmd => (
+          <ContextMenuItem
+            key={cmd.id}
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <polygon points="3,1 3,9 9,5" fill="currentColor"/>
+            </svg>}
+            label={cmd.name}
+            truncate
+            onClick={() => onRunCommand(cmd)}
+          />
+        ))}
+      </div>
+    )}
+
+    {/* 删除 */}
+    <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+      <ContextMenuItem
+        tone="danger"
+        icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3">
+          <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
+        </svg>}
+        label="删除服务"
+        onClick={onDelete}
+      />
+    </div>
+  </ContextMenu>
+);

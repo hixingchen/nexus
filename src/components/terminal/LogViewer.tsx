@@ -69,6 +69,8 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
           useLogStore.getState().setLogs(serviceKey, snapshot);
         }
       },
+      // 只留控制台：同步在轮询/状态切换时反复发生，弹 toast 会刷屏；
+      // 失败只影响这一次快照合并，下一次同步会自愈
       (e) => { console.error('同步服务日志失败:', serviceKey, e); }
     );
   }, [serviceKey]);

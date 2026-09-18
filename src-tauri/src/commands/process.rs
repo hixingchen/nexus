@@ -98,6 +98,74 @@ fn kill_then<T>(child: &mut std::process::Child, msg: String) -> Result<T, Strin
     Err(msg)
 }
 
+/// 日志批量事件的发送端：把 core 的回调接到 Tauri 事件总线上（ARCH-14 的装配点）。
+///
+/// `core::process` 不再知道 Tauri 的存在——它只收一个"把这一批发出去"的闭包；
+/// 发给谁、发失败怎么办，由这一层决定。
+fn log_sink(app: &tauri::AppHandle) -> crate::core::process::LogSink {
+    let app = app.clone();
+    Arc::new(move |payload| {
+        // 发送失败必须留痕：前端若尚未注册监听（或窗口已销毁），日志会静默消失，
+        // 用户看到的是"日志面板空着"，而控制台一条线索都没有
+        if let Err(e) = app.emit("service-log-batch", payload) {
+            log::warn!("[nexus] 服务日志批量事件发送失败（前端可能尚未注册监听）: {}", e);
+        }
+    })
+}
+
+/// 工具命令输出的共享通道：两个读取线程写入，一个发射线程取走。
+///
+/// 从 `run_tool_command` 里提出来（CQ-13：该函数原为 183 行 / 9 层嵌套）——
+/// 这组 Arc 以前是闭包捕获的，于是"读取线程怎么建""发射线程怎么建"都嵌在命令体里，
+/// 抽成结构体后两者都成了模块级函数，命令体只剩流程本身。
+struct ToolCmdOutput {
+    /// 待发行缓冲：两个读取线程共写、发射线程独取
+    pending: Arc<std::sync::Mutex<Vec<ToolCommandLogLine>>>,
+    /// 尚未结束的读取线程数：归零 = 不会再有新行
+    readers_alive: Arc<std::sync::atomic::AtomicUsize>,
+    /// 跨两个流的全局递增行号：结束时按它合并，还原 stdout/stderr 的真实交错顺序
+    seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// 一行读取线程：逐行入待发缓冲，并返回本流收集到的 (序号, 行) 供结束合并。
+///
+/// 只保留最新 `TOOL_CMD_OUTPUT_MAX_LINES` 行（全量收集在超长输出时撑爆 IPC payload）。
+fn spawn_stream_reader(
+    out: &ToolCmdOutput,
+    stream: &'static str,
+    pipe: Box<dyn std::io::Read + Send>,
+) -> std::io::Result<std::thread::JoinHandle<VecDeque<(u64, String)>>> {
+    let seq = Arc::clone(&out.seq);
+    let pending = Arc::clone(&out.pending);
+    let alive = Arc::clone(&out.readers_alive);
+    std::thread::Builder::new()
+        .name(format!("nexus-toolcmd-{stream}"))
+        .spawn(move || {
+            let reader = std::io::BufReader::new(pipe);
+            let mut collected: VecDeque<(u64, String)> = VecDeque::with_capacity(TOOL_CMD_OUTPUT_MAX_LINES);
+            for line in reader.lines() {
+                let Ok(line) = line else { continue };
+                let line = crate::core::process::truncate_line(line, 8192);
+                let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // 只入队不 emit：由发射线程按 50ms 批量发（锁中毒也继续发，
+                // 缓冲只是输出通道，不该因别的线程 panic 就吞掉已产生的行）
+                let mut p = match pending.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                p.push(ToolCommandLogLine { stream: stream.into(), data: line.clone() });
+                drop(p);
+                if collected.len() >= TOOL_CMD_OUTPUT_MAX_LINES {
+                    collected.pop_front();
+                }
+                collected.push_back((n, line));
+            }
+            // 递减必须在所有 push 之后（发射线程的收尾判据依赖这个顺序）
+            alive.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            collected
+        })
+}
+
 /// 查询服务信息（name, command, cwd, project_id, env_vars）
 fn get_service_info(db: &crate::database::Database, service_id: &str) -> Result<(String, String, String, String, String), String> {
     db.with_conn(|conn| {
@@ -118,12 +186,24 @@ pub struct ToolCommandResult {
     pub exit_code: Option<i32>,
 }
 
-/// 工具命令实时输出事件 payload（run_id 用于前端区分并发执行）
+/// 工具命令输出的单行（批量事件的元素）
 #[derive(Clone, Serialize)]
-pub struct ToolCommandLogPayload {
-    pub run_id: String,
+pub struct ToolCommandLogLine {
     pub stream: String,
     pub data: String,
+}
+
+/// 工具命令实时输出事件 payload（run_id 用于前端区分并发执行）
+///
+/// **批量而非逐行**（PERF-11）：一次 `emit` 的完整链路是 serde_json 序列化 → 拼 JS 脚本串
+/// → `EventLoopProxy` 跨线程 → 主线程 `ExecuteScript`。逐行发时 5000 行的构建输出 =
+/// 5000 次主线程脚本执行；这里与服务日志（`core/process.rs`）同口径按 50ms 一批摊平，
+/// IPC 次数从 O(行数) 降到 O(20/s)。前端本就有的 50ms 合帧只合并了 store 写入，
+/// 一行都省不掉 IPC——那一半补在这里。
+#[derive(Clone, Serialize)]
+pub struct ToolCommandLogBatchPayload {
+    pub run_id: String,
+    pub lines: Vec<ToolCommandLogLine>,
 }
 
 /// 运行中服务（含所属项目，供前端按项目维度判断运行状态）
@@ -156,7 +236,7 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
         let envs = crate::core::process::parse_env_vars(&env_vars)?;
         state.process_mgr.start(crate::core::process::ServiceSpawn {
             project_id: &project_id, service_id: &service_id, name: &name,
-            command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app_handle,
+            command: &command, cwd: &cwd, env_vars: &envs, log_sink: log_sink(&app_handle),
         }).map_err(|e| format!("服务「{}」{}", name, e))
     }).await.map_err(|e| format!("启动服务任务失败: {}", e))?
 }
@@ -181,7 +261,7 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
         let envs = crate::core::process::parse_env_vars(&env_vars)?;
         state.process_mgr.restart(crate::core::process::ServiceSpawn {
             project_id: &project_id, service_id: &service_id, name: &name,
-            command: &command, cwd: &cwd, env_vars: &envs, app_handle: &app,
+            command: &command, cwd: &cwd, env_vars: &envs, log_sink: log_sink(&app),
         }).map_err(|e| format!("服务「{}」{}", name, e))
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
@@ -221,7 +301,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
             };
             if let Err(e) = state.process_mgr.start(crate::core::process::ServiceSpawn {
                 project_id: &project_id, service_id: id, name, command: cmd, cwd,
-                env_vars: &envs, app_handle: &app_handle,
+                env_vars: &envs, log_sink: log_sink(&app_handle),
             }) {
                 errors.push(format!("{}: {}", name, e));
             }
@@ -389,49 +469,42 @@ pub async fn run_tool_command(
                 None => return kill_then(&mut child, "无法获取 stderr".to_string()),
             };
 
-            // stdout/stderr 各起一个读取线程：逐行 emit 事件 + 收集 (序号, 行)
+            // stdout/stderr 各起一个读取线程：逐行入待发缓冲 + 收集 (序号, 行)
             // 序号为全局递增计数，结束时按序号合并，还原两流的真实交错顺序
-            let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let spawn_reader = {
-                let app = app_handle.clone();
-                let run_id = run_id.clone();
-                move |stream: &'static str, pipe: Box<dyn std::io::Read + Send>| {
-                    let app = app.clone();
-                    let run_id = run_id.clone();
-                    let seq = seq.clone();
-                    std::thread::Builder::new()
-                        .name(format!("nexus-toolcmd-{stream}"))
-                        .spawn(move || {
-                            let reader = std::io::BufReader::new(pipe);
-                            // 只保留最新 N 行：全量收集在超长输出时撑爆 IPC payload
-                            let mut collected: VecDeque<(u64, String)> = VecDeque::with_capacity(TOOL_CMD_OUTPUT_MAX_LINES);
-                            for line in reader.lines() {
-                                let Ok(line) = line else { continue };
-                                let line = crate::core::process::truncate_line(line, 8192);
-                                let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = app.emit("tool-command-log", ToolCommandLogPayload {
-                                    run_id: run_id.clone(),
-                                    stream: stream.into(),
-                                    data: line.clone(),
-                                });
-                                if collected.len() >= TOOL_CMD_OUTPUT_MAX_LINES {
-                                    collected.pop_front();
-                                }
-                                collected.push_back((n, line));
-                            }
-                            collected
-                        })
-                        .map_err(|e| format!("创建{stream}读取线程失败: {}", e))
-                }
+            let out = ToolCmdOutput {
+                pending: Arc::new(std::sync::Mutex::new(Vec::new())),
+                readers_alive: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+                seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            let stdout_handle = match spawn_reader("stdout", Box::new(stdout)) {
+            let stdout_handle = match spawn_stream_reader(&out, "stdout", Box::new(stdout)) {
                 Ok(h) => h,
-                Err(e) => return kill_then(&mut child, e),
+                Err(e) => return kill_then(&mut child, format!("创建 stdout 读取线程失败: {}", e)),
             };
-            let stderr_handle = match spawn_reader("stderr", Box::new(stderr)) {
+            let stderr_handle = match spawn_stream_reader(&out, "stderr", Box::new(stderr)) {
                 Ok(h) => h,
-                Err(e) => return kill_then(&mut child, e),
+                Err(e) => return kill_then(&mut child, format!("创建 stderr 读取线程失败: {}", e)),
             };
+
+            // 批量发射线程（两个读取线程都起好后再起，避免失败路径留下孤儿线程）。
+            // 与服务日志共用 `core::process::spawn_log_flush_thread`——两条通道的突发形态
+            // 相同，且"最后一批不能丢"的不变式只该有一份实现（含测试）。
+            let flush_app = app_handle.clone();
+            let flush_run_id = run_id.clone();
+            let flush_started = crate::core::process::spawn_log_flush_thread(
+                format!("nexus-toolcmd-flush-{}", run_id),
+                Arc::clone(&out.pending),
+                Arc::clone(&out.readers_alive),
+                move |batch| {
+                    let _ = flush_app.emit("tool-command-log-batch", ToolCommandLogBatchPayload {
+                        run_id: flush_run_id.clone(),
+                        lines: batch,
+                    });
+                },
+            );
+            if let Err(e) = flush_started {
+                // 发射线程起不来 = 实时输出丢失（最终结果仍由返回值兜底）
+                return kill_then(&mut child, format!("创建输出发射线程失败: {}", e));
+            }
 
             let status = child.wait().map_err(|e| format!("等待命令退出失败: {}", e))?;
             let mut all: Vec<_> = stdout_handle.join().map_err(|_| "stdout 读取线程异常".to_string())?

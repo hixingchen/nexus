@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type FileChangeEvent } from '../../services/service';
-import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
 import { useAiPanelReserve } from '../../hooks/useAiPanelReserve';
 
@@ -73,12 +72,9 @@ export function RestartConfirm() {
       unlisten = fn;
     }).catch((e) => {
       // 订阅失败 = "改动文件后提示重启"整体失效，用户只会觉得"改了没反应"
-      console.error('订阅 file-changed 失败:', e);
-      showNotification({
-        variant: 'error',
+      reportError('订阅 file-changed 失败', e, {
         title: '文件变更订阅失败',
         description: '监听文件发生变化时将不再提示重启，请重启应用',
-        duration: 8000,
       });
     });
     return () => { disposed = true; unlisten?.(); };

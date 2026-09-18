@@ -116,11 +116,25 @@ pub fn set_service_open_tool(
 #[tauri::command]
 pub fn list_service_open_tool_bindings(state: State<AppState>, project_id: String) -> Result<Vec<ServiceOpenToolBinding>, String> {
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    state.db.with_conn(|conn| {
+    list_bindings_for_project(&state.db, &project_id)
+}
+
+/// 上面那条命令的 DB 部分（抽出来以便测试）。
+///
+/// **`AS service_id` 这个别名不是装饰**：SQLite 对 `s.id` 给出的结果列名是短名 `id`，
+/// 于是按列名取值的 `row.get("service_id")` 会返回 `InvalidColumnName`。原实现漏了别名，
+/// 后果是"项目下任何一条服务绑定了打开工具，这个命令就整体失败"——前端拿不到绑定，
+/// 右键菜单里「用 XX 打开」全空，而错误只在控制台里（直到本轮把这类失败升级成可见提示
+/// 才暴露）。**改这条 SQL 时别把别名删掉**，下方回归测试会立刻红。
+pub(crate) fn list_bindings_for_project(
+    db: &crate::database::Database,
+    project_id: &str,
+) -> Result<Vec<ServiceOpenToolBinding>, String> {
+    db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT s.id, b.tool_id FROM service_open_tools b JOIN services s ON s.id = b.service_id WHERE s.project_id=?1"
+            "SELECT s.id AS service_id, b.tool_id FROM service_open_tools b JOIN services s ON s.id = b.service_id WHERE s.project_id=?1"
         ).map_err(|e| format!("查询服务工具绑定失败: {}", e))?;
-        let rows = stmt.query_map([&project_id], |row| {
+        let rows = stmt.query_map([project_id], |row| {
             Ok(ServiceOpenToolBinding { service_id: row.get("service_id")?, tool_id: row.get("tool_id")? })
         }).map_err(|e| format!("查询服务工具绑定失败: {}", e))?;
         let mut out = Vec::new();
@@ -435,6 +449,35 @@ mod tests {
     fn test_inject_with_embedded_placeholder() {
         // 占位符嵌在 token 内也安全（argv 单元素可含空格）
         assert_eq!(inject("C:/my dir", "dir={path}"), vec!["dir=C:/my dir"]);
+    }
+
+    /// 回归：绑定查询**必须真的能读到行**。
+    ///
+    /// 这条测试守的是 `list_bindings_for_project` 的列名契约：原实现写的是
+    /// `SELECT s.id, …` 而映射用 `row.get("service_id")`，SQLite 给出的结果列名是短名
+    /// `id` → 每一行都解不出来 → 命令整体失败（"解析服务工具绑定失败: Invalid column name"）。
+    /// 只建表、不插行的测试**测不出来**（没有行就不会执行映射闭包），所以这里必须插一条绑定。
+    #[test]
+    fn test_list_bindings_maps_service_id_column() {
+        use crate::database::{init_schema, Database};
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库");
+        init_schema(&conn).expect("建表");
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path) VALUES ('p1', 'P', 'C:/p');
+             INSERT INTO services (id, project_id, name) VALUES ('s1', 'p1', 'svc');
+             INSERT INTO open_tools (id, name, executable) VALUES ('t1', 'IDEA', 'C:/idea64.exe');
+             INSERT INTO service_open_tools (service_id, tool_id) VALUES ('s1', 't1');",
+        ).expect("填测试数据");
+        let db = Database::from_connection(conn);
+
+        let rows = list_bindings_for_project(&db, "p1").expect("绑定查询不应失败");
+        assert_eq!(rows.len(), 1, "有一行绑定就必须读到一行");
+        assert_eq!(rows[0].service_id, "s1", "service_id 必须映射到服务的 id");
+        assert_eq!(rows[0].tool_id, "t1");
+
+        // 没有绑定的项目返回空表而不是报错（前端据此判断"没绑定"）
+        let empty = list_bindings_for_project(&db, "p1-none").expect("空项目不应失败");
+        assert!(empty.is_empty());
     }
 }
 

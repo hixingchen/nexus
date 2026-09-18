@@ -1,6 +1,9 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, lazy, Suspense } from 'react';
 import { EditorTabs } from '../editor/EditorTabs';
-import { CodeViewer } from '../editor/CodeViewer';
+// CodeViewer 是首屏最大的一块（CodeMirror 核心 326KB），改为按需加载（PERF-19）：
+// 未打开文件时不该为它付出解析成本（冷启动首屏实测因此少 326KB raw）。
+// 它与下方三个 Viewer 不同：那些各自很小，静态引入无妨。
+const CodeViewer = lazy(() => import('../editor/CodeViewer').then(m => ({ default: m.CodeViewer })));
 import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
@@ -26,7 +29,7 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
-import { useAiStore } from '../../stores/aiStore';
+import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
 import { serviceApi, type Service, type ServiceTemplate } from '../../services/service';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
@@ -79,7 +82,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         // useProjectDetail 的 load 里按当前项目的服务列表清理
         pruneServiceDrafts('template', list.map(t => t.id));
       })
-      .catch(e => console.error('加载模板失败:', e));
+      .catch(e => reportError('加载模板失败', e));
   }, []);
 
   useEffect(() => {
@@ -158,12 +161,13 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const openServiceEdit = useCallback((svc: Service) => {
     setEditingTemplate(null);
     setEditingService(prev => prev?.id === svc.id ? null : svc);
-  }, []);
+    // 两个 setter 都是 useState 的稳定引用（React 保证身份不变），进依赖不会导致重建
+  }, [setEditingTemplate, setEditingService]);
   // 与服务卡片一致：再次点击正在编辑的模板 → 关闭面板
   const openTemplateEdit = useCallback((tpl: ServiceTemplate) => {
     setEditingService(null);
     setEditingTemplate(prev => prev?.id === tpl.id ? null : tpl);
-  }, []);
+  }, [setEditingService, setEditingTemplate]);
 
   if (!detail) {
     return (
@@ -202,11 +206,15 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                 ) : activeTab.viewerType === 'jar' ? (
                   <JarViewer path={activeTab.path} />
                 ) : (
-                  <CodeViewer
-                    filePath={activeTab.path}
-                    editable={!activeTab.readonly}
-                    onChange={(content) => useEditorStore.getState().updateDraft(content)}
-                  />
+                  // fallback 用编辑器自身的底色占位：chunk 从本地盘加载（几十 ms），
+                  // 空白会让"打开文件"看起来像闪了一下
+                  <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                    <CodeViewer
+                      filePath={activeTab.path}
+                      editable={!activeTab.readonly}
+                      onChange={(content) => useEditorStore.getState().updateDraft(content)}
+                    />
+                  </Suspense>
                 )}
               </div>
             </>
@@ -443,12 +451,11 @@ function CollapsedView({
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
 }) {
-  // 图标亮 = 本项目的 AI 会话活跃（进程 running 且归属本项目——物理进程
-  // 跨项目单例，须用 sessionCwd 判别，进程在别的项目时不误亮）；
+  // 图标亮 = 本项目的 AI 会话活跃（判据见 selectAiRunningHere）；
   // 选中底色只表示「面板展开」：面板收起时会话照跑，此时只亮不选中（同满足两态会像被按下的开关）
-  const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
+  const aiRunning = useAiStore(selectAiRunningHere);
   /** 面板是否真的显示（安装进度会强制撑开面板，与 RestartConfirm 判定同源） */
-  const aiPanelVisible = useAiStore(s => s.panelOpen || s.installing);
+  const aiPanelVisible = useAiStore(selectAiPanelVisible);
   const toggleAi = () => useAiStore.getState().togglePanel();
   return (
     <div className="flex flex-col h-full w-full">
@@ -598,8 +605,8 @@ function ServiceSection({
 }: ServiceSectionProps) {
   // 图标亮 = 本项目的 AI 会话活跃（进程归属判别见 CollapsedView 说明）；
   // 选中底色只在面板展开时给，收起时会话照跑但只亮不选中
-  const aiRunning = useAiStore(s => s.running && s.sessionCwd === s.currentCwd);
-  const aiPanelVisible = useAiStore(s => s.panelOpen || s.installing);
+  const aiRunning = useAiStore(selectAiRunningHere);
+  const aiPanelVisible = useAiStore(selectAiPanelVisible);
   const toggleAi = () => useAiStore.getState().togglePanel();
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板

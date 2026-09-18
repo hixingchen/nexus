@@ -1,6 +1,8 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
+import { reportError } from '../../utils/error';
 import { useCallback, useEffect, useState, useRef } from 'react';
+import { useClickOutside } from '../../hooks/useClickOutside';
 
 interface TitleBarProps {
   projectName?: string | null;
@@ -17,17 +19,24 @@ export function TitleBar({ projectName }: TitleBarProps) {
     // 裸 .then 会抛未处理的 rejection，且窗口尺寸变化后状态会一直不同步
     const syncMaximized = () => {
       appWindow.isMaximized().then(v => { if (!disposed) setIsMaximized(v); })
+        // 只留控制台：影响面是标题栏图标的最大化/还原外观，弹 toast 属噪音
         .catch(e => console.error('查询窗口最大化状态失败:', e));
     };
     syncMaximized();
     appWindow.onResized(syncMaximized)
       .then(fn => { if (disposed) { fn(); return; } unlisten = fn; })
+      // 同上：订阅失败只是图标不再自动同步，用户仍能点按钮切换
       .catch(e => console.error('订阅窗口尺寸变化失败:', e));
     return () => { disposed = true; unlisten?.(); };
   }, [appWindow]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest('button, [data-menu]')) return;
+    // 收窄而不是断言（CQ-21）：mousedown 的 target 可能是**文本节点**（点中的是标题栏
+    // 里的文字），此时 `.closest` 为 undefined —— `as HTMLElement` 会让它一路跑到
+    // "closest is not a function" 的 TypeError，把标题栏拖拽整个打断。
+    // 非元素目标一律按"没点在按钮/菜单上"处理（与点空白处一致）。
+    const target = e.target;
+    if (target instanceof Element && target.closest('button, [data-menu]')) return;
     appWindow.startDragging().catch(() => { /* 非 mousedown 上下文等场景下拖动被拒绝，忽略 */ });
   }, [appWindow]);
 
@@ -69,14 +78,8 @@ function HelpMenu() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [open]);
+  // 点击菜单外部关闭（菜单内的点击由各自按钮处理）
+  useClickOutside(ref, () => setOpen(false));
 
   return (
     <div className="relative h-full" ref={ref}>
@@ -98,7 +101,7 @@ function HelpMenu() {
               try {
                 await openUrl('https://github.com/hixingchen/nexus');
               } catch (err) {
-                console.error('打开网页失败:', err);
+                reportError('打开网页失败', err);
               }
             }}
           >

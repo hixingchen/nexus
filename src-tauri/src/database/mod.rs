@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use crate::models::Service;
 
-/// 数据库放在用户目录 ~/.nexus/ 下，避免 Tauri dev watcher 检测到项目目录中的文件变化导致无限重启
+/// 数据库放在数据目录下（默认 `~/.nexus/`，可用 `NEXUS_DATA_DIR` 覆盖，见 `crate::data_dir`），
+/// 避免 Tauri dev watcher 检测到项目目录中的文件变化导致无限重启
 fn db_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let nexus_dir = home.join(".nexus");
+    let nexus_dir = crate::data_dir();
     // 目录建不出来（无写权限/磁盘只读）时打开数据库必然失败，
     // 这里直接上报真实原因，而不是让后续 open 报一句笼统的 "unable to open database file"
     std::fs::create_dir_all(&nexus_dir)
@@ -16,6 +16,18 @@ fn db_path() -> Result<PathBuf, String> {
 
 pub struct Database {
     pub conn: Mutex<Connection>,
+    /// 最近一次取到连接锁的线程标识（0 = 未记录）。仅供 `lock_conn` 的同线程重入检测使用。
+    conn_owner: std::sync::atomic::AtomicU64,
+}
+
+/// 当前线程的稳定标识：`ThreadId` 不能原子存取，故用 thread_local 懒分配一个递增序号
+fn thread_key() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static KEY: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    KEY.with(|k| *k)
 }
 
 impl Database {
@@ -23,26 +35,64 @@ impl Database {
     pub fn try_new() -> Result<Self, String> {
         let conn = Connection::open(db_path()?).map_err(|e| format!("无法打开数据库: {}", e))?;
         init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), conn_owner: std::sync::atomic::AtomicU64::new(0) })
+    }
+
+    /// 用已有连接构造（仅测试）：生产路径一律走 `try_new`。
+    /// 存在的意义是让测试不必写出字段列表——否则每加一个内部字段都要改所有测试构造点。
+    #[cfg(test)]
+    pub(crate) fn from_connection(conn: Connection) -> Self {
+        Self { conn: Mutex::new(conn), conn_owner: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// 取连接锁。**同一线程重入会被识别出来并 panic，而不是静默死锁。**
+    ///
+    /// 为什么值得专门检测：`std::sync::Mutex` 不可重入，而本项目的调用链里存在
+    /// "在 `with_conn*` 闭包内调用另一个会查库的函数"这一模式（路径/白名单校验函数最容易踩）。
+    /// 一旦发生就是**永久死锁**——闭包不返回 → 守卫不释放 → 之后所有查库命令一起卡死、
+    /// 界面冻结、只能杀进程；而 clippy、单测、类型检查**全都发现不了**。
+    /// `add_service_from_template` 就是这样踩中的（事务闭包内回调 `registered_dirs`）。
+    ///
+    /// 这里把它变成一条带修复指引的 panic：开发期一眼可见，而不是用户侧的静默冻死。
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        use std::sync::atomic::Ordering;
+        use std::sync::TryLockError;
+        match self.conn.try_lock() {
+            Ok(guard) => {
+                self.conn_owner.store(thread_key(), Ordering::Relaxed);
+                guard
+            }
+            // 锁中毒（持锁线程 panic）继续使用内部连接：与 core/process.rs::stop_all 同策略。
+            // 此前直接返回错误 → 一次 panic 会让整个数据库功能永久不可用
+            Err(TryLockError::Poisoned(poisoned)) => {
+                log::error!("数据库连接锁已中毒，继续使用: {}", poisoned);
+                self.conn_owner.store(thread_key(), Ordering::Relaxed);
+                poisoned.into_inner()
+            }
+            Err(TryLockError::WouldBlock) => {
+                if self.conn_owner.load(Ordering::Relaxed) == thread_key() {
+                    panic!(
+                        "检测到同一线程重入数据库连接锁 —— 这必然死锁。\
+                         调用链中有人在 with_conn/with_conn_mut 的闭包内又发起了查库\
+                         （常见于路径/白名单校验函数），请把那次查库移到取锁之前。"
+                    );
+                }
+                // 其他线程持有时按原语义阻塞等待
+                self.conn.lock().unwrap_or_else(|e| {
+                    log::error!("数据库连接锁已中毒，继续使用: {}", e);
+                    e.into_inner()
+                })
+            }
+        }
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-        // 锁中毒（持锁线程 panic）继续使用内部连接：与 core/process.rs::stop_all 同策略。
-        // 此前直接返回错误 → 一次 panic 会让整个数据库功能永久不可用
-        let conn = self.conn.lock().unwrap_or_else(|e| {
-            log::error!("数据库连接锁已中毒，继续使用: {}", e);
-            e.into_inner()
-        });
-        f(&conn)
+        f(&self.lock_conn())
     }
 
     /// 可变连接（事务等需要 &mut 的场景）
     pub fn with_conn_mut<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| {
-            log::error!("数据库连接锁已中毒，继续使用: {}", e);
-            e.into_inner()
-        });
-        f(&mut conn)
+        f(&mut self.lock_conn())
     }
 }
 
@@ -196,14 +246,37 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
-/// services 表按列名取值的共享 SELECT 列表（映射一律用「列名」而不是下标）。
+/// services 表的共享列清单：SELECT（读侧）与两处 INSERT（写侧）**共用这一份**。
 ///
-/// 为什么必须按列名：位置化 `row.get(N)` 一旦与 SELECT 列表顺序不一致，**不会报错**——
+/// 读侧为什么必须按列名：位置化 `row.get(N)` 一旦与 SELECT 列表顺序不一致，**不会报错**——
 /// 相邻的同类型列会被静默互换（类型正确、编译干净、测试全绿，界面显示错数据）。
-/// 加一个字段要跨 9 个文件 80 处同步，正是这种映射方式的结构成本。
+///
+/// 写侧为什么也要共用：`services` 原先有 4 份手工列清单（3 处 INSERT + 1 处 UPDATE）。
+/// 给表加一列时漏掉 `duplicate_project` 的那一份**不是报错**——新列有 DEFAULT，
+/// 复制出来的服务"新字段全是默认值"，配置与非复制版本悄悄不一致，没有任何测试会失败。
+/// 共用常量后这份清单只剩一处，配套的绑定方式见 `named_placeholders`。
 pub const SERVICE_COLUMNS: &str =
     "id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
      restart_mode, enabled, show_file_tree, sort_index, tool_commands";
+
+/// `UPDATE services` 允许改动的列（`id`/`project_id`/`sort_index` 不由更新命令改）。
+pub const SERVICE_UPDATABLE_COLUMNS: &str =
+    "name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, \
+     enabled, show_file_tree, tool_commands";
+
+/// 由列清单生成 `VALUES` 用的命名占位符（`:列名`，顺序与列清单一致）。
+///
+/// 为什么用命名参数而不是 `?1..?N`：位置化绑定下，"往列清单中间插一列"会让后面的值
+/// 整体错位——占位符个数仍然对得上，于是**静默写错列**。命名参数下漏给一个值会直接
+/// 报 `InvalidParameterName`（响亮失败），且列清单的增删与值的书写顺序解耦。
+pub fn named_placeholders(columns: &str) -> String {
+    columns.split(',').map(|c| format!(":{}", c.trim())).collect::<Vec<_>>().join(", ")
+}
+
+/// 由列清单生成 `UPDATE` 的 `SET` 片段（`列名=:列名, …`）。
+pub fn named_assignments(columns: &str) -> String {
+    columns.split(',').map(|c| { let c = c.trim(); format!("{c}=:{c}") }).collect::<Vec<_>>().join(", ")
+}
 
 /// 查询指定项目下的所有服务（共享函数，消除重复 SQL）
 pub fn query_services_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Service>, String> {
@@ -239,6 +312,40 @@ mod tests {
 
     fn in_memory() -> Connection {
         Connection::open_in_memory().expect("打开内存数据库失败")
+    }
+
+    fn db_wrapper() -> Database {
+        Database::from_connection(in_memory())
+    }
+
+    /// 同线程重入连接锁必须是**响亮失败**而不是永久死锁。
+    ///
+    /// 死锁的后果是整个应用静默冻死（闭包不返回 → 守卫不释放 → 后续所有查库命令一起卡死），
+    /// 且 clippy / 单测 / 类型检查全抓不到。`add_service_from_template` 正是这样踩中的
+    /// （事务闭包内回调 `registered_dirs`）。这条测试把该防护钉住：若哪天有人把重入检测删掉，
+    /// 这个测试会**挂住**（而不是失败）——故用独立线程 + 超时感知，见下。
+    #[test]
+    fn test_reentrant_with_conn_panics_instead_of_deadlocking() {
+        let db = db_wrapper();
+        // 在子线程里做重入：真出现死锁时只冻住子线程，主线程能超时返回、测试不至于永久挂起
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        let handle = std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = db.with_conn(|_| db.with_conn(|_| Ok::<(), String>(())));
+            }));
+            assert!(r.is_err(), "同线程重入数据库连接锁应当 panic，而不是继续执行");
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        for _ in 0..200 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "重入检测失效：子线程既没 panic 也没返回（很可能是死锁）",
+        );
+        handle.join().expect("子线程不应 panic 出测试范围");
     }
 
     /// 所有表 + 索引都在
@@ -343,6 +450,57 @@ mod tests {
         assert!(s.show_file_tree);
         assert_eq!(s.sort_index, 7);
         assert_eq!(s.tool_commands, "[{\"id\":\"c1\"}]");
+    }
+
+    /// 共享列清单必须覆盖 `services` 的**全部**列，且 UPDATE 清单必须是它的子集。
+    ///
+    /// 为什么值得一条测试：`SERVICE_COLUMNS` 现在是读侧 SELECT 与写侧两处 INSERT 的唯一来源，
+    /// 而"给表加列"（CREATE TABLE + MIGRATION_COLUMNS 各改一行）与"更新这份清单"是两处独立编辑。
+    /// 漏更新的后果**不报错**：INSERT 少写一列 → 该列取 DEFAULT，复制出来的服务配置悄悄走样，
+    /// 编译、clippy、其余测试全绿。这条测试把两处编辑绑在一起，漏了立刻红。
+    #[test]
+    fn test_service_column_lists_cover_schema() {
+        let conn = in_memory();
+        init_schema(&conn).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(services)").unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let listed: Vec<String> = SERVICE_COLUMNS.split(',').map(|c| c.trim().to_string()).collect();
+        // created_at 不进清单：它是"这行什么时候建的"，写侧一律交给 DB 默认值
+        let missing: Vec<&String> = actual
+            .iter()
+            .filter(|c| !listed.contains(c) && c.as_str() != "created_at")
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "services 新增了列 {:?}：请同步 SERVICE_COLUMNS（读侧 SELECT 与两处 INSERT 共用它），\
+             漏掉它不会报错——新列会静默取默认值",
+            missing
+        );
+
+        let updatable: Vec<&str> = SERVICE_UPDATABLE_COLUMNS.split(',').map(|c| c.trim()).collect();
+        for c in &updatable {
+            assert!(
+                listed.iter().any(|l| l == c),
+                "SERVICE_UPDATABLE_COLUMNS 里的 {:?} 不在 SERVICE_COLUMNS 中",
+                c
+            );
+        }
+        let not_updatable: Vec<&str> = listed
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|c| !updatable.contains(c))
+            .collect();
+        assert_eq!(
+            not_updatable,
+            vec!["id", "project_id", "sort_index"],
+            "UPDATE 清单之外的列变了：如果是新增列，请明确它该不该被 update_service 改写\
+             （不该改就加进本断言的期望值，该改就加进 SERVICE_UPDATABLE_COLUMNS）"
+        );
     }
 
     /// 重复初始化幂等（每次启动都会跑 init_schema）

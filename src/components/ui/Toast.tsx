@@ -1,4 +1,6 @@
 import { toast } from 'sonner';
+import { setNotifier } from '../../utils/notify';
+
 
 type ToastVariant = 'success' | 'error' | 'warning' | 'info';
 
@@ -34,6 +36,8 @@ interface ToastOptions {
   title: string;
   description?: string;
   duration?: number;
+  /** 行动按钮（如保存冲突的「重新加载」）：点了就跑，并把这条通知收掉 */
+  action?: { label: string; run: () => void };
 }
 
 /**
@@ -60,6 +64,7 @@ export function showNotification({
   title,
   description,
   duration,
+  action,
 }: ToastOptions) {
   const style = VARIANT_STYLES[variant];
   const hideAfter = duration ?? VARIANT_DURATION[variant];
@@ -82,12 +87,24 @@ export function showNotification({
           )}
         </div>
 
+        {action && (
+          <button
+            className="px-2 py-1 text-[11px] font-medium text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 flex-shrink-0 transition-colors"
+            onClick={() => { action.run(); toast.dismiss(t); }}
+          >{action.label}</button>
+        )}
+
         {copyDetail && (
           <button
             title="复制错误详情"
             className="p-1 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
             onClick={() => {
-              void navigator.clipboard.writeText(`${title}: ${description}`).catch(() => {});
+              // 静默写入：复制失败**不能**弹新通知——那会盖住用户正要复制的这条错误通知。
+              // 这里不调 utils/clipboard 的 copyText：它要弹提示就不得不 import 本文件，
+              // 于是形成 `Toast → clipboard → Toast` 的循环依赖（构建期警告 + 运行期
+              // 绑定可能是 undefined）。三行内联换一个无环的依赖图，值。
+              void navigator.clipboard.writeText(`${title}: ${description}`)
+                .catch((e) => console.warn('复制错误详情失败:', e));
             }}
           >
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -111,3 +128,9 @@ export function showNotification({
     { duration: hideAfter },
   );
 }
+
+// 注册为全局通知出口（ARCH-17）：`utils/` 与 `stores/` 不能 import 本文件，只能通过
+// `utils/notify.ts` 的端口弹提示，由这里在模块加载时把实现接上去。
+// 放在模块底部而不是某个组件里：任何 import 了本文件的地方（`MainLayout` 挂 <Toaster>）
+// 都会把它带上，不需要谁记得额外调用一次注册。
+setNotifier(showNotification);

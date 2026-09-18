@@ -1,4 +1,4 @@
-import { useAiStore } from '../stores/aiStore';
+import { useAiStore, selectAiPanelVisible } from '../stores/aiStore';
 
 /**
  * AI 面板占用的右侧宽度（逻辑像素；0 = 未占用）。
@@ -20,5 +20,6 @@ import { useAiStore } from '../stores/aiStore';
  * 期间突然跳到窗口居中再跳回来。
  */
 export function useAiPanelReserve(): number {
-  return useAiStore((s) => (s.panelOpen || s.installing ? s.panelWidth : 0));
+  // 面板是否占宽 = selectAiPanelVisible（安装进度同样撑开面板），此处只多取一个宽度
+  return useAiStore((s) => (selectAiPanelVisible(s) ? s.panelWidth : 0));
 }

@@ -46,20 +46,31 @@ interface LayoutStore {
 let pending: Record<string, string> = {};
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-function flush(): void {
+function flush(): Promise<void> {
   const patch = pending;
   pending = {};
   flushTimer = null;
-  if (Object.keys(patch).length === 0) return;
-  layoutApi.save(patch).catch((e) => reportError('保存布局失败', e, { silent: true }));
+  if (Object.keys(patch).length === 0) return Promise.resolve();
+  // 返回 Promise 而不是 fire-and-forget：退出路径必须在 `app.exit(0)` 之前确定写库完成，
+  // 否则这条 IPC 与退出流程竞争，挂起的布局改动会随进程一起消失
+  return layoutApi.save(patch).catch((e) => {
+    reportError('保存布局失败', e, { silent: true });
+  });
 }
 
-/** 立即把待写内容落库（退出前/需要确定性时用） */
-export function flushLayoutWrites(): void {
+/**
+ * 立即把待写内容落库（退出前用）。
+ *
+ * 必须 await：`app.exit(0)` 会终止 WebView，挂起的 500ms 防抖定时器永远不会执行。
+ * 原实现是 fire-and-forget 且**零调用点**——注释写着"退出前用"，但没有任何退出路径调它，
+ * 于是拖完面板宽度后 500ms 内关窗，改动就静默丢失。
+ */
+export function flushLayoutWrites(): Promise<void> {
   if (flushTimer !== null) {
     clearTimeout(flushTimer);
-    flush();
+    return flush();
   }
+  return Promise.resolve();
 }
 
 /**
@@ -101,8 +112,3 @@ export const useLayoutStore = create<LayoutStore>((set, get) => ({
   },
 }));
 
-/** 便捷读取：确保已加载后取单个键（首次调用会触发一次查库） */
-export async function readLayoutValue(key: LayoutKey): Promise<string | undefined> {
-  const values = await useLayoutStore.getState().ensureLoaded();
-  return values[key];
-}

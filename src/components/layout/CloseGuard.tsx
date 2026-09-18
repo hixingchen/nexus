@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { useEditorStore, saveAllDirtyTabs } from '../../stores/editor';
+import { useEditorStore, saveAllDirtyTabs, unsavedDraftCount } from '../../stores/editor';
 import { useServiceDraftStore } from '../../stores/serviceDraftStore';
 import { prepareExit } from '../../services/system';
+import { flushLayoutWrites } from '../../stores/layoutStore';
 import { reportError } from '../../utils/error';
 import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
@@ -32,11 +33,22 @@ export function CloseGuard() {
   /** 监听回调只注册一次，闭包里的 dirtyCount 会过期——用 ref 读最新值 */
   const dirtyRef = useRef(dirtyCount);
   dirtyRef.current = dirtyCount;
+  /**
+   * 事件回调里的"此刻"草稿数：`dirtyRef` 是渲染期快照，而大文档的编辑可能还在
+   * `CodeViewer` 的合帧窗口里（见 PERF-13）——`unsavedDraftCount()` 先结算再计数，
+   * 否则"改一下立刻点 ✕"会在计数里看不见那次改动。
+   */
+  const freshDirtyCount = () =>
+    unsavedDraftCount() + Object.keys(useServiceDraftStore.getState().drafts).length;
 
   const beginExit = useCallback(async () => {
     setAskClose(false);
     setExiting(true);
     try {
+      // 先把待写的布局改动落库再退出：布局写入有 500ms 防抖，进程退出后挂起的定时器
+      // 永不执行（拖完面板尺寸立刻关窗 = 改动丢失）。必须 await——否则这条 IPC 会与
+      // 下面的 `app.exit(0)` 竞争。
+      await flushLayoutWrites();
       await prepareExit();
       // 正常情况下不会走到这里：后端清理完成即退出进程。走到这里说明命令已受理但进程未退，
       // 保留遮罩继续等待（不要再放开界面，避免用户在半清理状态下继续操作）。
@@ -54,11 +66,15 @@ export function CloseGuard() {
       .onCloseRequested(event => {
         // 一律拦下：由这里决定"弹确认"还是"直接退出"，否则窗口会立刻销毁（草稿丢失）
         event.preventDefault();
-        if (dirtyRef.current > 0) setAskClose(true);
+        if (freshDirtyCount() > 0) setAskClose(true);
         else void beginExit();
       })
       .then(fn => { if (disposed) fn(); else unlisten = fn; })
-      .catch(e => console.error('订阅窗口关闭请求失败（未保存确认将失效）:', e));
+      .catch(e => reportError('订阅窗口关闭请求失败', e, {
+        // 这条失败用户完全无感却后果严重：关窗确认从此不再弹出，草稿会被直接丢掉
+        title: '关窗保护未生效',
+        description: '未能监听窗口关闭请求，关闭窗口时不会再有未保存确认。建议重启应用',
+      }));
     return () => { disposed = true; unlisten?.(); };
   }, [beginExit]);
 
@@ -72,11 +88,11 @@ export function CloseGuard() {
       const isCloseWin = mod && (e.key === 'w' || e.key === 'W');
       if (isCloseWin) {
         e.preventDefault();
-        getCurrentWindow().close().catch(err => console.error('请求关闭窗口失败:', err));
+        getCurrentWindow().close().catch(err => reportError('请求关闭窗口失败', err));
         return;
       }
       if (!isReload) return;
-      const dirty = dirtyRef.current;
+      const dirty = freshDirtyCount();
       if (dirty === 0) return; // 无草稿：刷新无损失，照旧放行（开发期调试也不受影响）
       e.preventDefault();
       showNotification({

@@ -82,6 +82,12 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     tokio::fs::write(&class_path, bytes).await.map_err(|e| format!("写入临时 class 失败: {}", e))?;
 
     let mut cmd = tokio::process::Command::new("java");
+    // 跳过"当前目录优先"的可执行文件搜索（SEC-14，与 `build_internal_command` 同口径）。
+    // CreateProcess 在 lpApplicationName 为空时把**父进程当前目录**排在 PATH 之前，而
+    // Nexus 的 CWD 可能是用户从某个仓库目录启动的（快捷方式"起始位置"/终端/`tauri dev`）——
+    // 那种情况下"点开仓库里的一个 .class"就会执行该目录下预置的 java.exe，用户并未表达
+    // 任何执行意图。java 由我们完全掌控、不承载用户 shell，故可以安全关掉这一级。
+    cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
     // -Xmx：CFR 对超大/畸形 class 可能持续膨胀（默认堆上限是物理内存的 1/4），
     // 256m 对正常 class 绰绰有余，超限只会让 JVM 自己 OOM 退出并走前端回退路径
     cmd.arg("-Xmx256m")

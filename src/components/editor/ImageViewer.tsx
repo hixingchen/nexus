@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { readImageData } from '../../services/editor';
+import { getExtension } from '../../utils/path';
 
 /** 扩展名 → MIME（拼 data URL 用，webview 原生解码） */
 const MIME: Record<string, string> = {
@@ -51,7 +52,7 @@ export function ImageViewer({ path, name }: { path: string; name: string }) {
     setErr(null);
     readImageData(path)
       .then(b64 => {
-        const ext = path.split('.').pop()?.toLowerCase() ?? '';
+        const ext = getExtension(path, { lower: true });
         const url = `data:${MIME[ext] ?? 'application/octet-stream'};base64,${b64}`;
         cacheSet(path, url);
         if (alive) setSrc(url);

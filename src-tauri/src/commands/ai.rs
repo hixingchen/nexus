@@ -80,8 +80,8 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             }
             // 会话工作目录 = dsh agent 的工作目录（它有文件与命令工具），必须限定在已登记
             // 项目目录内：否则一次 invoke('ai_start',{cwd:'C:\\'}) 就能在任意目录起一个
-            // 能读写文件、能执行命令的会话，绕过文件白名单（见 editor.rs 的"配置路径收口"）
-            crate::commands::editor::ensure_project_dir_allowed(&state, dir, "AI 会话工作目录")?;
+            // 能读写文件、能执行命令的会话，绕过文件白名单（见 commands/paths.rs 的"配置路径收口"）
+            state.paths.ensure_project_dir_allowed(&state.db, dir, "AI 会话工作目录")?;
         }
 
         // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
@@ -134,11 +134,24 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
 
         // 入库前复查代数：期间有 stop/新 start → 终止本次进程防幽灵
         let mut pending = Some(session);
+        // 被本次入库顶掉的旧会话（NEW-19）：必须在**锁外** stop
+        let mut displaced: Option<AiSession> = None;
         {
             let mut h = state.ai.lock().map_err(|e| format!("获取 AI 会话锁失败: {}", e))?;
             if state.ai_epoch.load(Ordering::SeqCst) == gen {
+                // 槽里可能已有**并发启动的会话**：B 在本函数开头 h.take() 时槽还是空的
+                // （A 尚未入库），而 B 卡在 ensure_workspace_active / spawn（慢盘可达秒级）
+                // 期间 A 走完启动并落了槽。此时 B 的 gen 更大、复查通过，直接 `*h = …`
+                // 会把 A 静默顶掉——而 `AiSession` 没有 Drop、其 `Child` 也不随 drop 终止，
+                // A 的 dsh web 就此成为既不进表也无人停的幽灵（端口/内存长期被占，
+                // 只在应用退出时由 Job Object 兜底）。
+                displaced = h.take();
                 *h = pending.take();
             }
+        }
+        if let Some(mut old) = displaced {
+            log::warn!("[ai] 会话槽被覆盖，终止被取代的 dsh (pid={})", old.pid);
+            old.stop();
         }
         if let Some(mut abandoned) = pending {
             log::warn!("[ai] 启动被更新的请求取代，终止本次 dsh (pid={})", abandoned.pid);

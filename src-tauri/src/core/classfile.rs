@@ -157,12 +157,40 @@ fn cp_utf8(pool: &[Option<CpEntry>], idx: u16) -> String {
     }
 }
 
+/// 单条**展示文本**的字符上限。
+///
+/// 为什么必须有：常数池里的一个 `Utf8` 最长 65535 字节，而它可以被**任意多条**字段/注解/
+/// 指令引用，每个引用在输入里只花 3~8 字节——即"输入小、输出大"的放大面。实测 81KB 的
+/// class 能渲染出 125MB 文本，几十万字节的输入就能把内存撑爆（Rust 分配失败走
+/// `handle_alloc_error` → abort，Tauri 拦不住，应用直接消失）。
+/// 4096 字符对真实代码里的标识符/字符串字面量远远够用，超出只影响构造出来的输入。
+///
+/// **只用于展示**：逻辑判断（属性名比较、常量池解析）仍走 `cp_utf8` 原文，不要在这里截断。
+const MAX_DISPLAY_CHARS: usize = 4096;
+
+/// 按**字符**（不是字节）截断展示文本，超长时附加省略标记。
+/// 返回 `Cow` 以便短字符串零拷贝。
+fn clip_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_DISPLAY_CHARS {
+        return std::borrow::Cow::Borrowed(s); // 字节数不超过上限时字符数必然也不超过
+    }
+    match s.char_indices().nth(MAX_DISPLAY_CHARS) {
+        None => std::borrow::Cow::Borrowed(s),
+        Some((cut, _)) => std::borrow::Cow::Owned(format!(
+            "{}…（已截断，原长 {} 字符）",
+            &s[..cut],
+            s.chars().count()
+        )),
+    }
+}
+
 /// 类/数组类型名：Class 条目需再解一层引用；数组描述符（如 [Ljava/lang/String;）本身是 Utf8
 fn cp_class_name(pool: &[Option<CpEntry>], idx: u16) -> String {
-    match pool.get(idx as usize).and_then(|e| e.as_ref()) {
+    let name = match pool.get(idx as usize).and_then(|e| e.as_ref()) {
         Some(CpEntry::Class(name_idx)) => cp_utf8(pool, *name_idx),
         _ => cp_utf8(pool, idx),
-    }
+    };
+    clip_display(&name).into_owned()
 }
 
 /// 方法/字段引用注释：java/lang/Object."<init>":()V
@@ -193,7 +221,7 @@ fn cp_display(pool: &[Option<CpEntry>], idx: u16) -> String {
         return String::from("<invalid>");
     };
     match e {
-        CpEntry::Utf8(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        CpEntry::Utf8(s) => format!("\"{}\"", clip_display(&s.replace('"', "\\\""))),
         CpEntry::Integer(v) => format!("int {}", v),
         CpEntry::Float(v) => format!("float {}", v),
         CpEntry::Long(v) => format!("long {}l", v),
@@ -473,8 +501,8 @@ fn literal_at(pool: &[Option<CpEntry>], idx: u16) -> String {
         Some(CpEntry::Float(v)) => format!("{}f", v),
         Some(CpEntry::Long(v)) => format!("{}L", v),
         Some(CpEntry::Double(v)) => format!("{}", v),
-        Some(CpEntry::String(i)) => format!("\"{}\"", cp_utf8(pool, *i).replace('"', "\\\"")),
-        Some(CpEntry::Utf8(s)) => format!("\"{}\"", s.replace('"', "\\\"")),
+        Some(CpEntry::String(i)) => format!("\"{}\"", clip_display(&cp_utf8(pool, *i).replace('"', "\\\""))),
+        Some(CpEntry::Utf8(s)) => format!("\"{}\"", clip_display(&s.replace('"', "\\\""))),
         _ => String::from("<invalid>"),
     }
 }
@@ -624,7 +652,7 @@ fn render_element_value(reg: &TypeRegistry, v: &ElementValue) -> String {
         ElementValue::Double(d) => format!("{}", d),
         ElementValue::Float(f) => format!("{}f", f),
         ElementValue::Long(l) => format!("{}L", l),
-        ElementValue::Str(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        ElementValue::Str(s) => format!("\"{}\"", clip_display(&s.replace('"', "\\\""))),
         ElementValue::Enum { ty, cnst } => format!("{}.{}", reg.display(ty), cnst),
         ElementValue::Class { ty } => format!("{}.class", reg.display(ty)),
         ElementValue::Ann(a) => render_annotation(reg, a),
@@ -889,6 +917,13 @@ fn push_line(lines: &mut Vec<String>, pc: i64, line: String) {
 /// 反汇编输出的总行数上限（跨方法累计）：单个 50MB class 可产出千万级指令行
 /// （放大到 GB 级文本并撑爆 IPC payload）；达到上限后以提示行收尾，不再继续放大内存。
 const MAX_DISASSEMBLE_LINES: usize = 200_000;
+
+/// 反汇编**输出总字节**上限（跨字段/方法累计）。
+///
+/// 行数上限单独不够用：一行可以很长——字段名/注解字符串/指令操作数都取自常数池，
+/// 单个 `Utf8` 最长 65535 字节。200000 行 × 65KB 仍是 GB 级。两者是**不同量纲**的护栏，
+/// 都必须有：行数限制"条数"，字节数限制"体积"。达到上限后追加一行说明并收尾。
+const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 fn disassemble_code(
     code: &[u8],
@@ -1279,24 +1314,28 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
         writeln!(out, "{} {{", decl).unwrap();
     }
 
+    let mut out_truncated = false;
     for (f_access, name_idx, desc_idx, const_val, annos) in &fields {
+        if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
         for a in annos {
             writeln!(out, "  {}", render_annotation(&reg, a)).unwrap();
         }
         let flags_str = field_flags(*f_access).join(" ").to_lowercase().replace("acc_", "");
         let prefix = if flags_str.is_empty() { String::new() } else { format!("{} ", flags_str) };
-        let t = display_type(&reg, &cp_utf8(&pool, *desc_idx));
+        let t = clip_display(&display_type(&reg, &cp_utf8(&pool, *desc_idx))).into_owned();
         let init = const_val.map(|idx| format!(" = {}", literal_at(&pool, idx))).unwrap_or_default();
-        writeln!(out, "  {}{} {}{};", prefix, t, cp_utf8(&pool, *name_idx), init).unwrap();
+        writeln!(out, "  {}{} {}{};", prefix, t, clip_display(&cp_utf8(&pool, *name_idx)), init).unwrap();
     }
 
     // 字节码输出总预算（跨方法累计）：防止超大/畸形 class 把内存与 IPC payload 放大到失控
     let mut emitted_lines: usize = 0;
     for (m_access, name_idx, desc_idx, info) in &methods {
+        if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
         let raw_name = cp_utf8(&pool, *name_idx);
-        // 构造器显示为类名（javap/IDE 同款）且无返回类型；<clinit> 保持原样
+        // 构造器显示为类名（javap/IDE 同款）且无返回类型；<clinit> 保持原样。
+        // 注意：`raw_name` 参与 `<init>` 的逻辑比较，故截断只作用于展示副本
         let is_ctor = raw_name == "<init>";
-        let display_name = if is_ctor { this_short.clone() } else { raw_name };
+        let display_name = if is_ctor { this_short.clone() } else { clip_display(&raw_name).into_owned() };
         let desc = cp_utf8(&pool, *desc_idx);
         let (ret, params) = method_desc_parts(&reg, &desc).unwrap_or((desc.clone(), vec![]));
 
@@ -1348,6 +1387,13 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
         }
     }
 
+    if out_truncated {
+        writeln!(
+            out,
+            "  // 反汇编输出已达 {} MB 上限，其余内容省略（文件可能被构造或异常巨大）",
+            MAX_OUTPUT_BYTES / 1024 / 1024
+        ).unwrap();
+    }
     writeln!(out, "}}").unwrap();
     Ok(out)
 }
@@ -1370,6 +1416,70 @@ mod tests {
         u2(name_idx, b);
         u4(data.len() as u32, b);
         b.extend_from_slice(data);
+    }
+
+    /// 手工构造"字段名极长、且被多个字段共用"的 class。
+    ///
+    /// 为什么需要它：常数池里的一个 Utf8 可以被**任意多条**字段引用，而每个引用在输入里
+    /// 只花 8 字节——一条字段的渲染成本是 `name_len` 字节，而它的输入成本只有 8 字节，
+    /// 放大倍率 ≈ `name_len / 8`。审计实测的形状是 81,594 B 的 class 渲染出 131,088,093 B
+    /// 文本（分配失败 = abort，应用直接消失）。这个 fixture 把该形状固定下来。
+    fn class_with_long_field_names(name_len: usize, field_count: u16) -> Vec<u8> {
+        let long_name = "A".repeat(name_len);
+        let mut b = vec![];
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        u2(0, &mut b); // minor
+        u2(52, &mut b); // major = Java 8
+        u2(5, &mut b); // constant_pool_count = 4 项 + 1
+        utf8("Test", &mut b); // #1
+        utf8("java/lang/Object", &mut b); // #2
+        utf8(&long_name, &mut b); // #3 —— 被所有字段共用
+        utf8("I", &mut b); // #4 字段描述符
+        u2(0x0021, &mut b); // ACC_PUBLIC | ACC_SUPER
+        u2(1, &mut b); // this_class = #1（Class 条目缺省时按 Utf8 兜底）
+        u2(2, &mut b); // super_class = #2
+        u2(0, &mut b); // interfaces_count
+        u2(field_count, &mut b);
+        for _ in 0..field_count {
+            u2(0x0001, &mut b); // ACC_PUBLIC
+            u2(3, &mut b); // name_idx → 那个超长 Utf8
+            u2(4, &mut b); // desc_idx  → "I"
+            u2(0, &mut b); // attributes_count
+        }
+        u2(0, &mut b); // methods_count
+        u2(0, &mut b); // class attributes_count
+        b
+    }
+
+    /// 超长常数池字符串不得再被逐字展开——单条展示文本按字符截断，且总输出受字节预算约束。
+    ///
+    /// 形状取自审计实测（`65535 字节字段名 × 2000 字段` = 81,594 B 输入 → 131,088,093 B 输出），
+    /// 字段数加大到 3000 以便**同时**压到两条护栏：单条截断与总字节预算。
+    #[test]
+    fn test_long_constant_pool_strings_are_clipped_in_output() {
+        // 65535 是 class 文件里单个 Utf8 的最大字节长度——这是攻击面的上界，不是随手取的大数
+        let name_len = 65_535;
+        let field_count = 3_000u16;
+        let bytes = class_with_long_field_names(name_len, field_count);
+
+        // 先证明"放大"这件事成立，否则下面的断言等于在测一个不存在的威胁
+        let naive = name_len * field_count as usize;
+        assert!(
+            naive > bytes.len() * 100,
+            "放大关系不成立：输入 {} B，未截断输出约 {} B",
+            bytes.len(),
+            naive
+        );
+
+        let out = disassemble_class(&bytes).unwrap();
+        assert!(
+            out.len() < naive / 10,
+            "输出必须被截断：实际 {} B，未截断时约 {} B",
+            out.len(),
+            naive
+        );
+        assert!(out.contains("已截断"), "单条超长字段名应带截断标记");
+        assert!(out.contains("上限，其余内容省略"), "输出总量应受字节预算约束");
     }
 
     /// 手工构造一个最小 class 文件（Java 8，Test 类，含 <init> 与行号表）

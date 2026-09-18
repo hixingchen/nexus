@@ -4,8 +4,11 @@ import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
 import { SvgIcon } from '../ui/SvgIcon';
 import { getIconSvg } from '../file-tree/FileIcons';
-import { useEditorStore, switchToTab, saveActiveFile } from '../../stores/editor';
+import { useEditorStore, switchToTab, saveActiveFile, reloadTab } from '../../stores/editor';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
+import { useClickOutside } from '../../hooks/useClickOutside';
+import { ContextMenuItem } from '../ui/ContextMenu';
+import { getExtension } from '../../utils/path';
 import type { FileTab } from '../../types/editor';
 
 export function EditorTabs() {
@@ -81,15 +84,8 @@ export function EditorTabs() {
     tabsScrollRef.current?.scrollBy({ left: dir * 300, behavior: 'smooth' });
   };
 
-  // 右键菜单：mousedown 外部点击关闭（菜单内不关，否则菜单项点击失效）
-  useEffect(() => {
-    if (!tabMenu) return;
-    const h = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setTabMenu(null);
-    };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
-  }, [tabMenu]);
+  // 右键菜单：点击外部关闭（菜单内不关，否则菜单项点击失效）
+  useClickOutside(menuRef, () => setTabMenu(null));
 
   // 单标签关闭：未保存先弹确认
   const handleCloseClick = (e: React.MouseEvent, tab: FileTab) => {
@@ -141,7 +137,6 @@ export function EditorTabs() {
 
   if (tabs.length === 0) return null;
 
-  const menuItemCls = "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors text-left disabled:opacity-40 disabled:hover:bg-transparent";
   const lastTabId = tabs[tabs.length - 1].id;
 
   return (
@@ -156,7 +151,8 @@ export function EditorTabs() {
           {tabs.map(tab => {
           const isActive = activeTabId === tab.id;
           const isDirty = dirtyIds.includes(tab.id);
-          const ext = tab.name.split('.').pop() ?? '';
+          // 不传 lower：扩展名原样交给 getIconSvg（它内部自行小写化），保持原行为
+          const ext = getExtension(tab.name);
 
           return (
             <div
@@ -239,7 +235,7 @@ export function EditorTabs() {
         <div className="flex items-center px-2 flex-shrink-0">
           <button
             className="p-1 rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted transition-colors"
-            title={activeTab?.readonly ? '文件过大，仅支持查看' : '保存当前文件（Ctrl+S）'}
+            title={activeTab?.readonly ? (activeTab.readonlyReason ?? '文件过大，仅支持查看') : '保存当前文件（Ctrl+S）'}
             disabled={dirtyIds.length === 0 || !!activeTab?.readonly}
             onClick={() => { void saveActiveFile(); }}
           >
@@ -263,8 +259,25 @@ export function EditorTabs() {
         >
           {/* 在目录树中定位（主操作，独立一组） */}
           <div className="py-1.5 px-1.5">
-            <button
-              className={menuItemCls}
+            <ContextMenuItem
+              // 色调 muted：图标恒静默。原实现按钮上没有 group 标记，图标自带的
+              // group-hover: 从未生效（原语保留这段死类、同样不加 group）
+              tone="muted"
+              icon={<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+                <path d="M10 6a4 4 0 11-1.3-2.95"/><path d="M10 1.6V4.2H7.4"/>
+              </svg>}
+              label="从磁盘重新加载"
+              // 只读标签（图片/hex/jar/超大文件/有损编码）没有"保存冲突"可言，重载也无内容可换
+              disabled={tabMenu.tab.readonly}
+              onClick={() => { void reloadTab(tabMenu.tab.id); setTabMenu(null); }}
+            />
+            <ContextMenuItem
+              tone="muted"
+              icon={<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round">
+                <path d="M6 1.5a4 4 0 00-4 4c0 2.8 4 5.5 4 5.5s4-2.7 4-5.5a4 4 0 00-4-4z"/>
+                <circle cx="6" cy="5.4" r="1.4"/>
+              </svg>}
+              label="在目录树中定位"
               onClick={() => {
                 useEditorStore.getState().requestReveal(tabMenu.tab.path);
                 setTabMenu(null);
@@ -277,42 +290,27 @@ export function EditorTabs() {
                   if (now.revealConsumedSeq < seq) {
                     showNotification({
                       title: '未定位到文件',
-                      description: '所属服务目录树未展开，请先在左侧展开对应服务再试',
+                      // 两处都能定位到它：所属服务的目录树，或项目自己的目录树（后者覆盖
+                      // 不属于任何服务的文件）。只说"展开对应服务"会让人在服务里白找
+                      description: '所属目录树未展开，请先在左侧展开对应服务或「项目目录」再试',
                     });
                   }
                 }, 400);
               }}
-            >
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-                <path d="M6 1.5a4 4 0 00-4 4c0 2.8 4 5.5 4 5.5s4-2.7 4-5.5a4 4 0 00-4-4z"/>
-                <circle cx="6" cy="5.4" r="1.4"/>
-              </svg>
-              <span className="text-[12px] text-nexus-text">在目录树中定位</span>
-            </button>
+            />
           </div>
 
-          {/* 关闭功能组 */}
+          {/* 关闭功能组。恒可用的两行显式传 disabled={false}：原 menuItemCls 里带禁用样式，
+              传了才保留同组的观感（false 不渲染 disabled 属性，行为不变） */}
           <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-            <button className={menuItemCls} onClick={() => handleMenuClose(tabMenu.tab)}>
-              <span className="text-[12px] text-nexus-text">关闭</span>
-            </button>
-            <button className={menuItemCls} disabled={tabs.length <= 1} onClick={() => handleMenuCloseOthers(tabMenu.tab)}>
-              <span className="text-[12px] text-nexus-text">关闭其他</span>
-            </button>
-            <button className={menuItemCls} disabled={lastTabId === tabMenu.tab.id} onClick={() => handleMenuCloseRight(tabMenu.tab)}>
-              <span className="text-[12px] text-nexus-text">关闭右侧</span>
-            </button>
-            <button className={menuItemCls} disabled={tabs[0].id === tabMenu.tab.id} onClick={() => handleMenuCloseLeft(tabMenu.tab)}>
-              <span className="text-[12px] text-nexus-text">关闭左侧</span>
-            </button>
+            <ContextMenuItem label="关闭" disabled={false} onClick={() => handleMenuClose(tabMenu.tab)} />
+            <ContextMenuItem label="关闭其他" disabled={tabs.length <= 1} onClick={() => handleMenuCloseOthers(tabMenu.tab)} />
+            <ContextMenuItem label="关闭右侧" disabled={lastTabId === tabMenu.tab.id} onClick={() => handleMenuCloseRight(tabMenu.tab)} />
+            <ContextMenuItem label="关闭左侧" disabled={tabs[0].id === tabMenu.tab.id} onClick={() => handleMenuCloseLeft(tabMenu.tab)} />
           </div>
           <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-            <button className={menuItemCls} disabled={!tabs.some(t => !dirtyIds.includes(t.id))} onClick={handleMenuCloseSaved}>
-              <span className="text-[12px] text-nexus-text">关闭已保存</span>
-            </button>
-            <button className={menuItemCls} onClick={handleMenuCloseAll}>
-              <span className="text-[12px] text-nexus-text">关闭所有</span>
-            </button>
+            <ContextMenuItem label="关闭已保存" disabled={!tabs.some(t => !dirtyIds.includes(t.id))} onClick={handleMenuCloseSaved} />
+            <ContextMenuItem label="关闭所有" disabled={false} onClick={handleMenuCloseAll} />
           </div>
         </div>,
         document.body,

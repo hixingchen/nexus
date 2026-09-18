@@ -80,6 +80,8 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
       statusSeq++;
       set({ running: r.running, failed: r.failed, loaded: true });
     } catch (e) {
+      // 只留控制台：3 秒轮询的后台请求，失败时保留上一次状态即可（下次轮询自愈），
+      // 弹 toast 会变成「后端一抖动就刷屏」
       console.error('获取运行状态失败:', e);
     }
   },

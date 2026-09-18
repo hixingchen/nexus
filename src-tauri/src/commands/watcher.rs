@@ -20,6 +20,29 @@ fn warn_invalid_paths(service_name: &str, paths: &[String]) {
     }
 }
 
+/// 项目显示名（监听线程把它填进事件里，前端据此显示"XX 有文件变更"）
+///
+/// 抽成一处（CQ-20）：同一条 `SELECT name FROM projects` 原先是 3 份拷贝。
+fn project_name(db: &crate::database::Database, project_id: &str) -> Result<String, String> {
+    db.with_conn(|conn| {
+        conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
+            |row| row.get("name")
+        ).map_err(|e| format!("项目不存在: {}", e))
+    })
+}
+
+/// 把文件变更事件转发给前端。
+///
+/// 为什么收成一处（CQ-20）：三条调用路径（启动监听 / 移除单服务 / 刷新服务配置）原先
+/// 各写一份 `let _ = app.emit(...)`，**全部丢弃发送结果**——前端若尚未注册监听（或已卸载），
+/// 事件静默消失，用户看到的是"改了文件却没有重启提示"，日志里一条线索都没有。
+/// 这三条路径恰恰就是那个现场。
+fn emit_file_changed(app: &AppHandle, event: FileChangeEvent) {
+    if let Err(e) = app.emit("file-changed", event) {
+        log::warn!("[nexus] 文件变更事件发送失败（前端可能尚未注册监听）: {}", e);
+    }
+}
+
 /// 从数据库读取单个服务的监听配置
 ///
 /// restart_mode=0（关闭监听）的服务不返回——与项目级加载（restart_mode>0）语义一致：
@@ -119,11 +142,7 @@ pub async fn start_watching(app: AppHandle, project_id: String, service_id: Opti
     if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let project_name: String = state.db.with_conn(|conn| {
-            conn.query_row("SELECT name FROM projects WHERE id=?1", [&project_id],
-                |row| row.get("name")
-            ).map_err(|e| format!("项目不存在: {}", e))
-        })?;
+        let project_name = project_name(&state.db, &project_id)?;
 
         let new_services = if let Some(sid) = service_id.as_deref() {
             // 单服务模式：只启动该服务的监听
@@ -160,9 +179,7 @@ pub async fn start_watching(app: AppHandle, project_id: String, service_id: Opti
             &project_id,
             &project_name,
             &merged,
-            move |event: FileChangeEvent| {
-                let _ = emit_app.emit("file-changed", event);
-            },
+            move |event: FileChangeEvent| emit_file_changed(&emit_app, event),
         )
     }).await.map_err(|e| format!("启动文件监听任务失败: {}", e))?
 }
@@ -176,22 +193,26 @@ pub(crate) fn remove_service_watch(
     project_id: &str,
     service_id: &str,
 ) -> Result<(), String> {
-    let remaining = state.file_watcher.remove_service_from_watching(project_id, service_id);
+    // 只读地算出剩余列表，**不要**先改 map 里的 services（NEW-18）：
+    // 下面的 start_watching 可能失败（剩余服务的监听路径全失效 = 磁盘上目录已不存在），
+    // 而失败时运行中的线程仍持有旧的 svc_map。若先把 map 改掉，就会出现
+    // "map 说 [T]、线程实际监听 [S,T]" 的永久分叉——改 S 的目录照样 emit，
+    // 弹出"需要重启 S"的卡片，而 S 已被删除 → 点重启必然报"服务不存在"。
+    // 提交点统一在 start_watching 末尾，失败时 map 保持原样（与旧线程一致）。
+    let Some(existing) = state.file_watcher.get_watched_services(project_id) else {
+        // 该项目本就没有在监听：无需重建，也无需 stop（幂等）
+        return Ok(());
+    };
+    let remaining: Vec<ServiceWatchConfig> = existing.into_iter().filter(|s| s.id != service_id).collect();
     if remaining.is_empty() {
         return state.file_watcher.stop_watching(project_id);
     }
-    let project_name: String = state.db.with_conn(|conn| {
-        conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
-            |row| row.get("name")
-        ).map_err(|e| format!("项目不存在: {}", e))
-    })?;
+    let project_name = project_name(&state.db, project_id)?;
     state.file_watcher.start_watching(
         project_id,
         &project_name,
         &remaining,
-        move |event: FileChangeEvent| {
-            let _ = app.emit("file-changed", event);
-        },
+        move |event: FileChangeEvent| emit_file_changed(&app, event),
     )
 }
 
@@ -220,18 +241,12 @@ pub(crate) fn refresh_service_watch(
     if updated.is_empty() {
         return state.file_watcher.stop_watching(project_id);
     }
-    let project_name: String = state.db.with_conn(|conn| {
-        conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
-            |row| row.get("name")
-        ).map_err(|e| format!("项目不存在: {}", e))
-    })?;
+    let project_name = project_name(&state.db, project_id)?;
     state.file_watcher.start_watching(
         project_id,
         &project_name,
         &updated,
-        move |event: FileChangeEvent| {
-            let _ = app.emit("file-changed", event);
-        },
+        move |event: FileChangeEvent| emit_file_changed(&app, event),
     )
 }
 

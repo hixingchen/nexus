@@ -161,12 +161,26 @@ fn atomic_write_bytes(file: &Path, content: &[u8]) -> Result<(), String> {
 /// zstd 魔数（帧头 4 字节）
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-/// 解压 zstd 数据
+/// 解压输出上限（256MB）。dsh 会话文件是流式追加的 JSONL，正常远小于此；
+/// 设限是为了让畸形/恶意输入（单个 zstd 帧可以极小的体积解出几十 GB）失败退出，
+/// 而不是把内存吃光——分配失败在 Rust 里是 abort，Tauri 拦不住，整个应用会直接消失。
+const MAX_ZSTD_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 解压 zstd 数据（输出受 [`MAX_ZSTD_DECODE_BYTES`] 约束）
 fn zstd_decode(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let mut dec = zstd::stream::Decoder::new(std::io::Cursor::new(data))
+    let dec = zstd::stream::Decoder::new(std::io::Cursor::new(data))
         .map_err(|e| format!("zstd 解压初始化失败: {}", e))?;
-    std::io::Read::read_to_end(&mut dec, &mut out).map_err(|e| format!("zstd 解压失败: {}", e))?;
+    // take(上限 + 1)：多读 1 字节用于区分"刚好等于上限"与"超过上限"
+    let mut limited = std::io::Read::take(dec, MAX_ZSTD_DECODE_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut out)
+        .map_err(|e| format!("zstd 解压失败: {}", e))?;
+    if out.len() as u64 > MAX_ZSTD_DECODE_BYTES {
+        return Err(format!(
+            "会话内容解压后超过 {} MB 上限，已跳过（文件可能损坏或被构造）",
+            MAX_ZSTD_DECODE_BYTES / 1024 / 1024
+        ));
+    }
     Ok(out)
 }
 
@@ -505,11 +519,11 @@ fn tail_text(text: &str) -> String {
 
 /// 解析版本号：主段数字逐段比较前统一补足 3 段 + 是否有预发布后缀。
 /// "v1.2.3-beta.1" → ([1,2,3], true)。解析失败 → None
-fn parse_version(raw: &str) -> Option<(Vec<u64>, bool)> {
+fn parse_version(raw: &str) -> Option<(Vec<u64>, Vec<PreId>)> {
     let s = raw.trim().trim_start_matches('v').trim_start_matches('V');
-    let (core, pre) = match s.split_once('-') {
-        Some((c, p)) => (c, !p.trim().is_empty()),
-        None => (s, false),
+    let (core, pre_raw) = match s.split_once('-') {
+        Some((c, p)) => (c, p.trim()),
+        None => (s, ""),
     };
     if core.is_empty() {
         return None;
@@ -524,6 +538,13 @@ fn parse_version(raw: &str) -> Option<(Vec<u64>, bool)> {
     while segs.len() < 3 {
         segs.push(0);
     }
+    // 预发布段：`rc.2` → [Alpha("rc"), Num(2)]。解析不出数字的段当字母段（宽松，
+    // 不为一个奇怪的后缀丢掉整个版本号）
+    let pre = pre_raw
+        .split('.')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u64>().map(PreId::Num).unwrap_or_else(|_| PreId::Alpha(p.to_ascii_lowercase())))
+        .collect();
     Some((segs, pre))
 }
 
@@ -532,13 +553,45 @@ pub fn version_cmp(a: &str, b: &str) -> Option<Ordering> {
     let (sa, pa) = parse_version(a)?;
     let (sb, pb) = parse_version(b)?;
     match sa.cmp(&sb) {
-        Ordering::Equal => match (pa, pb) {
-            (true, false) => Some(Ordering::Less),
-            (false, true) => Some(Ordering::Greater),
-            _ => Some(Ordering::Equal),
-        },
+        Ordering::Equal => Some(cmp_pre(&pa, &pb)),
         o => Some(o),
     }
+}
+
+/// 预发布段里的一个标识符：数字段按**数值**比、字母段按字典序比，且**数字 < 字母**
+/// （语义化版本规则）。
+#[derive(Debug, PartialEq, Eq)]
+enum PreId {
+    Num(u64),
+    Alpha(String),
+}
+
+/// 按语义化版本规则比较预发布段。
+///
+/// 为什么不能只看"有没有预发布后缀"：dsh 发布的全是预发布版（`0.1.5-rc.1`、`0.1.6-alpha.1`…），
+/// 只判有无的话 `0.1.5-rc.1` 与 `0.1.5-rc.2` 会判成**相等**——同一个主段内的升级永远检测不到，
+/// 用户明明装的是旧 rc，界面却说"已是最新版本"（升级按钮根本不出现）。
+fn cmp_pre(a: &[PreId], b: &[PreId]) -> Ordering {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        // 无预发布 > 有预发布：1.0.0 > 1.0.0-rc.1
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        _ => {}
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = match (x, y) {
+            (PreId::Num(n), PreId::Num(m)) => n.cmp(m),
+            (PreId::Num(_), PreId::Alpha(_)) => Ordering::Less,
+            (PreId::Alpha(_), PreId::Num(_)) => Ordering::Greater,
+            (PreId::Alpha(s), PreId::Alpha(t)) => s.cmp(t),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    // 公共前缀全同：段数少的更小（1.0.0-rc < 1.0.0-rc.1）
+    a.len().cmp(&b.len())
 }
 
 /// 从命令输出中提取第一个形如 x.y.z（可带 v 前缀/预发布后缀）的版本号
@@ -757,7 +810,38 @@ fn stderr_summary(tail: &Arc<Mutex<String>>) -> String {
 /// 但环回端口上的对端不一定是 dsh——端口被别的进程占用时，`read_to_end` 会一直读到对方
 /// 关闭连接为止，把任意大小的数据读进内存（且有 3s 读超时也拦不住持续输出的流）。
 /// 超限即按"响应不可信"处理，直接放弃这次探测（调用方本就有超时兜底）。
+///
+/// **只适用于小响应**（握手 + 那一小段 HTML）。要读 body 的请求别用这条口径：
+/// 插件 bundle 是 JS 资源、有好几 MB，用 2MB 上限去量它只会**每次都判不可信**
+/// （曾经就是这样——见 `raw_get_status`）。
 const RAW_GET_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 只取状态行的裸 GET（`Connection: close`）——给"只需知道对方是不是 200"的探测用。
+///
+/// 为什么不复用 `raw_get`：它会把整个 body 读进内存并受 `RAW_GET_MAX_BYTES` 限制，
+/// 而**插件 bundle 是好几 MB 的 JS**——于是那条探测每次都撞上限、必然判为不可信，
+/// 8 秒轮询窗口被白烧光（日志实测：每次会话启动都比 dsh 就绪晚 **8.1 秒**，
+/// 之后才由前端刷新兜底）。这里只读到状态行，body 一个字都不读（调用方本来也不用）。
+fn raw_get_status(port: u16, path: &str, cookie: Option<&str>) -> Option<u16> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(AiTimeouts::LOOPBACK_READ)).ok()?;
+    let mut req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
+        path, port
+    );
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: {}\r\n", c));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    // take(8KB)：状态行 + 头只有几百字节，这个上限只为挡住"端口上其实是别的进程"时
+    // 那条没有换行的长行（read_line 会一直长下去）。body 不在读取范围内。
+    let mut reader = BufReader::new(Read::take(&mut stream, 8 * 1024));
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
 
 /// 一次裸 HTTP GET（Connection: close），返回 (状态行, headers, body)
 fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, String)> {
@@ -826,11 +910,13 @@ fn wait_plugins_ready(port: u16, token: &str) {
         return;
     };
 
-    // 3. 轮询 bundle 直到 200 / 超时（退避：首测常在几百毫秒内就绪，固定 200ms 会白等）
+    // 3. 轮询 bundle 直到 200 / 超时（退避：首测常在几百毫秒内就绪，固定 200ms 会白等）。
+    //    用 `raw_get_status` 而不是 `raw_get`：bundle 是好几 MB 的 JS，把 body 读进来
+    //    既慢又会撞 2MB 上限判成"不可信"——那样这条探测永远不可能成功（见该函数的说明）。
     let mut backoff = Duration::from_millis(50);
     loop {
-        match cookie.as_ref().and_then(|c| raw_get(port, &bundle_path, Some(c))) {
-            Some((200, _, _)) => {
+        match cookie.as_ref().and_then(|c| raw_get_status(port, &bundle_path, Some(c))) {
+            Some(200) => {
                 // 用 start 时刻计时：deadline 是未来时刻，deadline.elapsed() 恒为 0
                 log::info!("[ai] 插件 bundle 就绪（{}ms）", started.elapsed().as_millis());
                 return;
@@ -1037,6 +1123,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ── 插件就绪探测 ─────────────────────────────────────
+
+    /// 回归：插件 bundle 是好几 MB 的 JS，探测**必须只看状态行**。
+    ///
+    /// 老实现用 `raw_get`（把 body 整读进内存 + 2MB 上限），于是每次会话启动都判
+    /// "响应不可信" → 8 秒轮询窗口被白烧光（日志实测 10:40.281 就绪 → 10:48.443 超时，
+    /// 每次差值 8.1s）。这条测试用"状态行 + 2.5MB body"的假服务端把该契约钉住。
+    #[test]
+    fn test_raw_get_status_ignores_large_body() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 随机端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let writer = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2621440\r\n\r\n");
+                let chunk = vec![b'x'; 64 * 1024];
+                // 读端只取状态行后就关闭连接 → 这里的写会失败并退出循环（不会挂住 join）
+                for _ in 0..40 {
+                    if s.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            raw_get_status(port, "/plugins/??@deepseek-ai/dsh&rev=abc", None),
+            Some(200),
+            "body 再大也不该影响状态判定"
+        );
+        let _ = writer.join();
+    }
+
     // ── 版本解析 / 比较 ──────────────────────────────────
 
     #[test]
@@ -1060,6 +1178,31 @@ mod tests {
         assert_eq!(version_cmp("1.2.3-beta", "0.9.0"), Some(Ordering::Greater));
         // 解析失败
         assert_eq!(version_cmp("abc", "1.0.0"), None);
+    }
+
+    /// 同一主段的两个预发布版必须能分出先后。
+    ///
+    /// 这条是**真缺陷的回归测试**：原实现只记录"有没有预发布后缀"这一个布尔，
+    /// 于是 `0.1.5-rc.1` 与 `0.1.5-rc.2` 判成相等 → "检查更新"永远显示已是最新，
+    /// 而 dsh 发布的全是预发布版（rc/alpha），等于同主段内的升级全部检测不到。
+    #[test]
+    fn test_version_cmp_prerelease_ordering() {
+        use std::cmp::Ordering;
+        // 实际会遇到的形状
+        assert_eq!(version_cmp("0.1.5-rc.1", "0.1.5-rc.2"), Some(Ordering::Less));
+        assert_eq!(version_cmp("0.1.5-rc.2", "0.1.5-rc.1"), Some(Ordering::Greater));
+        assert_eq!(version_cmp("0.1.5-rc.10", "0.1.5-rc.9"), Some(Ordering::Greater), "数字段按数值比，不是字典序");
+        // 字母段按字典序：alpha < beta < rc
+        assert_eq!(version_cmp("0.1.5-alpha.2", "0.1.5-rc.1"), Some(Ordering::Less));
+        assert_eq!(version_cmp("0.1.5-rc.1", "0.1.6-alpha.1"), Some(Ordering::Less), "主段优先于预发布段");
+        // 段数不同：1.0.0-rc < 1.0.0-rc.1
+        assert_eq!(version_cmp("1.0.0-rc", "1.0.0-rc.1"), Some(Ordering::Less));
+        // 数字段 < 字母段（语义化版本规则）
+        assert_eq!(version_cmp("1.0.0-1", "1.0.0-alpha"), Some(Ordering::Less));
+        // 完全相同
+        assert_eq!(version_cmp("0.1.5-rc.2", "0.1.5-rc.2"), Some(Ordering::Equal));
+        // 大小写不敏感（同一版本的两种写法不该判成有新旧）
+        assert_eq!(version_cmp("0.1.5-RC.2", "0.1.5-rc.2"), Some(Ordering::Equal));
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import { useAiStore, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
+import { useAiStore, selectAiRunningHere, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
 import { useUiStore } from '../../stores/uiStore';
 import { aiService } from '../../services/aiService';
 import { reportError } from '../../utils/error';
@@ -53,12 +53,47 @@ let lastFocusCmdAt = 0;
 
 /**
  * 面板收起（显隐模式：只移屏不销毁）期间的重贴暂停标志：WebView 保留在屏外
- * （-20000,0），窗口事件/宽度变化触发的重贴一律短路，防把隐藏的 WebView 贴回
+ * （OFFSCREEN_X），窗口事件/宽度变化触发的重贴一律短路，防把隐藏的 WebView 贴回
  * 可见区。单实例组件，模块级安全。
  */
 let wvHidden = false;
 
 interface Bounds { x: number; y: number; width: number; height: number }
+
+/**
+ * 子 WebView 的屏外停靠横坐标（逻辑像素）。
+ *
+ * 原实现把这个值硬编码在 5 处。量级要求是"远到任何窗口摆放都落在屏外"：多屏虚拟
+ * 桌面允许负坐标（副屏在主屏左侧时窗口 x 可以是负的），-2000 级仍有落在屏内的可能，
+ * -20000 是既有实现验证过的量级。
+ */
+const OFFSCREEN_X = -20000;
+
+/**
+ * 把子 WebView 移到屏外停靠位。
+ *
+ * 失败只留一行控制台线索，不弹 toast：这里的 catch 是"移屏失败 → WebView 浮在弹窗/
+ * 收起的面板之上"这一症状的唯一观测点，静默吞掉则现场毫无线索；但移屏失败在关闭
+ * 路径上是常见瞬态（WebView 已在销毁），弹通知会在关面板时刷屏——观测量小、噪音成本高，
+ * 所以只进控制台。
+ */
+function parkOffscreen(wv: Webview): void {
+  void wv.setPosition(new LogicalPosition(OFFSCREEN_X, 0)).catch((e) => {
+    console.warn(`AI 面板子 WebView(${wv.label}) 移出屏幕失败（可能仍浮在界面上）:`, e);
+  });
+}
+
+/**
+ * 关闭子 WebView（清理路径专用）。
+ *
+ * 同样不弹 toast：调用点都在销毁/放弃创建的分支上，失败时用户已经看不到副作用
+ * （页面本就不该展示），能做的只有留下控制台线索。
+ */
+async function closeQuietly(wv: Webview): Promise<void> {
+  await wv.close().catch((e) => {
+    console.warn(`AI 面板子 WebView(${wv.label}) 关闭失败（原生层可能残留）:`, e);
+  });
+}
 
 /**
  * WebView 铺位同步器：高频调用（拖拽 60fps）下的 IPC 合入器。
@@ -122,9 +157,8 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const lastError = useAiStore((s) => s.lastError);
   /** dsh 安装/升级进行中（错误卡与更新弹窗共用的安装入口，进度统一显示在面板主体） */
   const installing = useAiStore((s) => s.installing);
-  /** 本项目的会话是否活跃（进程 running 且归属本项目 —— 物理进程跨项目单例，
-   *  展示层必须用 sessionCwd 判别，避免「进程在别的项目」时误亮/误显示） */
-  const runningHere = useAiStore((s) => s.running && s.sessionCwd === s.currentCwd);
+  /** 本项目的会话是否活跃（进程 running 且归属本项目；判据见 selectAiRunningHere） */
+  const runningHere = useAiStore(selectAiRunningHere);
   /** 是否有全局弹窗打开（添加服务/工具库/更新等）——打开时子 WebView 移出屏幕 */
   const anyModalOpen = useUiStore((s) => s.modalCount > 0);
 
@@ -173,8 +207,8 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     if (wv) {
       // 先移出可视区再 close：close 是异步的（且可能失败/卡顿），
       // 移屏保证「关闭」在视觉上立即成立，残留只可能是屏外无感句柄
-      void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
-      void wv.close().catch(() => {});
+      parkOffscreen(wv);
+      void closeQuietly(wv);
     }
     for (const un of unlistenWinRef.current) un();
     unlistenWinRef.current = [];
@@ -186,7 +220,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const hideWv = () => {
     wvHidden = true;
     const wv = wvRef.current;
-    if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+    if (wv) parkOffscreen(wv);
   };
 
   /** 显隐模式的「显示」：移回槽位（两帧后重贴，等面板宽度过渡布局稳定） */
@@ -229,14 +263,20 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     }
   }, [panelOpen, runningHere, url, cwd, lastError, starting, projectName]);
 
-  // 关闭兜底：无论什么状态（含 installing 撑宽分支/拖拽残留），关闭必达——
-  // 以 DOM 为最终裁决强制收 0，杜绝「点了关闭面板还在」
+  // 关闭兜底：以 DOM 为最终裁决强制收 0，杜绝「点了关闭面板还在」（拖拽残留也算）。
+  //
+  // **但 installing 期间不兜底**：安装/更新会先把进度显示在面板主体上（`installing` 撑住宽度），
+  // 而**升级路径还必须先 `stop()`**（Windows 文件锁），stop 会把 `panelOpen` 置 false——
+  // 原来这条无视 installing 直接收 0，于是"一点更新面板就没了"、进度卡根本没机会显示。
+  // 安装路径没有 stop，所以看不到这个现象（用户实测正是这样报告的）。
+  // 用户自己按 ✕ 的场合不受影响：`handleHide` 会先把 installing 置 false 再收面板，
+  // 两个都为 false，这条照样生效（关闭必达）。
   useEffect(() => {
-    if (!panelOpen) {
+    if (!panelOpen && !installing) {
       manualWRef.current = null;
       if (dockRef.current) dockRef.current.style.width = '0px';
     }
-  }, [panelOpen]);
+  }, [panelOpen, installing]);
 
   // 仅当进程归属本项目时才展示其页面（sessionCwd 判别）
   const showFrame = runningHere && !!url;
@@ -275,7 +315,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           // 创建期间被收起/切项目/刷新 → 不展示过期页面，自毁
           sync.dispose();
           for (const un of unlistens) un();
-          await wv.close().catch(() => {});
+          await closeQuietly(wv);
           return;
         }
         wvRef.current = wv;
@@ -284,7 +324,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
         unlistenWinRef.current = unlistens;
         // 弹窗打开期间创建的 WebView：创建后立即贴屏外（初始定位会瞬时可见，
         // 创建完成即移走；弹窗期间的重建场景极少，可接受）
-        if (modalPause) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+        if (modalPause) parkOffscreen(wv);
         setWvReady(true);
       } catch (e) {
         setWvError(e instanceof Error ? e.message : String(e));
@@ -309,7 +349,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     modalPause = anyModalOpen;
     if (anyModalOpen) {
       const wv = wvRef.current;
-      if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
+      if (wv) parkOffscreen(wv);
     } else {
       const sync = syncRef.current;
       const slot = slotRef.current;
@@ -439,13 +479,50 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     // 先移屏再收宽度：原生 WebView 盖在 DOM 之上，宽度收起的瞬间主内容区立即
     // 扩展，若 WebView 还贴在原位置会短暂浮在扩展区上（闪烁）——先让它离开视线
     const wv = wvRef.current;
-    if (wv) void wv.setPosition(new LogicalPosition(-20000, 0)).catch(() => {});
-    if (st.installing) st.setInstalling(false);
+    if (wv) parkOffscreen(wv);
+    if (st.installing) {
+      // 安装期间用户自己关的：装完**不要**擅自把面板弹回来（那会覆盖用户的明确动作），
+      // 但会话该回来还是要回来——见 restoreAfterInstall
+      hiddenByUserRef.current = true;
+      st.setInstalling(false);
+    }
     st.setPanelOpen(false);
   };
 
   /** 未检测到 dsh（AI 引擎未安装）：错误卡换成「安装」引导而非终端命令提示 */
   const dshMissing = lastError != null && lastError.includes('未检测到 dsh');
+
+  /**
+   * 本次安装期间**用户自己**按过 ✕ 吗（`handleHide` 置位，`handleInstallDsh` 开头重置）。
+   *
+   * 用它把两种"面板是关着的"区分开：`stop()` 收的（要恢复）vs 用户自己关的（不要动）。
+   * 用 ref 而不是 state：它只在异步收尾里被读，不需要触发重渲染。
+   */
+  const hiddenByUserRef = useRef(false);
+
+  /**
+   * 安装/升级的收尾：**把"面板显隐"与"会话要不要回来"当成两件事**。
+   *
+   * 为什么要分开：`stop()`（升级前必须停会话，Windows 文件锁）会把面板一起收掉，
+   * 但用户也可能**在安装期间自己按 ✕**——`handleHide` 的注释写着"安装期间也收
+   * （进度卡让位）：后端升级不可中断，完成后仍弹成功通知"，即用户的关闭应当被尊重。
+   * 原来无条件 `setPanelOpen(true)` 会把它弹回来，等于覆盖用户的明确动作。
+   *
+   * 而 ✕ 的语义是"隐藏面板，会话保留"（见 `aiStore.togglePanel` 的注释），
+   * 所以**就算面板不恢复，升级前在跑的会话也必须带回来**，否则 AI 会静默死掉。
+   */
+  const restoreAfterInstall = (wasOpen: boolean, sessionWasStopped: boolean) => {
+    const s = useAiStore.getState();
+    const wantPanel = wasOpen && !hiddenByUserRef.current;
+    if (wantPanel && !s.panelOpen) {
+      // 面板被 stop() 收掉了、但它该开 → 恢复展开（setPanelOpen 内部会 ensureRunning）
+      void s.setPanelOpen(true);
+    } else if (s.currentCwd && (wantPanel || sessionWasStopped)) {
+      // 面板已经开着（错误卡场景：装完接着启会话，ensureRunning 开头会清掉旧 lastError）
+      // 或：面板被用户自己收掉、但升级前有会话在跑 → 只把会话带回来，面板保持收起
+      void s.ensureRunning(s.currentCwd, s.currentName);
+    }
+  };
 
   /**
    * 安装/升级 dsh 的唯一执行入口（错误卡「安装 dsh」与更新弹窗「升级到 vX」
@@ -457,25 +534,25 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const handleInstallDsh = async () => {
     if (useAiStore.getState().installing) return;
     const wasOpen = useAiStore.getState().panelOpen; // 安装前记住面板状态（升级需停会话会收面板）
+    hiddenByUserRef.current = false;                 // 新一轮安装：重新计"用户是否自己关过"
     useAiStore.getState().setInstalling(true);
+    // 升级前有会话在跑 → 它会被 stop() 停掉，收尾时必须带回来（见 restoreAfterInstall）
+    const sessionWasStopped = useAiStore.getState().running || useAiStore.getState().starting;
     try {
       const st = useAiStore.getState();
-      if (st.running || st.starting) await st.stop();
+      if (sessionWasStopped) await st.stop();
       await aiService.upgrade();
       useAiStore.getState().setInstalling(false);
       showNotification({ variant: 'success', title: 'dsh 安装完成', duration: 3000 });
-      const s2 = useAiStore.getState();
-      if (wasOpen && !s2.panelOpen) {
-        // 升级场景：stop() 收过面板 → 恢复展开（含占用记忆）并启会话
-        void s2.setPanelOpen(true);
-      } else if (s2.currentCwd) {
-        // 面板一直开着（错误卡场景）：直接启会话——ensureRunning 开头会清掉
-        // 启动失败留下的 lastError，错误卡自然过渡到会话，不残留旧错误
-        void s2.ensureRunning(s2.currentCwd, s2.currentName);
-      }
+      restoreAfterInstall(wasOpen, sessionWasStopped);
     } catch (e) {
       useAiStore.getState().setInstalling(false);
       reportError('dsh 安装/升级失败', e, { duration: 8000 });
+      // 失败也必须收尾（原来只在成功分支做）：升级前若会话在跑，`stop()` 已经把面板收掉，
+      // 而**失败时用户最需要的就是回到面板**——看失败原因、或点「安装 dsh」重试。
+      // 不恢复的话现象就是"点升级 → 面板消失"，只剩一条会飘走的 toast。
+      // 会话照常带回来：dsh 还能用就继续跑，起不来则落到错误卡（带原因与重试入口）。
+      restoreAfterInstall(wasOpen, sessionWasStopped);
     }
   };
 
@@ -574,7 +651,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           {installing ? (
             <div className="h-full flex flex-col items-center justify-center gap-3 text-nexus-muted">
               <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
-              <p className="text-[12px] select-none">正在安装 dsh…（需联网，约 1~2 分钟）</p>
+              <p className="text-[12px] select-none">正在安装 / 更新 dsh…（需联网，约 1~2 分钟）</p>
             </div>
           ) : lastError ? (
             <PanelMessage
@@ -698,6 +775,8 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
       if (Date.now() - lastFocusCmdAt < 500) return; // 节流：防焦点流转链重复触发
       lastFocusCmdAt = Date.now();
       if (Date.now() - lastParentFocusAt < 2000) return; // 主界面刚被操作，不抢
+      // 只留控制台：焦点流转触发的自动行为（已节流 + 防抢），失败时面板只是没抢到焦点，
+      // 弹 toast 会在切换窗口时反复打扰
       void aiService.focusPanel(appWindow.label, label).catch((e) => console.error('恢复 dsh 焦点失败:', e));
     }, 150);
   }));

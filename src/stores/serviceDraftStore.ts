@@ -60,10 +60,6 @@ export function readServiceDraft(key: string): ServiceFormDraft | undefined {
   return useServiceDraftStore.getState().drafts[key];
 }
 
-/** 未保存的表单草稿数量（关窗确认用：面板里的改动同样会随进程退出消失） */
-export function serviceDraftCount(): number {
-  return Object.keys(useServiceDraftStore.getState().drafts).length;
-}
 
 /**
  * 清理已不存在的编辑目标留下的草稿（服务/模板被删除后）。

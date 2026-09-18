@@ -14,6 +14,20 @@ export default defineConfig(async () => ({
   clearScreen: false,
   build: {
     rollupOptions: {
+      /**
+       * 构建警告即失败：把"0 警告"从口头约定变成硬门禁。
+       *
+       * 为什么值得（本轮实测的教训）：README 与审计报告的附录 B 都写着"vite build 0 警告"，
+       * 而工作区实际有 2 条（`@codemirror/lang-javascript`/`lang-css` 同时被静态与动态引用，
+       * 动态那半拆不出 chunk、纯属无效）。**声称的口径与实际不符而无人发现**——正是这份
+       * 审计报告反复点名的失败模式。这里让它不可能再静默存在。
+       *
+       * 若将来某个依赖发出无法消除的警告，应在此显式列出豁免并写明理由，
+       * 而不是把 `throw` 改成 `console.warn` 把门禁关掉。
+       */
+      onwarn(warning: { message: string }) {
+        throw new Error(`构建出现警告（基线是 0，见 vite.config.ts 的说明）：${warning.message}`);
+      },
       output: {
         /**
          * vendor 分包：把体积大、变更少的依赖拆成独立 chunk。

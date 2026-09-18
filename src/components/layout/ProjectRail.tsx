@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { projectApi, type Project } from '../../services/service';
 import { useRunningStore } from '../../stores/runningStore';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
+import { reportError } from '../../utils/error';
+import { needsFavoriteDivider } from '../../utils/projectList';
 
 /**
  * 项目列收起后的窄轨（32px）。
@@ -27,7 +29,7 @@ export function ProjectRail({ selectedId, onSelect, onExpand }: {
     let alive = true;
     projectApi.getAll()
       .then(list => { if (alive) setProjects(list); })
-      .catch(e => console.error('收起态加载项目列表失败:', e));
+      .catch(e => reportError('加载项目列表失败', e));
     return () => { alive = false; };
   }, []);
 
@@ -46,26 +48,33 @@ export function ProjectRail({ selectedId, onSelect, onExpand }: {
       </div>
 
       <div className="flex-1 flex flex-col items-center gap-1 overflow-y-auto py-2">
-        {projects.map(p => {
+        {projects.map((p, i) => {
           const active = isRunning(p.id);
           const selected = selectedId === p.id;
           return (
-            <button
-              key={p.id}
-              onClick={() => onSelect(p)}
-              className={`relative w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 text-[11px] font-medium transition-colors ${
-                selected
-                  ? 'bg-nexus-accent/15 text-nexus-accent'
-                  : 'text-nexus-muted/80 hover:bg-nexus-hover/50 hover:text-nexus-text'
-              }`}
-              title={`${p.name}${p.path ? ` · ${p.path}` : ''}${active ? '（运行中）' : ''}`}
-            >
-              {Array.from(p.name.trim())[0]?.toUpperCase() ?? '?'}
-              {/* 运行指示：右下角小圆点（同服务列的状态点语言） */}
-              {active && (
-                <span className="absolute right-0 bottom-0 w-[6px] h-[6px] rounded-full bg-nexus-success ring-2 ring-nexus-surface" />
+            // 收藏与其余之间一条横线：窄轨里收藏本来就排在前（DB 按 pinned DESC 排序），
+            // 但没有边界就看不出"从哪一格开始不是收藏"——完整列表那边有「收藏夹」标题，
+            // 两个视图对同一个概念的表达要一致（边界条件见 needsFavoriteDivider）
+            <Fragment key={p.id}>
+              {needsFavoriteDivider(projects, i) && (
+                <div className="w-4 h-px bg-nexus-border flex-shrink-0" />
               )}
-            </button>
+              <button
+                onClick={() => onSelect(p)}
+                className={`relative w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 text-[11px] font-medium transition-colors ${
+                  selected
+                    ? 'bg-nexus-accent/15 text-nexus-accent'
+                    : 'text-nexus-muted/80 hover:bg-nexus-hover/50 hover:text-nexus-text'
+                }`}
+                title={`${p.name}${p.path ? ` · ${p.path}` : ''}${active ? '（运行中）' : ''}`}
+              >
+                {Array.from(p.name.trim())[0]?.toUpperCase() ?? '?'}
+                {/* 运行指示：右下角小圆点（同服务列的状态点语言） */}
+                {active && (
+                  <span className="absolute right-0 bottom-0 w-[6px] h-[6px] rounded-full bg-nexus-success ring-2 ring-nexus-surface" />
+                )}
+              </button>
+            </Fragment>
           );
         })}
       </div>

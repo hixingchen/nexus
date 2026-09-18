@@ -1,0 +1,115 @@
+name: CI
+
+# 门禁：把 README「校验」节里那四条命令变成**机械拦截点**。
+#
+# 为什么必须有（审计 CQ-23）：本项目的缺陷大多不是"编译不过"，而是
+# 编译干净 + 类型干净 + 界面表现为"某个字段莫名其妙是空的"——
+# P0-4（事务内重入锁）、NEW-20（丢弃 stop 失败）、NEW-21（零调用的 flush）
+# 这三条里没有一条会被人眼或编译器拦下。门禁的存在不改变"必须在真机上跑一次
+# 主路径"这条铁律，它挡的是**复发**。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 权限最小化：CI 只需要读代码
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    # windows-latest 而不是 ubuntu：这是 Windows 应用（Job Object / taskkill /
+    # WebView2 / FILE_FLAG_BACKUP_SEMANTICS），在 Linux runner 上
+    # `#[cfg(windows)]` 分支全被 cfg 掉——测了等于没测
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # `-D warnings`：把"0 警告"从口头约定变成硬门禁。警告会累积——
+      # 上一轮正是因为基线是 0，才把新引入的 2 条当回归查出并清掉
+      - name: clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 不需要先构建前端：实测 `cargo check/test --lib` 在 `dist/` 缺失时也能编译
+      # （`generate_context!` 不在编译期嵌入前端资源）
+      - name: 单元测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 含 vite.config.ts（tsconfig 的 include 已把它纳入 program）——
+      # manualChunks 的键名写错不会有编译错误，只会在构建期被静默忽略（分包失效）
+      - name: 类型检查（0 错误）
+        run: pnpm exec tsc --noEmit
+
+      # `--max-warnings` 是**递减基线**：当前 6 条存量 exhaustive-deps 告警是刻意保留的
+      # （每处都要单独判断"依赖是真漏了还是故意不写"），但新代码不该再增加。清掉一条就下调一次。
+      - name: lint（0 错误 / ≤6 告警）
+        run: pnpm run lint
+
+      # 前端测试（node --test，零新依赖）：utils 纯逻辑 + editor store 的草稿状态机
+      - name: 前端测试
+        run: pnpm test
+
+      - name: 构建（0 警告）
+        run: pnpm exec vite build
+
+  # 依赖漏洞：与上两个 job 分开，失败点可归因（是依赖有问题，不是本次改动）
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 用 CLI 而不是 rustsec/audit-check action：后者的 issue/SARIF 上报需要额外的
+      # `issues: write` 权限，权限没配对时会以"CI 红但没漏洞"的形式误导。这里只要一条
+      # 能本地复跑的命令（`cargo install cargo-audit --locked && cargo audit`）。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}
+      - name: cargo audit
+        working-directory: src-tauri
+        run: |
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          cargo audit
+
+      - run: pnpm install --frozen-lockfile
+      # **必须显式指定 registry**：仓库的 .npmrc 指向 npmmirror（国内镜像），而它没有实现
+      # audit 端点 —— 不指定会得到 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS（红得莫名其妙）
+      - name: pnpm audit（high 及以上）
+        run: pnpm audit --registry=https://registry.npmjs.org/ --audit-level high

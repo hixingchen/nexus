@@ -81,6 +81,26 @@ function trimByBytes(lines: ServiceLogLine[], total: number): { lines: ServiceLo
   return { lines: lines.slice(drop), bytes: total - removed };
 }
 
+/**
+ * 把一行日志并入目标数组：`\r` 开头的行是单行刷新（webpack 进度条等），**就地替换队尾**
+ * 而不是追加，避免每帧占一行。
+ *
+ * 判据含三个条件、缺一不可，第三个最容易被漏：`\r` 开头、队尾存在、**stream 相同**
+ * （与后端 push_log_line 同口径）——队尾若是 system 行（"已启动"/退出码）或 stderr 行，
+ * stdout 的进度帧不能把它覆盖掉，否则会改写系统行的语义与颜色。
+ *
+ * 返回被替换掉的旧队尾（调用方要据此结算字节差值）；未命中刷新帧时返回 null 且**不动
+ * 目标数组**——"追加"与"满上限冻结"的策略在两个视图里不同，由调用方决定。
+ * 跟随视图与暂停视图共用本函数：原先两份拷贝，任一边漏改都会造成"只在暂停态复现"
+ * 的诡异渲染（CQ-19）。
+ */
+function mergeRefreshFrame(target: ServiceLogLine[], line: ServiceLogLine): ServiceLogLine | null {
+  const tail = target[target.length - 1];
+  if (!line.text.startsWith('\r') || !tail || tail.stream !== line.stream) return null;
+  target[target.length - 1] = { ...tail, seq: line.seq, text: line.text.slice(1), timestamp: line.timestamp };
+  return tail;
+}
+
 export const useLogStore = create<LogStore>((set) => ({
   logs: {},
   pausedLogs: {},
@@ -115,18 +135,14 @@ export const useLogStore = create<LogStore>((set) => ({
         let bytes = byteTotals.get(serviceKey) ?? sumBytes(merged);
         let added = 0;
         for (const l of newLines) {
-          // \r 开头 = 单行刷新（webpack 进度条等）：替换最后一条而非追加，避免每帧一行。
-          // 必须同时校验 stream（与后端 push_log_line 同口径）：队尾若是 system 行（"已启动"/退出码）
-          // 或 stderr 行，stdout 的进度帧不能把它覆盖掉——那会改写系统行的语义与颜色。
-          const tail = merged[merged.length - 1];
-          if (l.text.startsWith('\r') && tail && tail.stream === l.stream) {
-            bytes += l.text.length - tail.text.length; // 原地替换：只结算差值
-            merged[merged.length - 1] = { ...tail, seq: l.seq, text: l.text.slice(1), timestamp: l.timestamp };
-          } else {
-            merged.push(l);
-            bytes += l.text.length;
-            added++;
+          const replaced = mergeRefreshFrame(merged, l);
+          if (replaced) {
+            bytes += l.text.length - replaced.text.length; // 原地替换：只结算差值
+            continue;
           }
+          merged.push(l);
+          bytes += l.text.length;
+          added++;
         }
         // 行数上限：从头部丢弃并扣减字节（不重新遍历求和）
         if (merged.length > MAX_LINES) {
@@ -146,9 +162,7 @@ export const useLogStore = create<LogStore>((set) => ({
           const pMerged = [...paused];
           let pChanged = false;
           for (const l of newLines) {
-            const pTail = pMerged[pMerged.length - 1];
-            if (l.text.startsWith('\r') && pTail && pTail.stream === l.stream) {
-              pMerged[pMerged.length - 1] = { ...pTail, seq: l.seq, text: l.text.slice(1), timestamp: l.timestamp };
+            if (mergeRefreshFrame(pMerged, l)) {
               pChanged = true;
             } else if (pMerged.length < MAX_LINES) {
               pMerged.push(l);

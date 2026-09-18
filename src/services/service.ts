@@ -61,6 +61,16 @@ export interface Project {
 
 export interface ProjectDetail {
   project: Project;
+  /**
+   * 服务列表在本载荷里**只是缓存传输通道**：`useProjectDetail` 收到后立刻写进
+   * `svcCacheStore`，组件一律从那里取（单一来源）。
+   *
+   * 为什么不删掉它：删了就得为同一份数据再发一次 IPC。为什么不读它：读了就有了第二份
+   * 服务列表，"改一处漏一处"的经典现场（见架构审计 ARCH-18）。标 `@deprecated` 是为了
+   * 让编辑器把它划掉——这是当前唯一能机械提醒的手段。
+   *
+   * @deprecated 请从 `useSvcCacheStore` 取服务列表
+   */
   services: Service[];
 }
 
@@ -90,11 +100,21 @@ export interface ServiceTemplate {
   created_at: string;
 }
 
-/** 工具命令实时输出事件（run_id 用于区分并发执行） */
-export interface ToolCommandLogPayload {
-  run_id: string;
+/** 工具命令输出的单行（批量事件的元素） */
+export interface ToolCommandLogLine {
   stream: 'stdout' | 'stderr';
   data: string;
+}
+
+/**
+ * 工具命令实时输出事件（run_id 用于区分并发执行）。
+ *
+ * 批量而非逐行：后端每 50ms 把攒下的行一次发出（`commands/process.rs`），
+ * 否则 5000 行的构建输出就是 5000 次跨线程序列化 + 主线程脚本执行。
+ */
+export interface ToolCommandLogBatchPayload {
+  run_id: string;
+  lines: ToolCommandLogLine[];
 }
 
 // ─── Service API (scoped to project) ────────────────────────
@@ -236,7 +256,7 @@ export const projectApi = {
   /** 复制项目（含所有服务配置） */
   duplicate: (id: string) => invoke<Project>('duplicate_project', { id }),
 
-  /** 切换项目置顶 */
+  /** 切换项目收藏（字段名仍是 pinned） */
   togglePin: (id: string) => invoke<boolean>('toggle_pin_project', { id }),
 };
 

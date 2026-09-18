@@ -21,7 +21,7 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
 
   const handleSelectCwd = async () => {
     // 走后端原生选择器：选中即"用户已确认"，项目外目录才允许配置
-    const selected = await pickDirectory({ title: '选择工作目录', defaultPath: cwd || projectPath });
+    const selected = await pickDirectory({ purpose: 'serviceCwd', defaultPath: cwd || projectPath });
     if (selected) setCwd(selected);
   };
 

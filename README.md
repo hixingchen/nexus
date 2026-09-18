@@ -70,14 +70,22 @@ pnpm build:app        # 打包应用（tauri build）
 
 ### 校验
 
-改动后本地跑一遍即可（**前端暂无自动化测试**，纯逻辑改动需手工验证）：
+改动后本地跑一遍即可：
 
 ```bash
-pnpm exec tsc --noEmit                       # 前端类型检查（0 错误）
-pnpm exec vite build                         # 前端产物必须能构建
-cd src-tauri && cargo test --lib             # 后端单元测试（129 用例）
+pnpm exec tsc --noEmit                       # 前端类型检查（0 错误，含 vite.config.ts）
+pnpm exec vite build                         # 前端产物必须能构建（0 警告是硬门禁）
+pnpm test                                    # 前端测试（utils 纯逻辑 + editor store 状态机）
+pnpm lint                                    # eslint（0 错误 / ≤6 条存量告警基线）
+cd src-tauri && cargo test --lib             # 后端单元测试（用例数见输出）
 cd src-tauri && cargo clippy --all-targets   # 后端静态分析（0 警告）
 ```
+
+> 用例数**以命令输出为准**，不要照抄文档里的数字（写死的数字正是它出错的原因）。
+> 前端测试只覆盖 `.ts` 模块链（utils / stores / services）——JSX 无法被 Node 的类型擦除处理，
+> 组件仍靠真机点检；解析钩子见 `test/ts-hooks.mjs`。
+> 测试分布：Rust 侧覆盖 `core/` 与 `commands/` 的纯逻辑与边界（`spawn_guard.rs` 是源码扫描式
+> 守卫，`contract.rs` 是 IPC 字段契约）；前端集中在 `utils/` 与 `editor` store。
 
 ## 行为约定（容易踩到的几条）
 

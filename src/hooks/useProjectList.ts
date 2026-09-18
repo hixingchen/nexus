@@ -68,7 +68,7 @@ export function useProjectList() {
       await projectApi.togglePin(projectId);
       await load();
     } catch (e: unknown) {
-      reportError('置顶项目失败', e);
+      reportError('收藏项目失败', e);
     }
   }, [load]);
 
@@ -91,7 +91,15 @@ export function useProjectList() {
 
   // ── 展开/折叠 ──────────────────────────────────────────────
 
-  const toggleSvcExpand = useCallback((e: React.MouseEvent, projectId: string, serviceId: string) => {
+  /**
+   * 参数收窄成"只需要能阻止冒泡"的结构性类型（CQ-21）。
+   *
+   * 唯一调用点（`ProjectList` 的 `onToggleSvcExpand`）手上只有 serviceId、**没有**真实事件
+   * 对象——签成 `React.MouseEvent` 就会逼它在调用点伪造一个 `as React.MouseEvent` 的假事件；
+   * 而假事件在将来真用到 `currentTarget`/`preventDefault` 时会运行期抛 TypeError，
+   * 编译期毫无提示。用结构性类型后，调用点传的就是一个名实相符的 no-op。
+   */
+  const toggleSvcExpand = useCallback((e: { stopPropagation(): void }, projectId: string, serviceId: string) => {
     e.stopPropagation();
     const key = `${projectId}:${serviceId}`;
     // 函数式更新：用捕获的 expandedSvc 计算会让同一 tick 内的两次切换互相覆盖

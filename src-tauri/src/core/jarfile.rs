@@ -74,11 +74,15 @@ pub fn list_entries(jar_bytes: &[u8]) -> Result<Vec<JarEntryInfo>, String> {
 }
 
 /// 读取 jar 条目字节；nested 为嵌套 jar 的条目路径链（外层 → 内层）
-pub fn read_entry(jar_bytes: &[u8], nested: &[String], name: &str) -> Result<Vec<u8>, String> {
+///
+/// 接收 `Vec<u8>` 而不是 `&[u8]`（PERF-14）：与 `innermost_archive` 同一理由——调用方
+/// 本来就是 owned 字节，按值 move 进来省掉整包拷贝。原实现在函数第一件事就 `to_vec()`，
+/// 而 `nested` 为空（最常见的情形）时这次拷贝 **100% 白做**；fat jar 上是几十 MB 的白拷贝。
+pub fn read_entry(jar_bytes: Vec<u8>, nested: &[String], name: &str) -> Result<Vec<u8>, String> {
     if nested.len() > MAX_NESTED_DEPTH {
         return Err(format!("嵌套 jar 层数过多（{} 层，上限 {}）", nested.len(), MAX_NESTED_DEPTH));
     }
-    let mut current: Vec<u8> = jar_bytes.to_vec();
+    let mut current: Vec<u8> = jar_bytes;
     // 逐层进入嵌套 jar（Spring Boot BOOT-INF/lib/*.jar）。
     // 内层作用域保证 archive 借用先结束，才能把新字节赋回 current
     for n in nested {
@@ -103,7 +107,7 @@ pub fn read_entry(jar_bytes: &[u8], nested: &[String], name: &str) -> Result<Vec
 /// （原来无论嵌套与否都会先 `to_vec()` 复制一整份——fat jar 上是几十 MB 的白拷贝）。
 pub fn innermost_archive(jar_bytes: Vec<u8>, nested: &[String]) -> Result<Vec<u8>, String> {
     if let Some((last, prefix)) = nested.split_last() {
-        read_entry(&jar_bytes, prefix, last)
+        read_entry(jar_bytes, prefix, last)
     } else {
         Ok(jar_bytes)
     }
@@ -140,7 +144,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "条目数错误");
         assert!(entries.iter().any(|e| e.name == "META-INF/MANIFEST.MF"));
         assert!(entries.iter().any(|e| e.name == "com/x/A.class"));
-        let content = read_entry(&bytes, &[], "META-INF/MANIFEST.MF").unwrap();
+        let content = read_entry(bytes.clone(), &[], "META-INF/MANIFEST.MF").unwrap();
         assert_eq!(content, b"Manifest-Version: 1.0\n");
     }
 
@@ -149,9 +153,8 @@ mod tests {
         let inner = make_jar(&[("hello.txt", b"hi".as_slice())]);
         let outer = make_jar(&[("BOOT-INF/lib/inner.jar", inner.as_slice())]);
         // 穿过嵌套层读取条目
-        let content = read_entry(&outer, &["BOOT-INF/lib/inner.jar".to_string()], "hello.txt").unwrap();
+        let content = read_entry(outer.clone(), &["BOOT-INF/lib/inner.jar".to_string()], "hello.txt").unwrap();
         assert_eq!(content, b"hi");
-        // 列嵌套层条目
         // 列嵌套层条目（按值传入：函数会 move 走整包字节，省掉一次整包拷贝）
         let innermost = innermost_archive(outer.clone(), &["BOOT-INF/lib/inner.jar".to_string()]).unwrap();
         let entries = list_entries(&innermost).unwrap();
@@ -162,7 +165,7 @@ mod tests {
     #[test]
     fn test_read_missing_entry() {
         let bytes = make_jar(&[("a.txt", b"a".as_slice())]);
-        assert!(read_entry(&bytes, &[], "nope.txt").is_err());
+        assert!(read_entry(bytes.clone(), &[], "nope.txt").is_err());
     }
 
     #[test]
@@ -206,7 +209,7 @@ mod tests {
         // 前置确认：伪造生效（声明值确实变小了）
         assert!(bytes.len() < 1024 * 1024, "样本应被压缩得很小，实际 {} 字节", bytes.len());
 
-        let err = read_entry(&bytes, &[], "bomb.bin").unwrap_err();
+        let err = read_entry(bytes.clone(), &[], "bomb.bin").unwrap_err();
         assert!(
             err.contains("zip 炸弹") || err.contains("过大"),
             "应按实际字节数拒绝伪造声明的条目，实际错误: {}",
@@ -218,7 +221,7 @@ mod tests {
     #[test]
     fn test_read_entry_accepts_normal_entry_after_cap() {
         let bytes = make_jar(&[("ok.txt", b"hello".as_slice())]);
-        assert_eq!(read_entry(&bytes, &[], "ok.txt").unwrap(), b"hello");
+        assert_eq!(read_entry(bytes.clone(), &[], "ok.txt").unwrap(), b"hello");
     }
 
     /// 嵌套深度上限：超过上限直接拒绝，不进入解压
@@ -226,7 +229,7 @@ mod tests {
     fn test_nested_depth_capped() {
         let bytes = make_jar(&[("a.txt", b"a".as_slice())]);
         let deep: Vec<String> = (0..MAX_NESTED_DEPTH + 1).map(|i| format!("l{}.jar", i)).collect();
-        let err = read_entry(&bytes, &deep, "x.txt").unwrap_err();
+        let err = read_entry(bytes.clone(), &deep, "x.txt").unwrap_err();
         assert!(err.contains("嵌套 jar 层数过多"), "应拒绝过深嵌套，实际错误: {}", err);
     }
 }

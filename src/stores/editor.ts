@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { showNotification } from '../components/ui/Toast';
+import { notify } from '../utils/notify';
 import { reportError } from '../utils/error';
+import { getExtension } from '../utils/path';
 import type { FileTab } from '../types/editor';
 import * as editorService from '../services/editor';
 
@@ -76,7 +77,6 @@ const BINARY_EXTS = new Set([
   'mp3', 'mp4', 'wav', 'flac', 'avi', 'mkv', 'mov', 'psd', 'ai', 'bin', 'dat', 'wasm', 'pyc',
 ]);
 
-const getExt = (path: string) => (path.split('.').pop() ?? '').toLowerCase();
 
 /**
  * 换行符规范化：\r\n / \r / \n 统一为 \n。
@@ -101,7 +101,8 @@ export function parseJarVirtualPath(path: string): { jarPath: string; nested: st
  *  mtime 用于保存前检测"文件已被外部改动"，避免静默覆盖 IDE/git 改过的版本 */
 interface FileMeta {
   line_ending: 'lf' | 'crlf' | 'cr';
-  encoding: 'utf8' | 'gb18030';
+  /** lossy = 既非合法 UTF-8 也非合法 GB18030（解码出了替换字符），按原编码写回会损坏文件 */
+  encoding: 'utf8' | 'gb18030' | 'lossy';
   /** 读取/上次写入后的修改时间（毫秒）；null = 未知（新建或读不到） */
   modified: number | null;
 }
@@ -114,7 +115,7 @@ async function fetchTextContent(path: string): Promise<{ content: string; size: 
     const res = await editorService.readJarEntry(jarPath, nested, name);
     return { content: res.content, size: res.size };
   }
-  if (getExt(path) === 'class') {
+  if (getExtension(path, { lower: true }) === 'class') {
     const content = await editorService.readClassFile(path);
     return { content, size: 0 };
   }
@@ -234,6 +235,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   closeTab: (id) => {
+    // 先结算未合帧的编辑：下面会删掉该标签的草稿，结算晚了会留下孤儿草稿
+    settlePendingEdit();
     const { tabs, activeTabId, dirtyIds } = get();
     const closedTab = tabs.find(t => t.id === id);
     const newTabs = tabs.filter(t => t.id !== id);
@@ -290,32 +293,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   updateDraft: (content) => {
-    const { activeTabId, dirtyIds } = get();
+    const { activeTabId } = get();
     if (!activeTabId) return;
-    set({ fileContent: content });
-    editSeqByTab.set(activeTabId, (editSeqByTab.get(activeTabId) ?? 0) + 1);
-    // dirty 判定只与"最后保存/打开的基线"比较（单一真相，见 baselines 注释）。
-    //
-    // 成本控制（每次按键都会走到这里）：
-    // ① 仅在内容确实含 \r 时才做全文 EOL 归一化——LF 文件（绝大多数）省掉一次全文正则；
-    // ② 先比长度：长度不同必然有改动，直接跳过与基线的全文比较。
-    const baseline = baselines.get(activeTabId);
-    const normalized = content.includes('\r') ? normalizeEOL(content) : content;
-    // 无基线视为未保存；有基线时先比长度（不同必然有改动，免去全文比较），长度相同才做全串比较
-    const isDirty = baseline === undefined
-      || normalized.length !== baseline.length
-      || normalized !== baseline;
-    if (!isDirty) {
-      drafts.delete(activeTabId);
-      if (dirtyIds.includes(activeTabId)) {
-        set({ dirtyIds: dirtyIds.filter(d => d !== activeTabId) });
-      }
-    } else {
-      drafts.set(activeTabId, content);
-      if (!dirtyIds.includes(activeTabId)) {
-        set({ dirtyIds: [...dirtyIds, activeTabId] });
-      }
-    }
+    applyDraft(activeTabId, content, set, get);
   },
 
   markClean: (id, content?: string) => {
@@ -422,7 +402,7 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
   const tab: FileTab = { id: `tab-${Date.now()}-${++tabSeq}`, name, path };
   const p = (async () => {
     try {
-      const ext = getExt(path);
+      const ext = getExtension(path, { lower: true });
       if (IMAGE_EXTS.has(ext)) {
         // 图片：内建预览（ImageViewer 自行加载，内容不进 store）
         tab.readonly = true;
@@ -447,6 +427,13 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
       if (ext === 'class') tab.readonly = true; // 字节码视图只读
       const { content, size } = await fetchTextContent(path);
       if (size > MAX_EDIT_SIZE) tab.readonly = true;
+      // 编码有损（既非 UTF-8 也非 GB18030）：允许查看与复制，但不允许落盘——
+      // 按原编码写回会把解码时的替换字符固化进文件，原字节永久消失（后端同样会拒绝）。
+      // 在这里就置只读，避免用户编辑半天后在保存时才发现
+      if (fileMetaCache.get(path)?.encoding === 'lossy') {
+        tab.readonly = true;
+        tab.readonlyReason = '该文件不是合法的 UTF-8 / GB18030 编码，保存会损坏原文件，仅支持查看';
+      }
       openLoadedTab(tab, content, mySeq);
     } catch (e) {
       if (e instanceof Error && e.message === 'BINARY') {
@@ -535,18 +522,26 @@ let savingInFlight = false;
  * 内容来源分两种：活动标签取 `fileContent`（最新），非活动标签取 `drafts`（切走时留下的草稿）。
  * 关窗时的"保存全部"依赖这条路径——因此不能再假设"要保存的只有活动标签"。
  */
-async function saveTabCore(id: string, notify: boolean): Promise<boolean> {
+async function saveTabCore(id: string, withToast: boolean): Promise<boolean> {
+  // **必须在读内容之前**：大文档的编辑可能还没写回 store（PERF-13 合帧），
+  // 直接读 fileContent/drafts 会拿到最多 200ms 前的内容并把它写进磁盘
+  settlePendingEdit();
   const { tabs, activeTabId, fileContent } = useEditorStore.getState();
   const tab = tabs.find(t => t.id === id);
   if (!tab) return true; // 标签已被关闭：无需保存
   if (tab.readonly) {
-    if (notify) showNotification({ variant: 'warning', title: '文件过大，仅支持查看（超过 10 MB 不能编辑）' });
+    if (withToast) {
+      notify({
+        variant: 'warning',
+        title: tab.readonlyReason ?? '文件过大，仅支持查看（超过 10 MB 不能编辑）',
+      });
+    }
     return false;
   }
   const content = id === activeTabId ? fileContent : (drafts.get(id) ?? null);
   // 内容从未成功加载（读取失败/仍在加载中）：写盘会把磁盘上的原文件覆盖成空内容
   if (content === null) {
-    if (notify) showNotification({ variant: 'error', title: '文件内容未加载，已取消保存' });
+    if (withToast) notify({ variant: 'error', title: '文件内容未加载，已取消保存' });
     return false;
   }
   if (savingInFlight) return false;
@@ -569,18 +564,20 @@ async function saveTabCore(id: string, notify: boolean): Promise<boolean> {
       if (meta) meta.modified = newModified;
       useEditorStore.getState().markClean(id, contentToSave);
     }
-    if (notify) showNotification({ title: `已保存「${tab.name}」` });
+    if (withToast) notify({ title: `已保存「${tab.name}」` });
     return true;
   } catch (e) {
     // 冲突单独提示：这是"文件被别的工具改过"，用户需要重新加载而不是反复重试
     const msg = String(e);
     if (msg.includes('已被外部修改')) {
-      console.error('保存文件失败:', e);
-      showNotification({
+      // duration 显式给 8s：冲突提示比普通警告更需要被读完，而 warning 的按级默认是 6s
+      reportError('保存文件失败', e, {
         variant: 'warning',
         title: `「${tab.name}」已被其他程序修改，未保存`,
-        description: '请关闭标签后重新打开以载入磁盘上的最新内容（如需保留当前修改，请先复制）',
+        description: '磁盘上的版本比编辑器里的新。点「重新加载」载入磁盘版本；如需保留当前修改，请先复制',
         duration: 8000,
+        // 现场给一步操作：提示里让用户"自己去关标签再打开"是本轮修掉的缺口
+        action: { label: '重新加载', run: () => { void reloadTab(id); } },
       });
     } else {
       reportError('保存文件失败', e);
@@ -591,10 +588,179 @@ async function saveTabCore(id: string, notify: boolean): Promise<boolean> {
   }
 }
 
+/**
+ * 未合帧编辑的**端口**（PERF-13）。
+ *
+ * 背景：大文档每次按键都 `doc.toString()` 会把整篇文档物化一遍（实测 10MB → 4.5ms/键，
+ * 并按 100MB/s 产生垃圾），因此 `CodeViewer` 对超过 `EDIT_COALESCE_MIN_LENGTH` 的文档
+ * 改为「攒 200ms 再写回 store」。问题是：**读内容的路径一旦读到旧值就会存旧内容**
+ * （最坏是丢用户的编辑）。
+ *
+ * 对策：把"未写回的编辑"登记在这里，并把**所有读内容的路径**收敛到一个入口
+ * （`settlePendingEdit`）——保存、切标签、关标签、关窗守卫都先经它取最新值。
+ * 这不是"记得在每个地方 flush"：登记的是 `(tabId, 取文本)` 一对，物化后按 **tabId**
+ * 落库（不是当时的 activeTabId），因此即便 flush 发生在切换标签之后也不会记到别的标签头上。
+ */
+let pendingEdit: { tabId: string; take: () => string | null } | null = null;
+
+/** 由编辑器登记"未写回的编辑"（同一时刻只有一个活动编辑器，故用单槽） */
+export function setPendingEditSource(tabId: string, take: () => string | null): void {
+  pendingEdit = { tabId, take };
+}
+
+/** 撤销登记（编辑器销毁且已结算后调用） */
+export function clearPendingEditSource(): void {
+  pendingEdit = null;
+}
+
+/**
+ * 物化并落库未合帧的编辑（无待处理内容时是 no-op）。**所有读取内容的路径都必须先经这里。**
+ *
+ * 先取出再物化：`take()` 可能触发 store 写入（进而重入本函数），清空槽位可避免重复落库。
+ */
+export function settlePendingEdit(): void {
+  const p = pendingEdit;
+  if (!p) return;
+  pendingEdit = null;
+  const text = p.take();
+  if (text === null) return;
+  applyDraft(p.tabId, text, useEditorStore.setState, useEditorStore.getState);
+}
+
+/**
+ * 未保存草稿数（关窗守卫判定用）。**统计前先结算未合帧的编辑**：
+ * 大文档的首次改动可能还在合帧窗口里（`dirtyIds` 尚未更新），直接读计数会漏掉它——
+ * 用户以为"没有未保存内容"直接关窗，那次编辑就跟着进程一起消失。
+ */
+export function unsavedDraftCount(): number {
+  settlePendingEdit();
+  return useEditorStore.getState().dirtyIds.length;
+}
+
+/**
+ * 把一份草稿内容落到指定标签（`updateDraft` 与 `settlePendingEdit` 的共同实现）。
+ *
+ * 为什么按 tabId 而不是 activeTabId：合帧路径落库时用户可能已经切到别的标签，
+ * 按 activeTabId 写会把 A 的编辑记到 B 头上。
+ */
+function applyDraft(
+  tabId: string,
+  content: string,
+  set: (partial: Partial<EditorStore>) => void,
+  get: () => EditorStore,
+): void {
+  const { activeTabId, dirtyIds } = get();
+  // fileContent 只表示"活动标签的当前内容"：非活动标签的编辑只进草稿
+  if (tabId === activeTabId) set({ fileContent: content });
+  editSeqByTab.set(tabId, (editSeqByTab.get(tabId) ?? 0) + 1);
+  // dirty 判定只与"最后保存/打开的基线"比较（单一真相，见 baselines 注释）。
+  //
+  // 成本控制（每次按键都会走到这里）：
+  // ① 仅在内容确实含 \r 时才做全文 EOL 归一化——LF 文件（绝大多数）省掉一次全文正则；
+  // ② 先比长度：长度不同必然有改动，直接跳过与基线的全文比较。
+  const baseline = baselines.get(tabId);
+  const normalized = content.includes('\r') ? normalizeEOL(content) : content;
+  // 无基线视为未保存；有基线时先比长度（不同必然有改动，免去全文比较），长度相同才做全串比较
+  const isDirty = baseline === undefined
+    || normalized.length !== baseline.length
+    || normalized !== baseline;
+  if (!isDirty) {
+    drafts.delete(tabId);
+    if (dirtyIds.includes(tabId)) {
+      set({ dirtyIds: dirtyIds.filter(d => d !== tabId) });
+    }
+  } else {
+    drafts.set(tabId, content);
+    if (!dirtyIds.includes(tabId)) {
+      set({ dirtyIds: [...dirtyIds, tabId] });
+    }
+  }
+}
+
 export async function saveActiveFile(): Promise<boolean> {
-  const { activeTabId } = useEditorStore.getState();
+  const { activeTabId, dirtyIds } = useEditorStore.getState();
   if (!activeTabId) return false;
+  // 没有未保存改动 → 什么都不做（甲-①）。两个理由：
+  // ① 内容与磁盘一致，写一次纯属浪费；
+  // ② 更关键的是**不该弹"已被其他程序修改"**——用户压根没改过，报冲突只会让人莫名其妙。
+  //    这正是"打开文件 → 别的工具改了它 → 按 Ctrl+S"出现的那个困惑。
+  // 不会因此丢掉"保存新文件"的能力：全仓没有"新建文件"入口（文件都是打开或粘贴来的），
+  // 所以"干净"必然意味着磁盘上已有同样的内容。
+  if (!dirtyIds.includes(activeTabId)) return true;
   return saveTabCore(activeTabId, true);
+}
+
+/**
+ * 从**磁盘**重新加载指定标签（用户显式动作：标签右键菜单 / 保存冲突提示里的按钮）。
+ *
+ * 为什么必须有它：保存冲突时后端拒绝写入，而编辑器**不会**自动重载（自动重载在"本地有
+ * 未保存改动"时就是静默丢改动）。此前用户只能"关标签再打开"来手工模拟这一步——
+ * 冲突提示里那句"请关闭标签后重新打开"就是这个缺口的自白。
+ *
+ * 它会丢掉三样东西，所以**只能是显式动作**、不做自动重载：
+ * - 该标签的未保存草稿（先结算未合帧的编辑再删草稿，否则它们会被当成"要保留的内容"）
+ * - 撤销历史（递增 `fileOpenSeq` → CodeViewer 按新会话重建，与"文件树里重新打开"同语义）
+ * - 内容缓存（不清则 `loadContentInto` 命中旧缓存，重载出来还是旧内容）
+ */
+export async function reloadTab(id: string): Promise<boolean> {
+  const tab = useEditorStore.getState().tabs.find(t => t.id === id);
+  if (!tab) return false;
+  if (tab.readonly || tab.viewerType) {
+    // 图片 / hex / jar 的内容由各自查看器管理，而且它们都不可保存——没有"保存冲突"可言
+    notify({ variant: 'info', title: '该标签不支持从磁盘重新加载' });
+    return false;
+  }
+  settlePendingEdit();
+  drafts.delete(id);
+
+  // ── 顺序是关键：**先把内容读回来，再一次性写进 store** ──────────────
+  // 不要复用 `loadContentInto`：它读盘前就 `setFileContent(null)`，于是编辑器会先按
+  // 空内容（或旧内容）重建一次，等新内容落地时只能走「外部内容同步」的文档替换——
+  // 而那是**一次可撤销的事务**，结果就是重载完按 Ctrl+Z 能撤回重载前的内容、标签重新变脏。
+  // 读盘期间一个字都不碰 store，重建就只发生一次且拿到的就是新内容：
+  // 编辑器不 dispatch、不进撤销历史，重载 = 干净的新会话（与"文件树里重新打开"同语义）。
+  const editsBefore = editSeqByTab.get(id) ?? 0;
+  let raw: string;
+  try {
+    ({ content: raw } = await fetchTextContent(tab.path));
+  } catch (e) {
+    reportError('重新加载失败', e);
+    return false;
+  }
+  // 读盘期间用户敲了字：重载会覆盖掉它们，放弃并如实告知（不静默丢输入）
+  if ((editSeqByTab.get(id) ?? 0) !== editsBefore) {
+    notify({
+      variant: 'warning',
+      title: '重新加载已取消',
+      description: '读取期间该文件有新的输入，重载会丢掉它们。请先复制或保存后再试',
+    });
+    return false;
+  }
+
+  commitReloadedContent(id, raw);
+  return true;
+}
+
+/**
+ * 把刚读到的磁盘内容提交到标签（`reloadTab` 的落地部分）。
+ *
+ * 抽出来是为了**可测**：这三步构成"重载后必须成立"的不变量——干净（基线 = 磁盘内容）、
+ * 内容槽已更新、会话序号已递增（编辑器据此重建并清撤销历史）。用户实测抓到过一次
+ * 这里的破洞：重载后标签仍显示未保存圆点，按 Ctrl+Z 还能撤回重载。
+ */
+export function commitReloadedContent(id: string, raw: string): void {
+  const tab = useEditorStore.getState().tabs.find(t => t.id === id);
+  if (!tab) return;
+  const normalized = normalizeEOL(raw);
+  drafts.delete(id);
+  setCacheContent(tab.path, normalized); // 缓存不同步的话，切走再切回会读到旧内容
+  // 磁盘内容即新基线 → 立刻是"干净"（不重置的话标签会显示未保存）
+  useEditorStore.getState().markClean(id, normalized);
+  useEditorStore.setState(s => ({
+    // 只有活动标签才更新内容槽；非活动标签只换会话序号，等切到它时按新内容重建
+    ...(s.activeTabId === id ? { fileContent: normalized } : {}),
+    fileOpenSeq: { ...s.fileOpenSeq, [tab.path]: (s.fileOpenSeq[tab.path] ?? 0) + 1 },
+  }));
 }
 
 /**
@@ -621,6 +787,8 @@ export async function saveAllDirtyTabs(): Promise<{ saved: number; failed: numbe
  * 读取期间用户可能已切换到其他标签，此时丢弃结果避免内容错位
  */
 async function loadContentInto(id: string, knownPath?: string): Promise<void> {
+  // 先把上一个文件未合帧的编辑结算掉：它按 tabId 落库，所以即便此刻切换也不串标签
+  settlePendingEdit();
   const { tabs, setActiveTabId, setFileContent } = useEditorStore.getState();
   const tab = tabs.find(t => t.id === id);
   const path = knownPath ?? tab?.path;

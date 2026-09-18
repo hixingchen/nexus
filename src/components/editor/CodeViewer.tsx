@@ -6,21 +6,29 @@ import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatchi
 import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
-import { useEditorStore, saveActiveFile } from '../../stores/editor';
+import { useEditorStore, saveActiveFile, setPendingEditSource, clearPendingEditSource, settlePendingEdit } from '../../stores/editor';
 import { isSubmitEnter } from '../../utils/keyboard';
+import { getExtension } from '../../utils/path';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
-import { cssLanguage } from '@codemirror/lang-css';
+import { css, cssLanguage } from '@codemirror/lang-css';
 // 其余语言包改为**按需动态导入**（见 langLoaders）：静态导入会让冷启动解析全部语言包，
-// 而一次会话通常只用一两种；cssLanguage 例外——它被 Vue 的混合解析器（vueScssMixed）引用，
-// 必须同步可用。
+// 而一次会话通常只用一两种；css 例外——它被 Vue 的混合解析器（vueScssMixed）引用，
+// 必须同步可用（`cssLanguage` 是解析器本体，`css` 是建 LanguageSupport 的工厂）。
 
 interface CodeViewerProps {
   filePath: string;
   /** 是否可编辑（默认 true） */
   editable?: boolean;
-  /** 内容变更回调（每次编辑触发，父组件写回 store） */
+  /**
+   * 内容变更回调（**小文档**的每次编辑触发，父组件写回 store）。
+   *
+   * 大文档（>256KB）走合帧路径时**不经过这里**：那条路要按"编辑发生时的 tabId"落库，
+   * 而 `onChange` 的语义是"写当前活动标签"——切走后再回调会记到别的标签头上。
+   * 合帧的落库统一由 `stores/editor.ts` 的 `settlePendingEdit()` 完成
+   * （见 PERF-13 与 `setPendingEditSource` 的说明）。
+   */
   onChange?: (content: string) => void;
 }
 
@@ -331,7 +339,8 @@ function SearchPanelView({ view }: { view: EditorView }) {
 
   // 应用搜索：更新 query → 统计匹配与当前序号 → 跳转第一个
   const applySearch = (search: string, cs: boolean, re: boolean, ww: boolean) => {
-    let q: SearchQuery | null = null;
+    // 不用 `= null` 初值：catch 分支直接 return，初值永远读不到（lint 的 no-useless-assignment）
+    let q: SearchQuery;
     try {
       q = new SearchQuery({ search, caseSensitive: cs, regexp: re, wholeWord: ww });
       setInvalid(false);
@@ -490,7 +499,7 @@ function legacyLang(mode: StreamParser<unknown>): Language {
 
 /** 根据文件扩展名获取语言支持（同步版，仅用于 JS 系列：最常用且体量小） */
 function getLanguageExtension(filePath: string) {
-  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  const ext = getExtension(filePath, { lower: true });
   if (ext === 'js' || ext === 'jsx' || ext === 'mjs' || ext === 'cjs') return [javascript()];
   if (ext === 'ts' || ext === 'tsx') return [javascript({ typescript: true, jsx: ext === 'tsx' })];
   return [];
@@ -504,17 +513,18 @@ function getLanguageExtension(filePath: string) {
  * 拆成动态导入后，主包只留核心（CodeMirror 运行时 + 本次打开文件的语言包）。
  */
 const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
-  js: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
-  jsx: () => import('@codemirror/lang-javascript').then(m => m.javascript({ jsx: true })),
-  ts: () => import('@codemirror/lang-javascript').then(m => m.javascript({ typescript: true })),
-  tsx: () => import('@codemirror/lang-javascript').then(m => m.javascript({ jsx: true, typescript: true })),
-  mjs: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
-  cjs: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
+  // 注意：js/jsx/ts/tsx/mjs/cjs **不在这里**——它们由 `getLanguageExtension` 同步装配
+  // （最常用的几种，且已在主包里）。此前这里也登记了一份动态导入，模块同时被静态与动态
+  // 引用 → Vite 警告"dynamic import will not move module into another chunk"（动态那半
+  // 白写），且装配完成后还会用一个等价实例再 reconfigure 一次。同步路径已覆盖，故摘除。
+  //
+  // css/scss 不能用动态导入：该模块被 `vueScssMixed` 静态引用，无论怎么写都会留在主包，
+  // 动态导入同样拆不出去。直接用已导入的工厂，省掉一次无意义的 chunk 边界请求。
   py: () => import('@codemirror/lang-python').then(m => m.python()),
   java: () => import('@codemirror/lang-java').then(m => m.java()),
   class: () => import('@codemirror/lang-java').then(m => m.java()), // .class 用 Java 高亮（反编译源码）
-  css: () => import('@codemirror/lang-css').then(m => m.css()),
-  scss: () => import('@codemirror/lang-css').then(m => m.css()), // 无官方 lang-scss，CSS 解析器近似
+  css: () => Promise.resolve(css()),
+  scss: () => Promise.resolve(css()), // 无官方 lang-scss，CSS 解析器近似
   less: () => import('@codemirror/lang-less').then(m => m.less()),
   sass: () => import('@codemirror/lang-sass').then(m => m.sass()),
   styl: () => import('@codemirror/legacy-modes/mode/stylus').then(m => legacyLang(m.stylus)),
@@ -531,8 +541,16 @@ const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
   vue: async () => {
     const { vue } = await import('@codemirror/lang-vue');
     const base = vue();
-    // 追加 style lang="scss"/"less" 块解析（见 vueScssMixed）
-    return new LanguageSupport((base.language as LRLanguage).configure({ wrap: vueScssMixed }), base.support);
+    // 追加 style lang="scss"/"less" 块解析（见 vueScssMixed）。
+    //
+    // 这里**运行期判定**而不是 `as LRLanguage` 断言（CQ-21）：`.configure()` 只存在于
+    // `LRLanguage`，当前只因 lang-vue 恰好基于它才成立——依赖升级把 `base.language`
+    // 换成别的 Language 实现时，断言会安静放行到 `.configure is not a function` 的
+    // TypeError，且只在打开 .vue 时触发（编译期零提示）。判定失败就退回原样，
+    // 编辑器的语法高亮退化，而不是整块炸掉。
+    return base.language instanceof LRLanguage
+      ? new LanguageSupport(base.language.configure({ wrap: vueScssMixed }), base.support)
+      : base;
   },
   xml: () => import('@codemirror/lang-xml').then(m => m.xml()),
   xhtml: () => import('@codemirror/lang-xml').then(m => m.xml()),
@@ -580,12 +598,13 @@ const languageCache = new Map<string, Promise<Language | LanguageSupport | null>
 
 /** 按扩展名加载语言包；失败一律降级为"无高亮"（不让编辑器创建失败） */
 function loadLanguage(filePath: string): Promise<Language | LanguageSupport | null> {
-  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  const ext = getExtension(filePath, { lower: true });
   const loader = langLoaders[ext];
   if (!loader) return Promise.resolve(null);
   const cached = languageCache.get(ext);
   if (cached) return cached;
   const p = loader().catch(e => {
+    // 只留控制台：已按设计降级（无高亮仍可读可编辑），弹 toast 会在每次打开这类文件时重复打扰
     console.error(`加载语言包失败（${ext}，已降级为无高亮）:`, e);
     return null;
   });
@@ -605,6 +624,23 @@ const MAX_MARK_DOC = 5 * 1024 * 1024;
 /** 选区匹配行扫描的防抖窗口（ms）：滚动条标记非瞬时反馈，攒够一次即可 */
 const MARK_SCAN_DEBOUNCE_MS = 120;
 
+/**
+ * 小文档直接写回 store 的长度上限（PERF-13）。
+ *
+ * 为什么要分档：`doc.toString()` 每次按键物化整篇文档，实测 2k 行/100KB 是 0.15ms、
+ * 10MB 是 4.5ms（并按 100MB/s 产生垃圾触发 major GC）。256KB 以下的成本在 0.1ms 量级，
+ * 而"store 里永远是最新内容"能省掉一整套 flush 时机管理——**绝大部分文件走的就是这条
+ * 零风险路径**，只有真正大的文件才需要合帧。
+ */
+const INSTANT_EMIT_MAX_LENGTH = 256 * 1024;
+
+/**
+ * 大文档合帧窗口（ms）。取 200ms：比人手速（约 10 键/秒）长，连打时只在停顿处物化一次；
+ * 又比"用户察觉卡顿"短——真正决定不丢内容的是 `settlePendingEdit` 的读取点（保存/切标签/
+ * 关标签/卸载都会先结算），这个定时器只是让 store 里的内容不至于长时间落后。
+ */
+const EDIT_COALESCE_MS = 200;
+
 /** 语言槽：语言包按需加载（见 langLoaders），加载完成后用它把语言装进已有编辑器 */
 const languageCompartment = new Compartment();
 
@@ -613,7 +649,12 @@ function createEditorState(
   content: string,
   filePath: string,
   editable: boolean,
-  onChange: (content: string) => void,
+  /**
+   * 文档变更回调。**交出去的是 EditorState 而不是已物化的字符串**（PERF-13）：
+   * 物化整篇文档的代价随文档大小线性增长（实测 10MB → 4.5ms/键），要不要现在物化、
+   * 还是攒一会儿再物化，只有调用方（它知道大小与保存时机）能决定。
+   */
+  onDocChange: (state: EditorState) => void,
   onMatchMarks: (marks: MatchMarks | null) => void,
 ) {
   // 上次扫描的选中文本：updateListener 据此跳过重复全文档扫描
@@ -707,7 +748,7 @@ function createEditorState(
     languageCompartment.of(getLanguageExtension(filePath)),
     // 颜色值色块（VS Code 风格）：CSS 类文件全文；Vue/HTML 仅 <style> 块内
     ...(() => {
-      const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+      const ext = getExtension(filePath, { lower: true });
       if (['css', 'scss', 'less', 'sass', 'styl'].includes(ext)) return [makeColorSwatchField(false)];
       if (ext === 'vue' || ext === 'html' || ext === 'htm') return [makeColorSwatchField(true)];
       return [];
@@ -797,9 +838,9 @@ function createEditorState(
 
   if (editable) {
     extensions.push(
-      // 变更监听：写回 store（配合父组件的 updateDraft 标记未保存）
+      // 变更监听：把新 state 交给调用方决定"现在物化还是合帧"（见 onDocChange 说明）
       EditorView.updateListener.of(update => {
-        if (update.docChanged) onChange(update.state.doc.toString());
+        if (update.docChanged) onDocChange(update.state);
       }),
       // Ctrl/Cmd+S 保存当前文件
       keymap.of([{
@@ -863,6 +904,11 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
   contentRef.current = content;
   /** 最近一次由本编辑器 emit 出去的内容：用于把"自己刚输入的回声"与"外部内容变化"区分开 */
   const lastEmittedRef = useRef<string | null>(null);
+  /** 大文档合帧：待物化的最新编辑器状态（null = 没有未写回的改动） */
+  const pendingStateRef = useRef<EditorState | null>(null);
+  /** 合帧定时器：空闲 200ms 后把待物化内容写回 store */
+  // 用 window.setTimeout（返回 number）：与 @types/node 的 Timeout 区分开，浏览器环境恒为 number
+  const settleTimerRef = useRef<number | null>(null);
 
   const locate = useEditorStore(s => s.locate);
   const clearLocate = useEditorStore(s => s.clearLocate);
@@ -887,13 +933,28 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
         currentContent,
         filePath,
         editable,
-        (doc) => {
-          lastEmittedRef.current = doc;
-          onChangeRef.current?.(doc);
+        (newState) => {
+          const text = newState.doc.toString();
           // EditorState 不可变：每次编辑产生新 state 对象，缓存里的引用会过期
           // （doc 对比失败 → 切换回来重建 → 撤销历史丢失）。编辑后把最新
           // state 写回缓存，切换回来 doc 对比命中、Ctrl+Z 历史保留
-          if (viewRef.current) stateCacheSet(key, viewRef.current.state);
+          stateCacheSet(key, newState);
+          if (text.length <= INSTANT_EMIT_MAX_LENGTH) {
+            // 小文档（绝大多数）：照旧每键写回 store。物化 256KB 的成本在 0.1ms 量级，
+            // 而同步写回意味着"store 里永远是最新内容"——没有 flush 时机的负担
+            lastEmittedRef.current = text;
+            onChangeRef.current?.(text);
+            return;
+          }
+          // 大文档：不在这里物化（PERF-13）。把这份 state 交给 store 的合帧槽，
+          // 由它在本组件请求时（保存/切标签/关标签/卸载）或 200ms 后物化
+          pendingStateRef.current = newState;
+          if (settleTimerRef.current === null) {
+            settleTimerRef.current = window.setTimeout(() => {
+              settleTimerRef.current = null;
+              settlePendingEdit();
+            }, EDIT_COALESCE_MS);
+          }
         },
         setMatchMarks,
       );
@@ -906,6 +967,23 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     });
     activeEditorView = viewRef.current;
 
+    // 把"未合帧的编辑"登记到 store（PERF-13）：登记的是 (tabId, 取文本) 一对，
+    // 于是即便结算发生在用户切走之后，内容也会落到**当时那个标签**头上。
+    // 没有待物化内容时 take() 返回 null，登记本身零成本。
+    const tabId = useEditorStore.getState().tabs.find(t => t.path === filePath)?.id;
+    if (tabId) {
+      setPendingEditSource(tabId, () => {
+        const pending = pendingStateRef.current;
+        if (!pending) return null;
+        pendingStateRef.current = null;
+        const text = pending.doc.toString();
+        // 与同步路径一致：把它记为"自己刚发出去的内容"，外部同步 effect 才不会
+        // 把这次写回当成"外部变化"再覆盖一遍编辑器
+        lastEmittedRef.current = text;
+        return text;
+      });
+    }
+
     // 语言包按需加载：拿到后把语言装进这个编辑器（缓存命中的 state 同样重装一次，
     // 覆盖"上次加载未完成就切走"的情况）。销毁后到达的加载结果由 view 身份校验拦掉。
     const view = viewRef.current;
@@ -914,11 +992,20 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       try {
         view.dispatch({ effects: languageCompartment.reconfigure(lang) });
       } catch (e) {
+        // 同上：降级路径，用户可见的结果是「没有高亮」，不需要额外提示
         console.error('装配语言包失败（已降级为无高亮）:', e);
       }
     });
 
     return () => {
+      // 卸载/换文件前必须结算：合帧窗口里的改动还只活在这个编辑器里，
+      // 一旦 destroy 就再无第二份（存储侧登记槽也要清掉，避免指向已销毁的 state）
+      if (settleTimerRef.current !== null) {
+        clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = null;
+      }
+      settlePendingEdit();
+      clearPendingEditSource();
       if (activeEditorView === viewRef.current) activeEditorView = null;
       viewRef.current?.destroy();
     };
@@ -936,6 +1023,9 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
+    // 先把未合帧的编辑结算掉（PERF-13）：否则下面会把"用户刚敲的内容"当成"外部变化"
+    // 覆盖掉（大文档合帧窗口内，store 里的 content 比编辑器旧）
+    settlePendingEdit();
     // 自己刚输入的回声先判：store 回写的就是编辑器内容，此时 `content` 与文档必然相等，
     // 无需再 `doc.toString()`（全文档序列化）。原实现把这个便宜的判断放在了**昂贵操作之后**，
     // 于是每次按键都要白白物化一次整篇文档。
@@ -1004,6 +1094,11 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       for (let n = 1; n <= doc.lines && hits.length < 500; n++) {
         const line = doc.line(n);
         const hay = line.text.toLowerCase();
+        // 先判有没有命中，再决定是否物化字符数组（PERF-12）：
+        // `Array.from` 把一个字符串摊成码点数组是这里最贵的操作，而全文绝大多数行
+        // 都不含搜索词。实测 200k 行文档：无条件物化 174ms → 命中后才物化 29ms（3.3×）。
+        // `indexOf` 的判空与下面 while 的首次判断完全等价，故不改变语义。
+        if (hay.indexOf(lowerQ) === -1) continue;
         // toLowerCase 可能改变个别字符的码点长度（如 İ→i̇），小写副本的偏移
         // 不能直接用于原文本——先映射为码点序号，再换算回原文本偏移
         const lineChars = Array.from(line.text);

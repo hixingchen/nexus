@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { processApi, type ToolCommandResult, type ToolCommandLogPayload } from '../services/service';
+import { processApi, type ToolCommandResult, type ToolCommandLogBatchPayload } from '../services/service';
 import { useToolLogStore } from '../stores/toolLogStore';
 import { showNotification } from '../components/ui/Toast';
 import { reportError } from '../utils/error';
@@ -42,10 +42,11 @@ export function useToolCommandRunner() {
     // 且不能留下未处理的 rejection
     let unlisten: (() => void) | null = null;
     try {
-      unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
+      unlisten = await listen<ToolCommandLogBatchPayload>('tool-command-log-batch', event => {
         if (event.payload.run_id !== runId) return;
-        // 只入缓冲，不做任何 React 工作（合帧由 store 负责）
-        useToolLogStore.getState().append(runId, [event.payload.data]);
+        // 只入缓冲，不做任何 React 工作（合帧由 store 负责）。
+        // 后端已按 50ms 批量，所以这里是一次事件一批行，而不是一行一事件
+        useToolLogStore.getState().append(runId, event.payload.lines.map(l => l.data));
       });
       const result = await processApi.runToolCommand(serviceId, commandId, runId);
       // 以完整结果兜底（含按序号合并的顺序，避免事件流微乱序）；行数与事件流同口径

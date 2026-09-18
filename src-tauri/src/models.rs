@@ -79,7 +79,11 @@ pub struct ServiceTemplate {
     pub created_at: String,
 }
 
-/// 项目详情：项目信息 + 其下所有服务
+/// 项目详情：项目信息 + 其下所有服务。
+///
+/// `services` 是**给前端缓存用的传输字段**，不是第二个真相来源：前端收到后立即写入
+/// `svcCacheStore`，所有组件从那里读（见架构审计 ARCH-18）。改这个字段前先确认
+/// 前端那唯一一处写入点仍成立。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDetail {
     pub project: Project,

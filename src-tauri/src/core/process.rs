@@ -6,7 +6,6 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 
 /// 日志缓冲区 key 类型，使用 Arc<str> 避免热路径 String clone
 type LogKey = Arc<str>;
@@ -48,16 +47,73 @@ pub struct ServiceLogBatchPayload {
     pub lines: Vec<Arc<LogLine>>,
 }
 
-/// 日志批量发射窗口（ms）。与服务日志面板前端的 50ms 渲染合帧同量级：
+/// 输出批量发射窗口（ms）。与服务日志面板前端的 50ms 渲染合帧同量级：
 /// 够小以保证交互式输出不卡顿，够大以摊平构建/进度条的突发输出。
-const LOG_FLUSH_MS: u64 = 50;
+///
+/// `pub(crate)`：工具命令输出（`commands/process.rs`）也走同一口径——两条通道的
+/// 突发形态相同（构建/装依赖），窗口取不同值只会让前端要照顾两种节奏。
+pub(crate) const LOG_FLUSH_MS: u64 = 50;
 
 /// 每服务日志缓冲行数上限（IDEA Console 式：只保留最新 2000 行）
 const MAX_LOG_LINES: usize = 2000;
+/// 每服务日志缓冲**字节**上限（与前端 `stores/logStore.ts` 的 `MAX_BYTES` 同值同口径）。
+/// 行数上限挡不住"2000 行 × 8KB 长行 = 16MB/服务"这种形状，两条上限量纲不同、都必须有。
+const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 /// 单行日志字节上限（base64/JSON dump 等超长行截断）
 const MAX_LINE_BYTES: usize = 8192;
 /// 全局最大并发服务数，防止日志缓冲无限增长
 const MAX_SERVICES: usize = 50;
+
+/// 批量发射循环的一步：**先读存活数，再取缓冲**，返回（本批要发的行，是否收尾退出）。
+///
+/// 顺序即不变式——反过来写会漏行：读取线程是"先 push 再递减存活计数"，于是
+/// "取缓冲"若发生在"读存活数"之前，就可能出现：取到空批 →（此时 reader 推入最后一行）
+/// → 读到存活数已归零 → 退出，那一行既不在已发出的批里，循环也再不会转一圈。
+/// 现在的顺序下，存活数归零一旦被读到（这一刻所有 push 都已发生），紧随其后的取缓冲
+/// 必然取得到；因此"存活归零 + 本批为空"才是真的没有下一行了。
+///
+/// 独立成函数是为了让这个顺序能被测试钉住——它此前在两处各写了一遍（服务日志与工具命令
+/// 输出），两份都只有肉眼复核。
+fn flush_step<T>(pending: &Mutex<Vec<T>>, readers_alive: &std::sync::atomic::AtomicUsize) -> (Vec<T>, bool) {
+    let alive_now = readers_alive.load(Ordering::SeqCst);
+    let batch = {
+        let mut guard = match pending.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        // mem::take：锁内只做移动，序列化/发送发生在锁外
+        std::mem::take(&mut *guard)
+    };
+    let done = alive_now == 0 && batch.is_empty();
+    (batch, done)
+}
+
+/// 批量发射线程（服务日志与工具命令输出共用）：
+/// 每 `LOG_FLUSH_MS` 把待发行缓冲整批交给 `emit`，读取线程全部退出且缓冲已空时收尾。
+///
+/// 为什么必须独立于读取线程：读取线程会阻塞在 `lines()` 上（命令打印一行后静默 10 秒
+/// 很常见），由它在读取线程侧"攒够再发"会让那一行直到下一行到来才显示。
+pub(crate) fn spawn_log_flush_thread<T, F>(
+    name: String,
+    pending: Arc<Mutex<Vec<T>>>,
+    readers_alive: Arc<std::sync::atomic::AtomicUsize>,
+    mut emit: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    T: Send + 'static,
+    F: FnMut(Vec<T>) + Send + 'static,
+{
+    std::thread::Builder::new().name(name).spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(LOG_FLUSH_MS));
+        let (batch, done) = flush_step(&pending, &readers_alive);
+        if !batch.is_empty() {
+            emit(batch);
+        }
+        if done {
+            break;
+        }
+    })
+}
 
 /// 按 char 边界截断超长日志行，防止单行超大输出撑爆缓冲和 IPC payload
 pub fn truncate_line(mut line: String, max: usize) -> String {
@@ -259,7 +315,54 @@ fn clean_ansi(line: &str) -> String {
 /// 直接克隆结构体等于在锁内做 2000 次字符串深拷贝（单行最长 8KB → 最坏十几 MB），
 /// 期间所有服务的 reader 线程都阻塞在同一把锁上。改成 Arc 后锁内只拷指针，
 /// 字符串拷贝推迟到锁外（序列化时自然发生）。
-type LogBuffers = Arc<Mutex<HashMap<LogKey, VecDeque<Arc<LogLine>>>>>;
+type LogBuffers = Arc<Mutex<HashMap<LogKey, LogBuffer>>>;
+
+/// 每条服务的日志缓冲：行队列 + **累计字节数**（PERF-17）。
+///
+/// 为什么行数上限单独不够：单行上限 8KB（`MAX_LINE_BYTES`），`MAX_LOG_LINES=2000` 行
+/// = **单服务最坏 16MB**；`MAX_SERVICES=50` → 最坏约 800MB。而且崩溃/秒退的服务会
+/// **保留**缓冲供诊断（进程摘表但缓冲不清），这些内存一直挂到用户手动停止/删除它。
+/// 前端那份副本另有 2MB 字节上限（`stores/logStore.ts` 的 `MAX_BYTES`），但那只约束
+/// 渲染进程，管不到后端这份。
+///
+/// 字节数**增量维护**：裁剪时遍历整个队列求和会把 O(1) 的追加变成 O(n)，而这些调用
+/// 在 reader 线程热路径上、且持有全局日志锁（所有服务共用一把）——前端同一处也是这么做的。
+#[derive(Default)]
+struct LogBuffer {
+    lines: VecDeque<Arc<LogLine>>,
+    /// 队列内所有 `text` 的字节数之和（UTF-8 字节；前端按 UTF-16 单元计，量级同）
+    bytes: usize,
+}
+
+impl LogBuffer {
+    /// 追加一行并按两条上限裁剪
+    fn push(&mut self, line: Arc<LogLine>) {
+        self.bytes += line.text.len();
+        self.lines.push_back(line);
+        self.trim();
+    }
+
+    /// 用新行替换队尾（`\r` 刷新帧：同一视觉行只换内容，见调用点的语义说明）
+    fn replace_tail(&mut self, line: Arc<LogLine>) {
+        if let Some(old) = self.lines.pop_back() {
+            self.bytes = self.bytes.saturating_sub(old.text.len());
+        }
+        self.push(line);
+    }
+
+    /// 从头部丢弃直到满足两条上限。
+    /// `lines.len() > 1` 保证**至少留最新一行**——否则单行超过字节上限时会把刚写进来的行也丢掉
+    fn trim(&mut self) {
+        while self.lines.len() > MAX_LOG_LINES
+            || (self.bytes > MAX_LOG_BYTES && self.lines.len() > 1)
+        {
+            match self.lines.pop_front() {
+                Some(old) => self.bytes = self.bytes.saturating_sub(old.text.len()),
+                None => break,
+            }
+        }
+    }
+}
 
 /// 日志文本规整：清 ANSI（仅在确有转义序列时）→ 刷新行补回 `\r` 前缀 → 截断超长行。
 ///
@@ -290,19 +393,72 @@ fn push_log_line(buffers: &LogBuffers, key: &LogKey, stream: &str, text: String,
     let Ok(mut b) = buffers.lock() else { return line };
     let e = b.entry(Arc::clone(key)).or_default();
     if is_refresh {
-        let mergeable = e.back().map(|l| l.stream == stream).unwrap_or(false);
+        let mergeable = e.lines.back().map(|l| l.stream == stream).unwrap_or(false);
         if mergeable {
             // 刷新帧取新 seq（替换同一视觉行）：前端"只应用更大 seq"的合并规则才不会把它当成旧行丢掉
-            e.pop_back();
-            e.push_back(Arc::clone(&line));
+            e.replace_tail(Arc::clone(&line));
             return line;
         }
     }
-    while e.len() >= MAX_LOG_LINES {
-        e.pop_front();
-    }
-    e.push_back(Arc::clone(&line));
+    e.push(Arc::clone(&line));
     line
+}
+
+/// 起一个输出流的读取线程：逐行读 → 识别刷新帧 → 写日志缓冲 → 入待发行队列。
+///
+/// 为什么收成一处（CQ-20）：stdout/stderr 两条流原本是**两份逐行同构**的实现，连注释
+/// 都是复制品。抽出来的理由不是少写几行，而是任何一次只改一边都会让两条流行为不一致——
+/// 刷新帧前缀集、停止标志的检查时机、写缓冲与入待发行的先后顺序，任一处漏改的症状都是
+/// "某个流偶尔渲染不对"，在界面上表现为随机的差异，极难定位。
+///
+/// 每个参数都是线程要独占的一份资源（`Arc` 克隆或 move 进来的管道），
+/// 合并成结构体只是把这份清单换个地方列，收益为零。
+#[allow(clippy::too_many_arguments)]
+fn spawn_log_reader(
+    pipe: impl std::io::Read + Send + 'static,
+    stream: &'static str,
+    key: LogKey,
+    log_buffers: LogBuffers,
+    pending: Arc<Mutex<Vec<Arc<LogLine>>>>,
+    readers_alive: Arc<std::sync::atomic::AtomicUsize>,
+    stop_flag: Arc<AtomicBool>,
+    done_tx: std::sync::mpsc::Sender<()>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("nexus-log-{}-{}", key, stream))
+        .spawn(move || {
+            let reader = BufReader::new(pipe);
+            for line in read_log_lines(reader) {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                // 刷新行识别：\r、\x1b[s（保存光标）、\x1b[2K/\x1b[K（清行）开头的行
+                // 都是单行刷新（webpack 进度条等），应合并而非逐帧追加
+                let is_refresh = line.starts_with('\r')
+                    || line.starts_with("\x1b[s")
+                    || line.starts_with("\x1b[2K")
+                    || line.starts_with("\x1b[K");
+                let line = prepare_log_text(line, is_refresh);
+                // 先写缓冲再入待发行：快照必然包含所有已发送事件（前端再按 seq 幂等合并）
+                let logged = push_log_line(&log_buffers, &key, stream, line, now, is_refresh);
+                if let Ok(mut p) = pending.lock() {
+                    p.push(logged);
+                }
+            }
+            // 退出前递减存活计数：发射线程据此收尾（含最后一批）
+            readers_alive.fetch_sub(1, Ordering::SeqCst);
+            drop(done_tx);
+        })
+}
+
+/// 取生命周期锁（NEW-17）。锁中毒同样继续用：进程生命周期离硬件更近，
+/// 让一次无关的 panic 变成"该服务永远起不来"是更坏的结局。
+fn lock_lifecycle<'a>(lock: &'a Arc<Mutex<()>>, key: &str) -> std::sync::MutexGuard<'a, ()> {
+    lock.lock().unwrap_or_else(|e| {
+        log::error!("[nexus] 服务 {} 的生命周期锁已中毒，继续使用: {}", key, e);
+        e.into_inner()
+    })
 }
 
 // ─── 类型别名 ───────────────────────────────────────────────
@@ -339,6 +495,9 @@ pub struct ProcessManager {
     log_buffers: LogBuffers,
     /// 意外退出的服务：key → 失败信息。日志保留供查看（正常停止/重启/全部停止时清除）
     failed: Mutex<HashMap<String, FailedService>>,
+    /// 每 key 一把生命周期锁，让 start/stop/restart 对同一服务串行（NEW-17）。
+    /// 键只增不删，理由见 `lifecycle_guard`。
+    lifecycles: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(windows)]
     job: Option<Arc<super::job_object::JobObject>>,
 }
@@ -355,8 +514,19 @@ pub struct ServiceSpawn<'a> {
     pub command: &'a str,
     pub cwd: &'a str,
     pub env_vars: &'a [(String, String)],
-    pub app_handle: &'a tauri::AppHandle,
+    pub log_sink: LogSink,
 }
+
+/// 日志批量事件的发送端（ARCH-14）。
+///
+/// 为什么不是 `tauri::AppHandle`：`core/` 反向依赖 IPC 框架会让 `ProcessManager::start`
+/// 在**结构上**不可测——而它恰恰是唯一真的 spawn 子进程、可能留下孤儿、含 TOCTOU 清理分支
+/// 的函数（24 个测试无一调用它）。换成"收一批日志，送去哪里由调用方决定"之后，
+/// 测试可以塞一个 no-op 或记录用的 sink，直接驱动 start/stop 的完整生命周期。
+///
+/// 用 `Arc` 而不是借用：批量发射线程要求 `'static`（`thread::spawn` 的硬约束），
+/// 借用进去编译不过；`Arc` 克隆进线程即可。
+pub type LogSink = Arc<dyn Fn(ServiceLogBatchPayload) + Send + Sync>;
 
 impl ProcessManager {
     pub fn new() -> Self {
@@ -364,9 +534,30 @@ impl ProcessManager {
             processes: Mutex::new(HashMap::new()),
             log_buffers: Arc::new(Mutex::new(HashMap::new())),
             failed: Mutex::new(HashMap::new()),
+            lifecycles: Mutex::new(HashMap::new()),
             #[cfg(windows)]
             job: None,
         }
+    }
+
+    /// 取某 key 的生命周期锁（不存在则建）。
+    ///
+    /// 为什么必须有（NEW-17）：`start` 在"检查进程表"与"插入进程表"之间**必须释放锁**
+    /// （spawn 不能持锁做）。服务 X 处于这个窗口时，`stop(X)` 查表为空 → 静默 no-op 并
+    /// 返回 `Ok(())` → 用户收到"所有服务已停止"，而 X 随后被插表并**真实运行**。
+    /// 加锁后 start/stop/restart 对同一 key 串行，窗口不再存在。
+    ///
+    /// 锁的获取顺序固定为 `lifecycles → processes`（本函数取完就释放，不与 processes 嵌套），
+    /// `stop_all` 也不走 `stop`（直接 drain 表再清理），故不会出现反向持有。
+    ///
+    /// 表项**不回收**：删除表项会让"并发中的 start 握着旧 Arc、新来的 stop 拿到新 Arc"，
+    /// 互斥直接失效。代价是每个曾启停过的服务 id 留一条 `String + Arc`——量级可忽略。
+    fn lifecycle_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut m = self.lifecycles.lock().unwrap_or_else(|e| {
+            log::error!("[nexus] lifecycles 锁已中毒，继续使用: {}", e);
+            e.into_inner()
+        });
+        Arc::clone(m.entry(key.to_string()).or_default())
     }
 
     /// 设置共享的 Job Object（确保子进程在应用退出时被终止）
@@ -381,8 +572,18 @@ impl ProcessManager {
         self.job.clone()
     }
 
+    /// 启动单个服务。
+    ///
+    /// 全程持有该 key 的**生命周期锁**（NEW-17）——见 `lifecycle_guard` 的说明。
     pub fn start(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
-        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, app_handle } = spec;
+        // 锁的 `Arc` 必须持有到函数结束：guard 借用的是它（不是堆上的 Mutex）
+        let lock = self.lifecycle_lock(spec.service_id);
+        let _guard = lock_lifecycle(&lock, spec.service_id);
+        self.start_locked(spec)
+    }
+
+    fn start_locked(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
+        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, log_sink } = spec;
         log::info!("[nexus] 启动服务: {} ({}) cmd={:?}, cwd={:?}", key, name, mask_command(command), cwd);
 
         // 工作目录为空：进程可能依赖相对路径/环境变量，直接拒绝并提示配置
@@ -453,13 +654,10 @@ impl ProcessManager {
         // 使用 Arc<str> 作为 key，避免热路径 String clone（P2 #6）
         // done 信号：reader 线程结束时发送端 drop → recv 返回 Disconnected。
         // 清理时用 recv_timeout 等待线程退出并限时放弃，避免无限 join 阻塞主线程。
-        let log_buffers = Arc::clone(&self.log_buffers);
         let key1: LogKey = Arc::from(key);
-        let key1_clone = Arc::clone(&key1);
         // 停止标志：cleanup 时置位，旧 reader 线程据此退出（否则 taskkill 未杀净时
         // 旧进程输出会串进新服务日志，且"已停止"的日志仍在增长）
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_stdout = Arc::clone(&stop_flag);
         // 待发行缓冲：reader 只把行推进来，由每服务一个批量发射线程按 50ms 窗口合成一条事件。
         //
         // 为什么必须批量：每行一次 `emit` 要走完整链路——serde 序列化 → 拼 JS 字符串 →
@@ -474,112 +672,51 @@ impl ProcessManager {
         // reader 存活计数：两个 reader 都退出（进程 EOF 或被停止）后发射线程收尾退出
         let readers_alive = Arc::new(std::sync::atomic::AtomicUsize::new(2));
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let pending_stdout = Arc::clone(&pending_emit);
-        let alive_stdout = Arc::clone(&readers_alive);
-        let stdout_thread = std::thread::Builder::new()
-            .name(format!("nexus-log-{}-stdout", key))
-            .spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in read_log_lines(reader) {
-                    if stop_flag_stdout.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let now = chrono::Utc::now().to_rfc3339();
-                    // 刷新行识别：\r、\x1b[s（保存光标）、\x1b[2K/\x1b[K（清行）开头的行
-                    // 都是单行刷新（webpack 进度条等），应合并而非逐帧追加
-                    let is_refresh = line.starts_with('\r')
-                        || line.starts_with("\x1b[s")
-                        || line.starts_with("\x1b[2K")
-                        || line.starts_with("\x1b[K");
-                    let line = prepare_log_text(line, is_refresh);
-                    // 先写缓冲再入待发行：快照必然包含所有已发送事件（前端再按 seq 幂等合并）
-                    let logged = push_log_line(&log_buffers, &key1, "stdout", line, now, is_refresh);
-                    if let Ok(mut p) = pending_stdout.lock() {
-                        p.push(logged);
-                    }
-                }
-                // 退出前递减存活计数：发射线程据此收尾（含最后一批）
-                alive_stdout.fetch_sub(1, Ordering::SeqCst);
-                drop(done_tx);
-            })
-            .map_err(|e| {
-                // 线程创建失败：杀掉已 spawn 的子进程并回收句柄，避免进程泄漏
-                kill_and_reap(&mut child, Duration::from_millis(2000));
-                format!("创建 stdout 日志读取线程失败: {}", e)
-            })?;
+        let stdout_thread = spawn_log_reader(
+            stdout, "stdout", Arc::clone(&key1), Arc::clone(&self.log_buffers),
+            Arc::clone(&pending_emit), Arc::clone(&readers_alive), Arc::clone(&stop_flag), done_tx,
+        )
+        .map_err(|e| {
+            // 线程创建失败：杀掉已 spawn 的子进程并回收句柄，避免进程泄漏
+            kill_and_reap(&mut child, Duration::from_millis(2000));
+            format!("创建 stdout 日志读取线程失败: {}", e)
+        })?;
         let _ = stdout_thread; // 不 join；线程在进程退出（EOF）后自然结束
 
-        let log_buffers = Arc::clone(&self.log_buffers);
-        let key2 = Arc::clone(&key1_clone);
-        let stop_flag_stderr = Arc::clone(&stop_flag);
-        let pending_stderr = Arc::clone(&pending_emit);
-        let alive_stderr = Arc::clone(&readers_alive);
         let (done_tx2, done_rx2) = std::sync::mpsc::channel::<()>();
         let mut done_rx_opt = Some(done_rx);
-        let stderr_thread = std::thread::Builder::new()
-            .name(format!("nexus-log-{}-stderr", key))
-            .spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in read_log_lines(reader) {
-                    if stop_flag_stderr.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let now = chrono::Utc::now().to_rfc3339();
-                    // 刷新行识别：\r、\x1b[s、\x1b[2K/\x1b[K 开头的行是单行刷新，合并而非逐帧追加
-                    let is_refresh = line.starts_with('\r')
-                        || line.starts_with("\x1b[s")
-                        || line.starts_with("\x1b[2K")
-                        || line.starts_with("\x1b[K");
-                    let line = prepare_log_text(line, is_refresh);
-                    // 先写缓冲再入待发行：快照必然包含所有已发送事件
-                    let logged = push_log_line(&log_buffers, &key2, "stderr", line, now, is_refresh);
-                    if let Ok(mut p) = pending_stderr.lock() {
-                        p.push(logged);
-                    }
-                }
-                alive_stderr.fetch_sub(1, Ordering::SeqCst);
-                drop(done_tx2);
-            })
-            .map_err(|e| {
-                // stderr 线程创建失败：杀掉进程树并回收句柄（stdout 线程随后读到 EOF 自行退出）
-                kill_and_reap(&mut child, Duration::from_millis(2000));
-                format!("创建 stderr 日志读取线程失败: {}", e)
-            })?;
+        let stderr_thread = spawn_log_reader(
+            stderr, "stderr", Arc::clone(&key1), Arc::clone(&self.log_buffers),
+            Arc::clone(&pending_emit), Arc::clone(&readers_alive), Arc::clone(&stop_flag), done_tx2,
+        )
+        .map_err(|e| {
+            // stderr 线程创建失败：杀掉进程树并回收句柄（stdout 线程随后读到 EOF 自行退出）
+            kill_and_reap(&mut child, Duration::from_millis(2000));
+            format!("创建 stderr 日志读取线程失败: {}", e)
+        })?;
         let _ = stderr_thread;
 
         // 批量发射线程（两个 reader 都创建成功后才起，避免失败路径留下孤儿线程）
         let flush_pending = Arc::clone(&pending_emit);
         let flush_alive = Arc::clone(&readers_alive);
-        let flush_app = app_handle.clone();
+        let flush_sink = Arc::clone(&log_sink);
         let flush_key = key.to_string();
-        std::thread::Builder::new()
-            .name(format!("nexus-logflush-{}", key))
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(LOG_FLUSH_MS));
-                let batch = {
-                    let mut guard = match flush_pending.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    // mem::take：锁内只做移动，序列化发生在锁外
-                    std::mem::take(&mut *guard)
-                };
-                if !batch.is_empty() {
-                    let _ = flush_app.emit("service-log-batch", ServiceLogBatchPayload {
-                        service_key: flush_key.clone(),
-                        lines: batch,
-                    });
-                }
-                // 两个 reader 都退出（进程 EOF / 被停止）→ 上面已把最后一批发完，收尾退出
-                if flush_alive.load(Ordering::SeqCst) == 0 {
-                    break;
-                }
-            })
-            .map_err(|e| {
-                // 发射线程起不来：日志仍写缓冲（面板打开时能取到快照），只是失去实时推送
-                kill_and_reap(&mut child, Duration::from_millis(2000));
-                format!("创建日志批量发射线程失败: {}", e)
-            })?;
+        spawn_log_flush_thread(
+            format!("nexus-logflush-{}", key),
+            flush_pending,
+            flush_alive,
+            move |batch| {
+                flush_sink(ServiceLogBatchPayload {
+                    service_key: flush_key.clone(),
+                    lines: batch,
+                });
+            },
+        )
+        .map_err(|e| {
+            // 发射线程起不来：日志仍写缓冲（面板打开时能取到快照），只是失去实时推送
+            kill_and_reap(&mut child, Duration::from_millis(2000));
+            format!("创建日志批量发射线程失败: {}", e)
+        })?;
 
         // Phase 3: 重新获取锁，二次检查后插入
         let mut procs = self.processes.lock().unwrap_or_else(|e| {
@@ -602,7 +739,14 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// 停止单个服务。全程持有该 key 的生命周期锁（NEW-17）。
     pub fn stop(&self, key: &str) -> Result<(), String> {
+        let lock = self.lifecycle_lock(key);
+        let _guard = lock_lifecycle(&lock, key);
+        self.stop_locked(key)
+    }
+
+    fn stop_locked(&self, key: &str) -> Result<(), String> {
         log::info!("[nexus] 停止服务: {}", key);
 
         // Phase 1: 从 map 中移除 entry，释放锁
@@ -635,9 +779,16 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// 重启单个服务。
+    ///
+    /// **整段**（stop + start）持有同一把生命周期锁：若只让 stop/start 各自加锁，
+    /// 两者之间会漏出一个窗口——并发调用方可以在这个窗口里插进自己的 start，
+    /// 于是"重启"的结果取决于调度顺序。这里用 `*_locked` 变体在同一把锁内完成两段。
     pub fn restart(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
-        self.stop(spec.service_id)?;
-        self.start(spec)
+        let lock = self.lifecycle_lock(spec.service_id);
+        let _guard = lock_lifecycle(&lock, spec.service_id);
+        self.stop_locked(spec.service_id)?;
+        self.start_locked(spec)
     }
 
     /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）
@@ -653,7 +804,7 @@ impl ProcessManager {
         let log_key: LogKey = Arc::from(key);
         match self.log_buffers.lock() {
             Ok(b) => b.get(&*log_key)
-                .map(|deque| deque.iter().cloned().collect())
+                .map(|buf| buf.lines.iter().cloned().collect())
                 .unwrap_or_default(),
             Err(e) => {
                 log::error!("ProcessManager log_buffers 锁已中毒: {}", e);
@@ -796,8 +947,7 @@ impl Drop for ProcessManager {
 fn append_system_line(buffers: &LogBuffers, key: &str, text: String) {
     if let Ok(mut b) = buffers.lock() {
         let e = b.entry(Arc::from(key)).or_default();
-        while e.len() >= MAX_LOG_LINES { e.pop_front(); }
-        e.push_back(Arc::new(LogLine { seq: LOG_SEQ.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), stream: "system".into(), text }));
+        e.push(Arc::new(LogLine { seq: LOG_SEQ.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), stream: "system".into(), text }));
     }
 }
 
@@ -944,6 +1094,10 @@ pub(crate) fn kill_process_tree(pid: u32) {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         match Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            // 跳过"当前目录优先"搜索（SEC-14，与 `build_internal_command` 同口径）：
+            // taskkill 是我们自己拉起的系统工具、不承载用户 shell，关掉这一级没有副作用，
+            // 却能避免"CWD 恰好是一个不可信仓库"时执行到那里预置的 taskkill.exe
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
             .stdout(Stdio::null()).stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -1459,6 +1613,115 @@ mod tests {
         assert!(mgr.get_logs("svc-3").is_empty());
     }
 
+    /// PERF-17 的回归：**字节**上限必须与行数上限同时生效。
+    ///
+    /// 形状取自审计：每行都顶到单行上限（8KB）时，行数上限挡不住膨胀——
+    /// 2000 行 × 8KB = 单服务 16MB，50 个服务 = 约 800MB。
+    /// 反证方式：把 `MAX_LOG_BYTES` 临时改成 `usize::MAX`，本测试应如期失败。
+    #[test]
+    fn test_log_buffer_is_byte_bounded_too() {
+        let mgr = ProcessManager::new();
+        let n = 400usize; // 400 × 8KB = 3.2MB > 2MB，必然触发裁剪
+        for i in 0..n {
+            mgr.append_system_line("svc-bytes", format!("{:0>width$}", i, width = MAX_LINE_BYTES));
+        }
+        let lines = mgr.get_logs("svc-bytes");
+        let total: usize = lines.iter().map(|l| l.text.len()).sum();
+        assert!(total <= MAX_LOG_BYTES, "总字节必须受上限约束，实际 {}", total);
+        assert!(lines.len() < n, "应已按字节裁剪，实际仍有 {} 行", lines.len());
+        assert!(lines.len() <= MAX_LOG_LINES, "行数上限仍须独立生效");
+        assert!(
+            lines.last().unwrap().text.ends_with(&format!("{:0>16}", n - 1)),
+            "保留的必须是最新写入的那行"
+        );
+    }
+
+    /// 测试用日志 sink：记录收到的批次。
+    /// ARCH-14 把 `AppHandle` 换成这个闭包之后，`start()` 的全部路径才第一次可测。
+    fn test_sink() -> (LogSink, Arc<Mutex<Vec<ServiceLogBatchPayload>>>) {
+        let seen: Arc<Mutex<Vec<ServiceLogBatchPayload>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        (Arc::new(move |p| {
+            if let Ok(mut v) = s.lock() {
+                v.push(p);
+            }
+        }), seen)
+    }
+
+    /// ARCH-14：`start()` 的"工作目录为空"分支此前零覆盖。
+    #[test]
+    fn test_start_rejects_empty_cwd() {
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let err = mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
+            cwd: "   ", env_vars: &[], log_sink: sink,
+        }).unwrap_err();
+        assert!(err.contains("工作目录为空"), "实际错误: {}", err);
+        // 被拒绝的启动不得留下任何痕迹（失败表/日志缓冲都该是干净的）
+        assert!(mgr.failed().is_empty(), "空 cwd 是配置错误，不该记成「服务启动失败」");
+        assert!(mgr.get_logs("s1").is_empty(), "拒绝路径不该写日志缓冲");
+    }
+
+    /// ARCH-14 解锁的核心用例：**spawn 失败路径**（此前 24 个测试无一走到 start）。
+    ///
+    /// 用"不存在的 cwd"触发：`cmd /C` 包着的命令本身总能 spawn，
+    /// 但 `current_dir` 指向不存在的目录时 `spawn()` 会直接失败。
+    #[test]
+    fn test_start_records_failure_when_spawn_fails() {
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let missing = std::env::temp_dir()
+            .join(format!("nexus_ut_missing_cwd_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let err = mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
+            cwd: &missing, env_vars: &[], log_sink: sink,
+        }).unwrap_err();
+        assert!(err.starts_with("启动失败"), "实际错误: {}", err);
+
+        // 失败必须同时落两处：失败表（卡片显示"失败"按钮）+ 日志缓冲（点开可见原因）
+        let failed = mgr.failed();
+        assert_eq!(failed.len(), 1, "失败必须进失败表");
+        assert_eq!(failed[0].service_id, "s1");
+        assert!(failed[0].exit_code.is_none(), "spawn 失败没有退出码");
+        assert!(
+            mgr.get_logs("s1").iter().any(|l| l.text.contains("启动失败")),
+            "日志缓冲应记下失败原因"
+        );
+        assert!(
+            !mgr.running().iter().any(|(_, id)| id == "s1"),
+            "失败的启动不得留在运行表"
+        );
+    }
+
+    /// NEW-17 的回归：同一 key 的 stop 必须等 start 的生命周期锁释放。
+    ///
+    /// 直接构造 start/stop 的真实交错需要进程调度运气（会变成 flaky 测试），
+    /// 而"锁是否真的把同 key 串行化"是确定性可测的——测它即可。
+    #[test]
+    fn test_lifecycle_lock_serializes_same_key() {
+        let mgr = Arc::new(ProcessManager::new());
+        let lock = mgr.lifecycle_lock("svc-x");
+        let guard = lock_lifecycle(&lock, "svc-x");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let mgr2 = Arc::clone(&mgr);
+        let done2 = Arc::clone(&done);
+        let t = std::thread::spawn(move || {
+            let _ = mgr2.stop("svc-x"); // 表里没有该 key：无锁时立即返回
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!done.load(Ordering::SeqCst), "同 key 的 stop 不该在锁被持有期间完成");
+
+        drop(guard);
+        t.join().expect("线程应能结束");
+        assert!(done.load(Ordering::SeqCst), "放锁后 stop 应立即完成");
+    }
+
     #[test]
     fn test_failed_table_records_and_drains_exit_status() {
         let mgr = ProcessManager::new();
@@ -1471,5 +1734,74 @@ mod tests {
         // 主动停止过的服务不该留在失败表里（前端据此显示"失败"按钮）
         mgr.stop("svc-x").unwrap();
         assert!(mgr.failed().iter().all(|f| f.service_id != "svc-x" || f.exit_code != Some(1)));
+    }
+
+    /// 收尾判据：**缓冲里还有行时绝不能退出**。
+    ///
+    /// 这正是"实时输出最后一行丢失"的窗口：读取线程先 push 再递减存活计数，
+    /// 若发射循环在取缓冲之后才读存活数，就可能"取到空批 → 读到归零 → 退出"，
+    /// 把那一行永远留在缓冲里。`flush_step` 把顺序固定成"先读存活、再取缓冲"，
+    /// 于是归零被读到的那一刻，所有 push 都已可见 —— 取到空批才是真的没有下一行了。
+    #[test]
+    fn test_flush_step_does_not_exit_with_pending_lines() {
+        let alive = std::sync::atomic::AtomicUsize::new(0);
+        let pending = Mutex::new(vec!["最后一行".to_string()]);
+
+        let (batch, done) = flush_step(&pending, &alive);
+        assert_eq!(batch, vec!["最后一行".to_string()], "存活归零但缓冲有行：必须发出去");
+        assert!(!done, "还有行要发时不能收尾");
+
+        // 下一轮：缓冲已空且存活归零 → 收尾
+        let (batch, done) = flush_step(&pending, &alive);
+        assert!(batch.is_empty());
+        assert!(done, "缓冲空 + 读取线程全部退出 = 可以收尾");
+    }
+
+    /// 读取线程仍在跑时一律不收尾（哪怕这一轮没取到行）——否则稀疏输出会被截断
+    #[test]
+    fn test_flush_step_keeps_running_while_readers_alive() {
+        let alive = std::sync::atomic::AtomicUsize::new(1);
+        let pending: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let (batch, done) = flush_step(&pending, &alive);
+        assert!(batch.is_empty());
+        assert!(!done, "还有读取线程在跑，不能收尾");
+    }
+
+    /// 端到端：真实发射线程 + 真实"读取线程"，最后一批必须到达且线程自行退出。
+    ///
+    /// 用 `alive` 从 1 → 0 的完整过程（而不是预置 0）覆盖"reader 推完最后一行后归零"这条
+    /// 主路径——`PERF-11` 的真机验证欠账里，"末批不丢"是其中一条，这里把它变成可复跑的判据。
+    #[test]
+    fn test_flush_thread_delivers_final_batch_and_exits() {
+        let pending: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let alive = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let got_sink = Arc::clone(&got);
+        let handle = spawn_log_flush_thread(
+            "test-flush".to_string(),
+            Arc::clone(&pending),
+            Arc::clone(&alive),
+            move |batch| got_sink.lock().unwrap().extend(batch),
+        )
+        .expect("发射线程应能创建");
+
+        // 模拟读取线程：推入最后一行后立刻归零
+        {
+            let pending = Arc::clone(&pending);
+            let alive = Arc::clone(&alive);
+            std::thread::spawn(move || {
+                pending.lock().unwrap().push("line-1".to_string());
+                pending.lock().unwrap().push("line-2".to_string());
+                alive.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+
+        handle.join().expect("读取线程归零后发射线程应自行退出");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec!["line-1".to_string(), "line-2".to_string()],
+            "最后一批必须完整送达（顺序即读取顺序）"
+        );
     }
 }

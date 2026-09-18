@@ -1,12 +1,11 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { openInExplorer } from '../../services/system';
 import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
 import { useSearchModalStore } from '../../stores/searchModal';
-import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
-import { showNotification } from '../ui/Toast';
-import { reportError } from '../../utils/error';
+import { copyText } from '../../utils/clipboard';
+import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 
 interface Props {
   project: Project;
@@ -37,22 +36,16 @@ export function ProjectListItem({
 
   // 服务行右键菜单（搜索文件内容）
   const [svcMenu, setSvcMenu] = useState<{ x: number; y: number; svc: Service } | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  /** 服务行右键菜单位置（实测尺寸后夹进内容区，见 useContextMenuPosition） */
-  const svcMenuPos = useContextMenuPosition(menuRef, svcMenu);
-
-  useEffect(() => {
-    if (!svcMenu) return;
-    const handleClose = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setSvcMenu(null);
-    };
-    document.addEventListener('mousedown', handleClose);
-    return () => document.removeEventListener('mousedown', handleClose);
-  }, [svcMenu]);
+  /**
+   * 项目自己的目录树是否展开。用本地 state 而不是 store：与服务的树展开态（`expandedSvc`）
+   * 同一性质——只活本次会话，重开应用/收起左栏后回到收起态（默认收起才不打扰）。
+   */
+  const [projectTreeOpen, setProjectTreeOpen] = useState(false);
 
   return (
     <>
-    <div className="mb-1.5">
+    {/* data-project-id：ProjectList 用它把"选中项滚进视野"（见那边的 effect） */}
+    <div className="mb-1.5" data-project-id={project.id}>
       <div
         className={`mx-2 rounded-md px-3 py-2.5 cursor-pointer group ${
           selected
@@ -113,7 +106,7 @@ export function ProjectListItem({
             </button>
           )}
 
-          {/* 置顶按钮 */}
+          {/* 收藏按钮（字段名仍是 pinned，界面上统一叫收藏） */}
           <button
             className={`flex-shrink-0 p-1 rounded transition-all ${
               project.pinned
@@ -121,7 +114,7 @@ export function ProjectListItem({
                 : 'text-nexus-muted/50 hover:text-nexus-accent hover:bg-nexus-accent/10'
             }`}
             onClick={onTogglePin}
-            title={project.pinned ? '取消置顶' : '置顶'}
+            title={project.pinned ? '取消收藏' : '收藏'}
           >
             <svg width="14" height="14" viewBox="0 0 12 12" fill={project.pinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
               <path d="M7.5 1.5L10.5 4.5 8 7l1.5 4-7-7L7 2.5l.5-1z"/>
@@ -129,12 +122,47 @@ export function ProjectListItem({
           </button>
         </div>
       </div>
-      {/* 展开：服务列表 + 可选展开的目录树 */}
+      {/* 展开：项目目录树（恒定）+ 各服务的目录树（可选，取决于服务的「在目录树中显示」） */}
       {isExpanded && (
         <div className="border-t border-nexus-border/50 mt-1 mx-2 bg-nexus-bg/20 rounded-b-md">
+          {/* 项目自己的目录树。
+              为什么要有：项目根下的文件（README、package.json、docker-compose、docs/…）不属于
+              任何服务的工作目录，此前只能靠"建一个指到根目录的服务"才看得到。
+              放在服务**之前**：树形结构的通行直觉是"根在上、子在下"（文件树本身也是目录在前），
+              而且它是**恒定存在**的那一项（服务树可有可无：取决于哪些服务开了"在目录树中显示"）——
+              不变的东西放在固定位置，展开项目时它永远在第一行。**默认收起**，不展开只占一行。
+              定位优先级低于服务树（见 FileTree 的 kind / utils/fileTree.ts）。 */}
+          <div>
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors ${
+                projectTreeOpen
+                  ? 'text-nexus-text bg-nexus-bg/40'
+                  : 'text-nexus-text-muted hover:bg-nexus-hover/30 hover:text-nexus-text'
+              }`}
+              onClick={() => setProjectTreeOpen(v => !v)}
+              title="项目根目录（不属于任何服务的文件在这里）"
+            >
+              <svg
+                className={`flex-shrink-0 text-nexus-muted/60 transition-transform ${projectTreeOpen ? 'rotate-90' : ''}`}
+                width="10" height="10" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"
+              >
+                <polyline points="3,1 7,5 3,9" />
+              </svg>
+              <span className="text-[13px] truncate">项目目录</span>
+            </div>
+            {projectTreeOpen && (
+              <div className="ml-[11px] pl-2 border-l border-nexus-border/30">
+                <FileTree rootPath={project.path} embedded kind="project" />
+              </div>
+            )}
+          </div>
+
           {showTreeServices.length === 0 ? (
-            <div className="py-3 px-3 text-[11px] text-nexus-muted/50 text-center">
-              暂无开启目录树的服务
+            // 不再是"空状态"（上面固定有项目目录节点），所以改成一条可操作的提示：
+            // 告诉用户服务树是**可以开的**，而不是让人以为这里出问题了
+            <div className="px-3 pt-2 pb-0.5 text-[11px] text-nexus-muted/50">
+              暂无服务目录树（可在服务编辑面板开启）
             </div>
           ) : (
             showTreeServices.map(s => {
@@ -180,82 +208,60 @@ export function ProjectListItem({
 
     {/* 服务行右键菜单：搜索文件内容 / 资源管理器 / 复制 */}
     {svcMenu && createPortal(
-      <div
-        ref={menuRef}
-        className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-        style={svcMenuPos}
-      >
+      <ContextMenu x={svcMenu.x} y={svcMenu.y} onClose={() => setSvcMenu(null)}>
         {/* 搜索文件内容 */}
         <div className="py-1.5 px-1.5">
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
+            </svg>}
+            label="搜索文件内容"
             onClick={() => {
               openSearch(svcMenu.svc.cwd, svcMenu.svc.name);
               setSvcMenu(null);
             }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">搜索文件内容</span>
-          </button>
+          />
         </div>
 
         {/* 在资源管理器中打开 / 复制路径 / 复制文件名 */}
         <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
+            </svg>}
+            label="在资源管理器中打开"
             onClick={() => {
               const { cwd } = svcMenu.svc;
               setSvcMenu(null);
               void openInExplorer(cwd);
             }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
-          </button>
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          />
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <rect x="3" y="3" width="5" height="5.5" rx=".8"/>
+              <path d="M2 2.5v4.5h.5V3.5h4V2.5H3a.5.5 0 00-.5.5z"/>
+            </svg>}
+            label="复制路径"
             onClick={async () => {
               const { cwd } = svcMenu.svc;
               setSvcMenu(null);
-              try {
-                await navigator.clipboard.writeText(cwd);
-                showNotification({ variant: 'success', title: '路径已复制' });
-              } catch (err) {
-                reportError('复制路径失败', err);
-              }
+              await copyText(cwd, '路径');
             }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <rect x="3" y="3" width="5" height="5.5" rx=".8"/>
-              <path d="M2 2.5v4.5h.5V3.5h4V2.5H3a.5.5 0 00-.5.5z"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">复制路径</span>
-          </button>
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
+          />
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <rect x="1" y="2" width="8" height="6" rx="1"/>
+              <path d="M3 4h4M3 6h2"/>
+            </svg>}
+            label="复制文件名"
             onClick={async () => {
               const { name } = svcMenu.svc;
               setSvcMenu(null);
-              try {
-                await navigator.clipboard.writeText(name);
-                showNotification({ variant: 'success', title: '文件名已复制' });
-              } catch (err) {
-                reportError('复制文件名失败', err);
-              }
+              await copyText(name, '文件名');
             }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <rect x="1" y="2" width="8" height="6" rx="1"/>
-              <path d="M3 4h4M3 6h2"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">复制文件名</span>
-          </button>
+          />
         </div>
-      </div>,
+      </ContextMenu>,
       document.body,
     )}
     </>

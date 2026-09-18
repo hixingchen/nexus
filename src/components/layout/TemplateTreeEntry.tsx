@@ -1,10 +1,10 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { ServiceTemplate } from '../../services/service';
-import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
+import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 
 interface Props {
   tpl: ServiceTemplate;
@@ -122,68 +122,40 @@ interface TemplateContextMenuProps {
   onClose: () => void;
 }
 
-const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, onDelete, onClose }: TemplateContextMenuProps) => {
-  const menuRef = useRef<HTMLDivElement | null>(null);
-
-  // 点击外部关闭菜单
-  useEffect(() => {
-    const handleClose = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        onClose();
-      }
-    };
-    document.addEventListener('mousedown', handleClose);
-    return () => document.removeEventListener('mousedown', handleClose);
-  }, [onClose]);
-
-  // 计算菜单位置，确保不超出内容区
-  // 与服务条目菜单同源：共享定位钩子实测尺寸后夹进「窗口 − AI 面板占用宽度」，
-  // 不再手写宽度/高度估算（估算偏小会让末尾条目落到屏幕外，偏大则白让位）
-  const anchor = useMemo(() => ({ x, y }), [x, y]);
-  const menuStyle = useContextMenuPosition(menuRef, anchor);
-
-  return (
-    <div
-      ref={menuRef}
-      className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
-      style={menuStyle}
-    >
-      {/* 打开资源管理器 / 打开终端 */}
-      {hasCwd && (
-        <div className="py-1.5 px-1.5">
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={onOpenInExplorer}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">在资源管理器中打开</span>
-          </button>
-          <button
-            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={onOpenTerminal}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
-              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
-            </svg>
-            <span className="text-[12px] text-nexus-text">打开终端</span>
-          </button>
-        </div>
-      )}
-
-      {/* 删除 */}
-      <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-        <button
-          className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-error/10 transition-colors group text-left"
-          onClick={onDelete}
-        >
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted group-hover:text-nexus-error flex-shrink-0">
-            <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
-          </svg>
-          <span className="text-[12px] text-nexus-muted group-hover:text-nexus-error">删除模板</span>
-        </button>
+// 容器/定位/关闭与行按钮走 ui/ContextMenu 原语：口径与服务条目菜单同源
+// （原实现手写「固定 180px 宽 + 估算高度」夹取，估算偏小会让末尾条目落到屏幕外）
+const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, onDelete, onClose }: TemplateContextMenuProps) => (
+  <ContextMenu x={x} y={y} onClose={onClose}>
+    {/* 打开资源管理器 / 打开终端 */}
+    {hasCwd && (
+      <div className="py-1.5 px-1.5">
+        <ContextMenuItem
+          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
+          </svg>}
+          label="在资源管理器中打开"
+          onClick={onOpenInExplorer}
+        />
+        <ContextMenuItem
+          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+          </svg>}
+          label="打开终端"
+          onClick={onOpenTerminal}
+        />
       </div>
+    )}
+
+    {/* 删除 */}
+    <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+      <ContextMenuItem
+        tone="danger"
+        icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3">
+          <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
+        </svg>}
+        label="删除模板"
+        onClick={onDelete}
+      />
     </div>
-  );
-};
+  </ContextMenu>
+);

@@ -4,10 +4,10 @@ import { create } from 'zustand';
  * 工具命令输出行（按 run_id 分桶）。
  *
  * 为什么单独一个 store 而不是放在 `ProjectDetail` 的 state 里：
- * 后端逐行 `emit("tool-command-log")`（`commands/process.rs`），原实现每行一次
- * `setToolCommandState` → **整个 ProjectDetail 子树**（标签栏 + 编辑器 + 全部服务卡 +
- * 模板卡 + 两套 dnd context）跟着重渲染，弹窗里还要把最多 2000 行重新 `join('\n')`。
- * `npm install`/`mvn` 这类命令每秒数百行时界面基本被占满。
+ * 后端按 50ms 批量 `emit("tool-command-log-batch")`（`commands/process.rs`），
+ * 原实现每行一次 `setToolCommandState` → **整个 ProjectDetail 子树**（标签栏 + 编辑器 +
+ * 全部服务卡 + 模板卡 + 两套 dnd context）跟着重渲染，弹窗里还要把最多 2000 行重新
+ * `join('\n')`。`npm install`/`mvn` 这类命令每秒数百行时界面基本被占满。
  *
  * 现在改成：事件回调只往模块级缓冲里推（零 React 工作），50ms 合帧一次写入 store；
  * 只有订阅了该 run_id 的弹窗组件会重渲染，`join` 也只在合帧后做一次。

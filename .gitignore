@@ -58,8 +58,6 @@ yarn-error.log*
 .nexus/
 
 # Cache
-.eslintcache
-.stylelintcache
 *.cache
 
 # AI Assistant

@@ -17,9 +17,16 @@ import type { FileEntry } from '../types/file';
  * 若走前端 `plugin-dialog` + 一个"确认目录"命令，被攻陷的 webview 可以自己确认任意路径，
  * 白名单收口就形同虚设（见 `src-tauri/src/commands/editor.rs` 的"配置路径收口"）。
  */
-export function pickDirectory(opts?: { title?: string; defaultPath?: string }): Promise<string | null> {
+/**
+ * 用途键 → 对话框标题由**后端**决定（SEC-17）：原生对话框无法被网页伪造，用户对它的
+ * 信任天然更高，所以标题不能被 IPC 指定——否则被攻陷的 webview 能弹出标题写着
+ * 「Nexus 需要访问 …\.ssh 才能继续」的系统级选择框。这里只传用途，不传文案。
+ */
+export type PickPurpose = 'projectDir' | 'serviceCwd';
+
+export function pickDirectory(opts?: { purpose?: PickPurpose; defaultPath?: string }): Promise<string | null> {
   return invoke<string | null>('pick_directory', {
-    title: opts?.title ?? null,
+    purpose: opts?.purpose ?? null,
     defaultPath: opts?.defaultPath ?? null,
   });
 }

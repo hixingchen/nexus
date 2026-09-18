@@ -96,7 +96,7 @@ export async function readJarEntryBytes(path: string, nested: string[], name: st
 export async function writeFile(
   path: string,
   content: string,
-  encoding?: 'utf8' | 'gb18030',
+  encoding?: 'utf8' | 'gb18030' | 'lossy',
   expectedModified?: number | null,
 ): Promise<number | null> {
   return await invoke<number | null>('write_file', {

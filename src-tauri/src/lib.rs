@@ -8,6 +8,10 @@ mod models;
 #[cfg(test)]
 mod contract;
 
+/// 内部命令收口的守卫测试（源码扫描，GUARD-1），仅测试构建参与编译
+#[cfg(test)]
+mod spawn_guard;
+
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -16,31 +20,15 @@ use crate::core::file_watcher::FileWatcher;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
 
-/// 允许根解析缓存：(原始根字符串列表, 已 canonicalize 的 PathBuf 列表, 上次核对时间)。
-///
-/// 键为原始列表 → DB 增删服务/模板后自然失效；`Instant` 给出复用窗口（见
-/// `ALLOWED_ROOTS_TTL`）——文件树连续展开时连"查库算原始列表"这一步也省掉。
-pub type AllowedRootsCache = std::sync::Mutex<
-    Option<(Vec<String>, std::sync::Arc<Vec<std::path::PathBuf>>, std::time::Instant)>,
->;
-
 pub struct AppState {
     pub db: Database,
     pub process_mgr: ProcessManager,
     pub file_watcher: FileWatcher,
-    // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
-    pub project_root: std::sync::Mutex<Option<String>>,
-    /// 本会话内由原生目录选择器确认过的目录（canonicalize 后）。
-    /// 为什么要有它：白名单的根来自 IPC 可写字段，若不收口，调用方（webview）
-    /// 可以自己把任意目录加进白名单。经用户亲自点选的目录才允许成为项目外的新根，
-    /// 见 `commands::editor::ensure_config_dir_allowed`。
-    pub confirmed_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
-    /// 允许访问根目录的解析缓存（见 `AllowedRootsCache`）。
+    /// 文件访问白名单：状态（项目根 / 已确认目录 / 解析缓存）与规则同住一处。
     ///
-    /// 为什么按"原始列表"做缓存键而不是手动失效：漏一处失效调用就会出现
-    /// "新加的服务目录打不开文件"。canonicalize 是这条热路径上真正的开销
-    /// （每个根一次文件系统路径解析），而 SQL 只查一张小表且有索引。
-    pub allowed_roots_cache: AllowedRootsCache,
+    /// 为什么收成一个字段：这三项此前是三个独立字段，而 39 个命令都能拿到 `AppState`——
+    /// "哪些代码能改白名单"在类型上给不出答案，只能 grep 字段名。见 `commands::paths`。
+    pub paths: crate::commands::paths::PathAllowlist,
     /// 搜索代数：每次发起内容搜索递增，正在跑的旧搜索据此尽早退出
     /// （Arc 是为了能把它克隆进 spawn_blocking 的闭包）
     pub search_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -104,17 +92,34 @@ fn purge_webview_cookies() {
     }
 }
 
-/// 启动致命错误落盘（`~/.nexus/logs/startup-error.log`）后退出。
+/// Nexus 自己的数据目录（数据库 + 日志）。
+///
+/// `NEXUS_DATA_DIR` 可覆盖它，用途是**跑一个与真实数据完全隔离的实例**——
+/// 端到端验证（"真机跑一次"）不能拿用户的真实库做实验，而 `dirs::home_dir()` 在
+/// Windows 上走 Known Folder API、**不认 `USERPROFILE`**，没有这个开关就没法隔离。
+/// 未设置时行为与之前完全一致（`~/.nexus`）。
+///
+/// 注意：**只影响 Nexus 自己的数据**。白名单里的"用户目录"（`commands/editor.rs`）
+/// 与 CFR 找 jar 的位置（`core/decompiler.rs`）必须仍指向真实用户目录——那两处跟着
+/// 数据目录走会让被隔离的实例看不到真实的用户主目录。
+pub(crate) fn data_dir() -> std::path::PathBuf {
+    match std::env::var_os("NEXUS_DATA_DIR") {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".nexus"),
+    }
+}
+
+/// 启动致命错误落盘（`<数据目录>/logs/startup-error.log`）后退出。
 ///
 /// 打包版没有控制台，启动期 panic 的表现是"双击后闪退、没有任何线索"；
-/// 落盘 + 明确退出码让用户/支持者至少能拿到原因（日志文件在 `~/.nexus/logs/`）。
+/// 落盘 + 明确退出码让用户/支持者至少能拿到原因。
 fn fatal_startup_error(msg: String) -> ! {
     log::error!("[nexus] 启动失败: {}", msg);
-    if let Some(home) = dirs::home_dir() {
-        let dir = home.join(".nexus").join("logs");
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("startup-error.log"), format!("{}\n", msg));
-    }
+    let dir = data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("startup-error.log"), format!("{}\n", msg));
     eprintln!("[nexus] 启动失败: {}", msg);
     std::process::exit(1);
 }
@@ -176,9 +181,7 @@ pub fn run() {
             db,
             process_mgr,
             file_watcher: FileWatcher::new(),
-            project_root: std::sync::Mutex::new(None),
-            confirmed_dirs: std::sync::Mutex::new(Vec::new()),
-            allowed_roots_cache: std::sync::Mutex::new(None),
+            paths: crate::commands::paths::PathAllowlist::new(),
             ai: std::sync::Mutex::new(None),
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
             search_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
