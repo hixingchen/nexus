@@ -5,7 +5,7 @@ import { useProjectList } from '../../hooks/useProjectList';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
-import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
+import { ProjectContextMenu } from './ProjectContextMenu';
 import { needsFavoriteDivider } from '../../utils/projectList';
 
 interface Props {
@@ -15,6 +15,13 @@ interface Props {
   onProjectPath?: (path: string) => void;
   /** 收起项目列（由 MainLayout 提供） */
   onCollapse?: () => void;
+  /**
+   * 「展开这个项目」的请求（由窄轨双击发出）。列表挂载后自行执行一次并回调 `onExpandHandled`
+   * 清除请求——用"请求 + 回执"而不是直接调用：窄轨与列表**不会同时挂载**，
+   * 窄轨手上没有 `useProjectList` 的行动作可调。
+   */
+  expandProjectId?: string | null;
+  onExpandHandled?: () => void;
 }
 
 /**
@@ -24,7 +31,7 @@ interface Props {
  */
 const NO_DOM_EVENT = { stopPropagation: () => {} };
 
-export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath, onCollapse }: Props) {
+export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath, onCollapse, expandProjectId, onExpandHandled }: Props) {
   const {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
@@ -35,10 +42,17 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
     editTarget, setEditTarget,
     duplicateTarget, setDuplicateTarget,
     filtered, isProjectRunning, load,
-    handleTogglePin,
-    handleStart, handleStop,
-    toggleSvcExpand, toggleExpand,
+    start, stop, togglePin,
+    toggleSvcExpand, toggleExpand, expandProject,
   } = useProjectList();
+
+  // 窄轨双击 → 面板展开 → 这里把那个项目也展开（"我就是要看到它"）。
+  // 先回执再执行：回执清除父组件的请求，避免下一次渲染重复触发
+  useEffect(() => {
+    if (!expandProjectId) return;
+    onExpandHandled?.();
+    void expandProject(expandProjectId);
+  }, [expandProjectId, expandProject, onExpandHandled]);
 
   /**
    * 选中项滚进视野。
@@ -54,6 +68,17 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
     const el = items && Array.from(items).find(e => e.dataset.projectId === selectedId);
     el?.scrollIntoView({ block: 'nearest' });
   }, [selectedId]);
+
+  /**
+   * 右键菜单里那两个"按状态改文案"的条目（启动/停止、收藏/取消收藏）需要目标项目的当前状态。
+   *
+   * 两者都是**现查**而不是右键时快照进 `ctxMenu`：菜单可能开着好几秒，期间列表会因别处
+   * 的操作重新 `load()`（如新开一个项目、详情页改了名字），快照会指向过期的值——
+   * 表现是"收藏后菜单仍显示收藏"、"启动了但菜单还写着启动"。运行状态本就在共享 store 里
+   * 实时变（3 秒轮询），更没有快照的道理。
+   */
+  const ctxProject = ctxMenu ? projects.find(p => p.id === ctxMenu.id) : undefined;
+  const ctxRunning = ctxMenu ? isProjectRunning(ctxMenu.id) : false;
 
   return (
     <div className="h-full bg-nexus-surface flex flex-col select-none">
@@ -86,82 +111,36 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
               onSelect={() => { onSelect(p.id); onProjectName?.(p.name); onProjectPath?.(p.path); }}
               onToggleExpand={e => toggleExpand(e, p.id)}
               onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setCtxMenu({ id: p.id, name: p.name, path: p.path, x: e.clientX, y: e.clientY }); }}
-              onStart={e => handleStart(e, p.id, p.name)}
-              onStop={e => handleStop(e, p.id, p.name)}
-              onTogglePin={e => handleTogglePin(e, p.id)}
+              // 卡片按钮有真实 DOM 事件：不拦住冒泡就会顺带触发卡片的 onClick（选中项目）
+              onStart={e => { e.stopPropagation(); void start(p.id, p.name); }}
+              onStop={e => { e.stopPropagation(); void stop(p.id, p.name); }}
+              onTogglePin={e => { e.stopPropagation(); void togglePin(p.id); }}
               onToggleSvcExpand={serviceId => toggleSvcExpand(NO_DOM_EVENT, p.id, serviceId)}
             />
           </Fragment>
         ))}
       </div>
 
-      {/* 右键菜单 */}
+      {/* 右键菜单：菜单本体与窄轨共用（ProjectContextMenu），这里只接行动作与三个弹窗 */}
       {ctxMenu && (
-        <ContextMenu x={ctxMenu.x} y={ctxMenu.y} onClose={() => setCtxMenu(null)}>
-          {/* 操作项 */}
-          <div className="py-1.5 px-1.5">
-            <ContextMenuItem
-              iconBox
-              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-              </svg>}
-              label="在资源管理器中打开"
-              onClick={() => {
-                // 失败原因由 openInExplorer 统一提示（白名单拒绝与路径不存在文案一致，都带原因）
-                void openInExplorer(ctxMenu.path);
-                setCtxMenu(null);
-              }}
-            />
-
-            <ContextMenuItem
-              iconBox
-              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
-              </svg>}
-              label="打开终端"
-              onClick={() => {
-                void openTerminal(ctxMenu.path);
-                setCtxMenu(null);
-              }}
-            />
-
-            <ContextMenuItem
-              iconBox
-              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <rect x="2.5" y="3" width="5" height="5.5" rx=".8"/>
-                <path d="M2 2.5v4.5h.5V3.5h4V2.5H3a.5.5 0 00-.5.5z"/>
-              </svg>}
-              label="复制项目"
-              onClick={() => { setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
-            />
-
-            <ContextMenuItem
-              iconBox
-              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <path d="M7 2l1 1-5.5 5.5H1.5V7.5L7 2z"/>
-              </svg>}
-              label="编辑项目"
-              onClick={() => {
-                const p = projects.find(pr => pr.id === ctxMenu.id);
-                if (p) setEditTarget(p);
-                setCtxMenu(null);
-              }}
-            />
-          </div>
-
-          {/* 分隔线和删除 */}
-          <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-            <ContextMenuItem
-              iconBox
-              tone="danger"
-              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
-              </svg>}
-              label="删除项目"
-              onClick={() => { setDeleteTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
-            />
-          </div>
-        </ContextMenu>
+        <ProjectContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          pinned={ctxProject?.pinned ?? false}
+          running={ctxRunning}
+          busy={actingId === ctxMenu.id}
+          onClose={() => setCtxMenu(null)}
+          onStart={() => void start(ctxMenu.id, ctxMenu.name)}
+          onStop={() => void stop(ctxMenu.id, ctxMenu.name)}
+          onTogglePin={() => void togglePin(ctxMenu.id)}
+          // 失败原因由 openInExplorer 统一提示（白名单拒绝与路径不存在文案一致，都带原因）
+          onOpenExplorer={() => void openInExplorer(ctxMenu.path)}
+          onOpenTerminal={() => void openTerminal(ctxMenu.path)}
+          onDuplicate={() => setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name })}
+          // 复用上面现查到的 ctxProject，而不是再 find 一次（同一个查找两处写，迟早分叉）
+          onEdit={() => { if (ctxProject) setEditTarget(ctxProject); }}
+          onDelete={() => setDeleteTarget({ id: ctxMenu.id, name: ctxMenu.name })}
+        />
       )}
 
       {/* Modals */}

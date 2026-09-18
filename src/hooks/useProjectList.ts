@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { projectApi, type Project } from '../services/service';
 import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
-import { startProjectWithFeedback, stopProjectWithFeedback } from '../stores/serviceActions';
+import { useProjectActions } from './useProjectActions';
 import { reportError } from '../utils/error';
 
 /**
@@ -22,7 +22,6 @@ export function useProjectList() {
   const svcCache = useSvcCacheStore(s => s.cache);
   // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
   const running = useRunningStore(s => s.running);
-  const [actingId, setActingId] = useState<string | null>(null);
 
   // modal state
   const [showNewModal, setShowNewModal] = useState(false);
@@ -43,6 +42,10 @@ export function useProjectList() {
 
   useEffect(() => { load(); }, [load]);
 
+  // 项目动作（启动/停止/收藏）与窄轨共用一份实现（见 useProjectActions 的说明）。
+  // 收藏会改变排序（后端 ORDER BY pinned DESC），所以动作完成后要重新拉列表
+  const { actingId, start, stop, togglePin } = useProjectActions(load);
+
   // 右键菜单关闭逻辑在 ProjectList 组件内处理（mousedown + 菜单内部不关闭）
 
   // ── 派生状态 ──────────────────────────────────────────────
@@ -59,35 +62,6 @@ export function useProjectList() {
     running.some(r => r.project_id === id),
     [running]
   );
-
-  // ── 项目操作 ──────────────────────────────────────────────
-
-  const handleTogglePin = useCallback(async (e: React.MouseEvent, projectId: string) => {
-    e.stopPropagation();
-    try {
-      await projectApi.togglePin(projectId);
-      await load();
-    } catch (e: unknown) {
-      reportError('收藏项目失败', e);
-    }
-  }, [load]);
-
-  const handleStart = useCallback(async (e: React.MouseEvent, id: string, name: string) => {
-    e.stopPropagation();
-    setActingId(id);
-    // 共享动作层：启动 + 项目级监听 + 运行状态刷新 + 逐服务失败汇总（与详情页同一实现）
-    await startProjectWithFeedback(id, name);
-    setActingId(null);
-  }, []);
-
-  const handleStop = useCallback(async (e: React.MouseEvent, id: string, name: string) => {
-    e.stopPropagation();
-    setActingId(id);
-    // 停止：日志清单取自缓存的服务列表（列表页只缓存了服务数组，与详情页口径一致）
-    const services = useSvcCacheStore.getState().cache[id] ?? [];
-    await stopProjectWithFeedback(id, name, services);
-    setActingId(null);
-  }, []);
 
   // ── 展开/折叠 ──────────────────────────────────────────────
 
@@ -112,18 +86,15 @@ export function useProjectList() {
     });
   }, []);
 
-  const toggleExpand = useCallback(async (e: React.MouseEvent, projectId: string) => {
-    e.stopPropagation();
-    if (expanded.has(projectId)) {
-      // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）
-      useSvcCacheStore.getState().invalidate(projectId);
-      setExpanded(prev => {
-        const next = new Set(prev);
-        next.delete(projectId);
-        return next;
-      });
-      return;
-    }
+  /**
+   * 只展开、不折叠。
+   *
+   * 为什么单列一个而不是复用 toggleExpand：**"从窄轨双击进来"要的是"看到它"**，
+   * 而 toggle 在"已经展开"时会把它收起来——正好与调用方的意图相反。列表里的双击
+   * 仍然是 toggle（那里看得见展开状态，用户点的是"切换"）。
+   */
+  const expandProject = useCallback(async (projectId: string) => {
+    if (expanded.has(projectId)) return;
     // 展开：先亮加载态，拉到服务列表后才真正展开——期间不展开可避免空缓存被渲染成
     // 「暂无开启目录树的服务」（那是加载失败，不是没有服务）；失败则不展开，重试 = 再点一次
     const seq = ++expandSeqRef.current;
@@ -140,6 +111,21 @@ export function useProjectList() {
       if (seq === expandSeqRef.current) setExpandingId(null);
     }
   }, [expanded]);
+
+  const toggleExpand = useCallback(async (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    if (expanded.has(projectId)) {
+      // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）
+      useSvcCacheStore.getState().invalidate(projectId);
+      setExpanded(prev => {
+        const next = new Set(prev);
+        next.delete(projectId);
+        return next;
+      });
+      return;
+    }
+    await expandProject(projectId);
+  }, [expanded, expandProject]);
   return {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
@@ -152,8 +138,7 @@ export function useProjectList() {
     filtered,
     isProjectRunning,
     load,
-    handleTogglePin,
-    handleStart, handleStop,
-    toggleSvcExpand, toggleExpand,
+    start, stop, togglePin,
+    toggleSvcExpand, toggleExpand, expandProject,
   };
 }

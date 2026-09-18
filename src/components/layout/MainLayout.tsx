@@ -137,6 +137,12 @@ export function MainLayout() {
     securityApi.setProjectRoot(selectedProjectPath).catch((e) => reportError('设置项目根失败', e));
   }, [selectedProjectPath]);
 
+  /**
+   * 窄轨双击项目 → 面板展开后要展开哪个项目。用"请求 + 回执"传递：窄轨与列表不会同时挂载，
+   * 请求在列表挂载后由它自己执行一次（见 ProjectList 的 effect）。
+   */
+  const [railExpandProjectId, setRailExpandProjectId] = useState<string | null>(null);
+
   const leftPanel = (
     <ProjectList
       selectedId={selectedProjectId}
@@ -144,6 +150,8 @@ export function MainLayout() {
       onProjectName={setSelectedProjectName}
       onProjectPath={setSelectedProjectPath}
       onCollapse={() => setLeftPanelCollapsed(true)}
+      expandProjectId={railExpandProjectId}
+      onExpandHandled={() => setRailExpandProjectId(null)}
     />
   );
 
@@ -153,6 +161,10 @@ export function MainLayout() {
       selectedId={selectedProjectId}
       onSelect={(p) => { setSelectedProjectId(p.id); setSelectedProjectName(p.name); setSelectedProjectPath(p.path); }}
       onExpand={() => setLeftPanelCollapsed(false)}
+      onExpandProject={(p) => {
+        setRailExpandProjectId(p.id);
+        setLeftPanelCollapsed(false); // 与顶部箭头同一入口（持久化由下面那个 effect 统一处理）
+      }}
     />
   );
 

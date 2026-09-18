@@ -1,9 +1,11 @@
-import { useState, useCallback, useEffect, lazy, Suspense } from 'react';
+import { useState, useCallback, useEffect, useMemo, lazy, Suspense } from 'react';
+import { createPortal } from 'react-dom';
 import { EditorTabs } from '../editor/EditorTabs';
 // CodeViewer 是首屏最大的一块（CodeMirror 核心 326KB），改为按需加载（PERF-19）：
 // 未打开文件时不该为它付出解析成本（冷启动首屏实测因此少 326KB raw）。
 // 它与下方三个 Viewer 不同：那些各自很小，静态引入无妨。
 const CodeViewer = lazy(() => import('../editor/CodeViewer').then(m => ({ default: m.CodeViewer })));
+const MarkdownPreview = lazy(() => import('../editor/MarkdownPreview').then(m => ({ default: m.MarkdownPreview })));
 import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
@@ -14,6 +16,7 @@ import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
 import { ServiceTreeEntry } from './ServiceTreeEntry';
+import { ServiceContextMenu } from './ServiceContextMenu';
 import { TemplateTreeEntry } from './TemplateTreeEntry';
 import { SearchResultPanel } from './SearchResultPanel';
 import { AddServiceFormContent } from './AddServiceFormContent';
@@ -29,9 +32,13 @@ import {
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
+import { isMarkdownFile } from '../../utils/markdown';
 import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
-import { serviceApi, type Service, type ServiceTemplate } from '../../services/service';
+import { openToolsApi, parseToolCommands, serviceApi, type Service, type ServiceTemplate } from '../../services/service';
+import { openInExplorer, openTerminal } from '../../services/system';
+import { useToolStore } from '../../stores/toolStore';
+import { useServiceActions } from '../../hooks/useServiceActions';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { useToolCommandRunner } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
@@ -54,6 +61,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     isServiceRunning, isServiceFailed, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
+  // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）
+  const mdPreview = useEditorStore(s => s.mdPreview);
+  const mdPreviewOnThisTab = mdPreview && !!activeTab && isMarkdownFile(activeTab.path);
 
   // 工具命令执行（订阅事件流 / 跑命令 / 失败态 / 停止）抽到独立 hook（ARCH-7 ②）
   const {
@@ -205,6 +215,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                   <HexViewer path={activeTab.path} />
                 ) : activeTab.viewerType === 'jar' ? (
                   <JarViewer path={activeTab.path} />
+                ) : mdPreviewOnThisTab ? (
+                  // Markdown 预览：内容取 store 里的当前文本（含未保存的编辑）——
+                  // 预览要从正在编辑的内容渲染，而不是磁盘上的旧版本
+                  <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                    <MarkdownPreview filePath={activeTab.path} />
+                  </Suspense>
                 ) : (
                   // fallback 用编辑器自身的底色占位：chunk 从本地盘加载（几十 ms），
                   // 空白会让"打开文件"看起来像闪了一下
@@ -411,6 +427,8 @@ function ServicePanel({
           isServiceFailed={isServiceFailed}
           onToggle={onToggle}
           onViewLog={handleViewLog}
+          onRunToolCommand={handleRunToolCommand}
+          load={load}
         />
       </div>
       {/* 展开内容：折叠时用 transform 向右滑出（GPU 合成，不触发布局 reflow，
@@ -442,7 +460,7 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, isServiceFailed, onToggle, onViewLog,
+  services, isServiceRunning, isServiceFailed, onToggle, onViewLog, onRunToolCommand, load,
 }: {
   services: Service[];
   isServiceRunning: (svc: Service) => boolean;
@@ -450,6 +468,10 @@ function CollapsedView({
   onToggle: () => void;
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
+  /** 工具命令：输出弹窗由 ProjectDetail 顶层渲染，与面板收起与否无关 */
+  onRunToolCommand: (serviceId: string, commandId: string, commandName: string) => void;
+  /** 动作完成后刷新服务列表（与展开态同一个 load：它写的是共享的 svcCacheStore） */
+  load: () => void;
 }) {
   // 图标亮 = 本项目的 AI 会话活跃（判据见 selectAiRunningHere）；
   // 选中底色只表示「面板展开」：面板收起时会话照跑，此时只亮不选中（同满足两态会像被按下的开关）
@@ -457,6 +479,20 @@ function CollapsedView({
   /** 面板是否真的显示（安装进度会强制撑开面板，与 RestartConfirm 判定同源） */
   const aiPanelVisible = useAiStore(selectAiPanelVisible);
   const toggleAi = () => useAiStore.getState().togglePanel();
+
+  /** 右键菜单指向的服务（null = 菜单没开） */
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  // 动作与展开态的服务卡片共用一份实现（见 useServiceActions 的说明）
+  const { runAction } = useServiceActions(load);
+  // 服务对象与工具绑定都现查、不快照：菜单可能开着好几秒，期间 services 会重新加载
+  const menuSvc = menu ? services.find(s => s.id === menu.id) : undefined;
+  const boundToolId = useToolStore(s => (menu ? s.bindings[menu.id] : undefined));
+  const openTools = useToolStore(s => s.openTools);
+  const boundTool = openTools.find(t => t.id === boundToolId);
+  const menuCommands = useMemo(
+    () => (menuSvc ? parseToolCommands(menuSvc.tool_commands) : []),
+    [menuSvc],
+  );
   return (
     <div className="flex flex-col h-full w-full">
       {/* 顶部：展开服务列表在上，AI 开关在它下方（收起态依旧可点） */}
@@ -491,12 +527,22 @@ function CollapsedView({
           return (
             <button
               key={svc.id}
+              // 与展开态的服务卡片同一个属性名：两处都靠它标识"这一格是哪个服务"
+              data-service-id={svc.id}
               disabled={!clickable}
               onClick={() => onViewLog(svc)}
+              // 右键菜单与展开态的服务卡片同一份（ServiceContextMenu 的前几组）：
+              // 未运行的服务在这里连点击都是 disabled，没有右键就等于"收起后完全够不着"
+              onContextMenu={e => {
+                e.preventDefault();
+                e.stopPropagation();
+                setMenu({ id: svc.id, x: e.clientX, y: e.clientY });
+              }}
               className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors ${
                 clickable ? 'hover:bg-nexus-accent/20 cursor-pointer' : 'cursor-default'
               }`}
-              title={`${svc.name}${running ? '（运行中）' : failed ? '（失败）' : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}`}
+              title={`${svc.name}${running ? '（运行中）' : failed ? '（失败）' : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}
+右键：启停 / 重启、工具、打开位置`}
             >
               <span className={`w-[8px] h-[8px] rounded-full flex-shrink-0 ${
                 running ? 'bg-nexus-success' : failed ? 'bg-nexus-error' : 'bg-nexus-muted/25'
@@ -505,6 +551,32 @@ function CollapsedView({
           );
         })}
       </div>
+
+      {/* 右键菜单：与展开态的卡片共用同一份，唯独**不传 onDelete**——收起态只有 24px 圆点，
+          删除这种破坏性操作挂在这里误触代价太高（其余条目都保留：收起态恰恰是最需要它们的场景）。
+          Portal 到 body：服务面板有 transform 容器（展开内容用 translate-x 滑出），
+          fixed 定位的菜单留在其内会以它为包含块，坐标错位被裁剪而不可见 */}
+      {menu && menuSvc && createPortal(
+        <ServiceContextMenu
+          x={menu.x}
+          y={menu.y}
+          cwd={menuSvc.cwd}
+          running={isServiceRunning(menuSvc)}
+          failed={isServiceFailed(menuSvc)}
+          openToolName={boundTool?.name ?? null}
+          toolCommands={menuCommands}
+          onViewLog={() => onViewLog(menuSvc)}
+          onStart={() => void runAction(menuSvc, 'start')}
+          onStop={() => void runAction(menuSvc, 'stop')}
+          onRestart={() => void runAction(menuSvc, 'restart')}
+          onOpenWithTool={() => { void openToolsApi.openWith(menuSvc.id).catch(e => reportError('用工具打开失败', e)); }}
+          onOpenInExplorer={() => void openInExplorer(menuSvc.cwd)}
+          onOpenTerminal={() => void openTerminal(menuSvc.cwd)}
+          onRunCommand={cmd => onRunToolCommand(menuSvc.id, cmd.id, cmd.name)}
+          onClose={() => setMenu(null)}
+        />,
+        document.body,
+      )}
     </div>
   );
 }

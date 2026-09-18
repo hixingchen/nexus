@@ -3,11 +3,11 @@ import { createPortal } from 'react-dom';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, processApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
-import { startSingleService, stopSingleService } from '../../stores/serviceActions';
+import { openToolsApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
+import { useServiceActions, type ServiceActionName } from '../../hooks/useServiceActions';
 import { useToolStore } from '../../stores/toolStore';
 import { reportError } from '../../utils/error';
-import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
+import { ServiceContextMenu } from './ServiceContextMenu';
 
 interface Props {
   service: Service;
@@ -21,9 +21,6 @@ interface Props {
   onViewLog?: () => void;
   onRunToolCommand?: (serviceId: string, commandId: string, commandName: string) => void;
 }
-
-/** 服务动作：卡片按钮与右键菜单共同的三档操作 */
-type ServiceActionName = 'start' | 'stop' | 'restart';
 
 export function ServiceTreeEntry({
   service, running, failed, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
@@ -44,7 +41,6 @@ export function ServiceTreeEntry({
     if (draggedRef.current) { draggedRef.current = false; return; }
     onEdit();
   };
-  const [busy, setBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   // 绑定的打开工具（服务设置中选择，全局工具库共享）
@@ -58,31 +54,14 @@ export function ServiceTreeEntry({
     [service.tool_commands],
   );
 
-  /** 服务动作的唯一实现：卡片 Hover 按钮与右键菜单共用，避免两处口径分叉 */
-  const runAction = async (action: ServiceActionName) => {
-    setBusy(true);
-    try {
-      if (action === 'start') {
-        // 共享动作层：启动进程 + 追加该服务的文件监听（口径与详情页一致）
-        await startSingleService(service.project_id, service.id);
-      } else if (action === 'stop') {
-        // 停止进程 + 移除监听 + 清日志（后端已清缓冲，前端缓存同步清）
-        await stopSingleService(service.project_id, service.id);
-      }
-      else await processApi.restart(service.id);
-      onRefresh();
-    } catch (err: unknown) {
-      reportError(`${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, err);
-      // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
-      if (action === 'start') onRefresh();
-    }
-    setBusy(false);
-  };
+  // 服务动作与"服务列收起后的圆点条"共用一份实现（见 useServiceActions 的说明）
+  const { busyId, runAction } = useServiceActions(onRefresh);
+  const busy = busyId === service.id;
 
   /** 卡片按钮入口：先阻止冒泡（卡片点击 = 打开编辑面板），再走共享动作 */
   const handleAction = (e: React.MouseEvent, action: ServiceActionName) => {
     e.stopPropagation();
-    void runAction(action);
+    void runAction(service, action);
   };
 
   const handleContextMenu = (e: React.MouseEvent) => {
@@ -92,13 +71,12 @@ export function ServiceTreeEntry({
     setContextMenu({ x: e.clientX, y: e.clientY });
   };
 
+  // 关菜单由 ServiceContextMenu 统一负责（它要保证每个条目都关），这里只管动作本身
   const handleRunCommand = (cmd: ToolCommand) => {
-    setContextMenu(null);
     onRunToolCommand?.(service.id, cmd.id, cmd.name);
   };
 
   const handleOpenWithTool = async () => {
-    setContextMenu(null);
     try {
       await openToolsApi.openWith(service.id);
     } catch (err) {
@@ -183,7 +161,7 @@ export function ServiceTreeEntry({
         </div>
       </div>
 
-      {/* 右键菜单。
+      {/* 右键菜单（与"服务列收起后的圆点条"共用同一份，见 ServiceContextMenu）。
           Portal 到 body：服务面板有 transform 容器（折叠动画），fixed 定位的菜单
           若留在其内会以 transform 容器为包含块，导致坐标错位被裁剪而不可见 */}
       {contextMenu && createPortal(
@@ -195,24 +173,15 @@ export function ServiceTreeEntry({
           failed={failed}
           openToolName={boundTool?.name ?? null}
           toolCommands={toolCommands}
-          onViewLog={onViewLog ? () => { setContextMenu(null); onViewLog(); } : undefined}
-          onStart={() => { setContextMenu(null); void runAction('start'); }}
-          onStop={() => { setContextMenu(null); void runAction('stop'); }}
-          onRestart={() => { setContextMenu(null); void runAction('restart'); }}
+          onViewLog={onViewLog}
+          onStart={() => void runAction(service, 'start')}
+          onStop={() => void runAction(service, 'stop')}
+          onRestart={() => void runAction(service, 'restart')}
           onOpenWithTool={handleOpenWithTool}
-          onOpenInExplorer={() => {
-            setContextMenu(null);
-            void openInExplorer(service.cwd);
-          }}
-          onOpenTerminal={() => {
-            setContextMenu(null);
-            void openTerminal(service.cwd);
-          }}
+          onOpenInExplorer={() => void openInExplorer(service.cwd)}
+          onOpenTerminal={() => void openTerminal(service.cwd)}
           onRunCommand={handleRunCommand}
-          onDelete={() => {
-            setContextMenu(null);
-            onContextMenu(service.id, service.name);
-          }}
+          onDelete={() => onContextMenu(service.id, service.name)}
           onClose={() => setContextMenu(null)}
         />,
         document.body,
@@ -221,144 +190,4 @@ export function ServiceTreeEntry({
   );
 }
 
-// ── 右键菜单组件 ──────────────────────────────────────────
-
-/** 查看日志：文档 + 折角（失败态复用同一图标，靠色调区分） */
-const LogIcon = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-    <path d="M2 1.5h3L7.5 4v4.5H2z"/><path d="M5 1.5V4h2.5"/>
-  </svg>
-);
-
-/** 重启：环形箭头（与卡片 ↻ 同义） */
-const RestartIcon = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1">
-    <path d="M8.75 5a3.75 3.75 0 1 1-3.75-3.75c1.05 0 2.05.42 2.81 1.14L8.75 3.33"/>
-    <path d="M8.75 1.25v2.08H6.67"/>
-  </svg>
-);
-
-/** 启动：实心三角（与卡片 ▶ 同形，也和"工具命令"条目同义） */
-const PlayIcon = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <polygon points="3,1.2 3,8.8 8.6,5" fill="currentColor"/>
-  </svg>
-);
-
-/** 停止：实心方块（与卡片 ■ 同形） */
-const StopIcon = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor"/>
-  </svg>
-);
-
-interface ServiceContextMenuProps {
-  x: number;
-  y: number;
-  cwd: string;
-  /** 运行中：显示 查看日志 / 重启服务 / 停止服务（与卡片按钮一致） */
-  running: boolean;
-  /** 意外失败：显示 查看失败日志 / 重新启动（与卡片按钮一致） */
-  failed: boolean;
-  /** 绑定的打开工具名（null = 未绑定，不显示该项） */
-  openToolName: string | null;
-  toolCommands: ToolCommand[];
-  /** 查看日志（调用方无日志入口时不传，该条目随之隐藏） */
-  onViewLog?: () => void;
-  onStart: () => void;
-  onStop: () => void;
-  onRestart: () => void;
-  onOpenWithTool: () => void;
-  onOpenInExplorer: () => void;
-  onOpenTerminal: () => void;
-  onRunCommand: (cmd: ToolCommand) => void;
-  onDelete: () => void;
-  onClose: () => void;
-}
-
-/** 服务条目的右键菜单：容器/定位/关闭与行按钮都走 ui/ContextMenu 原语，本组件只留条目编排 */
-const ServiceContextMenu = ({ x, y, cwd, running, failed, openToolName, toolCommands, onViewLog, onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ServiceContextMenuProps) => (
-  <ContextMenu x={x} y={y} onClose={onClose}>
-    {/* 服务动作：与卡片 Hover 按钮一一对应（运行中=日志/重启/停止，失败=失败日志/重启，未运行=启动）。
-        卡片按钮只在 Hover 时出现，右键是同一批操作的第二入口，两处共用 runAction */}
-    <div className="border-b border-nexus-border/30 py-1.5 px-1.5">
-      {running ? (
-        <>
-          {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看日志" tone="info" truncate onClick={onViewLog} />}
-          <ContextMenuItem icon={<RestartIcon />} label="重启服务" tone="warning" truncate onClick={onRestart} />
-          <ContextMenuItem icon={<StopIcon />} label="停止服务" tone="error" truncate onClick={onStop} />
-        </>
-      ) : failed ? (
-        <>
-          {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看失败日志" tone="error" truncate onClick={onViewLog} />}
-          <ContextMenuItem icon={<PlayIcon />} label="重新启动" tone="success" truncate onClick={onStart} />
-        </>
-      ) : (
-        <ContextMenuItem icon={<PlayIcon />} label="启动服务" tone="success" truncate onClick={onStart} />
-      )}
-    </div>
-
-    {/* 用绑定的工具打开（服务设置中选择，如 IDEA / VS Code） */}
-    {openToolName && (
-      <div className="py-1.5 px-1.5">
-        <ContextMenuItem
-          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-            <path d="M2 1h6a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1z"/><path d="M1.5 6.5h7M3.5 6.5V9"/>
-          </svg>}
-          label={`用 ${openToolName} 打开`}
-          truncate
-          onClick={onOpenWithTool}
-        />
-      </div>
-    )}
-
-    {/* 打开资源管理器 / 打开终端 */}
-    {cwd && (
-      <div className="py-1.5 px-1.5">
-        <ContextMenuItem
-          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-            <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
-          </svg>}
-          label="在资源管理器中打开"
-          onClick={onOpenInExplorer}
-        />
-        <ContextMenuItem
-          icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-            <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
-          </svg>}
-          label="打开终端"
-          onClick={onOpenTerminal}
-        />
-      </div>
-    )}
-
-    {/* 工具命令 */}
-    {toolCommands.length > 0 && (
-      <div className={`py-1.5 px-1.5 ${cwd ? 'border-t border-nexus-border/30' : ''}`}>
-        {toolCommands.map(cmd => (
-          <ContextMenuItem
-            key={cmd.id}
-            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-              <polygon points="3,1 3,9 9,5" fill="currentColor"/>
-            </svg>}
-            label={cmd.name}
-            truncate
-            onClick={() => onRunCommand(cmd)}
-          />
-        ))}
-      </div>
-    )}
-
-    {/* 删除 */}
-    <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
-      <ContextMenuItem
-        tone="danger"
-        icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3">
-          <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3"/>
-        </svg>}
-        label="删除服务"
-        onClick={onDelete}
-      />
-    </div>
-  </ContextMenu>
-);
+// 菜单本体与图标都在 ServiceContextMenu.tsx：它与"服务列收起后的圆点条"共用同一份
