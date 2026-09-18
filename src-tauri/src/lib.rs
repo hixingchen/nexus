@@ -249,7 +249,7 @@ pub fn run() {
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 // 这里**不做**清理：前端注册了 tauri://close-requested 监听后，Tauri 会自动
-                // prevent_close 并把决定权交给前端（未保存草稿确认，见 useAppCloseGuard）。
+                // prevent_close 并把决定权交给前端（未保存草稿确认，见 src/components/layout/CloseGuard.tsx）。
                 // 用户取消时窗口继续存在——此时停掉所有服务是错的。
                 // 真正的清理由 commands::app::prepare_exit 在独立线程执行（不冻结窗口），
                 // RunEvent::Exit 仍是最后兜底（幂等）。

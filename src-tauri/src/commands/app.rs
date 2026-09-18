@@ -20,7 +20,7 @@ static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 /// 内联在窗口事件/IPC 线程上，窗口会整段"未响应"（原实现就在 `CloseRequested` 里同步跑）。
 ///
 /// 为什么由前端调用而不是直接在 `CloseRequested` 里做：窗口关闭请求现在会先交给前端
-/// 处理"未保存草稿"确认（见 `src/hooks/useAppCloseGuard.ts`），用户可能**取消**关闭——
+/// 处理"未保存草稿"确认（见 `src/components/layout/CloseGuard.tsx`），用户可能**取消**关闭——
 /// 那时把服务全停掉是错的。所以清理只在"用户确认关闭"之后由本命令触发；
 /// `WindowEvent::CloseRequested` 不再做清理，`RunEvent::Exit` 仍是最后的兜底（幂等）。
 #[tauri::command]

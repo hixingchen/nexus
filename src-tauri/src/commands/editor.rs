@@ -352,9 +352,32 @@ fn open_verified_file(state: &AppState, path: &str) -> Result<(std::fs::File, st
     Ok((file, real))
 }
 
+/// 打开目录句柄。
+///
+/// **Windows 必须带 `FILE_FLAG_BACKUP_SEMANTICS`**：该标志的用途正是"允许打开目录句柄"，
+/// 不带时 `CreateFileW` 对目录一律返回 `ERROR_ACCESS_DENIED`（`std::fs::File::open` 不会替你
+/// 加，本机实测三种目录全部 PermissionDenied）。漏了它 `list_directory`（整个文件树）与
+/// "保存新文件时复核父目录"会全体失败，而单测不覆盖它们——见下方回归测试。
+/// 非 Windows 上 `File::open` 对目录本就成功。
+#[cfg(windows)]
+fn open_dir_for_handle(path: &str) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| format!("无法打开目录: {}", e))
+}
+
+#[cfg(not(windows))]
+fn open_dir_for_handle(path: &str) -> Result<std::fs::File, String> {
+    std::fs::File::open(path).map_err(|e| format!("无法打开目录: {}", e))
+}
+
 /// 打开目录句柄并复核真实目标（`list_directory` 用：列目录按句柄走）
 fn open_verified_dir(state: &AppState, path: &str) -> Result<(std::fs::File, std::path::PathBuf), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("无法打开目录: {}", e))?;
+    let file = open_dir_for_handle(path)?;
     let real = final_path_of_handle(&file)?;
     if let Some(reason) = dangerous_dir_reason(&real) {
         return Err(format!("访问被拒绝：目标是{}", reason));
@@ -1095,6 +1118,19 @@ mod tests {
     #[test]
     fn test_dangerous_dir_nonexistent_is_none() {
         assert!(dangerous_dir_reason(std::path::Path::new("Z:\\definitely\\missing\\dir")).is_none());
+    }
+
+    /// 回归：目录句柄必须能打开 —— Windows 上 `File::open` 对目录是 Access Denied，
+    /// 漏了 `FILE_FLAG_BACKUP_SEMANTICS` 会让 `list_directory`（文件树）与"新建文件时复核
+    /// 父目录"在运行时整体失败，而这两条路径此前没有任何测试覆盖。
+    #[test]
+    fn test_open_dir_for_handle_opens_directory() {
+        let dir = std::env::temp_dir();
+        let handle = open_dir_for_handle(&dir.to_string_lossy()).expect("目录句柄应能打开");
+        assert!(handle.metadata().expect("读取句柄元数据失败").is_dir(), "句柄应指向目录");
+        // 句柄级复核依赖 GetFinalPathNameByHandleW 对目录同样有效
+        let real = final_path_of_handle(&handle).expect("目录句柄应能解析真实路径");
+        assert!(real.is_dir(), "解析出的真实路径应为目录: {:?}", real);
     }
 
     #[test]
