@@ -5,6 +5,7 @@ import { showNotification } from '../ui/Toast';
 import { SvgIcon } from '../ui/SvgIcon';
 import { getIconSvg } from '../file-tree/FileIcons';
 import { useEditorStore, switchToTab, saveActiveFile, reloadTab } from '../../stores/editor';
+import { isMarkdownFile } from '../../utils/markdown';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useClickOutside } from '../../hooks/useClickOutside';
 import { ContextMenuItem } from '../ui/ContextMenu';
@@ -15,9 +16,13 @@ export function EditorTabs() {
   const tabs = useEditorStore(s => s.tabs);
   const activeTabId = useEditorStore(s => s.activeTabId);
   const dirtyIds = useEditorStore(s => s.dirtyIds);
+  const mdPreview = useEditorStore(s => s.mdPreview);
+  const toggleMdPreview = useEditorStore(s => s.toggleMdPreview);
   const closeTab = useEditorStore(s => s.closeTab);
   const closeTabs = useEditorStore(s => s.closeTabs);
   const activeTab = tabs.find(t => t.id === activeTabId) ?? null;
+  /** 当前标签是 md：只有它才有「源码 / 预览」这个开关 */
+  const activeIsMd = !!activeTab && isMarkdownFile(activeTab.path);
   /** 单标签关闭确认（未保存） */
   const [confirmTarget, setConfirmTarget] = useState<FileTab | null>(null);
   /** 右键菜单 */
@@ -231,8 +236,26 @@ export function EditorTabs() {
             </button>
           </>
         )}
-        {/* 右侧：保存当前文件（固定最右，标签滚动不覆盖；有未保存更改且非只读时可用） */}
-        <div className="flex items-center px-2 flex-shrink-0">
+        {/* 右侧：Markdown 预览开关 + 保存（保存固定最右，标签滚动不覆盖） */}
+        <div className="flex items-center gap-0.5 px-2 flex-shrink-0">
+          {activeIsMd && (
+            <button
+              className={`p-1 rounded transition-colors ${
+                mdPreview
+                  ? 'text-nexus-accent bg-nexus-accent/10'
+                  : 'text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover'
+              }`}
+              title={mdPreview ? '切回源码编辑' : '预览渲染效果（只读）'}
+              onClick={toggleMdPreview}
+            >
+              {/* 眼睛图标：填充=正在预览 */}
+              <svg width="13" height="13" viewBox="0 0 12 12" fill={mdPreview ? 'currentColor' : 'none'}
+                stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
+                <path d="M1 6s2-3.5 5-3.5S11 6 11 6s-2 3.5-5 3.5S1 6 1 6z"/>
+                <circle cx="6" cy="6" r="1.6" fill={mdPreview ? '#2f343e' : 'none'}/>
+              </svg>
+            </button>
+          )}
           <button
             className="p-1 rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-nexus-muted transition-colors"
             title={activeTab?.readonly ? (activeTab.readonlyReason ?? '文件过大，仅支持查看') : '保存当前文件（Ctrl+S）'}

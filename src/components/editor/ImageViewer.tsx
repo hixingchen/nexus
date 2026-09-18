@@ -1,19 +1,6 @@
 import { useEffect, useState } from 'react';
 import { readImageData } from '../../services/editor';
-import { getExtension } from '../../utils/path';
-
-/** 扩展名 → MIME（拼 data URL 用，webview 原生解码） */
-const MIME: Record<string, string> = {
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  svg: 'image/svg+xml',
-  ico: 'image/x-icon',
-  bmp: 'image/bmp',
-  avif: 'image/avif',
-};
+import { imageMimeOf } from '../../utils/path';
 
 /** 跨标签缓存 data URL，切换标签不重复读盘。字节上限（base64 膨胀 + 大图反复打开
  * 会无限驻留）→ 超限淘汰最久未用的条目 */
@@ -52,8 +39,7 @@ export function ImageViewer({ path, name }: { path: string; name: string }) {
     setErr(null);
     readImageData(path)
       .then(b64 => {
-        const ext = getExtension(path, { lower: true });
-        const url = `data:${MIME[ext] ?? 'application/octet-stream'};base64,${b64}`;
+        const url = `data:${imageMimeOf(path)};base64,${b64}`;
         cacheSet(path, url);
         if (alive) setSrc(url);
       })

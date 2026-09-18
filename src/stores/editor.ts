@@ -11,6 +11,14 @@ interface EditorStore {
   fileContent: string | null;
   /** 有未保存更改的标签 id */
   dirtyIds: string[];
+  /**
+   * Markdown 预览模式（只对当前活动标签的 .md 文件生效）。
+   *
+   * 为什么放在 store 而不是组件本地 state：切换按钮在 EditorTabs、渲染在 ProjectDetail，
+   * 两处都要读它。**刻意不在切标签时重置**——浏览一组 md 时模式保持一致更顺手；
+   * 非 md 标签只是忽略它。
+   */
+  mdPreview: boolean;
   /** 定位请求：打开文件后滚动到指定行并高亮命中词（CodeViewer 消费后清除） */
   locate: { path: string; line: number; query: string } | null;
   /** 高亮清除信号：每次 +1，CodeViewer 监听后清空命中装饰 */
@@ -35,6 +43,8 @@ interface EditorStore {
   closeTabs: (ids: string[]) => void;
   setActiveTabId: (id: string) => void;
   setFileContent: (content: string | null) => void;
+  /** 切换 Markdown 预览（切到预览前先把未合帧的编辑结算掉，避免预览到旧内容） */
+  toggleMdPreview: () => void;
   /** 编辑器内容变更：写入草稿并标记当前标签未保存 */
   updateDraft: (content: string) => void;
   markClean: (id: string, content?: string) => void;
@@ -213,6 +223,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   activeTabId: null,
   fileContent: null,
   dirtyIds: [],
+  mdPreview: false,
   fileOpenSeq: {},
   locate: null,
   hitSeq: 0,
@@ -290,6 +301,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   setFileContent: (content) => {
     set({ fileContent: content });
+  },
+
+  toggleMdPreview: () => {
+    // 大文档的编辑可能还在合帧窗口里（PERF-13）：不先结算，预览渲染的是 store 里的旧内容
+    settlePendingEdit();
+    set(s => ({ mdPreview: !s.mdPreview }));
   },
 
   updateDraft: (content) => {
