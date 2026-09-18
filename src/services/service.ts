@@ -257,7 +257,7 @@ export interface FailedService {
 }
 
 /** 运行状态总览：运行中 + 意外失败 */
-export interface ProcessStatus {
+interface ProcessStatus {
   running: RunningService[];
   failed: FailedService[];
 }

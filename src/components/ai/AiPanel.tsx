@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { useAiStore, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
 import { useUiStore } from '../../stores/uiStore';
 import { aiService } from '../../services/aiService';
+import { reportError } from '../../utils/error';
 import { showNotification } from '../ui/Toast';
 import { RobotIcon } from './RobotIcon';
 import { UpdateControl } from './UpdateControl';
@@ -153,6 +153,12 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const desiredKeyRef = useRef('');
   /** 刷新计数：头部刷新按钮 → 重建 WebView 重载页面 */
   const [refreshNonce, setRefreshNonce] = useState(0);
+  /**
+   * 创建重试计数：子 WebView 创建是异步的，创建期间内容键可能又变了——此时刚建好的实例
+   * 会自毁，但**必须有人重新发起一次创建**，否则 wvRef 恒为 null、wvReady 恒为 false、
+   * wvError 恒为 null，面板停在空白加载态且没有任何自愈路径（CQ-7）。
+   */
+  const [createNonce, setCreateNonce] = useState(0);
 
   const destroyWv = () => {
     const sync = syncRef.current;
@@ -162,7 +168,8 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     const wv = wvRef.current;
     wvRef.current = null;
     createdForRef.current = '';
-    desiredKeyRef.current = '';
+    // 注意：不清 desiredKeyRef —— 它代表"当下想要的内容键"，由生命周期 effect 每次运行时写入。
+    // 清掉会让在途创建完成时无法判断"要不要补一次创建"（CQ-7）；卸载时在清理函数里显式置空。
     if (wv) {
       // 先移出可视区再 close：close 是异步的（且可能失败/卡顿），
       // 移屏保证「关闭」在视觉上立即成立，残留只可能是屏外无感句柄
@@ -200,9 +207,11 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     document.addEventListener('focusin', onParentFocusIn);
     return () => {
       document.removeEventListener('focusin', onParentFocusIn);
+      // 卸载后不得再触发重建（在途创建的 finally 会读这个键）
+      desiredKeyRef.current = '';
       destroyWv();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // 挂载/卸载各一次：bootstrap 与 destroyWv 都是幂等命令，不依赖任何 props/state
   }, []);
 
   // 项目切换/挂载 → 应用该项目记忆的 AI 状态（开→自动恢复会话；关→面板收起）。
@@ -255,7 +264,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
       }
       destroyWv(); // url/刷新键变化 → 先销毁再重建
     }
-    if (createLockRef.current) return; // 上一次创建仍在途，等它完成（其自查会自毁）
+    if (createLockRef.current) return; // 上一次创建仍在途，等它完成（完成后会自查；键变了则由它补建）
     const slot = slotRef.current;
     if (!slot) return;
     setWvError(null);
@@ -281,10 +290,16 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
         setWvError(e instanceof Error ? e.message : String(e));
       } finally {
         createLockRef.current = null;
+        // 键在创建在途时又变了（用户切项目/刷新/收起再打开）：本次实例已自毁或已过期，
+        // 这里补发一次创建，否则没人再发起，面板会永久停在"没有 WebView"的状态（CQ-7）。
+        // desiredKeyRef 由 lifecycle effect 维护，卸载/面板收起时为空 → 不会重建。
+        const want = desiredKeyRef.current;
+        if (want !== '' && want !== createdForRef.current) setCreateNonce(n => n + 1);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [panelOpen, showFrame, url, refreshNonce]);
+    // 依赖即触发源：只有"该不该有 WebView / 该载哪个内容键"变化才重跑
+    // （modalPause 移屏、宽度重贴由各自 effect 处理，不在此重建）
+  }, [panelOpen, showFrame, url, refreshNonce, createNonce]);
 
   // 全局弹窗打开：子 WebView 移出屏幕——原生子 WebView 不受 DOM 遮罩（z-index）
   // 约束，不移走则弹窗打开期间 dsh 页面仍可点击操作。纯移动不销毁：会话进程与
@@ -310,7 +325,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     if (panelOpen && wvReady && syncRef.current && slotRef.current) {
       void guardedRelayout(syncRef.current, slotRef.current);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // 依赖即触发源：面板宽度落 store 后重贴一次；同步器/槽位 ref 变化不触发重贴
   }, [panelOpen, wvReady, panelWidth]);
 
   /** 由鼠标 X 计算夹取后的宽度（主内容至少留 420px） */
@@ -413,7 +428,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     const target = useAiStore.getState().url;
     if (!target) return;
     openUrl(target).catch((e) => {
-      showNotification({ variant: 'error', title: '在浏览器中打开失败', description: String(e), duration: 5000 });
+      reportError('在浏览器中打开失败', e, { duration: 5000 });
     });
   };
 
@@ -460,7 +475,7 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
       }
     } catch (e) {
       useAiStore.getState().setInstalling(false);
-      showNotification({ variant: 'error', title: 'dsh 安装/升级失败', description: String(e), duration: 8000 });
+      reportError('dsh 安装/升级失败', e, { duration: 8000 });
     }
   };
 
@@ -646,7 +661,7 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
   // 经 Rust 命令创建（带 initialization_script：dsh 页面焦点记忆/恢复脚本安装——
   // JS 侧 new Webview() 无注入脚本入口，原因与实现见 src-tauri/src/commands/ai.rs）
   const label = nextWvLabel();
-  await invoke('create_ai_panel_webview', {
+  await aiService.createPanelWebview({
     windowLabel: appWindow.label,
     label,
     url,
@@ -683,7 +698,7 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
       if (Date.now() - lastFocusCmdAt < 500) return; // 节流：防焦点流转链重复触发
       lastFocusCmdAt = Date.now();
       if (Date.now() - lastParentFocusAt < 2000) return; // 主界面刚被操作，不抢
-      void invoke('ai_panel_focus', { windowLabel: appWindow.label, label }).catch((e) => console.error('恢复 dsh 焦点失败:', e));
+      void aiService.focusPanel(appWindow.label, label).catch((e) => console.error('恢复 dsh 焦点失败:', e));
     }, 150);
   }));
   return { wv, sync, unlistens };

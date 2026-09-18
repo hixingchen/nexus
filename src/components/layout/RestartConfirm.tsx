@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type FileChangeEvent } from '../../services/service';
 import { showNotification } from '../ui/Toast';
-import { useAiStore } from '../../stores/aiStore';
+import { reportError } from '../../utils/error';
+import { useAiPanelReserve } from '../../hooks/useAiPanelReserve';
 
 type ConfirmItem = {
   serviceId: string;
@@ -20,10 +21,10 @@ export function RestartConfirm() {
   /** 记录 2 秒内已自动重启过的服务，防止事件风暴触发连环重启 */
   const autoRestartCooldownRef = useRef(new Set<string>());
   /** AI 面板占用右侧：卡片必须让位——原生子 WebView 盖在所有 DOM 之上，
-   *  卡片若落在面板区域内会既看不见也点不到（z-index 对原生层无效） */
-  const aiPanelVisible = useAiStore((s) => s.panelOpen || s.installing);
-  const aiPanelWidth = useAiStore((s) => s.panelWidth);
-  const cardRight = aiPanelVisible ? aiPanelWidth + 24 : 24;
+   *  卡片若落在面板区域内会既看不见也点不到（z-index 对原生层无效）。
+   *  口径收在 useAiPanelReserve（与通知/右键菜单同一处），随面板宽度变化自动跟随 */
+  const aiPanelReserve = useAiPanelReserve();
+  const cardRight = aiPanelReserve + 24;
 
   useEffect(() => {
     let disposed = false;
@@ -44,8 +45,7 @@ export function RestartConfirm() {
           autoRestartCooldownRef.current.add(sid);
           setTimeout(() => { autoRestartCooldownRef.current.delete(sid); }, AUTO_RESTART_DEBOUNCE_MS);
           processApi.restart(sid).catch((e) => {
-            console.error('自动重启服务失败:', e);
-            showNotification({ variant: 'error', title: '自动重启失败', description: String(e) });
+            reportError('自动重启失败', e);
           });
           continue;
         }
@@ -90,7 +90,7 @@ export function RestartConfirm() {
     ));
     try {
       await processApi.restart(item.serviceId);
-    } catch (e) { console.error('重启服务失败:', e); showNotification({ variant: 'error', title: '重启服务失败', description: String(e) }); }
+    } catch (e) { reportError('重启服务失败', e); }
     setItems(prev => prev.filter(i => i.serviceId !== item.serviceId));
   }, []);
 
@@ -103,7 +103,7 @@ export function RestartConfirm() {
   return (
     <div
       className="fixed bottom-10 z-[80] flex flex-col-reverse gap-3"
-      // right 动态让位 AI 面板（见 aiPanelVisible 注释）：面板宽度可拖拽变化，订阅 store 自动跟随
+      // right 动态让位 AI 面板（见 aiPanelReserve 注释）：面板宽度可拖拽变化，订阅 store 自动跟随
       style={{ right: cardRight }}
     >
       {items.map(item => (

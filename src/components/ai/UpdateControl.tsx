@@ -46,7 +46,7 @@ export function UpdateControl({ onInstall }: UpdateControlProps) {
     onInstall();
   };
 
-  const installing = phase.kind === 'result' && !phase.info.dshFound;
+  const installing = phase.kind === 'result' && !phase.info.dsh_found;
 
   return (
     <>
@@ -84,11 +84,11 @@ export function UpdateControl({ onInstall }: UpdateControlProps) {
           {phase.kind === 'result' && (
             <>
               <div className="space-y-2 text-[12px]">
-                <VersionRow label="当前版本" value={phase.info.dshFound ? phase.info.current ?? '未知' : '未安装'} />
+                <VersionRow label="当前版本" value={phase.info.dsh_found ? phase.info.current ?? '未知' : '未安装'} />
                 <VersionRow label="最新版本" value={phase.info.latest ?? '—'} highlight={phase.info.outdated} />
               </div>
 
-              {!phase.info.dshFound ? (
+              {!phase.info.dsh_found ? (
                 <p className="text-[11.5px] text-nexus-muted leading-relaxed">
                   未检测到 dsh（DeepSeek Harness CLI）。点下方按钮安装最新版，
                   安装进度将显示在 AI 面板上，装好后自动启动会话。
@@ -103,7 +103,7 @@ export function UpdateControl({ onInstall }: UpdateControlProps) {
               ) : null}
 
               <div className="flex justify-end gap-2">
-                {(phase.info.outdated || !phase.info.dshFound) && (
+                {(phase.info.outdated || !phase.info.dsh_found) && (
                   <ActionButton onClick={handleUpgrade}>
                     {installing ? `安装 ${phase.info.latest ?? '最新版'}` : `升级到 ${phase.info.latest ?? '最新版'}`}
                   </ActionButton>

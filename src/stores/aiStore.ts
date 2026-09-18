@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { aiService } from '../services/aiService';
-import { layoutApi } from '../services/service';
+import { LAYOUT_KEYS, saveLayout, useLayoutStore, type LayoutKey } from './layoutStore';
 
 /** 面板宽度范围（逻辑像素） */
 export const AI_PANEL_MIN_W = 320;
@@ -118,20 +118,34 @@ export const useAiStore = create<AiState>((set, get) => ({
     // 只恢复拖拽宽度。AI 启用记忆已改为「仅本次运行内」：旧版本遗留在布局库的
     // ai_on_* 行不再读取，启动时清空，避免残留行继续误导
     try {
-      const l = await layoutApi.load();
-      const saved = Number(l.ai_panel_width);
+      // 布局读走 layoutStore（共享同一次查库）；写同样走它（统一防抖与错误上报）
+      const l = await useLayoutStore.getState().ensureLoaded();
+      const saved = Number(l[LAYOUT_KEYS.aiPanelWidth]);
       if (Number.isFinite(saved) && saved > 0) {
         set({ panelWidth: Math.min(Math.max(Math.round(saved), AI_PANEL_MIN_W), AI_PANEL_MAX_W) });
       }
-      const legacy: Record<string, string> = {};
+      const legacy: Partial<Record<LayoutKey, string>> = {};
       for (const k of Object.keys(l)) {
-        if (k.startsWith(AI_ON_KEY_PREFIX)) legacy[k] = '';
+        if (k.startsWith(AI_ON_KEY_PREFIX)) legacy[k as LayoutKey] = '';
       }
-      if (Object.keys(legacy).length > 0) {
-        layoutApi.save(legacy).catch((e) => console.error('清理遗留 AI 状态失败:', e));
-      }
+      if (Object.keys(legacy).length > 0) saveLayout(legacy);
     } catch {
       // 布局库读失败：宽度用默认；记忆本就为空（本次运行尚未启用过任何项目）
+    }
+    // 与后端对一次账：本进程可能是"热重载/前端重载"后的新 store（内存状态为空），
+    // 而 dsh 子进程其实还活着。不查这一次，runningHere 就永远为 false，
+    // AiPanel 的"崩溃自愈"守卫（!runningHere && !url && !lastError）也永远不会走到
+    // ensureRunning —— 表现为面板空白、进程却在后台跑，用户只能重启应用。
+    try {
+      const s = await aiService.status();
+      set({
+        running: s.running,
+        url: s.url,
+        sessionCwd: s.cwd,
+      });
+    } catch (e) {
+      // 查询失败不阻塞启动：只是少一次对账，后续 ensureRunning 仍会按需启动
+      console.error('查询 AI 会话状态失败:', e);
     }
   },
 
@@ -203,7 +217,8 @@ export const useAiStore = create<AiState>((set, get) => ({
   setPanelWidth: (width) => {
     const w = Math.min(Math.max(width, AI_PANEL_MIN_W), AI_PANEL_MAX_W);
     set({ panelWidth: w });
-    layoutApi.save({ ai_panel_width: String(Math.round(w)) }).catch((e) => console.error('保存 AI 面板宽度失败:', e));
+    // 拖拽中会高频调用：走统一防抖入口（500ms 窗口内合并为一次写库）
+    saveLayout({ [LAYOUT_KEYS.aiPanelWidth]: String(Math.round(w)) });
   },
 
   ensureRunning: async (cwd, projectName = null) => {
@@ -217,6 +232,7 @@ export const useAiStore = create<AiState>((set, get) => ({
       return;
     }
     set({ starting: true, lastError: null });
+    const wantName = projectName?.trim() || null;
     try {
       const s = await aiService.start(cwd, projectName);
       set({
@@ -225,7 +241,9 @@ export const useAiStore = create<AiState>((set, get) => ({
         sessionCwd: s.cwd,
         starting: false,
         lastError: null,
-        pendingTarget: null,
+        // 这里**不能**顺手清 pendingTarget：请求期间新记下的目标就存在这个字段里，
+        // 清掉会让下面的收敛分支永远读到 null，表现为"切项目后面板停在启动中"
+        // （sessionCwd 还是老项目 → runningHere=false，且没有自愈路径）
       });
     } catch (e) {
       const msg = String(e);
@@ -233,9 +251,10 @@ export const useAiStore = create<AiState>((set, get) => ({
       if (!msg.startsWith('已取消')) set({ lastError: msg });
       set({ starting: false, running: false, url: null, sessionCwd: null });
     }
-    // 收敛：请求期间目标又变了 → 补一次最新目标的启动
+    // 收敛：请求期间目标又变了 → 补一次最新目标的启动。cwd 与项目名都要比：
+    // 同一个项目目录换显示名同样需要重启会话（workspace 标题不同）
     const pending = get().pendingTarget;
-    if (pending != null && pending.cwd !== cwd) {
+    if (pending != null && (pending.cwd !== cwd || pending.name !== wantName)) {
       set({ pendingTarget: null });
       void get().ensureRunning(pending.cwd, pending.name);
     }

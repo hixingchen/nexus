@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { showNotification } from '../components/ui/Toast';
+import { reportError } from '../utils/error';
 import type { FileTab } from '../types/editor';
 import * as editorService from '../services/editor';
 
@@ -27,7 +28,7 @@ interface EditorStore {
    */
   fileOpenSeq: Record<string, number>;
   /** 同步操作：打开标签页并设置内容 */
-  openTab: (tab: FileTab, content: string) => void;
+  openTab: (tab: FileTab, content: string, activate?: boolean) => void;
   closeTab: (id: string) => void;
   /** 批量关闭标签（逐个复用 closeTab 逻辑，含活动标签切换与草稿清理） */
   closeTabs: (ids: string[]) => void;
@@ -99,7 +100,7 @@ export function parseJarVirtualPath(path: string): { jarPath: string; nested: st
 /** 每文件的原始字节特征（换行风格 + 编码 + 读取时 mtime）：保存时按此写回，保证字节保真；
  *  mtime 用于保存前检测"文件已被外部改动"，避免静默覆盖 IDE/git 改过的版本 */
 interface FileMeta {
-  lineEnding: 'lf' | 'crlf' | 'cr';
+  line_ending: 'lf' | 'crlf' | 'cr';
   encoding: 'utf8' | 'gb18030';
   /** 读取/上次写入后的修改时间（毫秒）；null = 未知（新建或读不到） */
   modified: number | null;
@@ -120,7 +121,7 @@ async function fetchTextContent(path: string): Promise<{ content: string; size: 
   const res = await editorService.readFile(path);
   if (res.is_binary) throw new Error('BINARY');
   // jar 内条目/class 无磁盘 mtime 概念：清掉旧值，避免把上一个同名文件的 mtime 带过来
-  fileMetaCache.set(path, { lineEnding: res.lineEnding, encoding: res.encoding, modified: res.modified });
+  fileMetaCache.set(path, { line_ending: res.line_ending, encoding: res.encoding, modified: res.modified });
   return { content: res.content, size: res.size };
 }
 
@@ -131,17 +132,23 @@ function toOriginalEnding(text: string, lineEnding: 'lf' | 'crlf' | 'cr'): strin
   return text;
 }
 
-/** 打开新标签（读取期间可能已被其他调用打开：已有标签则切换过去，恢复其未保存草稿） */
-function openLoadedTab(tab: FileTab, content: string) {
+/**
+ * 打开新标签（读取期间可能已被其他调用打开：已有标签则切换过去，恢复其未保存草稿）
+ *
+ * `openSeq` 为发起读取时的请求序号：晚到的结果（用户已去点别的文件）只入标签不抢焦点。
+ */
+function openLoadedTab(tab: FileTab, content: string, openSeq?: number) {
   const normalized = normalizeEOL(content);
+  const isLatestRequest = openSeq === undefined || openSeq === latestOpenSeq;
   const already = useEditorStore.getState().tabs.find(t => t.path === tab.path);
   if (already) {
     setCacheContent(tab.path, normalized);
     const draft = drafts.get(already.id);
-    useEditorStore.getState().setFileContent(draft ?? normalized);
-    useEditorStore.getState().setActiveTabId(already.id);
+    if (isLatestRequest) useEditorStore.getState().setFileContent(draft ?? normalized);
+    if (isLatestRequest) useEditorStore.getState().setActiveTabId(already.id);
   } else {
-    useEditorStore.getState().openTab(tab, normalized);
+    // 晚到的结果不激活：内容入列表与缓存即可，活动标签保持用户当下选的那个
+    useEditorStore.getState().openTab(tab, normalized, isLatestRequest);
   }
 }
 
@@ -212,7 +219,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   revealSeq: 0,
   revealConsumedSeq: 0,
 
-  openTab: (tab, content) => {
+  openTab: (tab, content, activate = true) => {
     const { tabs } = get();
     // 全链路统一存归一化内容（\n）：CodeMirror 建 doc 时也做同样归一，缓存/基线/展示三者一致
     // 才能命中 stateCache（否则 CRLF 文件每次切回都重建、撤销历史与光标丢失）；
@@ -220,11 +227,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const normalized = normalizeEOL(content);
     setCacheContent(tab.path, normalized);
     baselines.set(tab.id, normalized);
-    set({
-      tabs: [...tabs, tab],
-      activeTabId: tab.id,
-      fileContent: normalized,
-    });
+    // activate=false：只入列表（晚到的读盘结果不抢当前标签），此时不得改 fileContent
+    set(activate
+      ? { tabs: [...tabs, tab], activeTabId: tab.id, fileContent: normalized }
+      : { tabs: [...tabs, tab] });
   },
 
   closeTab: (id) => {
@@ -287,10 +293,19 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const { activeTabId, dirtyIds } = get();
     if (!activeTabId) return;
     set({ fileContent: content });
+    editSeqByTab.set(activeTabId, (editSeqByTab.get(activeTabId) ?? 0) + 1);
     // dirty 判定只与"最后保存/打开的基线"比较（单一真相，见 baselines 注释）。
-    // 归一化在写入基线时已做过，这里只归一当前内容一次
-    const normalized = normalizeEOL(content);
-    if (normalized === baselines.get(activeTabId)) {
+    //
+    // 成本控制（每次按键都会走到这里）：
+    // ① 仅在内容确实含 \r 时才做全文 EOL 归一化——LF 文件（绝大多数）省掉一次全文正则；
+    // ② 先比长度：长度不同必然有改动，直接跳过与基线的全文比较。
+    const baseline = baselines.get(activeTabId);
+    const normalized = content.includes('\r') ? normalizeEOL(content) : content;
+    // 无基线视为未保存；有基线时先比长度（不同必然有改动，免去全文比较），长度相同才做全串比较
+    const isDirty = baseline === undefined
+      || normalized.length !== baseline.length
+      || normalized !== baseline;
+    if (!isDirty) {
       drafts.delete(activeTabId);
       if (dirtyIds.includes(activeTabId)) {
         set({ dirtyIds: dirtyIds.filter(d => d !== activeTabId) });
@@ -349,6 +364,26 @@ let tabSeq = 0;
 const pendingLoads = new Map<string, Promise<void>>();
 
 /**
+ * 最近一次"打开文件"请求的序号。
+ *
+ * 为什么需要：读盘是异步的（`.class` 还要走 CFR 反编译，上限 15s），而打开完成的动作里包含
+ * `setActiveTabId`。用户点了慢文件 A 又去点/切到 B 时，A 的读盘结果晚到会把活动标签**抢回 A**，
+ * 表现为"我明明点的是 B，界面跳到 A"。同仓其他异步加载点（项目列表展开、文件树目录、
+ * 搜索结果）都已有"最新请求才生效"的守卫，这里补齐。
+ * 标签本身仍会入列表（内容不丢），只是不再抢焦点。
+ */
+let latestOpenSeq = 0;
+
+/**
+ * 每标签的编辑代数：每次用户编辑 +1。
+ *
+ * 用于"读盘结果晚到"的判定（见 loadContentInto）：请求发出前记下代数，结果回来时若已变，
+ * 说明用户在这段窗口里已经改过内容，此时**必须丢弃磁盘内容**，否则用户刚敲的字被覆盖
+ * （更糟的是保存路径取 fileContent，会把覆盖后的内容写回磁盘）。
+ */
+const editSeqByTab = new Map<string, number>();
+
+/**
  * 打开文件：检查缓存 → 读取内容 → 更新 store
  * 由组件调用，store 不直接执行异步操作
  */
@@ -366,6 +401,8 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
     const seq = (st.fileOpenSeq[path] ?? 0) + 1;
     useEditorStore.setState({ fileOpenSeq: { ...st.fileOpenSeq, [path]: seq } });
   }
+  // 本次打开请求的序号：读盘期间用户又点了别的文件时，本请求的结果不再抢活动标签
+  const mySeq = ++latestOpenSeq;
   // 检查是否已打开
   const existing = useEditorStore.getState().tabs.find(t => t.path === path);
   if (existing) {
@@ -373,12 +410,12 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
     return;
   }
 
-  // 并发去重：同一 path 正在加载时复用，读取完成后切换过去
+  // 并发去重：同一 path 正在加载时复用，读取完成后切换过去（仍以"最新请求"为准）
   const pending = pendingLoads.get(path);
   if (pending) {
     await pending;
     const tab = useEditorStore.getState().tabs.find(t => t.path === path);
-    if (tab) useEditorStore.getState().setActiveTabId(tab.id);
+    if (tab && mySeq === latestOpenSeq) useEditorStore.getState().setActiveTabId(tab.id);
     return;
   }
 
@@ -390,43 +427,42 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
         // 图片：内建预览（ImageViewer 自行加载，内容不进 store）
         tab.readonly = true;
         tab.viewerType = 'image';
-        openLoadedTab(tab, '');
+        openLoadedTab(tab, '', mySeq);
         return;
       }
       if (ext === 'jar') {
         // jar 包：内建浏览（条目列表 → 点开 class/资源），只读
         tab.readonly = true;
         tab.viewerType = 'jar';
-        openLoadedTab(tab, '');
+        openLoadedTab(tab, '', mySeq);
         return;
       }
       if (BINARY_EXTS.has(ext)) {
         // 已知二进制类型：直接 hex 视图，免整文件读入嗅探
         tab.readonly = true;
         tab.viewerType = 'hex';
-        openLoadedTab(tab, '');
+        openLoadedTab(tab, '', mySeq);
         return;
       }
       if (ext === 'class') tab.readonly = true; // 字节码视图只读
       const { content, size } = await fetchTextContent(path);
       if (size > MAX_EDIT_SIZE) tab.readonly = true;
-      openLoadedTab(tab, content);
+      openLoadedTab(tab, content, mySeq);
     } catch (e) {
       if (e instanceof Error && e.message === 'BINARY') {
         // 扩展名未命中黑名单的二进制：NUL 嗅探后进 hex 视图
         tab.readonly = true;
         tab.viewerType = 'hex';
-        openLoadedTab(tab, '');
+        openLoadedTab(tab, '', mySeq);
         return;
       }
-      console.error('读取文件内容失败:', e);
-      showNotification({ variant: 'error', title: '读取文件内容失败' });
+      reportError('读取文件内容失败', e);
       const already = useEditorStore.getState().tabs.find(t => t.path === path);
       if (!already) {
         // 必须只读：空内容 + 可编辑 ⇒ 用户按 Ctrl+S 会把空内容写回磁盘，原文件被截断
         // （后端对 >50MB 文件直接拒绝读取，打开大文件必然走这条 catch）
         tab.readonly = true;
-        useEditorStore.getState().openTab(tab, '');
+        useEditorStore.getState().openTab(tab, '', mySeq === latestOpenSeq);
       }
     }
   })();
@@ -460,17 +496,17 @@ export async function openJarEntry(jarPath: string, nested: string[], entry: { n
     path: virtualPath,
     readonly: true,
   };
+  const mySeq = ++latestOpenSeq;
   try {
     const res = await editorService.readJarEntry(jarPath, nested, entry.name);
     if (res.kind === 'binary') {
       tab.viewerType = 'hex';
-      openLoadedTab(tab, '');
+      openLoadedTab(tab, '', mySeq);
     } else {
-      openLoadedTab(tab, res.content);
+      openLoadedTab(tab, res.content, mySeq);
     }
   } catch (e) {
-    console.error('读取 jar 条目失败:', e);
-    showNotification({ variant: 'error', title: '读取 jar 条目失败', description: String(e) });
+    reportError('读取 jar 条目失败', e);
   }
 }
 
@@ -493,60 +529,91 @@ export async function locateFile(path: string, name: string, line: number, query
  */
 let savingInFlight = false;
 
-export async function saveActiveFile(): Promise<boolean> {
+/**
+ * 保存指定标签（任意标签，不限于活动标签），成功返回 true。
+ *
+ * 内容来源分两种：活动标签取 `fileContent`（最新），非活动标签取 `drafts`（切走时留下的草稿）。
+ * 关窗时的"保存全部"依赖这条路径——因此不能再假设"要保存的只有活动标签"。
+ */
+async function saveTabCore(id: string, notify: boolean): Promise<boolean> {
   const { tabs, activeTabId, fileContent } = useEditorStore.getState();
-  if (!activeTabId) return false;
-  const tab = tabs.find(t => t.id === activeTabId);
-  if (!tab) return false;
+  const tab = tabs.find(t => t.id === id);
+  if (!tab) return true; // 标签已被关闭：无需保存
   if (tab.readonly) {
-    showNotification({ variant: 'warning', title: '文件过大，仅支持查看（超过 10 MB 不能编辑）' });
+    if (notify) showNotification({ variant: 'warning', title: '文件过大，仅支持查看（超过 10 MB 不能编辑）' });
     return false;
   }
+  const content = id === activeTabId ? fileContent : (drafts.get(id) ?? null);
   // 内容从未成功加载（读取失败/仍在加载中）：写盘会把磁盘上的原文件覆盖成空内容
-  if (fileContent === null) {
-    showNotification({ variant: 'error', title: '文件内容未加载，已取消保存' });
+  if (content === null) {
+    if (notify) showNotification({ variant: 'error', title: '文件内容未加载，已取消保存' });
     return false;
   }
   if (savingInFlight) return false;
   savingInFlight = true;
   try {
     // 写盘前捕获快照：markClean 的基线必须等于实际写入磁盘的内容，
-    // 不能用 await 后的 fileContent（保存期间用户可能已继续编辑）
-    const contentToSave = fileContent;
+    // 不能用 await 后的内容（保存期间用户可能已继续编辑）
+    const contentToSave = content;
     // 按原文件换行风格/编码写回：CodeMirror 规范化换行 + UTF-8 写回会让
     // "编辑→撤销→保存"后的字节与原始文件不同（git 误报变更）
     const meta = fileMetaCache.get(tab.path);
-    const bytesToWrite = meta ? toOriginalEnding(contentToSave, meta.lineEnding) : contentToSave;
+    const bytesToWrite = meta ? toOriginalEnding(contentToSave, meta.line_ending) : contentToSave;
     // 回传打开时的 mtime：磁盘已被外部改动时后端拒绝写入，不再静默覆盖（P0-1）
     const newModified = await editorService.writeFile(tab.path, bytesToWrite, meta?.encoding, meta?.modified ?? null);
     // 保存期间标签可能已被关闭：此时不再写缓存与基线（markClean 内部也会校验）
-    if (useEditorStore.getState().tabs.some(t => t.id === activeTabId)) {
+    if (useEditorStore.getState().tabs.some(t => t.id === id)) {
       // 缓存与基线存编辑器内容（不转换），切换标签/撤销比较都在编辑器内容维度
       setCacheContent(tab.path, contentToSave);
       // 刷新 mtime 基线：否则下一次保存会拿打开时的旧值比对，被自己的上次写入判成冲突
       if (meta) meta.modified = newModified;
-      useEditorStore.getState().markClean(activeTabId, contentToSave);
+      useEditorStore.getState().markClean(id, contentToSave);
     }
-    showNotification({ title: `已保存「${tab.name}」` });
+    if (notify) showNotification({ title: `已保存「${tab.name}」` });
     return true;
   } catch (e) {
-    console.error('保存文件失败:', e);
     // 冲突单独提示：这是"文件被别的工具改过"，用户需要重新加载而不是反复重试
     const msg = String(e);
     if (msg.includes('已被外部修改')) {
+      console.error('保存文件失败:', e);
       showNotification({
         variant: 'warning',
-        title: '文件已被其他程序修改，未保存',
+        title: `「${tab.name}」已被其他程序修改，未保存`,
         description: '请关闭标签后重新打开以载入磁盘上的最新内容（如需保留当前修改，请先复制）',
         duration: 8000,
       });
     } else {
-      showNotification({ variant: 'error', title: '保存文件失败', description: msg });
+      reportError('保存文件失败', e);
     }
     return false;
   } finally {
     savingInFlight = false;
   }
+}
+
+export async function saveActiveFile(): Promise<boolean> {
+  const { activeTabId } = useEditorStore.getState();
+  if (!activeTabId) return false;
+  return saveTabCore(activeTabId, true);
+}
+
+/**
+ * 保存全部未保存标签（关窗确认的「保存全部并关闭」用它）。
+ *
+ * 串行执行：后端写盘是 atomic rename，但同一目录下的并发写在部分文件系统上会互相干扰；
+ * 且失败时希望"先写成功的算成功"，串行最容易给出准确的成功/失败计数。
+ * 返回仍然失败的标签数（0 = 全部保存成功，可以安全关闭）。
+ */
+export async function saveAllDirtyTabs(): Promise<{ saved: number; failed: number }> {
+  const ids = [...useEditorStore.getState().dirtyIds];
+  let saved = 0;
+  let failed = 0;
+  for (const id of ids) {
+    const ok = await saveTabCore(id, false);
+    if (ok) saved++;
+    else failed++;
+  }
+  return { saved, failed };
 }
 
 /**
@@ -580,16 +647,20 @@ async function loadContentInto(id: string, knownPath?: string): Promise<void> {
     // 先清空活动内容：编辑器只在 filePath/openSeq 变化时消费 content，若沿用上一个文件的
     // 内容建文档，读盘期间它会显示成新文件的内容（并可被 Ctrl+S 写回错误文件）
     setFileContent(null);
+    // 读盘窗口内的编辑代数：await 回来后若已变，说明用户已经敲过字，磁盘内容必须丢掉
+    const editsBefore = editSeqByTab.get(id) ?? 0;
     const { content } = await fetchTextContent(path);
     // 读取期间用户可能已切换到其他标签，此时丢弃结果避免内容错位
     if (useEditorStore.getState().activeTabId !== id) return;
+    // 读取期间用户已开始编辑（例如切回来立刻打字，而读盘还在排队）：
+    // 覆盖会让刚敲的内容无声消失，并且保存路径正是取 fileContent → 会把覆盖后的内容写回磁盘
+    if ((editSeqByTab.get(id) ?? 0) !== editsBefore) return;
     const normalized = normalizeEOL(content);
     setCacheContent(path, normalized);
     setFileContent(normalized);
   } catch (e) {
     if (useEditorStore.getState().activeTabId !== id) return;
-    console.error('读取文件内容失败:', e);
-    showNotification({ variant: 'error', title: '读取文件内容失败' });
+    reportError('读取文件内容失败', e);
     setFileContent(null);
   }
 }

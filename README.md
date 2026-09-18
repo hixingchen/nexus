@@ -1,6 +1,6 @@
 # Nexus
 
-开发环境管理平台：把多个项目的多个服务（前端/后端/中间件…）集中在一处启停、看日志、改配置、翻代码，基于 **Tauri 2 + React + TypeScript** 构建，**以 Windows 为主平台**（macOS/Linux 有对应的命令分支，但进程树清理、文件剪贴板互通等能力为 Windows 实现）。
+开发环境管理平台：把多个项目的多个服务（前端/后端/中间件…）集中在一处启停、看日志、改配置、翻代码，基于 **Tauri 2 + React + TypeScript** 构建，**以 Windows 为主平台**（macOS/Linux 有对应的命令分支，但进程树清理、文件剪贴板互通等能力为 Windows 实现；这些分支可编译但未参与打包、未经测试，见 `src-tauri/src/commands/editor.rs` 顶部的平台分支约定）。
 
 ## 功能特性
 
@@ -70,12 +70,22 @@ pnpm build:app        # 打包应用（tauri build）
 
 ### 校验
 
+改动后本地跑一遍即可（**前端暂无自动化测试**，纯逻辑改动需手工验证）：
+
 ```bash
-pnpm exec tsc --noEmit                       # 前端类型检查（应 0 错误）
-cd src-tauri && cargo test --lib             # 后端单元测试
-cd src-tauri && cargo clippy --all-targets   # 后端静态分析
-cd src-tauri && cargo check --all-targets    # 后端编译检查
+pnpm exec tsc --noEmit                       # 前端类型检查（0 错误）
+pnpm exec vite build                         # 前端产物必须能构建
+cd src-tauri && cargo test --lib             # 后端单元测试（129 用例）
+cd src-tauri && cargo clippy --all-targets   # 后端静态分析（0 警告）
 ```
+
+## 行为约定（容易踩到的几条）
+
+- **关窗有确认**：有未保存的文件或服务配置时，关闭窗口会先确认（保存全部 / 放弃 / 取消）。
+- **路径白名单**：文件 API 只能访问已登记项目目录（及各服务/模板工作目录）。项目外的目录需要经「选择目录」原生对话框确认一次；AI 会话的工作目录必须是已登记项目目录。
+- **AI 面板是原生子 WebView**：它永远盖在所有网页元素之上（z-index 无效），因此面板网页内的鼠标右键被禁用，弹窗/浮层会主动避开面板区域。
+- **环境变量默认遮蔽**：服务编辑面板里 `KEY=VALUE` 的值默认显示为掩码，点「显示值」后可查看与编辑（保存的始终是真实值）。
+- **反编译进程受管**：`.class` 反编译用的 JVM 有 256MB 堆上限，并纳入应用级 Job Object（Nexus 退出/被强杀时不残留）。
 
 ## 数据与日志位置
 
@@ -99,19 +109,18 @@ nexus/
 │   │   ├── terminal/             # 服务日志面板
 │   │   ├── ai/                   # 内嵌 dsh 面板
 │   │   └── ui/                   # 通用件（Modal/Toast/ErrorBoundary）
-│   ├── stores/                   # Zustand 状态（编辑器/日志/运行态/AI/工具/布局）
-│   ├── services/                 # Tauri invoke 封装
-│   ├── hooks/                    # 业务编排 hooks
-│   └── utils/                    # 日志格式化、配色、键盘等纯函数
+│   ├── stores/                   # Zustand 状态（编辑器/日志/运行态/AI/工具/布局/服务动作）
+│   ├── services/                 # Tauri invoke 封装（所有 IPC 的唯一入口）
+│   ├── hooks/                    # 业务编排 hooks（含工具命令执行）
+│   └── utils/                    # 日志格式化、错误归一化、查找、配色等纯函数
 ├── src-tauri/                    # Rust 后端
 │   ├── src/
 │   │   ├── commands/             # Tauri 命令（IPC 边界）
 │   │   ├── core/                 # 进程、监听、AI 会话、class/jar 解析、反编译、Job Object
 │   │   ├── database/             # rusqlite + schema 增量迁移
+│   │   ├── contract.rs           # IPC 字段命名契约测试（响应 snake_case / 请求 camelCase）
 │   │   └── logger.rs             # 控制台 + 文件双写日志
 │   └── Cargo.toml
-├── docs/
-│   └── AUDIT_REPORT.md           # 待处理问题清单（代码审计遗留项）
 ├── tailwind.config.js
 ├── vite.config.ts
 └── package.json

@@ -28,7 +28,7 @@ pub fn load_layout(state: State<AppState>) -> Result<HashMap<String, String>, St
         let mut stmt = conn.prepare("SELECT key, value FROM layout")
             .map_err(|e| format!("查询布局数据失败: {}", e))?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>("key")?, row.get::<_, String>("value")?))
         }).map_err(|e| format!("读取布局数据失败: {}", e))?;
         let mut map = HashMap::new();
         for r in rows {

@@ -24,7 +24,6 @@ const MAX_DEST_ATTEMPTS: usize = 1000;
 /// 此时**前面的源已经在磁盘上了**，调用方却拿不到这个清单，于是按"全部失败"
 /// 刷新界面，用户看到文件明明在、界面却说没成功。
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PasteFilesResult {
     pub created: Vec<String>,
     pub failed: Vec<String>,

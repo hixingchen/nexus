@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { projectApi, type Project } from '../../services/service';
+import { pickDirectory } from '../../services/system';
 import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
+import { reportError, toMessage } from '../../utils/error';
 import { isSubmitEnter } from '../../utils/keyboard';
 
 interface CreateModalProps {
@@ -24,8 +26,8 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
   }, [open]);
 
   const handleSelectPath = async () => {
-    const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
-    const selected = await openDialog({ directory: true, title: '选择项目目录' });
+    // 走后端原生选择器：路径会成为文件访问白名单的根，必须由用户亲手选择（见 utils/error 同层说明）
+    const selected = await pickDirectory({ title: '选择项目目录' });
     if (selected) setPath(selected);
   };
 
@@ -39,9 +41,8 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
       onCreated(project);
       onClose();
     } catch (e: unknown) {
-      const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e);
-      console.error('创建项目失败:', msg);
-      showNotification({ variant: 'error', title: msg || '创建项目失败' });
+      // 后端会给出可行动的原因（路径不存在/危险目录/未授权），标题直接用原因更利于纠错
+      reportError(toMessage(e) || '创建项目失败', e, { description: '' });
     }
     setSaving(false);
   };
@@ -119,8 +120,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
   }, [project]);
 
   const handleSelectPath = async () => {
-    const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
-    const selected = await openDialog({ directory: true, title: '选择项目目录' });
+    const selected = await pickDirectory({ title: '选择项目目录', defaultPath: path || project?.path });
     if (selected) setPath(selected);
   };
 
@@ -136,7 +136,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
       onUpdated();
       onClose();
     } catch (e: unknown) {
-      showNotification({ variant: 'error', title: String(e) });
+      reportError('更新项目失败', e);
     }
     setSaving(false);
   };
@@ -210,7 +210,7 @@ export function DeleteProjectModal({ target, onClose, onDeleted, onDeselectIfSel
       onDeleted(target.id);
       onClose();
     } catch (e: unknown) {
-      showNotification({ variant: 'error', title: String(e) });
+      reportError(`删除项目「${target.name}」失败`, e);
     }
     setDeleting(false);
   };
@@ -258,7 +258,7 @@ export function DuplicateProjectModal({ target, onClose, onDuplicated }: Duplica
       onDuplicated();
       onClose();
     } catch (e: unknown) {
-      showNotification({ variant: 'error', title: String(e) });
+      reportError(`复制项目「${target.name}」失败`, e);
     }
     setDuplicating(false);
   };

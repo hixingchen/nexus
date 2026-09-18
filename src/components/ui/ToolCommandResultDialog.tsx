@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCommandResult } from '../../services/service';
 import { useUiStore } from '../../stores/uiStore';
+import { EMPTY_LOGS, useToolLogStore } from '../../stores/toolLogStore';
 
 // 常见退出码 → 中文含义（Unix 约定），未识别返回 null
 function describeExitCode(code: number | null): string | null {
@@ -21,16 +22,18 @@ function describeExitCode(code: number | null): string | null {
 interface Props {
   open: boolean;
   commandName: string;
+  /** 本次运行的 id：输出行按它从 store 订阅（50ms 合帧，见 stores/toolLogStore） */
+  runId: string | null;
   result: ToolCommandResult | null;
-  /** 执行中的实时输出（stdout/stderr 合并流式追加，最多保留最近 2000 行） */
-  logs: string[];
   loading: boolean;
+  /** 失败原因（执行失败时展示在弹窗内，不再只靠 3 秒 toast） */
+  error?: string | null;
   /** 停止执行（终止进程树）；仅执行中提供 */
   onStop?: () => void;
   onClose: () => void;
 }
 
-export function ToolCommandResultDialog({ open, commandName, result, logs, loading, onStop, onClose }: Props) {
+export function ToolCommandResultDialog({ open, commandName, runId, result, loading, error, onStop, onClose }: Props) {
   const outputRef = useRef<HTMLPreElement>(null);
   /** 已请求停止（防重复点击）：命令返回（loading 变 false）后自动复位 */
   const [stopping, setStopping] = useState(false);
@@ -38,16 +41,30 @@ export function ToolCommandResultDialog({ open, commandName, result, logs, loadi
   const overlayRef = useRef<HTMLDivElement>(null);
   const mouseDownTarget = useRef<EventTarget | null>(null);
 
+  // 订阅本次运行的输出行：只有本组件随合帧重渲染，ProjectDetail 不再被每行输出带动
+  const streamedLogs = useToolLogStore(s => (runId ? s.logs[runId] : undefined) ?? EMPTY_LOGS);
+
   useEffect(() => {
     if (!loading) setStopping(false);
   }, [loading]);
 
-  // 自动滚动到底部（result 和实时 logs 都在变化）
+  useEffect(() => {
+    if (!open || !runId) return;
+    return () => { useToolLogStore.getState().drop(runId); };
+  }, [open, runId]);
+
+  // 全文只在"流式行变化 / 结果到达"时拼一次：原实现每次重渲染都 join 最多 2000 行
+  const output = useMemo(() => {
+    if (!loading && result) return result.output ?? '';
+    return streamedLogs.join('\n');
+  }, [loading, result, streamedLogs]);
+
+  // 自动滚动到底部（内容变化时）
   useEffect(() => {
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
-  }, [result, logs]);
+  }, [output]);
 
   // 全屏遮罩弹窗：打开期间通知全局（AI 面板子 WebView 移出屏幕，防弹窗期间仍可点击）
   useEffect(() => {
@@ -118,35 +135,34 @@ export function ToolCommandResultDialog({ open, commandName, result, logs, loadi
         {/* 内容：单框混合输出（与 cmd 终端一致，stdout/stderr 按时间序交错）。
             自身不滚动，交给下面的输出框滚动——否则自动滚到底要跨两层容器 */}
         <div className="flex-1 min-h-0 p-4 flex flex-col">
+          {error ? (
+            <div className="mb-3 text-[12px] text-nexus-error bg-nexus-error/10 border border-nexus-error/30 rounded-md px-3 py-2 break-all">
+              执行失败：{error}
+            </div>
+          ) : null}
           {loading ? (
-            logs.length > 0 ? (
+            output ? (
               <pre
                 ref={outputRef}
                 className="flex-1 min-h-0 bg-[#0d1117] text-[#c9d1d9] text-[12px] leading-relaxed p-3 rounded-md overflow-auto font-mono whitespace-pre-wrap break-all"
               >
-                {logs.join('\n')}
+                {output}
               </pre>
             ) : (
               <div className="flex items-center justify-center py-8">
                 <span className="text-[12px] text-nexus-muted">执行中...</span>
               </div>
             )
-          ) : result ? (
-            result.output ? (
-              <pre
-                ref={outputRef}
-                className="flex-1 min-h-0 bg-[#0d1117] text-[#c9d1d9] text-[12px] leading-relaxed p-3 rounded-md overflow-auto font-mono whitespace-pre-wrap break-all"
-              >
-                {result.output}
-              </pre>
-            ) : (
-              <div className="text-[12px] text-nexus-muted text-center py-4">
-                命令执行完成，无输出
-              </div>
-            )
+          ) : output ? (
+            <pre
+              ref={outputRef}
+              className="flex-1 min-h-0 bg-[#0d1117] text-[#c9d1d9] text-[12px] leading-relaxed p-3 rounded-md overflow-auto font-mono whitespace-pre-wrap break-all"
+            >
+              {output}
+            </pre>
           ) : (
             <div className="text-[12px] text-nexus-muted text-center py-4">
-              等待执行...
+              {result ? '命令执行完成，无输出' : '等待执行...'}
             </div>
           )}
         </div>

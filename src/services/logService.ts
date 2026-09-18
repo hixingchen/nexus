@@ -5,18 +5,17 @@ export type LogStream = 'stdout' | 'stderr' | 'system';
 
 /// 单条服务日志
 export interface ServiceLogLine {
+  /** 服务内单调行号：快照与实时事件靠它做幂等合并（见 stores/logStore 的 lastSeq） */
+  seq: number;
   timestamp: string;
   stream: LogStream;
   text: string;
 }
 
-/// 服务日志实时事件（由后端推送）
-export interface ServiceLogEvent {
+/// 服务日志批量事件（由后端每 ~50ms 推送一批；取代原来的逐行事件）
+export interface ServiceLogBatchEvent {
   service_key: string;
-  stream: LogStream;
-  data: string;
-  /** 行产生时间（RFC3339，后端打点） */
-  timestamp: string;
+  lines: ServiceLogLine[];
 }
 
 export const logService = {

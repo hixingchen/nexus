@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod app;
 pub mod editor;
 pub mod fileops;
 pub mod layout;

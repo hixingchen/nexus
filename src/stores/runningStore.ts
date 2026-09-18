@@ -10,6 +10,16 @@ const POLL_INTERVAL_MS = 3000;
 let intervalId: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * 状态代际号：每次"被采纳的写入"（轮询响应或动作后的主动刷新）都 +1。
+ *
+ * 为什么需要：轮询响应在途时，一次用户动作（启停服务）会走 `load()` → `setRunning` 拿到
+ * 更新的数据；若随后到达的**更早发出的**轮询响应照样写入，界面会把刚启动的服务显示成未运行
+ * （下一次轮询才纠正，中间这 3 秒用户会以为没启动成功）。规则：响应只在"发出后没有任何
+ * 更新的写入"时才被采纳。
+ */
+let statusSeq = 0;
+
+/**
  * 比对两组运行/失败列表是否等价（逐字段、按下标）。
  * 供 refresh 与 setRunning 共用：后端每次返回的是新数组，
  * 内容未变时照样 set 等于换引用，会把所有订阅方（项目行/服务面板/展开的目录树）全部重渲染。
@@ -49,6 +59,8 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
 
   setRunning: (running, failed) => {
     const st = get();
+    // 动作后的主动刷新：数据一定比在途轮询新，占一个代际（让在途响应作废）
+    statusSeq++;
     // 与 refresh 同一套变更检测：内容未变则不 set（loaded 未置位时必须 set，首次要把 loaded 翻成 true）
     if (st.loaded && sameStatus(st.running, running, st.failed, failed)) return;
     set({ running, failed, loaded: true });
@@ -56,12 +68,16 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
 
   /** 拉取一次最新状态（失败只记录日志：后端故障时每 3 秒弹 toast 会刷屏） */
   refresh: async () => {
+    const reqSeq = statusSeq; // 请求发出时的代际
     try {
       const r = await processApi.getRunning();
+      // 期间有更新的写入（动作结果 / 更晚的刷新）→ 丢弃这次过期响应
+      if (statusSeq !== reqSeq) return;
       const st = get();
       // 变更检测：内容未变则不 set——避免每 3 秒产生新数组引用，
       // 触发所有订阅方（项目行/服务面板/展开的目录树）全量重渲染
       if (st.loaded && sameStatus(st.running, r.running, st.failed, r.failed)) return;
+      statusSeq++;
       set({ running: r.running, failed: r.failed, loaded: true });
     } catch (e) {
       console.error('获取运行状态失败:', e);

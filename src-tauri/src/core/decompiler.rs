@@ -82,7 +82,10 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     tokio::fs::write(&class_path, bytes).await.map_err(|e| format!("写入临时 class 失败: {}", e))?;
 
     let mut cmd = tokio::process::Command::new("java");
-    cmd.arg("-jar")
+    // -Xmx：CFR 对超大/畸形 class 可能持续膨胀（默认堆上限是物理内存的 1/4），
+    // 256m 对正常 class 绰绰有余，超限只会让 JVM 自己 OOM 退出并走前端回退路径
+    cmd.arg("-Xmx256m")
+        .arg("-jar")
         .arg(jar)
         .arg("--silent").arg("true")
         .arg("--showversion").arg("false")
@@ -94,7 +97,17 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = tokio::time::timeout(DECOMPILE_TIMEOUT, cmd.output())
+    // 显式 spawn（而非 cmd.output()）：需要在进程跑起来后按 pid 纳入共享 Job Object——
+    // kill_on_drop 只在"本进程还活着"时有效，Nexus 被强杀时靠 KILL_ON_JOB_CLOSE 兜底
+    let child = cmd.spawn().map_err(|e| format!("启动 java 失败（需要 JRE）: {}", e))?;
+    #[cfg(windows)]
+    if let Some(job) = crate::core::job_object::shared() {
+        if let Some(pid) = child.id() {
+            job.assign_pid(pid);
+        }
+    }
+
+    let output = tokio::time::timeout(DECOMPILE_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| "反编译超时（>15s），已终止 java 进程".to_string());
 

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tauri::Manager;
 
-use crate::core::process::build_command;
+use crate::core::process::build_internal_command;
 
 // ─── dsh workspace 注册（GUI 工作区跟随项目目录的尽力机制） ─────────
 
@@ -211,24 +211,90 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 扫描 dsh 会话目录，返回 cwd 匹配指定目录的会话文件（cwd 归一比较）
+/// 探测 header 时只读文件前若干字节。
+///
+/// 会话文件首帧就是 header 一行（几百字节），而原实现为了拿 `cwd` 把**每个**会话文件
+/// 整读一遍（会话文件可以很大）——每次打开 AI 面板都要付出"全部会话字节"的读盘量。
+/// 64KB 足够覆盖首帧及其后的第二个魔数（`first_frame_bounds` 需要它来界定首帧边界）。
+const HEADER_PROBE_BYTES: u64 = 64 * 1024;
+
+/// 读文件前若干字节（不足则返回全部）；失败返回 None
+fn read_prefix(file: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(file).ok()?;
+    let mut buf = Vec::with_capacity(max.min(HEADER_PROBE_BYTES) as usize);
+    f.take(max).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// 只读前缀解析会话 header（拿 cwd / createdAt 用，不做整读）
+fn probe_session_header(file: &Path) -> Option<serde_json::Value> {
+    decode_session_header(&read_prefix(file, HEADER_PROBE_BYTES)?)
+}
+
+/// dsh 会话分组目录名（cwd 派生）：`D:\work\GitProject\nexus` → `--D-work-GitProject-nexus--`。
+///
+/// 规则由真实目录反推（本机 7 个样本全部吻合）：去掉 `:`，`\` 换成 `-`，非 ASCII 按
+/// UTF-16 码元转义为 `~XXXX`（大写十六进制，如 `福清` → `~798F~6E05`），最后前后各加 `--`。
+/// 派生规则万一与 dsh 版本不一致，调用方有"整体回退扫描"兜底（见 find_project_sessions）。
+fn group_name_for(dir: &str) -> String {
+    let normalized = dir.replace('/', "\\");
+    let mut out = String::with_capacity(normalized.len() + 16);
+    out.push_str("--");
+    for ch in normalized.chars() {
+        match ch {
+            ':' => {}
+            '\\' => out.push('-'),
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for unit in c.encode_utf16(&mut buf) {
+                    out.push_str(&format!("~{:04X}", unit));
+                }
+            }
+        }
+    }
+    out.push_str("--");
+    out
+}
+
+/// 扫描 dsh 会话目录，返回 cwd 匹配指定目录的会话文件（cwd 归一比较）。
+///
+/// 性能路径（原实现每次都整读**每个**会话文件）：① 先按 cwd 派生的分组目录名筛选，
+/// 命中即只扫该目录；② 未命中则退回全量扫描，但每个文件只读前 64KB 解析 header。
+/// 两条路径都不会因"派生规则不一致"而漏掉会话（后者只是慢一点，结果一样）。
 fn find_project_sessions(storage: &Path, dir_norm: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let sessions_root = storage.join("sessions");
     let Ok(top) = std::fs::read_dir(&sessions_root) else { return out };
-    for group in top.flatten() {
-        let Ok(ses) = std::fs::read_dir(group.path()) else { continue };
+    let groups: Vec<std::path::PathBuf> = top.flatten().map(|g| g.path()).collect();
+    let expected = group_name_for(dir_norm);
+    let matched: Vec<&std::path::PathBuf> =
+        groups.iter().filter(|g| g.file_name().and_then(|n| n.to_str()) == Some(expected.as_str())).collect();
+    let scan: Vec<&std::path::PathBuf> = if matched.is_empty() {
+        log::debug!("[ai] 会话分组名未命中（{}），回退全量扫描", expected);
+        groups.iter().collect()
+    } else {
+        matched
+    };
+    for group in scan {
+        let Ok(ses) = std::fs::read_dir(group) else { continue };
         for s in ses.flatten() {
             let file = s.path().join("session.jsonl.zstd");
             if !file.exists() { continue; }
-            let Ok(raw) = std::fs::read(&file) else { continue };
-            let Some(header) = decode_session_header(&raw) else { continue };
+            let Some(header) = probe_session_header(&file) else { continue };
             let cwd_matches = header.get("cwd").and_then(|c| c.as_str()).map(norm_path) == Some(dir_norm.to_string());
             if cwd_matches { out.push(file); }
         }
     }
     out
 }
+
+/// createdAt 距今小于该阈值的会话视为"已经是活跃的"，跳过整文件重写。
+///
+/// 重写一次会话文件 = 整读 + 解压首帧 + 重新压缩 + 写临时文件 + rename（按原大小整体写盘），
+/// 而 dsh GUI 选中工作区看的是"最近活动"，同一分钟内重复打开面板根本不需要再 bump。
+const BUMP_SKIP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// bump 会话文件首帧 createdAt = 现在。
 /// 帧替换语义：只解/改/压第一个帧（header 行），其余帧原样拼接 —— dsh 格式要求
@@ -267,6 +333,15 @@ pub fn ensure_workspace_active(dir: &str, title: Option<&str>) {
     // 2. bump 本项目会话的活动时间 → recentWorkspace 必选中本项目
     let dir_norm = norm_path(dir);
     for file in find_project_sessions(&storage, &dir_norm) {
+        // 已经足够"新鲜"的会话不必重写：bump 一次 = 整读 + 解压 + 重压 + 整份写盘（见常量的说明）
+        let created_at = probe_session_header(&file)
+            .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()));
+        if let Some(ts) = created_at {
+            if epoch_ms() - ts < BUMP_SKIP_WINDOW_MS {
+                log::debug!("[ai] 会话活动时间已新鲜，跳过重写: {}", file.display());
+                continue;
+            }
+        }
         if let Err(e) = bump_session_activity(&file) {
             log::warn!("[ai] 会话活动时间 bump 失败（忽略）: {}", e);
         }
@@ -296,13 +371,37 @@ impl AiSession {
     }
 }
 
+/// dsh 相关操作的超时集中表（ARCH-10）。
+///
+/// 为什么收进一处：此前这些数字散落在 6 个函数里（`Duration::from_secs(10)` 出现两次、
+/// 60s 启动超时写在调用方），改一个值要在多个文件中找；而它们全都属于同一类决策
+/// （"等 dsh/npm 多久算卡住"）。集中后既便于按机器/网络调优，也便于在文档里一句话说明。
+pub struct AiTimeouts;
+
+impl AiTimeouts {
+    /// `dsh --version`（探活/取版本）：正常 <1s，10s 足够宽裕
+    pub const VERSION_PROBE: Duration = Duration::from_secs(10);
+    /// `npm view`（联网查最新版）：registry 慢时常见数秒
+    pub const NPM_QUERY: Duration = Duration::from_secs(30);
+    /// `npm install -g`（下载安装/升级 dsh）：唯一允许分钟级的操作
+    pub const NPM_INSTALL: Duration = Duration::from_secs(300);
+    /// `dsh web` 启动并打印 URL：冷启动要起 Node + 加载插件，60s 是保守上限
+    pub const WEB_START: Duration = Duration::from_secs(60);
+    /// 插件 bundle 就绪轮询窗口（URL 已打印但模块服务尚未注册）
+    pub const PLUGINS_READY: Duration = Duration::from_secs(8);
+    /// 环回 HTTP 读超时
+    pub const LOOPBACK_READ: Duration = Duration::from_secs(3);
+    /// 杀进程树后等它真正退出的宽限期（统一口径，避免各处写不同的毫秒数）
+    pub const REAP: Duration = Duration::from_millis(2000);
+}
+
 /// dsh CLI 是否可用（`dsh --version` 能否成功退出）
 ///
 /// 走 `run_captured` 而不是手写 `spawn + wait`：后者**没有超时**（CLI 挂起会
 /// 永久占用一个阻塞线程，AI 面板再也拿不到状态），也**没有把子进程加入 Job Object**
 /// （应用异常退出后该进程可残留）。`run_captured` 两者都具备。
 pub fn dsh_available(app: &tauri::AppHandle) -> bool {
-    run_captured(app, "dsh --version", Duration::from_secs(10)).is_ok()
+    run_captured(app, "dsh --version", AiTimeouts::VERSION_PROBE).is_ok()
 }
 
 // ─── dsh 版本检查 / 升级（面板「检查更新」） ─────────────────────
@@ -314,7 +413,7 @@ pub fn dsh_available(app: &tauri::AppHandle) -> bool {
 /// 进程退出与 reader 线程刷盘有微小竞态，退出后短睡再读（诊断文本，无需精确）
 fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Result<String, String> {
     log::info!("[ai] 执行命令: {}", crate::core::process::mask_command(command));
-    let mut cmd = build_command(command);
+    let mut cmd = build_internal_command(command);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
     #[cfg(windows)]
@@ -324,8 +423,11 @@ fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Res
     let stdout = child.stdout.take().ok_or_else(|| "无法读取命令输出".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "无法读取命令错误输出".to_string())?;
     let captured = Arc::new(Mutex::new(String::new()));
-    spawn_capture_reader(stdout, Arc::clone(&captured));
-    spawn_capture_reader(stderr, Arc::clone(&captured));
+    // 停止标志：超时终止进程树后置位。若孙进程仍持有管道写端，reader 不会等到 EOF，
+    // 两个线程 + 缓冲会永久留在进程里（反复点「检查更新」会持续堆积线程）
+    let stop_reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_capture_reader(stdout, Arc::clone(&captured), Arc::clone(&stop_reading));
+    spawn_capture_reader(stderr, Arc::clone(&captured), Arc::clone(&stop_reading));
 
     let deadline = Instant::now() + timeout;
     loop {
@@ -340,24 +442,38 @@ fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Res
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
+                    crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
+                    stop_reading.store(true, std::sync::atomic::Ordering::Relaxed);
                     return Err(format!("命令超时（超过 {} 秒），已终止：{}", timeout.as_secs(), command));
                 }
                 std::thread::sleep(Duration::from_millis(80));
             }
-            Err(e) => return Err(format!("等待命令退出失败: {}", e)),
+            Err(e) => {
+                stop_reading.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(format!("等待命令退出失败: {}", e));
+            }
         }
     }
 }
 
 /// 后台线程逐行累积输出（stdout/stderr 各起一个；非 UTF-8 行跳过；保留尾部）
-fn spawn_capture_reader<R: std::io::Read + Send + 'static>(stream: R, captured: Arc<Mutex<String>>) {
+///
+/// 用 `read_log_lines`（有界行读取）而不是 `BufRead::lines()`：后者会把整行先读进内存，
+/// 命令输出单行 GB 级（base64/JSON dump）时足以打满内存；同时它允许我们在超时终止后
+/// 通过 `stop` 标志让线程主动退出（不必等管道 EOF）。
+fn spawn_capture_reader<R: std::io::Read + Send + 'static>(
+    stream: R,
+    captured: Arc<Mutex<String>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
     let spawn = std::thread::Builder::new()
         .name("nexus-cmd-capture".into())
         .spawn(move || {
             let reader = std::io::BufReader::new(stream);
-            for line in reader.lines() {
-                let Ok(line) = line else { continue };
+            for line in crate::core::process::read_log_lines(reader) {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if let Ok(mut c) = captured.lock() {
                     c.push_str(line.trim_end());
                     c.push('\n');
@@ -436,14 +552,14 @@ fn extract_version(text: &str) -> Option<String> {
 
 /// dsh 本地安装版本（`dsh --version` 输出首个版本号；未安装/解析失败 → None）
 pub fn query_dsh_version(app: &tauri::AppHandle) -> Option<String> {
-    run_captured(app, "dsh --version", Duration::from_secs(10))
+    run_captured(app, "dsh --version", AiTimeouts::VERSION_PROBE)
         .ok()
         .and_then(|out| extract_version(&out))
 }
 
 /// npm registry 上 @deepseek-ai/dsh 的最新稳定版（联网，上限 30 秒）
 pub fn query_dsh_latest(app: &tauri::AppHandle) -> Result<String, String> {
-    let out = run_captured(app, "npm view @deepseek-ai/dsh version", Duration::from_secs(30))?;
+    let out = run_captured(app, "npm view @deepseek-ai/dsh version", AiTimeouts::NPM_QUERY)?;
     extract_version(&out).ok_or_else(|| format!("无法从 npm 响应解析版本号：{}", tail_text(&out)))
 }
 
@@ -453,7 +569,7 @@ pub fn upgrade_dsh(app: &tauri::AppHandle) -> Result<String, String> {
     run_captured(
         app,
         "npm install -g @deepseek-ai/dsh@latest --no-fund --no-audit",
-        Duration::from_secs(300),
+        AiTimeouts::NPM_INSTALL,
     )?;
     Ok(query_dsh_version(app).unwrap_or_default())
 }
@@ -487,7 +603,8 @@ pub fn spawn_dsh_web(
 ) -> Result<AiSession, String> {
     log::info!("[ai] 启动 dsh web (cwd={:?})", cwd);
 
-    let mut cmd = build_command("dsh web --no-open --port 0");
+    // 内部命令（dsh/npm）：禁用"当前目录优先解析"，否则项目内的 dsh.cmd 会被优先执行（SEC-12）
+    let mut cmd = build_internal_command("dsh web --no-open --port 0");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -534,7 +651,7 @@ pub fn spawn_dsh_web(
                 }
             })
             .map_err(|e| {
-                crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
+                crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
                 format!("创建 dsh web stderr 读取线程失败: {}", e)
             })?;
     }
@@ -573,7 +690,7 @@ pub fn spawn_dsh_web(
                 }
             })
             .map_err(|e| {
-                crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
+                crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
                 format!("创建 dsh web stdout 读取线程失败: {}", e)
             })?;
     }
@@ -582,11 +699,11 @@ pub fn spawn_dsh_web(
     let url = match rx.recv_timeout(timeout) {
         Ok(u) if !u.is_empty() => u,
         Ok(_) => {
-            crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
+            crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
             return Err(format!("dsh web 启动失败：进程提前退出。{}", stderr_summary(&stderr_tail)));
         }
         Err(_) => {
-            crate::core::process::kill_and_reap(&mut child, Duration::from_millis(2000));
+            crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
             return Err(format!("等待 dsh web 启动超时（{} 秒）。{}", timeout.as_secs(), stderr_summary(&stderr_tail)));
         }
     };
@@ -634,11 +751,19 @@ fn stderr_summary(tail: &Arc<Mutex<String>>) -> String {
 
 // ─── 插件 bundle 就绪探测（冷启动竞态防护） ────────────────────
 
+/// `raw_get` 的响应上限（2 MB）。
+///
+/// 为什么要有：这里请求的是 dsh 自己的环回服务，正常响应只有几百字节（303 头 + 一小段 HTML）。
+/// 但环回端口上的对端不一定是 dsh——端口被别的进程占用时，`read_to_end` 会一直读到对方
+/// 关闭连接为止，把任意大小的数据读进内存（且有 3s 读超时也拦不住持续输出的流）。
+/// 超限即按"响应不可信"处理，直接放弃这次探测（调用方本就有超时兜底）。
+const RAW_GET_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
 /// 一次裸 HTTP GET（Connection: close），返回 (状态行, headers, body)
 fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, String)> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_read_timeout(Some(AiTimeouts::LOOPBACK_READ)).ok()?;
     let mut req = format!(
         "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
         path, port
@@ -649,7 +774,12 @@ fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, 
     req.push_str("\r\n");
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).ok()?;
+    // take(上限)：超限时返回"已读到的部分"而不报错，这里用读满上限来判定不可信
+    stream.take(RAW_GET_MAX_BYTES).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 >= RAW_GET_MAX_BYTES {
+        log::warn!("[ai] 插件就绪探测：响应超过 {} 字节上限，按不可信处理并放弃", RAW_GET_MAX_BYTES);
+        return None;
+    }
     let text = String::from_utf8_lossy(&buf);
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let status: u16 = head.lines().next()
@@ -666,7 +796,7 @@ fn raw_get(port: u16, path: &str, cookie: Option<&str>) -> Option<(u16, String, 
 /// 轮询该 URL 直到 200。超时只告警不失败（让前端重试路径兜底）。
 fn wait_plugins_ready(port: u16, token: &str) {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(8);
+    let deadline = started + AiTimeouts::PLUGINS_READY;
 
     // 1. 握手：GET /?token= → 303 + Set-Cookie
     let handshake = raw_get(port, &format!("/?token={}", token), None);
@@ -792,6 +922,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ai-ws-test-{}", uuid::Uuid::new_v4()));
         assert!(ensure_workspace_registered_at(&dir, "D:\\x", None).is_ok()); // 不报错、不创建文件
         assert!(!dir.join("storages").exists());
+    }
+
+    /// 会话分组目录名的派生规则：期望值全部取自本机 `~/.dsh/sessions` 的**真实目录名**，
+    /// 规则一旦与 dsh 版本不符，这里会先炸（而不是让 AI 面板静默选错工作区）。
+    #[test]
+    fn test_group_name_for_matches_real_dsh_dirs() {
+        assert_eq!(group_name_for(r"D:\work\GitProject\nexus"), "--D-work-GitProject-nexus--");
+        assert_eq!(
+            group_name_for(r"D:\work\GitProject\nexus\src-tauri"),
+            "--D-work-GitProject-nexus-src-tauri--"
+        );
+        assert_eq!(
+            group_name_for(r"D:\work\SVNProject\老干局-人才库"),
+            "--D-work-SVNProject-~8001~5E72~5C40-~4EBA~624D~5E93--"
+        );
+        assert_eq!(
+            group_name_for("D:/work/SVNProject/演示-智慧运维电梯服务平台-show-smart-elevator-ops-platform"),
+            "--D-work-SVNProject-~6F14~793A-~667A~6167~8FD0~7EF4~7535~68AF~670D~52A1~5E73~53F0-show-smart-elevator-ops-platform--"
+        );
+        assert_eq!(
+            group_name_for(r"D:\work\SVNProject\福清-陆源科技化工园区-code"),
+            "--D-work-SVNProject-~798F~6E05-~9646~6E90~79D1~6280~5316~5DE5~56ED~533A-code--"
+        );
     }
 
     #[test]

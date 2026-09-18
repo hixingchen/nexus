@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { projectApi, processApi, watchApi, type Project } from '../services/service';
+import { projectApi, type Project } from '../services/service';
 import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
-import { showNotification } from '../components/ui/Toast';
+import { startProjectWithFeedback, stopProjectWithFeedback } from '../stores/serviceActions';
+import { reportError } from '../utils/error';
 
 /**
  * ProjectList 组件的业务逻辑 hook
@@ -36,8 +37,7 @@ export function useProjectList() {
     try {
       setProjects(await projectApi.getAll());
     } catch (e) {
-      console.error('加载项目列表失败:', e);
-      showNotification({ variant: 'error', title: '加载项目列表失败' });
+      reportError('加载项目列表失败', e);
     }
   }, []);
 
@@ -68,45 +68,24 @@ export function useProjectList() {
       await projectApi.togglePin(projectId);
       await load();
     } catch (e: unknown) {
-      showNotification({ variant: 'error', title: String(e) });
+      reportError('置顶项目失败', e);
     }
   }, [load]);
 
   const handleStart = useCallback(async (e: React.MouseEvent, id: string, name: string) => {
     e.stopPropagation();
     setActingId(id);
-    try {
-      const errors = await processApi.startProject(id);
-      // 与详情页 handleStartAll 对齐：项目启动 → 开启项目级文件监听（restart_mode>0 且 enabled=1 的服务）
-      watchApi.start(id).catch((err) => console.error('启动文件监听失败:', err));
-      await useRunningStore.getState().refresh();
-      if (errors.length > 0) {
-        showNotification({ variant: 'error', title: '部分服务启动失败', description: errors.join(', ') });
-      } else {
-        showNotification({ title: `「${name}」已启动`, description: '所有已启用的服务已启动' });
-      }
-    } catch (err: unknown) {
-      showNotification({ variant: 'error', title: String(err) });
-    }
+    // 共享动作层：启动 + 项目级监听 + 运行状态刷新 + 逐服务失败汇总（与详情页同一实现）
+    await startProjectWithFeedback(id, name);
     setActingId(null);
   }, []);
 
   const handleStop = useCallback(async (e: React.MouseEvent, id: string, name: string) => {
     e.stopPropagation();
     setActingId(id);
-    try {
-      // stop_project_services 后端同时停止进程与项目级文件监听（总开关）
-      // 返回逐个服务的失败清单；有失败时不能报"所有服务已停止"
-      const errors = await processApi.stopProject(id);
-      await useRunningStore.getState().refresh();
-      if (errors.length > 0) {
-        showNotification({ variant: 'error', title: `「${name}」部分服务停止失败`, description: errors.join(', ') });
-      } else {
-        showNotification({ variant: 'info', title: `「${name}」已停止`, description: '所有服务已停止' });
-      }
-    } catch (err: unknown) {
-      showNotification({ variant: 'error', title: String(err) });
-    }
+    // 停止：日志清单取自缓存的服务列表（列表页只缓存了服务数组，与详情页口径一致）
+    const services = useSvcCacheStore.getState().cache[id] ?? [];
+    await stopProjectWithFeedback(id, name, services);
     setActingId(null);
   }, []);
 
@@ -148,8 +127,7 @@ export function useProjectList() {
       setExpanded(new Set([projectId])); // 单开（同一时间只展开一个项目）
     } catch (err) {
       if (seq !== expandSeqRef.current) return;
-      console.error('加载服务列表失败:', err);
-      showNotification({ variant: 'error', title: '加载服务列表失败' });
+      reportError('加载服务列表失败', err);
     } finally {
       if (seq === expandSeqRef.current) setExpandingId(null);
     }

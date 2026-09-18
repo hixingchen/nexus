@@ -3,12 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@10.4.1",
   "scripts": {
     "dev": "tauri dev",
     "dev:frontend": "vite",
     "build": "tsc && vite build",
     "build:app": "tauri build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@codemirror/commands": "6.10.4",
@@ -39,7 +41,6 @@
     "@dnd-kit/sortable": "10.0.0",
     "@dnd-kit/utilities": "3.2.2",
     "@lezer/common": "1.5.2",
-    "@lezer/highlight": "1.2.3",
     "@replit/codemirror-indentation-markers": "6.5.3",
     "@tanstack/react-virtual": "3.14.5",
     "@tauri-apps/api": "2.11.1",

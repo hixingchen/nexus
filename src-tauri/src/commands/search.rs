@@ -6,7 +6,6 @@ use crate::commands::editor::check_path_allowed;
 
 /// 单条搜索结果
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchResultItem {
     pub path: String,
     pub name: String,
@@ -16,7 +15,6 @@ pub struct SearchResultItem {
 
 /// 搜索响应
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
     pub results: Vec<SearchResultItem>,
     /// 结果/扫描达到上限被截断
@@ -89,29 +87,49 @@ pub async fn search_files(
     let q = if params.case_sensitive { query } else { query.to_lowercase() };
     let max_results = params.max_results.clamp(1, 5000);
 
+    // 代数递增：新搜索一旦发起，正在跑的旧搜索会尽早自行退出（原实现里
+    // "改一次关键词"就会多一个跑满 2 万文件的阻塞任务排队，互相叠着占线程）
+    let my_epoch = state.search_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let epoch_handle = std::sync::Arc::clone(&state.search_epoch);
+
     // 同步遍历 + 读文件放 spawn_blocking，避免阻塞主线程
     tokio::task::spawn_blocking(move || {
-        search_in_dir(&root, &q, params.case_sensitive, &exts, max_results)
+        search_in_dir(&root, &q, params.case_sensitive, &exts, max_results, Some((epoch_handle, my_epoch)))
     })
     .await
     .map_err(|e| format!("搜索失败: {}", e))?
 }
 
 /// 同步递归搜索（在 spawn_blocking 中执行）
+///
+/// `cancel`：(共享代数, 本次代数)。每次扫描若干文件检查一次，若代数已被更新的搜索取代
+/// 就提前返回（结果由前端按请求序号丢弃，这里只是别让旧任务继续占满 IO/CPU）。
 fn search_in_dir(
     root: &str,
     q: &str,
     case_sensitive: bool,
     exts: &[String],
     max_results: usize,
+    cancel: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) -> Result<SearchResponse, String> {
+    /// 每扫描多少个文件检查一次取消（检查本身是原子读，频率不用太高）
+    const CANCEL_CHECK_EVERY: usize = 256;
+    let superseded = |scanned: usize| -> bool {
+        match &cancel {
+            Some((handle, my)) => {
+                scanned.is_multiple_of(CANCEL_CHECK_EVERY)
+                    && handle.load(std::sync::atomic::Ordering::Relaxed) != *my
+            }
+            None => false,
+        }
+    };
     // 单文件搜索（目录树文件节点右键）：搜文件自身
     let root_path = PathBuf::from(root);
     if root_path.is_file() {
         let mut results = Vec::new();
         let truncated = false;
-        if file_is_searchable(&root_path, exts) {
-            if let Some(hits) = search_file(&root_path, q, case_sensitive, max_results) {
+        if let Some(bytes) = read_searchable(&root_path, &root_path, exts) {
+            if let Some(hits) = search_bytes(&root_path, &bytes, q, case_sensitive, max_results) {
                 results.extend(hits);
             }
         }
@@ -148,9 +166,15 @@ fn search_in_dir(
             } else if file_type.is_file() {
                 scanned += 1;
                 if scanned > MAX_SCAN_FILES { truncated = true; break; }
-                if !file_is_searchable(&path, exts) { continue; }
-                if let Some(hits) = search_file(&path, q, case_sensitive, max_results - results.len()) {
-                    results.extend(hits);
+                // 被更新的搜索取代：提前退出（结果前端本来就会丢弃）
+                if superseded(scanned) { truncated = true; break; }
+                // 一次 open：候选判定（大小/扩展名/NUL 探测）与逐行搜索共用同一份字节，
+                // 原实现先 stat + open 读 8KB 探测、再 open 整读一遍——同一文件两次打开、
+                // 前 8KB 读两次（上限 2 万文件时最坏多出 2 万次 open）
+                if let Some(bytes) = read_searchable(&root_path, &path, exts) {
+                    if let Some(hits) = search_bytes(&path, &bytes, q, case_sensitive, max_results - results.len()) {
+                        results.extend(hits);
+                    }
                 }
             }
         }
@@ -162,36 +186,54 @@ fn search_in_dir(
     Ok(SearchResponse { results, truncated })
 }
 
-/// 文件是否可搜索：大小上限 / 扩展名筛选 / 二进制扩展名 / 内容含 NUL
-fn file_is_searchable(path: &Path, exts: &[String]) -> bool {
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if len == 0 || len > MAX_SEARCH_FILE_SIZE { return false; }
-
+/// 候选文件读取 + 可搜索判定（一次 open 完成）。
+///
+/// 判定顺序：扩展名筛选（不读盘）→ 打开并**按句柄复核真实目标仍在搜索根内**（SEC-4：
+/// 目录遍历与实际读取之间，项目内并发脚本可以把某个路径换成指向外面的 junction，
+/// 若不复核就会把白名单外文件的内容作为命中片段返回给界面）→ 整读（受大小上限约束）
+/// → 头部 NUL 探测。返回 `None` 表示跳过该文件（过大/非目标类型/二进制/读失败/越界）。
+fn read_searchable(root: &Path, path: &Path, exts: &[String]) -> Option<Vec<u8>> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ext = Path::new(name).extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if !exts.is_empty() && !exts.iter().any(|e| e == &ext) { return false; }
-    if BINARY_EXTENSIONS.contains(&ext.as_str()) { return false; }
+    // 先按名字过滤：命中排除项就不必打开文件
+    if !exts.is_empty() && !exts.iter().any(|e| e == &ext) { return None; }
+    if BINARY_EXTENSIONS.contains(&ext.as_str()) { return None; }
 
-    // 二进制检测：读前 8KB，含 NUL 字节视为二进制跳过
-    let mut buf = [0u8; BINARY_PROBE_SIZE];
-    let n = std::fs::File::open(path).ok()
-        .and_then(|mut f| std::io::Read::read(&mut f, &mut buf).ok())
-        .unwrap_or(0);
-    !buf[..n].contains(&0)
+    use std::io::Read;
+    // 一次 open，后续读取都在这条已复核的句柄上
+    let file = std::fs::File::open(path).ok()?;
+    let real = crate::commands::editor::final_path_of_handle(&file).ok()?;
+    // 复核基准同样取"内核解析后的根"，两边同为 verbatim 形式才能正确比较
+    let real_root = std::fs::canonicalize(root).ok()?;
+    if !real.starts_with(&real_root) { return None; }
+
+    let metadata = file.metadata().ok()?;
+    if metadata.len() == 0 || metadata.len() > MAX_SEARCH_FILE_SIZE { return None; }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    // 上限 +1 字节：读满即说明文件比 metadata 报的更大，下面按实际长度复核
+    file.take(MAX_SEARCH_FILE_SIZE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_SEARCH_FILE_SIZE { return None; }
+    // 二进制检测：头部含 NUL 视为二进制（原先单独读 8KB 探测，现在用已读入的字节）
+    let probe = &bytes[..bytes.len().min(BINARY_PROBE_SIZE)];
+    if probe.contains(&0) { return None; }
+    Some(bytes)
 }
 
-/// 在单文件中逐行搜索，返回命中行
-fn search_file(path: &Path, q: &str, case_sensitive: bool, limit: usize) -> Option<Vec<SearchResultItem>> {
+/// 在单文件的**已读入字节**中逐行搜索，返回命中行
+fn search_bytes(
+    path: &Path,
+    bytes: &[u8],
+    q: &str,
+    case_sensitive: bool,
+    limit: usize,
+) -> Option<Vec<SearchResultItem>> {
     // UTF-8 严格解码失败 → 回退 GB18030（GBK 超集）：与编辑器读取（decode_text）对齐，
     // 否则 Windows 中文老项目的 GBK 文件在搜索中静默缺失
-    let content = match std::fs::read(path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(c) => c,
-            Err(utf8_bytes) => encoding_rs::GB18030.decode(&utf8_bytes.into_bytes()).0.into_owned(),
-        },
-        Err(_) => return None, // 读取失败：跳过
+    let content = match std::str::from_utf8(bytes) {
+        Ok(c) => c.to_string(),
+        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
     };
     let mut hits = Vec::new();
     let q_char_count = q.chars().count();

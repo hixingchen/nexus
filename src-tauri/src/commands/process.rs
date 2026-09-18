@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager, State};
 use serde::Serialize;
 use crate::AppState;
 use crate::core::process::LogLine;
+use std::sync::Arc;
 
 /// 工具命令默认执行超时（未配置 timeout_secs 时）：防止长驻命令（npm run dev 等）
 /// 永久占用线程池。构建类长任务应在命令上配置 timeout_secs（如 1800）或 0（不限）
@@ -12,17 +13,29 @@ const TOOL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// 工具命令输出最多保留的行数（对齐服务日志上限，防止超长输出撑爆 IPC payload 和前端渲染）
 const TOOL_CMD_OUTPUT_MAX_LINES: usize = 2000;
 
-/// 运行中的工具命令表（run_id → pid）：供 stop_tool_command 按 run_id 终止进程树，
+/// 运行中的工具命令表项：pid + 进程启动时间。
+///
+/// 为什么要记启动时间：`stop_tool_command` 只知道 pid，而 pid 会被系统回收——
+/// 命令结束与用户点「停止」之间若发生 pid 复用，就会杀掉一个完全无关的进程树。
+/// 启动时间（毫秒）在进程存活期间不变，比对它即可确认"还是当初那个进程"。
+#[derive(Clone, Copy)]
+struct RunningToolCmd {
+    pid: u32,
+    /// 登记时的进程启动时间；取不到（权限/竞态）时为 None，此时退化为"只按 pid"
+    started_at: Option<u64>,
+}
+
+/// 运行中的工具命令表（run_id → 进程信息）：供 stop_tool_command 按 run_id 终止进程树，
 /// 也是超时兜底杀进程的 pid 来源（不再用 oneshot 单次传递）
-fn running_tool_cmds() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
-    static TABLE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+fn running_tool_cmds() -> &'static std::sync::Mutex<std::collections::HashMap<String, RunningToolCmd>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, RunningToolCmd>>> =
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 读取运行表中的 pid（不移除）。超时分支只在阻塞任务真正结束前需要它，
+/// 读取运行表中的项（不移除）。超时分支只在阻塞任务真正结束前需要它，
 /// 表项的移除交给 RunTableGuard，避免"提前取走 pid → 任务结束时无项可清"
-fn peek_running_pid(run_id: &str) -> Option<u32> {
+fn peek_running_cmd(run_id: &str) -> Option<RunningToolCmd> {
     running_tool_cmds().lock().ok().and_then(|m| m.get(run_id).copied())
 }
 
@@ -36,11 +49,33 @@ struct RunTableGuard {
 }
 
 impl RunTableGuard {
-    fn register(run_id: &str, pid: u32) -> Self {
-        if let Ok(mut table) = running_tool_cmds().lock() {
-            table.insert(run_id.to_string(), pid);
+    /// 原子占位：在同一把锁内完成"查重 + 登记"，已存在即失败。
+    ///
+    /// 为什么要占位而不是 spawn 后再登记：原实现是 spawn **之前**查重、spawn **之后** insert，
+    /// 两步之间隔着进程创建（毫秒级），两个并发请求带同一 run_id 时会双双通过查重，
+    /// 后者覆盖前者的表项——先启动的那个进程从此失去终止句柄（`timeout_secs: 0` 的长构建
+    /// 会一直跑到进程树自己结束）。
+    fn reserve(run_id: &str) -> Result<Self, String> {
+        let mut table = running_tool_cmds()
+            .lock()
+            .map_err(|e| format!("工具命令运行表锁中毒: {}", e))?;
+        if table.contains_key(run_id) {
+            return Err(format!("run_id 已被占用: {}", run_id));
         }
-        Self { run_id: run_id.to_string() }
+        // pid=0 = 已占位、进程尚未启动；spawn 成功后由 set_pid 补上真实值
+        table.insert(run_id.to_string(), RunningToolCmd { pid: 0, started_at: None });
+        Ok(Self { run_id: run_id.to_string() })
+    }
+
+    /// spawn 成功后补上真实 pid 与启动时间
+    fn set_pid(&self, pid: u32) {
+        if let Ok(mut table) = running_tool_cmds().lock() {
+            // 只在自己仍持有该键时写入（正常情况下必然如此）
+            if let Some(entry) = table.get_mut(&self.run_id) {
+                entry.pid = pid;
+                entry.started_at = crate::core::process::process_start_time_millis(pid);
+            }
+        }
     }
 }
 
@@ -69,7 +104,7 @@ fn get_service_info(db: &crate::database::Database, service_id: &str) -> Result<
         conn.query_row(
             "SELECT name, command, cwd, project_id, env_vars FROM services WHERE id=?1",
             [service_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
+            |row| Ok((row.get::<_, String>("name")?, row.get::<_, String>("command")?, row.get::<_, String>("cwd")?, row.get::<_, String>("project_id")?, row.get::<_, String>("env_vars")?)),
         )
         .map_err(|e| format!("服务不存在: {}", e))
     })
@@ -167,7 +202,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
                 "SELECT id, name, command, cwd, env_vars FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
             ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
             let rows = stmt.query_map([&project_id], |row| {
-                Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?, row.get::<_,String>(4)?))
+                Ok((row.get::<_, String>("id")?, row.get::<_, String>("name")?, row.get::<_, String>("command")?, row.get::<_, String>("cwd")?, row.get::<_, String>("env_vars")?))
             }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
             let mut svcs = Vec::new();
             for r in rows { svcs.push(r.map_err(|e| format!("解析项目服务数据失败: {}", e))?); }
@@ -248,11 +283,11 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
 
 /// 读取服务的日志快照。
 ///
-/// 异步 + spawn_blocking：`get_logs` 会在日志锁内克隆最多 2000 条 `LogLine`
-/// （每行 3 个 String，最坏约 16MB）并参与 IPC 序列化。同步执行时这段工作内联在
-/// IPC 请求路径上，与日志面板的轮询/切换叠加会造成可感的卡顿。
+/// 异步 + spawn_blocking：`get_logs` 在全局日志锁内取快照（元素是 `Arc<LogLine>`，
+/// 锁内只拷指针），随后的 IPC 序列化在这条阻塞线程上完成——不占用 IPC 请求线程，
+/// 也不把 2000 行字符串的序列化成本压在日志锁上。
 #[tauri::command]
-pub async fn get_service_logs(app: tauri::AppHandle, service_key: String) -> Result<Vec<LogLine>, String> {
+pub async fn get_service_logs(app: tauri::AppHandle, service_key: String) -> Result<Vec<Arc<LogLine>>, String> {
     if service_key.trim().is_empty() { return Err("服务标识不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -276,10 +311,9 @@ pub async fn run_tool_command(
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     if command_id.trim().is_empty() { return Err("命令ID不能为空".into()); }
     if run_id.trim().is_empty() { return Err("run_id 不能为空".into()); }
-    // run_id 是运行表的 key：重复会覆盖旧表项，令旧进程失去可终止句柄
-    if running_tool_cmds().lock().map(|m| m.contains_key(&run_id)).unwrap_or(false) {
-        return Err(format!("run_id 已被占用: {}", run_id));
-    }
+    // run_id 是运行表的 key：占用检查与登记必须原子完成（见 RunTableGuard::reserve）——
+    // 原来"先查重、spawn 后再 insert"中间隔着进程创建，同 run_id 并发时后者会覆盖前者
+    let run_guard = RunTableGuard::reserve(&run_id)?;
 
     // 获取服务信息和工具命令
     let (service_name, _command, cwd, project_id, tool_commands_json) = state.db.with_conn(|conn| {
@@ -287,11 +321,11 @@ pub async fn run_tool_command(
             "SELECT name, command, cwd, project_id, tool_commands FROM services WHERE id=?1",
             [&service_id],
             |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, String>("name")?,
+                row.get::<_, String>("command")?,
+                row.get::<_, String>("cwd")?,
+                row.get::<_, String>("project_id")?,
+                row.get::<_, String>("tool_commands")?,
             )),
         )
         .map_err(|e| format!("服务不存在: {}", e))
@@ -338,9 +372,9 @@ pub async fn run_tool_command(
                 .spawn()
                 .map_err(|e| format!("执行命令失败: {}", e))?;
             let pid = child.id();
-            // 注册到运行表（stop_tool_command / 超时兜底据此按 run_id 终止进程树）；
+            // 登记 pid 与启动时间（stop_tool_command / 超时兜底据此按 run_id 终止进程树）；
             // 守卫在闭包任意返回路径（含 `?` 早退）都会清理表项
-            let _run_guard = RunTableGuard::register(&run_id, pid);
+            run_guard.set_pid(pid);
             #[cfg(windows)]
             if let Some(job) = &job {
                 job.assign_child(&child);
@@ -418,14 +452,24 @@ pub async fn run_tool_command(
         Ok(inner) => inner?,
         Err(_) => {
             // 超时：终止命令进程树，避免后台残留（已 emit 的部分输出仍保留在前端）。
-            // pid 取自运行表（spawn 成功即注册）；若命令仍在阻塞池排队（尚未 spawn）
-            // 则取不到 pid——命令随后仍会照常启动（无法拦截），如实告知而非谎报"已终止"
-            let pid = peek_running_pid(&run_id);
+            // pid 取自运行表（spawn 成功即登记）；若命令仍在阻塞池排队（尚未 spawn，
+            // 表里是 pid=0 的占位）则取不到可杀目标——命令随后仍会照常启动（无法拦截），
+            // 如实告知而非谎报"已终止"
+            let pid = peek_running_cmd(&run_id).map(|e| e.pid).filter(|p| *p != 0);
             let secs = timeout_dur.map(|d| d.as_secs()).unwrap_or(0);
             return match pid {
                 Some(p) => {
-                    crate::core::process::kill_process_tree(p);
-                    Err(format!("命令执行超时（{} 秒），已终止。长构建类命令请在工具命令上配置更长的超时（或 0 = 不限制）", secs))
+                    // 与 stop_tool_command 同口径：pid 身份复核后再杀，避免 pid 复用误杀
+                    let identity_ok = peek_running_cmd(&run_id)
+                        .and_then(|e| e.started_at)
+                        .map(|t| crate::core::process::process_start_time_millis(p) == Some(t))
+                        .unwrap_or(true);
+                    if identity_ok {
+                        crate::core::process::kill_process_tree(p);
+                        Err(format!("命令执行超时（{} 秒），已终止。长构建类命令请在工具命令上配置更长的超时（或 0 = 不限制）", secs))
+                    } else {
+                        Err(format!("命令执行超时（{} 秒），且 pid {} 已被系统复用——未执行终止，请检查是否有残留进程", secs, p))
+                    }
                 }
                 None => Err(format!("命令执行超时（{} 秒），且未能取得进程 ID——命令可能仍在启动队列中，请留意是否残留运行", secs)),
             };
@@ -448,17 +492,25 @@ pub async fn stop_tool_command(run_id: String) -> Result<(), String> {
     if run_id.trim().is_empty() {
         return Err("run_id 不能为空".into());
     }
-    let pid = running_tool_cmds()
-        .lock()
-        .map_err(|e| format!("工具命令运行表锁中毒: {}", e))?
-        .get(&run_id)
-        .copied();
-    match pid {
-        Some(p) => {
-            log::info!("[nexus] 停止工具命令 run_id={} pid={}", run_id, p);
-            crate::core::process::kill_process_tree(p);
-            Ok(())
-        }
-        None => Err("命令未在运行（可能已结束）".into()),
+    let entry = peek_running_cmd(&run_id).ok_or_else(|| "命令未在运行（可能已结束）".to_string())?;
+    if entry.pid == 0 {
+        return Err("命令正在启动中，请稍后再停止".into());
     }
+    // pid 身份复核（SEC-11）：登记过启动时间就必须一致——不一致说明这个 pid 已被系统
+    // 回收给别的进程，此时 taskkill 会杀掉无关进程树；查不到启动时间（进程已退出）同样不杀
+    if let Some(started_at) = entry.started_at {
+        match crate::core::process::process_start_time_millis(entry.pid) {
+            Some(now) if now == started_at => {}
+            Some(_) => {
+                return Err(format!(
+                    "命令已结束且 pid {} 已被系统复用，已放弃终止（避免误杀无关进程）",
+                    entry.pid
+                ));
+            }
+            None => return Err("命令已结束（进程不存在）".into()),
+        }
+    }
+    log::info!("[nexus] 停止工具命令 run_id={} pid={}", run_id, entry.pid);
+    crate::core::process::kill_process_tree(entry.pid);
+    Ok(())
 }

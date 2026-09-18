@@ -12,9 +12,9 @@ pub fn get_projects(state: State<AppState>) -> Result<Vec<Project>, String> {
         ).map_err(|e| format!("查询项目列表失败: {}", e))?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
-                id: row.get(0)?, name: row.get(1)?, path: row.get(2)?,
-                pinned: row.get::<_,i32>(3)? != 0,
-                sort_index: row.get(4)?,
+                id: row.get("id")?, name: row.get("name")?, path: row.get("path")?,
+                pinned: row.get::<_, i32>("pinned")? != 0,
+                sort_index: row.get("sort_index")?,
             })
         }).map_err(|e| format!("读取项目数据失败: {}", e))?;
         let mut projects = Vec::new();
@@ -32,9 +32,9 @@ pub fn get_project_detail(state: State<AppState>, project_id: String) -> Result<
             "SELECT id, name, path, pinned, sort_index FROM projects WHERE id=?1",
             [&project_id],
             |row| Ok(Project {
-                id: row.get(0)?, name: row.get(1)?, path: row.get(2)?,
-                pinned: row.get::<_,i32>(3)? != 0,
-                sort_index: row.get(4)?,
+                id: row.get("id")?, name: row.get("name")?, path: row.get("path")?,
+                pinned: row.get::<_, i32>("pinned")? != 0,
+                sort_index: row.get("sort_index")?,
             })
         ).map_err(|e| format!("项目不存在: {}", e))?;
 
@@ -55,6 +55,9 @@ pub fn add_project(state: State<AppState>, name: String, path: String) -> Result
     if !std::path::Path::new(&path).is_dir() {
         return Err("项目路径不存在或不是目录".into());
     }
+    // 项目路径会直接成为文件访问白名单的根：新路径必须是用户经原生选择器确认过的目录
+    // （见 editor.rs 的"配置路径收口"），驱动器根/系统目录等一律拒绝
+    crate::commands::editor::ensure_config_dir_allowed(&state, &path, "项目路径")?;
     state.db.with_conn(|conn| {
         // 查重失败（DB 错误）不能当作"不存在"：那会放进一个重名项目
         let exists: bool = conn.query_row(
@@ -88,6 +91,9 @@ pub fn update_project(state: State<AppState>, id: String, name: String, path: St
     if !std::path::Path::new(&path).is_dir() {
         return Err("项目路径不存在或不是目录".into());
     }
+    // 项目路径会直接成为文件访问白名单的根：新路径必须是用户经原生选择器确认过的目录
+    // （见 editor.rs 的"配置路径收口"），驱动器根/系统目录等一律拒绝
+    crate::commands::editor::ensure_config_dir_allowed(&state, &path, "项目路径")?;
     state.db.with_conn(|conn| {
         // 同名查重失败必须上报，不能静默按"无重名"继续写
         let exists: bool = conn.query_row(
@@ -145,9 +151,9 @@ pub fn duplicate_project(state: State<AppState>, id: String) -> Result<Project, 
             "SELECT id, name, path, pinned, sort_index FROM projects WHERE id=?1",
             [&id],
             |row| Ok(Project {
-                id: row.get(0)?, name: row.get(1)?, path: row.get(2)?,
-                pinned: row.get::<_,i32>(3)? != 0,
-                sort_index: row.get(4)?,
+                id: row.get("id")?, name: row.get("name")?, path: row.get("path")?,
+                pinned: row.get::<_, i32>("pinned")? != 0,
+                sort_index: row.get("sort_index")?,
             })
         ).map_err(|e| format!("项目不存在: {}", e))?;
 

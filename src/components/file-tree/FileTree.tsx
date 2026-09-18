@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback, useRef, memo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { showNotification } from '../ui/Toast';
 import { useEditorStore, loadAndOpenFile, parseJarVirtualPath } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { listJar, type JarEntryInfo } from '../../services/editor';
+import { listDirectory, pasteFiles, copyFilesToClipboard, openInExplorer } from '../../services/system';
+import { reportError } from '../../utils/error';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
 import { SvgIcon } from '../ui/SvgIcon';
@@ -12,12 +13,6 @@ import { getDirColorClass } from '../../utils/fileColors';
 import type { FileEntry } from '../../types/file';
 
 const getExtension = (name: string) => (name.split('.').pop() ?? '').toLowerCase();
-
-/** 粘贴结果：created 为已落盘路径，failed 为逐个源的失败原因（空数组 = 全部成功） */
-interface PasteFilesResult {
-  created: string[];
-  failed: string[];
-}
 
 /**
  * 粘贴系统剪贴板文件到目标目录，随后刷新。
@@ -27,7 +22,7 @@ interface PasteFilesResult {
  */
 async function pasteInto(targetDir: string, refresh: () => void) {
   try {
-    const res = await invoke<PasteFilesResult>('paste_files', { targetDir });
+    const res = await pasteFiles(targetDir);
     if (res.failed.length > 0) {
       showNotification({
         variant: 'error',
@@ -41,8 +36,7 @@ async function pasteInto(targetDir: string, refresh: () => void) {
     }
     refresh();
   } catch (err) {
-    console.error('粘贴失败:', err);
-    showNotification({ variant: 'error', title: String(err) });
+    reportError('粘贴失败', err);
   }
 }
 const INDENT_STEP = 14;
@@ -164,15 +158,14 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     const seq = ++toggleSeqRef.current;
     setLoading(true);
     try {
-      const list = await invoke<FileEntry[]>('list_directory', { path: e.path });
+      const list = await listDirectory(e.path);
       if (seq !== toggleSeqRef.current) return;
       setKids(list);
       setShowAll(false);
       setOpen(true);
     } catch (err) {
       if (seq !== toggleSeqRef.current) return;
-      console.error('刷新目录失败:', err);
-      showNotification({ variant: 'error', title: '刷新目录失败' });
+      reportError('刷新目录失败', err);
     } finally {
       if (seq === toggleSeqRef.current) setLoading(false);
     }
@@ -242,14 +235,14 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     if (!revealPath.startsWith(e.path + '/')) return;
     const seq = ++toggleSeqRef.current;
     setLoading(true);
-    invoke<FileEntry[]>('list_directory', { path: e.path })
+    listDirectory(e.path)
       .then(list => { if (seq === toggleSeqRef.current) { setKids(list); setOpen(true); } })
       .catch((err: unknown) => {
         if (seq !== toggleSeqRef.current) return;
-        console.error('展开目录失败:', err);
+        reportError('展开目录失败', err, { variant: 'warning' });
       })
       .finally(() => { if (seq === toggleSeqRef.current) setLoading(false); });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- open 故意不入依赖（见上方注释）
+    // 依赖不含 open：open 故意不入依赖（见上方注释）
   }, [revealSeq, e.path, e.is_dir]);
 
   // 定位到目标文件：滚动使其尽量居中（上下留出上下文）。
@@ -260,18 +253,13 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     useEditorStore.getState().markRevealConsumed();
     entryRef.current?.scrollIntoView({ block: 'center' });
     onSelect(e.path);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- 触发信号用 revealSeq（reveal 由 revealPath 推导）
+    // 触发信号用 revealSeq（reveal 由 revealPath 推导，不入依赖）
   }, [revealSeq]);
 
-  // 在资源管理器中打开
-  const handleOpenInExplorer = async () => {
+  // 在资源管理器中打开（openInExplorer 内部已带失败提示）
+  const handleOpenInExplorer = () => {
     setContextMenu(null);
-    try {
-      await invoke('open_in_explorer', { path: e.path });
-    } catch (err) {
-      console.error('打开资源管理器失败:', err);
-      showNotification({ variant: 'error', title: '打开资源管理器失败' });
-    }
+    void openInExplorer(e.path);
   };
 
   // 复制路径
@@ -282,8 +270,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
       showNotification({ variant: 'success', title: '路径已复制' });
     } catch (err) {
       // 剪贴板受权限门控，失败必须告知：原实现只写 console，用户点了"复制"却什么都没发生
-      console.error('复制路径失败:', err);
-      showNotification({ variant: 'error', title: '复制路径失败', description: String(err) });
+      reportError('复制路径失败', err);
     }
   };
 
@@ -294,8 +281,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
       await navigator.clipboard.writeText(e.name);
       showNotification({ variant: 'success', title: '文件名已复制' });
     } catch (err) {
-      console.error('复制文件名失败:', err);
-      showNotification({ variant: 'error', title: '复制文件名失败', description: String(err) });
+      reportError('复制文件名失败', err);
     }
   };
 
@@ -309,11 +295,10 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
   const handleCopy = async () => {
     setContextMenu(null);
     try {
-      await invoke('copy_files_to_clipboard', { paths: [e.path] });
+      await copyFilesToClipboard([e.path]);
       showNotification({ variant: 'success', title: '已复制，可在资源管理器中粘贴' });
     } catch (err) {
-      console.error('复制到剪贴板失败:', err);
-      showNotification({ variant: 'error', title: String(err) });
+      reportError('复制到剪贴板失败', err);
     }
   };
 
@@ -346,7 +331,7 @@ const Entry = memo(function Entry({ e, indentPx, selectedPath, revealPath, revea
     return () => document.removeEventListener('mousedown', handleClose);
   }, [contextMenu]);
 
-  /** 节点右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  /** 节点右键菜单位置（实测尺寸后夹进内容区，见 useContextMenuPosition） */
   const menuPos = useContextMenuPosition(menuRef, contextMenu);
 
   const iconSvg = e.is_dir
@@ -546,12 +531,12 @@ export function FileTree({ rootPath, embedded }: {
   const revealSeq = useEditorStore(s => s.revealSeq);
 
   // 打开/切换文件 → 树选中态跟随 + 清除定位标记（定位高亮是临时的，
-  // 用户切换文件后以当前选中文件为主，避免两个高亮）
+  // 用户切换文件后以当前选中文件为主，避免两个高亮）。
+  // 无条件赋值（含 null）：关掉最后一个标签后 activeTabPath 变 null，本地选中必须一起清，
+  // 否则树里仍高亮着已关闭的文件（选中态与编辑器各说一套真相）
   useEffect(() => {
-    if (activeTabPath) {
-      setSelectedPath(activeTabPath);
-      useEditorStore.getState().clearReveal();
-    }
+    setSelectedPath(activeTabPath);
+    if (activeTabPath) useEditorStore.getState().clearReveal();
   }, [activeTabPath]);
 
   // 用户手动点击树节点：同样以新选中为主，清除定位标记。
@@ -567,7 +552,7 @@ export function FileTree({ rootPath, embedded }: {
     if (!rootPath) return;
     const seq = ++rootSeqRef.current;
     try {
-      const list = await invoke<FileEntry[]>('list_directory', { path: rootPath });
+      const list = await listDirectory(rootPath);
       if (seq === rootSeqRef.current) { setEntries(list); setErr(null); }
     } catch (e: unknown) {
       if (seq === rootSeqRef.current) setErr(String(e));

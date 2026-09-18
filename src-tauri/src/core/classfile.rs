@@ -924,6 +924,12 @@ fn disassemble_code(
                     return Err("tableswitch 范围过大（疑似损坏/恶意 class）".into());
                 }
                 let n = span as usize;
+                // 行数上限也要在指令内部生效：外部 while 只在每条指令入口检查，
+                // 单条 switch 就能一次 push 上百万行（见下方 lookupswitch 的同类问题）
+                if lines.len() + n >= max_lines {
+                    lines.push("... 输出已达上限，其余指令省略".into());
+                    return Ok(());
+                }
                 push_line(lines, pc, format!("tableswitch {{ // {} to {}", low, high));
                 for k in 0..n {
                     let target = r.i4()?;
@@ -941,7 +947,20 @@ fn disassemble_code(
                 if npairs < 0 {
                     return Err("lookupswitch 键值对数非法".into());
                 }
+                // 与 tableswitch 同口径的上限：声明的对数不受 code 实际长度约束，
+                // 恶意/损坏 class 可以声明 2^31-1 对，让下面的循环读到内存耗尽。
+                // 每对固定 8 字节（key + target），所以先按剩余字节算出真实可能的最大值。
+                let max_pairs = code.len().saturating_sub(r.pos) / 8;
+                if npairs as usize > max_pairs {
+                    return Err("lookupswitch 键值对数超出剩余字节（疑似损坏/恶意 class）".into());
+                }
                 let n = npairs as usize;
+                // 行数上限也要在指令内部生效：外部 while 只在每条指令入口检查，
+                // 单条 switch 就能一次 push 上百万行
+                if lines.len() + n >= max_lines {
+                    lines.push("... 输出已达上限，其余指令省略".into());
+                    return Ok(());
+                }
                 push_line(lines, pc, format!("lookupswitch {{ // {} keys", n));
                 for _ in 0..n {
                     let key = r.i4()?;

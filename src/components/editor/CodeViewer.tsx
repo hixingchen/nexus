@@ -1,6 +1,6 @@
-import { useRef, useState, useEffect } from 'react';
+import { useRef, useState, useEffect, useMemo, memo } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, type DecorationSet, type Panel } from '@codemirror/view';
-import { EditorState, StateEffect, StateField, type Range, type Text } from '@codemirror/state';
+import { EditorState, StateEffect, StateField, Compartment, type Range, type Text } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
 import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, LanguageSupport, LRLanguage, StreamLanguage, type StreamParser } from '@codemirror/language';
 import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
@@ -11,38 +11,13 @@ import { isSubmitEnter } from '../../utils/keyboard';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
-import { python } from '@codemirror/lang-python';
-import { java } from '@codemirror/lang-java';
-import { css, cssLanguage } from '@codemirror/lang-css';
-import { html } from '@codemirror/lang-html';
-import { json } from '@codemirror/lang-json';
-import { markdown } from '@codemirror/lang-markdown';
-import { rust } from '@codemirror/lang-rust';
-import { go } from '@codemirror/lang-go';
-import { sql } from '@codemirror/lang-sql';
-import { vue } from '@codemirror/lang-vue';
-import { xml } from '@codemirror/lang-xml';
-import { cpp } from '@codemirror/lang-cpp';
-import { yaml } from '@codemirror/lang-yaml';
-import { php } from '@codemirror/lang-php';
-import { sass } from '@codemirror/lang-sass';
-import { less } from '@codemirror/lang-less';
-// legacy-modes：无官方 @codemirror/lang-* 的常用语言，用 StreamLanguage 桥接
-import { shell } from '@codemirror/legacy-modes/mode/shell';
-import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
-import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
-import { ruby } from '@codemirror/legacy-modes/mode/ruby';
-import { swift } from '@codemirror/legacy-modes/mode/swift';
-import { lua } from '@codemirror/legacy-modes/mode/lua';
-import { toml } from '@codemirror/legacy-modes/mode/toml';
-import { protobuf } from '@codemirror/legacy-modes/mode/protobuf';
-import { properties } from '@codemirror/legacy-modes/mode/properties';
-import { csharp, kotlin } from '@codemirror/legacy-modes/mode/clike';
-import { stylus } from '@codemirror/legacy-modes/mode/stylus';
+import { cssLanguage } from '@codemirror/lang-css';
+// 其余语言包改为**按需动态导入**（见 langLoaders）：静态导入会让冷启动解析全部语言包，
+// 而一次会话通常只用一两种；cssLanguage 例外——它被 Vue 的混合解析器（vueScssMixed）引用，
+// 必须同步可用。
 
 interface CodeViewerProps {
   filePath: string;
-  content: string;
   /** 是否可编辑（默认 true） */
   editable?: boolean;
   /** 内容变更回调（每次编辑触发，父组件写回 store） */
@@ -267,6 +242,22 @@ function makeColorSwatchField(styleBlockOnly: boolean) {
     },
     update(deco, tr) {
       if (!tr.docChanged) return deco.map(tr.changes);
+      // 增量预判：改动文本里没有任何颜色线索时直接沿用旧装饰（按变更区间挪位）。
+      // 全文 toString + 全文档正则（COLOR_RE 的命名色分支几乎匹配每个标识符）是按键路径上
+      // 最贵的一步，而普通打字（字母/数字/回车）根本不可能改变颜色值。
+      let maybeColor = false;
+      tr.changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+        if (maybeColor) return;
+        const inserted = tr.state.sliceDoc(fromB, toB);
+        if (inserted === '' || /[#<]|rgb|hsl|\bstyle\b/i.test(inserted)) maybeColor = true;
+      });
+      // 删除也可能是删掉颜色值的一部分：保守起来只在"纯插入且无疑似线索"时跳过重扫
+      const onlyInsertions = tr.changes.empty || (() => {
+        let insertedOnly = true;
+        tr.changes.iterChangedRanges((fromA, toA) => { if (toA > fromA) insertedOnly = false; });
+        return insertedOnly;
+      })();
+      if (!maybeColor && onlyInsertions) return deco.map(tr.changes);
       return buildSwatchDeco(tr.state.doc, styleBlockOnly);
     },
     provide: f => EditorView.decorations.from(f),
@@ -497,82 +488,109 @@ function legacyLang(mode: StreamParser<unknown>): Language {
   return StreamLanguage.define(mode);
 }
 
-/** 根据文件扩展名获取语言支持 */
+/** 根据文件扩展名获取语言支持（同步版，仅用于 JS 系列：最常用且体量小） */
 function getLanguageExtension(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  if (ext === 'js' || ext === 'jsx' || ext === 'mjs' || ext === 'cjs') return [javascript()];
+  if (ext === 'ts' || ext === 'tsx') return [javascript({ typescript: true, jsx: ext === 'tsx' })];
+  return [];
+}
 
-  const langMap: Record<string, () => Language | LanguageSupport> = {
-    js: () => javascript(),
-    jsx: () => javascript({ jsx: true }),
-    ts: () => javascript({ typescript: true }),
-    tsx: () => javascript({ jsx: true, typescript: true }),
-    mjs: () => javascript(),
-    cjs: () => javascript(),
-    py: () => python(),
-    java: () => java(),
-    class: () => java(), // .class 显示反编译后的 Java 源码，用 Java 高亮
-    css: () => css(),
-    scss: () => css(), // 无官方 lang-scss，CSS 解析器近似（嵌套选择器标 error 但属性正常高亮）
-    less: () => less(),
-    sass: () => sass(), // 官方 lang-sass，仅缩进语法（.sass）
-    styl: () => legacyLang(stylus),
-    html: () => html(),
-    htm: () => html(),
-    json: () => json(),
-    jsonc: () => json(),
-    json5: () => json(),
-    geojson: () => json(),
-    md: () => markdown(),
-    rs: () => rust(),
-    go: () => go(),
-    sql: () => sql(),
-    vue: () => {
-      const base = vue();
-      // 追加 style lang="scss"/"less" 块解析（见 vueScssMixed）
-      return new LanguageSupport((base.language as LRLanguage).configure({ wrap: vueScssMixed }), base.support);
-    },
-    xml: () => xml(),
-    xhtml: () => xml(),
-    svg: () => xml(),
-    // C/C++
-    c: () => cpp(),
-    h: () => cpp(),
-    cc: () => cpp(),
-    cpp: () => cpp(),
-    cxx: () => cpp(),
-    hpp: () => cpp(),
-    // YAML / PHP
-    yml: () => yaml(),
-    yaml: () => yaml(),
-    php: () => php(),
-    // 脚本（legacy-modes）
-    sh: () => legacyLang(shell),
-    bash: () => legacyLang(shell),
-    zsh: () => legacyLang(shell),
-    bat: () => legacyLang(powerShell), // 无 batch 模式，PowerShell 近似
-    cmd: () => legacyLang(powerShell),
-    ps1: () => legacyLang(powerShell),
-    rb: () => legacyLang(ruby),
-    erb: () => legacyLang(ruby), // ERB 模板，Ruby 模式近似
-    // 其他（legacy-modes）
-    dockerfile: () => legacyLang(dockerFile), // 无扩展名，按文件名匹配
-    makefile: () => legacyLang(shell), // 无官方包，Shell 近似
-    swift: () => legacyLang(swift),
-    lua: () => legacyLang(lua),
-    toml: () => legacyLang(toml),
-    proto: () => legacyLang(protobuf),
-    cs: () => legacyLang(csharp),
-    kt: () => legacyLang(kotlin),
-    kts: () => legacyLang(kotlin),
-    ini: () => legacyLang(properties),
-    conf: () => legacyLang(properties),
-    properties: () => legacyLang(properties),
-    env: () => legacyLang(properties),
-    gitignore: () => legacyLang(properties), // .gitignore 无扩展名，按文件名匹配
-  };
+/**
+ * 语言包按需加载表：扩展名 → 加载器。
+ *
+ * 为什么改成动态导入：原来 30 个语言包全部静态导入（17 个 `@codemirror/lang-*` +
+ * 11 个 legacy-modes），冷启动必须解析并执行**全部**语言包，而一次会话通常只用一两种。
+ * 拆成动态导入后，主包只留核心（CodeMirror 运行时 + 本次打开文件的语言包）。
+ */
+const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
+  js: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
+  jsx: () => import('@codemirror/lang-javascript').then(m => m.javascript({ jsx: true })),
+  ts: () => import('@codemirror/lang-javascript').then(m => m.javascript({ typescript: true })),
+  tsx: () => import('@codemirror/lang-javascript').then(m => m.javascript({ jsx: true, typescript: true })),
+  mjs: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
+  cjs: () => import('@codemirror/lang-javascript').then(m => m.javascript()),
+  py: () => import('@codemirror/lang-python').then(m => m.python()),
+  java: () => import('@codemirror/lang-java').then(m => m.java()),
+  class: () => import('@codemirror/lang-java').then(m => m.java()), // .class 用 Java 高亮（反编译源码）
+  css: () => import('@codemirror/lang-css').then(m => m.css()),
+  scss: () => import('@codemirror/lang-css').then(m => m.css()), // 无官方 lang-scss，CSS 解析器近似
+  less: () => import('@codemirror/lang-less').then(m => m.less()),
+  sass: () => import('@codemirror/lang-sass').then(m => m.sass()),
+  styl: () => import('@codemirror/legacy-modes/mode/stylus').then(m => legacyLang(m.stylus)),
+  html: () => import('@codemirror/lang-html').then(m => m.html()),
+  htm: () => import('@codemirror/lang-html').then(m => m.html()),
+  json: () => import('@codemirror/lang-json').then(m => m.json()),
+  jsonc: () => import('@codemirror/lang-json').then(m => m.json()),
+  json5: () => import('@codemirror/lang-json').then(m => m.json()),
+  geojson: () => import('@codemirror/lang-json').then(m => m.json()),
+  md: () => import('@codemirror/lang-markdown').then(m => m.markdown()),
+  rs: () => import('@codemirror/lang-rust').then(m => m.rust()),
+  go: () => import('@codemirror/lang-go').then(m => m.go()),
+  sql: () => import('@codemirror/lang-sql').then(m => m.sql()),
+  vue: async () => {
+    const { vue } = await import('@codemirror/lang-vue');
+    const base = vue();
+    // 追加 style lang="scss"/"less" 块解析（见 vueScssMixed）
+    return new LanguageSupport((base.language as LRLanguage).configure({ wrap: vueScssMixed }), base.support);
+  },
+  xml: () => import('@codemirror/lang-xml').then(m => m.xml()),
+  xhtml: () => import('@codemirror/lang-xml').then(m => m.xml()),
+  svg: () => import('@codemirror/lang-xml').then(m => m.xml()),
+  // C/C++
+  c: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  h: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  cc: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  cpp: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  cxx: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  hpp: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
+  // YAML / PHP
+  yml: () => import('@codemirror/lang-yaml').then(m => m.yaml()),
+  yaml: () => import('@codemirror/lang-yaml').then(m => m.yaml()),
+  php: () => import('@codemirror/lang-php').then(m => m.php()),
+  // 脚本（legacy-modes）
+  sh: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
+  bash: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
+  zsh: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
+  // 无 batch 模式，PowerShell 近似
+  bat: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
+  cmd: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
+  ps1: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
+  rb: () => import('@codemirror/legacy-modes/mode/ruby').then(m => legacyLang(m.ruby)),
+  erb: () => import('@codemirror/legacy-modes/mode/ruby').then(m => legacyLang(m.ruby)), // ERB，Ruby 近似
+  // 其他（legacy-modes）
+  dockerfile: () => import('@codemirror/legacy-modes/mode/dockerfile').then(m => legacyLang(m.dockerFile)),
+  makefile: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)), // Shell 近似
+  swift: () => import('@codemirror/legacy-modes/mode/swift').then(m => legacyLang(m.swift)),
+  lua: () => import('@codemirror/legacy-modes/mode/lua').then(m => legacyLang(m.lua)),
+  toml: () => import('@codemirror/legacy-modes/mode/toml').then(m => legacyLang(m.toml)),
+  proto: () => import('@codemirror/legacy-modes/mode/protobuf').then(m => legacyLang(m.protobuf)),
+  cs: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.csharp)),
+  kt: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.kotlin)),
+  kts: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.kotlin)),
+  ini: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+  conf: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+  properties: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+  env: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+  gitignore: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+};
 
-  const factory = langMap[ext];
-  return factory ? [factory()] : [];
+/** 语言加载缓存：同一扩展名只加载一次（Promise 也缓存，避免并发重复请求） */
+const languageCache = new Map<string, Promise<Language | LanguageSupport | null>>();
+
+/** 按扩展名加载语言包；失败一律降级为"无高亮"（不让编辑器创建失败） */
+function loadLanguage(filePath: string): Promise<Language | LanguageSupport | null> {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  const loader = langLoaders[ext];
+  if (!loader) return Promise.resolve(null);
+  const cached = languageCache.get(ext);
+  if (cached) return cached;
+  const p = loader().catch(e => {
+    console.error(`加载语言包失败（${ext}，已降级为无高亮）:`, e);
+    return null;
+  });
+  languageCache.set(ext, p);
+  return p;
 }
 
 /** 选中匹配的滚动条标记：匹配行集合 + 总行数（按行聚合） */
@@ -584,6 +602,12 @@ interface MatchMarks {
 /** 滚动条标记的文档大小上限（防超大文件选区扫描卡顿） */
 const MAX_MARK_DOC = 5 * 1024 * 1024;
 
+/** 选区匹配行扫描的防抖窗口（ms）：滚动条标记非瞬时反馈，攒够一次即可 */
+const MARK_SCAN_DEBOUNCE_MS = 120;
+
+/** 语言槽：语言包按需加载（见 langLoaders），加载完成后用它把语言装进已有编辑器 */
+const languageCompartment = new Compartment();
+
 /** 创建 CodeMirror 编辑器状态（含语言支持和主题） */
 function createEditorState(
   content: string,
@@ -594,6 +618,8 @@ function createEditorState(
 ) {
   // 上次扫描的选中文本：updateListener 据此跳过重复全文档扫描
   let lastMarkText: string | null = null;
+  /** 扫描防抖计时器：选区/文档连续变化时只在停下来之后扫一次 */
+  let markScanTimer: ReturnType<typeof setTimeout> | null = null;
 
   const extensions = [
     lineNumbers(),
@@ -634,11 +660,17 @@ function createEditorState(
       }
       if (!update.docChanged && lastMarkText === text) return; // 内容没变，标记仍有效
       lastMarkText = text;
-      const lines = new Set<number>();
-      for (let n = 1; n <= doc.lines && lines.size < 500; n++) {
-        if (doc.line(n).text.includes(text)) lines.add(n);
-      }
-      onMatchMarks({ lines, total: doc.lines });
+      // 扫描防抖：有选区时每次按键/每次指针移动都会到这里，全文档逐行 includes（数千行文件
+      // 即数千次行物化）不该每秒跑十几遍。滚动条标记本来就不是瞬时反馈，120ms 后扫一次即可。
+      if (markScanTimer !== null) clearTimeout(markScanTimer);
+      markScanTimer = setTimeout(() => {
+        markScanTimer = null;
+        const lines = new Set<number>();
+        for (let n = 1; n <= doc.lines && lines.size < 500; n++) {
+          if (doc.line(n).text.includes(text)) lines.add(n);
+        }
+        onMatchMarks({ lines, total: doc.lines });
+      }, MARK_SCAN_DEBOUNCE_MS);
     }),
     searchHitField,
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
@@ -671,7 +703,8 @@ function createEditorState(
       // template 区域 HTML 注释，script/style 区域返回 false 交由语言包处理
       ...(filePath.toLowerCase().endsWith('.vue') ? [{ key: 'Mod-/', run: vueCommentToggle }] : []),
     ]),
-    ...getLanguageExtension(filePath),
+    // 语言槽：JS 系列同步装（最常用且体量小），其余先留空、由 loadLanguage 异步 reconfigure
+    languageCompartment.of(getLanguageExtension(filePath)),
     // 颜色值色块（VS Code 风格）：CSS 类文件全文；Vue/HTML 仅 <style> 块内
     ...(() => {
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -785,12 +818,19 @@ function createEditorState(
 /**
  * 选中匹配标记 overlay：在垂直滚动条轨道上显示蓝色小圆点，
  * 标记文档中与当前选中文字相同的行。pointer-events-none 不影响滚动条交互。
+ *
+ * `memo` + `useMemo`：父组件（CodeViewer → ProjectDetail 子树）每次重渲染都会带着同一个
+ * `matchMarks` 引用进来，原来会白白重建数组并 reconcile 最多 500 个绝对定位 div。
  */
-function MatchMarksOverlay({ matchMarks }: { matchMarks: MatchMarks | null }) {
-  if (!matchMarks || matchMarks.lines.size === 0) return null;
+const MatchMarksOverlay = memo(function MatchMarksOverlay({ matchMarks }: { matchMarks: MatchMarks | null }) {
+  const tops = useMemo(
+    () => (matchMarks ? [...matchMarks.lines].slice(0, 500) : []),
+    [matchMarks],
+  );
+  if (!matchMarks || tops.length === 0) return null;
   return (
     <div className="absolute right-0 top-0 bottom-0 w-[14px] pointer-events-none z-10">
-      {[...matchMarks.lines].slice(0, 500).map(n => (
+      {tops.map(n => (
         <div
           key={n}
           className="absolute w-[6px] h-[2px] rounded-full bg-[#4f8cff]"
@@ -799,13 +839,22 @@ function MatchMarksOverlay({ matchMarks }: { matchMarks: MatchMarks | null }) {
       ))}
     </div>
   );
-}
+});
 
-export function CodeViewer({ filePath, content, editable = true, onChange }: CodeViewerProps) {
+export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerProps) {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   /** 选中匹配的滚动条标记（选区变化时由 updateListener 计算） */
   const [matchMarks, setMatchMarks] = useState<MatchMarks | null>(null);
+  /**
+   * 直接订阅 store 里的当前内容，而不是由父级传 prop。
+   *
+   * 为什么：编辑时 `fileContent` 每个按键都会更新（那是编辑器自己的回声），若由
+   * `ProjectDetail` 订阅再传下来，**整棵 ProjectDetail 子树**（标签栏 + 编辑器 + 全部服务卡 +
+   * 模板卡 + 两套 dnd context）都会跟着重渲染。订阅放进本组件后，重渲染只发生在编辑器自身。
+   * `contentRef` 与下面的同步 effect 都用这份值，语义与之前的 prop 完全一致。
+   */
+  const content = useEditorStore(s => s.fileContent) ?? '';
   // 回调与最新内容存 ref：编辑器只在 filePath 变化时重建，
   // 编辑中 content 回写（onChange → store）不触发重建，避免光标/焦点丢失
   const onChangeRef = useRef(onChange);
@@ -856,6 +905,18 @@ export function CodeViewer({ filePath, content, editable = true, onChange }: Cod
       parent: editorRef.current,
     });
     activeEditorView = viewRef.current;
+
+    // 语言包按需加载：拿到后把语言装进这个编辑器（缓存命中的 state 同样重装一次，
+    // 覆盖"上次加载未完成就切走"的情况）。销毁后到达的加载结果由 view 身份校验拦掉。
+    const view = viewRef.current;
+    void loadLanguage(filePath).then(lang => {
+      if (!lang || viewRef.current !== view) return;
+      try {
+        view.dispatch({ effects: languageCompartment.reconfigure(lang) });
+      } catch (e) {
+        console.error('装配语言包失败（已降级为无高亮）:', e);
+      }
+    });
 
     return () => {
       if (activeEditorView === viewRef.current) activeEditorView = null;

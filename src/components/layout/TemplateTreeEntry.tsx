@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { openInExplorer, openTerminal } from '../../services/system';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { ServiceTemplate } from '../../services/service';
-import { showNotification } from '../ui/Toast';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 
 interface Props {
   tpl: ServiceTemplate;
@@ -48,24 +48,14 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
     setContextMenu({ x: e.clientX, y: e.clientY });
   };
 
-  const handleOpenInExplorer = async () => {
+  const handleOpenInExplorer = () => {
     setContextMenu(null);
-    try {
-      await invoke('open_in_explorer', { path: tpl.cwd });
-    } catch (err) {
-      console.error('打开资源管理器失败:', err);
-      showNotification({ variant: 'error', title: '打开资源管理器失败' });
-    }
+    void openInExplorer(tpl.cwd);
   };
 
-  const handleOpenTerminal = async () => {
+  const handleOpenTerminal = () => {
     setContextMenu(null);
-    try {
-      await invoke('open_terminal', { path: tpl.cwd });
-    } catch (err) {
-      console.error('打开终端失败:', err);
-      showNotification({ variant: 'error', title: '打开终端失败' });
-    }
+    void openTerminal(tpl.cwd);
   };
 
   return (
@@ -146,17 +136,11 @@ const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, o
     return () => document.removeEventListener('mousedown', handleClose);
   }, [onClose]);
 
-  // 计算菜单位置，确保不超出屏幕
-  const menuStyle = useMemo(() => {
-    const itemCount = (hasCwd ? 2 : 0) + 1;
-    const menuHeight = itemCount * 34 + 24;
-    const maxX = window.innerWidth - 180 - 8;
-    const maxY = window.innerHeight - menuHeight - 8;
-    return {
-      left: Math.min(x, maxX),
-      top: Math.min(y, maxY),
-    };
-  }, [x, y, hasCwd]);
+  // 计算菜单位置，确保不超出内容区
+  // 与服务条目菜单同源：共享定位钩子实测尺寸后夹进「窗口 − AI 面板占用宽度」，
+  // 不再手写宽度/高度估算（估算偏小会让末尾条目落到屏幕外，偏大则白让位）
+  const anchor = useMemo(() => ({ x, y }), [x, y]);
+  const menuStyle = useContextMenuPosition(menuRef, anchor);
 
   return (
     <div

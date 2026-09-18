@@ -4,10 +4,11 @@ import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
+import { includesIgnoreCase } from '../../utils/search';
 import { isSubmitEnter } from '../../utils/keyboard';
 import type { ServiceLogLine } from '../../services/logService';
 
-interface LogViewerProps { serviceKey: string; serviceName?: string; maxHeight?: string; fill?: boolean; onClose?: () => void; }
+interface LogViewerProps { serviceKey: string; serviceName?: string; fill?: boolean; onClose?: () => void; }
 
 /** 空数组常量（避免选择器每次返回新引用导致无谓重渲染） */
 const EMPTY_LINES: ServiceLogLine[] = [];
@@ -17,6 +18,8 @@ const ESTIMATED_ROW_H = 21;
 const OVERSCAN = 12;
 /** 日志上下内边距（交给 virtualizer 的 paddingStart/End，贴底计算与真实滚动高度同一口径） */
 const PAD_Y = 12;
+/** 判定"用户是否在底部"的容差（px）：小于它视为跟随中，可以贴底 */
+const STICK_TO_BOTTOM_EPSILON = 24;
 /** 搜索输入防抖间隔 */
 const SEARCH_DEBOUNCE_MS = 200;
 
@@ -26,7 +29,7 @@ const SEARCH_DEBOUNCE_MS = 200;
  * 日志再多也不会让拖拽分隔条时逐帧重排上千行文本（原实现为整块 <pre> innerHTML，
  * 宽度一变就要重新断行 2000 行，是拖拽卡顿的主因）。
  */
-export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight, fill, onClose }: LogViewerProps) {
+export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onClose }: LogViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   /** 暂停开始时的累计新增行数（差值 = 暂停期间新增 N 行） */
@@ -94,8 +97,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
   const searchActive = debouncedTerm.trim().length > 0;
   const rows = useMemo(() => {
     if (!searchActive) return lines;
-    const term = debouncedTerm.toLowerCase();
-    return lines.filter(l => l.text.toLowerCase().includes(term));
+    // 大小写不敏感匹配用无分配实现：`l.text.toLowerCase()` 每个刷新周期要为最多 2000 行
+    // 各分配一个临时字符串（20 次/秒 → 4 万次分配/秒），纯属给 GC 添活
+    const term = debouncedTerm;
+    return lines.filter(l => includesIgnoreCase(l.text, term));
   }, [lines, searchActive, debouncedTerm]);
   const searchMatches = searchActive ? rows.length : 0;
   /** 传给行组件的搜索词：非搜索态为空串（与旧的整块渲染同口径） */
@@ -125,7 +130,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
     useLogStore.getState().resumeLogs(serviceKey);
     // 打开面板：无条件以后端缓冲为准同步（后端清空过则本地缓存一并清掉）
     syncLogsFromBackend();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // 依赖即触发源：只列真正需要重跑的项（syncLogsFromBackend 是 store 的稳定动作，不入依赖）
   }, [serviceKey, syncLogsFromBackend]);
 
   // 卸载时清理暂停视图（释放暂停期间保留的数据）
@@ -135,11 +140,19 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
 
   // 跟随模式：每次数据更新后贴底（等价旧实现的 scrollTop = scrollHeight）。
   // 用 layout effect 让新行与目标滚动位置同帧提交，避免先看到旧位置再跳到底部；
-  // 暂停 / 搜索态不贴底（与旧实现一致：暂停冻结视图、搜索时定位由 goMatch 接管）
+  // 暂停 / 搜索态不贴底（与旧实现一致：暂停冻结视图、搜索时定位由 goMatch 接管）。
+  //
+  // 仅在"本来就在底部附近"时才贴底：原实现每个刷新周期（20 次/秒）无条件调
+  // `scrollToEnd()`，在刚 commit 完 DOM 的 layout effect 里读写滚动位置会强制同步布局，
+  // 即使用户正在上翻看历史、或服务已停止输出也照付。
   useLayoutEffect(() => {
     if (paused || searchActive) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceToBottom > STICK_TO_BOTTOM_EPSILON) return; // 用户在翻历史：不打断
     virtualizer.scrollToEnd();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // 依赖即触发源：新行/暂停/搜索状态变化时才重贴底；virtualizer 实例跨渲染稳定，不入依赖
   }, [version, rows.length, paused, searchActive]);
 
   // ── 暂停 ──────────────────────────────────────────────────
@@ -213,7 +226,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, maxHeight,
           行高实测值依赖这里的 leading-relaxed，改动需同步 ESTIMATED_ROW_H */}
       <div ref={scrollRef}
         className={`overflow-auto bg-[#0d1117] font-mono text-[13px] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
-        style={fill ? undefined : { maxHeight: maxHeight ?? '220px' }}>
+        style={fill ? undefined : { maxHeight: '220px' }}>
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualItems.map(vi => {
             const line = rows[vi.index];

@@ -39,12 +39,14 @@ impl FileSink {
         Some(Self { file, written, path })
     }
 
-    fn write_line(&mut self, line: &str) {
-        if self.written + line.len() as u64 + 1 > MAX_LOG_BYTES {
+    fn write_line(&mut self, line_with_newline: &str) {
+        if self.written + line_with_newline.len() as u64 > MAX_LOG_BYTES {
             self.rotate();
         }
-        if self.file.write_all(line.as_bytes()).is_ok() && self.file.write_all(b"\n").is_ok() {
-            self.written += line.len() as u64 + 1;
+        // 一次 write_all（调用方已把换行拼进字符串）：原实现分两次写正文与换行，
+        // 每条日志记录多一次系统调用——诊断日志常有逐行输出（RUST_LOG=debug 时更甚）
+        if self.file.write_all(line_with_newline.as_bytes()).is_ok() {
+            self.written += line_with_newline.len() as u64;
         }
     }
 
@@ -79,9 +81,10 @@ impl log::Log for CompositeLogger {
         }
         self.console.log(record);
         let Some(sink) = &self.file else { return };
-        // 文件行自带时间戳（控制台格式由 env_logger 负责，文件需要可检索的时间与级别）
+        // 文件行自带时间戳（控制台格式由 env_logger 负责，文件需要可检索的时间与级别）；
+        // 换行在这里拼进同一份字符串，写盘时只需一次系统调用
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
-        let line = format!("{} {:<5} {} {}", ts, record.level(), record.target(), record.args());
+        let line = format!("{} {:<5} {} {}\n", ts, record.level(), record.target(), record.args());
         if let Ok(mut s) = sink.lock() {
             s.write_line(&line);
         }
@@ -128,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_line_appends_newline() {
+    fn test_write_line_writes_single_call() {
         let dir = std::env::temp_dir().join(format!("nexus-logger-w-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nexus.log");
@@ -137,9 +140,11 @@ mod tests {
             written: 0,
             path: path.clone(),
         };
-        sink.write_line("hello");
-        sink.write_line("world");
+        // 约定：调用方把换行拼进字符串，写入只做一次系统调用
+        sink.write_line("hello\n");
+        sink.write_line("world\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
+        assert_eq!(sink.written, 12, "字节计数应包含换行");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

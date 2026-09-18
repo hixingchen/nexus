@@ -4,6 +4,7 @@ import { Modal } from '../ui/Modal';
 import { openToolsApi, type OpenTool } from '../../services/service';
 import { useToolStore } from '../../stores/toolStore';
 import { showNotification } from '../ui/Toast';
+import { reportError } from '../../utils/error';
 
 interface Props {
   open: boolean;
@@ -56,8 +57,7 @@ export function ToolsManagerModal({ open, onClose }: Props) {
       resetForm();
       showNotification({ variant: 'success', title: editing ? '工具已更新' : '工具已添加' });
     } catch (e) {
-      console.error('保存工具失败:', e);
-      showNotification({ variant: 'error', title: '保存工具失败', description: String(e) });
+      reportError('保存工具失败', e);
     }
   };
 
@@ -79,8 +79,7 @@ export function ToolsManagerModal({ open, onClose }: Props) {
       await refreshTools();
       showNotification({ title: `已删除工具「${t.name}」` });
     } catch (e) {
-      console.error('删除工具失败:', e);
-      showNotification({ variant: 'error', title: '删除工具失败', description: String(e) });
+      reportError('删除工具失败', e);
     }
   };
 

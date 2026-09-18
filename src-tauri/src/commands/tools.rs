@@ -21,8 +21,8 @@ pub fn list_open_tools(state: State<AppState>) -> Result<Vec<OpenTool>, String> 
             .map_err(|e| format!("查询打开工具失败: {}", e))?;
         let rows = stmt.query_map([], |row| {
             Ok(OpenTool {
-                id: row.get(0)?, name: row.get(1)?, command: row.get(2)?,
-                executable: row.get(3)?, args: row.get(4)?,
+                id: row.get("id")?, name: row.get("name")?, command: row.get("command")?,
+                executable: row.get("executable")?, args: row.get("args")?,
             })
         }).map_err(|e| format!("查询打开工具失败: {}", e))?;
         let mut out = Vec::new();
@@ -121,7 +121,7 @@ pub fn list_service_open_tool_bindings(state: State<AppState>, project_id: Strin
             "SELECT s.id, b.tool_id FROM service_open_tools b JOIN services s ON s.id = b.service_id WHERE s.project_id=?1"
         ).map_err(|e| format!("查询服务工具绑定失败: {}", e))?;
         let rows = stmt.query_map([&project_id], |row| {
-            Ok(ServiceOpenToolBinding { service_id: row.get(0)?, tool_id: row.get(1)? })
+            Ok(ServiceOpenToolBinding { service_id: row.get("service_id")?, tool_id: row.get("tool_id")? })
         }).map_err(|e| format!("查询服务工具绑定失败: {}", e))?;
         let mut out = Vec::new();
         for r in rows { out.push(r.map_err(|e| format!("解析服务工具绑定失败: {}", e))?); }
@@ -139,7 +139,7 @@ pub fn open_service_with_tool(state: State<AppState>, service_id: String) -> Res
         conn.query_row(
             "SELECT s.name, s.cwd, b.tool_id FROM services s LEFT JOIN service_open_tools b ON b.service_id = s.id WHERE s.id=?1",
             [&service_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
+            |r| Ok((r.get::<_, String>("name")?, r.get::<_, String>("cwd")?, r.get::<_, Option<String>>("tool_id")?)),
         )
         .map_err(|e| format!("服务不存在: {}", e))
     })?;
@@ -150,8 +150,8 @@ pub fn open_service_with_tool(state: State<AppState>, service_id: String) -> Res
     let (tool_name, legacy_command, executable, args) = state.db.with_conn(|conn| {
         conn.query_row("SELECT name, command, executable, args FROM open_tools WHERE id=?1", [&tid],
             |r| Ok((
-                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?, r.get::<_, String>(3)?,
+                r.get::<_, String>("name")?, r.get::<_, String>("command")?,
+                r.get::<_, String>("executable")?, r.get::<_, String>("args")?,
             )))
             .map_err(|e| format!("打开工具不存在或已被删除: {}", e))
     })?;
@@ -163,7 +163,7 @@ pub fn open_service_with_tool(state: State<AppState>, service_id: String) -> Res
     } else {
         // 历史行兼容：整串 shell 命令（{path} 占位替换）
         log::info!("[nexus] 工具「{}」为旧版命令格式，建议重新编辑保存升级", tool_name);
-        spawn_detached(&render_legacy_command(&legacy_command, &cwd))
+        spawn_detached(&render_legacy_command(&legacy_command, &cwd)?)
             .map_err(|e| format!("启动工具「{}」失败: {}", tool_name, e))?;
     }
     log::info!("[nexus] 用工具打开服务: {} ({}) -> {}", name, tool_name, cwd);
@@ -200,6 +200,43 @@ fn spawn_detached(rendered: &str) -> Result<(), String> {
 /// - `.exe` / 程序路径：`Command::new` 直启，参数逐个直传——路径含空格天然安全
 /// - `.cmd` / `.bat`（Windows cmd shim）：必须经 `cmd /C`，此时才做字符串化
 ///   （逐个参数包引号，仅此场景有引号负担，且 shim 场景少见）
+///
+/// 把一个参数安全地拼进 `cmd /C` 整串命令行（仅 .cmd/.bat shim 与历史行命令需要）。
+///
+/// 为什么不是"删掉引号"：原实现 `s.replace('"', "")` 会**静默改写**参数
+/// （`C:\a"b` → `C:\ab`），用户看到的现象是"用错路径打开了文件"，且无从察觉；
+/// 无法安全表达的参数必须报错，而不是猜。
+///
+/// 拒绝规则（都来自 cmd 的实际语义）：
+/// - `"`：Windows 路径本就非法字符；出现在参数里只能靠转义，而 `cmd /C` 下
+///   转义规则与 `CommandLineToArgvW` 叠加，无法可靠推断，直接拒绝；
+/// - `%` / `!`：环境变量展开与延迟展开，**在双引号内同样生效**（`"%PATH%"` 会展开），
+///   而命令行上没有可靠的转义写法（`%%` 只在批处理文件里折叠为 `%`）；
+/// - 换行：会把单条命令截成两条（注入）。
+///
+/// 尾随反斜杠按 `CommandLineToArgvW` 规则翻倍：`"C:\dir\"` 中的 `\"` 会被解析成字面引号，
+/// 参数变成 `C:\dir"`，路径尾部的反斜杠因此丢失。
+fn quote_for_cmd(s: &str) -> Result<String, String> {
+    if s.contains('"') {
+        return Err(format!("参数含双引号，无法安全传给 cmd：{}", s));
+    }
+    if s.contains('%') || s.contains('!') {
+        return Err(format!("参数含 cmd 展开字符（% 或 !），已拒绝执行：{}", s));
+    }
+    if s.contains('\n') || s.contains('\r') {
+        return Err("参数含换行，已拒绝执行".into());
+    }
+    let trailing = s.len() - s.trim_end_matches('\\').len();
+    let mut out = String::with_capacity(s.len() + 2 + trailing);
+    out.push('"');
+    out.push_str(s);
+    for _ in 0..trailing {
+        out.push('\\'); // N 个尾随反斜杠 → 2N 个才是字面量
+    }
+    out.push('"');
+    Ok(out)
+}
+
 fn spawn_tool_program(executable: &str, args_template: &str, path: &str) -> Result<(), String> {
     let mut args = split_args(args_template);
     // {path} 作为独立参数注入（token 内替换也安全——argv 单元素可含空格）；
@@ -217,11 +254,11 @@ fn spawn_tool_program(executable: &str, args_template: &str, path: &str) -> Resu
         use std::os::windows::process::CommandExt;
         let lower = executable.to_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-            // cmd /C 只能吃整串命令，引号必须自己拼：内嵌双引号会截断参数造成注入，
-            // 与 render_legacy_command 对路径的清洗保持一致
-            let quote = |s: &str| format!("\"{}\"", s.replace('"', ""));
-            let mut parts = vec![quote(executable)];
-            parts.extend(args.iter().map(|a| quote(a)));
+            // cmd /C 只能吃整串命令，引号必须自己拼——注入面见 quote_for_cmd
+            let mut parts = vec![quote_for_cmd(executable)?];
+            for a in &args {
+                parts.push(quote_for_cmd(a)?);
+            }
             std::process::Command::new("cmd")
                 .args(["/C", &parts.join(" ")])
                 .creation_flags(0x08000000)
@@ -247,18 +284,18 @@ fn spawn_tool_program(executable: &str, args_template: &str, path: &str) -> Resu
     }
 }
 
-/// 渲染历史行命令：`{path}` 占位替换并包双引号。
+/// 渲染历史行命令：`{path}` 占位替换并包双引号（安全规则见 quote_for_cmd）。
 ///
 /// 历史行最终经 `cmd /C`/`sh -c` 整串执行——cwd 含空格时断参、含 `&`/`|` 等
 /// 元字符时会被 shell 解释执行。包引号后空格与大多数元字符只作为路径一部分。
 /// 模板自带引号（`"{path}"`）时先整体替换，避免二次包引号出现 `""C:\x""`。
 /// 注意信任边界：command 本身仍是用户配置的 shell 命令串（与工具命令同级），
 /// 本函数只保证**注入的路径**不成为新命令。
-fn render_legacy_command(template: &str, path: &str) -> String {
-    let quoted = format!("\"{}\"", path.replace('"', ""));
-    template
+fn render_legacy_command(template: &str, path: &str) -> Result<String, String> {
+    let quoted = quote_for_cmd(path)?;
+    Ok(template
         .replace("\"{path}\"", &quoted)
-        .replace("{path}", &quoted)
+        .replace("{path}", &quoted))
 }
 
 /// 迷你参数分词：空白分隔 + 双引号分组
@@ -293,7 +330,7 @@ mod tests {
     fn test_render_legacy_bare_placeholder_gets_quoted() {
         // 裸 {path} 必须包引号：路径含空格/& 时不被 shell 拆成多 token
         assert_eq!(
-            render_legacy_command("idea64 {path}", r"C:\My & calc Project"),
+            render_legacy_command("idea64 {path}", r"C:\My & calc Project").unwrap(),
             "idea64 \"C:\\My & calc Project\""
         );
     }
@@ -302,7 +339,7 @@ mod tests {
     fn test_render_legacy_pre_quoted_not_double_quoted() {
         // 模板自带引号：整体替换，不出现 ""C:\x"" 二次包裹
         assert_eq!(
-            render_legacy_command("idea64 \"{path}\"", r"C:\My Project"),
+            render_legacy_command("idea64 \"{path}\"", r"C:\My Project").unwrap(),
             "idea64 \"C:\\My Project\""
         );
     }
@@ -311,9 +348,30 @@ mod tests {
     fn test_render_legacy_embedded_placeholder() {
         // 占位符嵌在 token 中同样补引号（防元字符逃逸，token 完整性由用户模板负责）
         assert_eq!(
-            render_legacy_command("prog dir={path}", r"C:\a&b"),
+            render_legacy_command("prog dir={path}", r"C:\a&b").unwrap(),
             "prog dir=\"C:\\a&b\""
         );
+    }
+
+    #[test]
+    fn test_quote_for_cmd_rejects_expansion_and_quotes() {
+        // SEC-13：无法安全表达的参数必须报错，而不是静默删字符改写路径
+        assert!(quote_for_cmd(r"C:\a%TEMP%b").is_err(), "% 会被 cmd 展开");
+        assert!(quote_for_cmd(r"C:\a!b").is_err(), "! 在延迟展开下会被吃");
+        assert!(quote_for_cmd("C:\\a\"b").is_err(), "双引号无法可靠转义");
+        assert!(quote_for_cmd("C:\\a\nb").is_err(), "换行会截断命令");
+        // 原实现会把引号删掉：路径被静默改写（C:\a"b → C:\ab）
+        assert_ne!(
+            quote_for_cmd("C:\\a\"b").unwrap_or_default(),
+            "\"C:\\ab\""
+        );
+    }
+
+    #[test]
+    fn test_quote_for_cmd_doubles_trailing_backslash() {
+        // CommandLineToArgvW：尾随反斜杠必须翻倍，否则 \" 被解析成字面引号
+        assert_eq!(quote_for_cmd(r"C:\dir\").unwrap(), r#""C:\dir\\""#);
+        assert_eq!(quote_for_cmd(r"C:\dir").unwrap(), r#""C:\dir""#);
     }
 
     // ── split_args ──────────────────────────────────────────

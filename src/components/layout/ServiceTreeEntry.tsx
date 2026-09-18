@@ -1,12 +1,13 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { openInExplorer, openTerminal } from '../../services/system';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, processApi, watchApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
-import { useLogStore } from '../../stores/logStore';
+import { openToolsApi, processApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
+import { startSingleService, stopSingleService } from '../../stores/serviceActions';
 import { useToolStore } from '../../stores/toolStore';
-import { showNotification } from '../ui/Toast';
+import { reportError } from '../../utils/error';
+import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 
 interface Props {
   service: Service;
@@ -20,6 +21,9 @@ interface Props {
   onViewLog?: () => void;
   onRunToolCommand?: (serviceId: string, commandId: string, commandName: string) => void;
 }
+
+/** 服务动作：卡片按钮与右键菜单共同的三档操作 */
+type ServiceActionName = 'start' | 'stop' | 'restart';
 
 export function ServiceTreeEntry({
   service, running, failed, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
@@ -54,30 +58,31 @@ export function ServiceTreeEntry({
     [service.tool_commands],
   );
 
-  const handleAction = async (e: React.MouseEvent, action: 'start' | 'stop' | 'restart') => {
-    e.stopPropagation();
+  /** 服务动作的唯一实现：卡片 Hover 按钮与右键菜单共用，避免两处口径分叉 */
+  const runAction = async (action: ServiceActionName) => {
     setBusy(true);
     try {
       if (action === 'start') {
-        await processApi.start(service.id);
-        // 启动单服务的文件监听（追加到项目监听中）
-        watchApi.start(service.project_id, service.id).catch((err) => console.error('启动文件监听失败:', err));
+        // 共享动作层：启动进程 + 追加该服务的文件监听（口径与详情页一致）
+        await startSingleService(service.project_id, service.id);
       } else if (action === 'stop') {
-        await processApi.stop(service.id);
-        // 停止单服务的文件监听（从项目监听中移除）
-        watchApi.stop(service.project_id, service.id).catch((err) => console.error('停止文件监听失败:', err));
-        // 正常停止：日志清空（后端已清缓冲，前端缓存同步清）
-        useLogStore.getState().clearLogs(service.id);
+        // 停止进程 + 移除监听 + 清日志（后端已清缓冲，前端缓存同步清）
+        await stopSingleService(service.project_id, service.id);
       }
       else await processApi.restart(service.id);
       onRefresh();
     } catch (err: unknown) {
-      console.error(String(err));
-      showNotification({ variant: 'error', title: `${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, description: String(err) });
+      reportError(`${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, err);
       // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
       if (action === 'start') onRefresh();
     }
     setBusy(false);
+  };
+
+  /** 卡片按钮入口：先阻止冒泡（卡片点击 = 打开编辑面板），再走共享动作 */
+  const handleAction = (e: React.MouseEvent, action: ServiceActionName) => {
+    e.stopPropagation();
+    void runAction(action);
   };
 
   const handleContextMenu = (e: React.MouseEvent) => {
@@ -97,8 +102,7 @@ export function ServiceTreeEntry({
     try {
       await openToolsApi.openWith(service.id);
     } catch (err) {
-      console.error('用工具打开失败:', err);
-      showNotification({ variant: 'error', title: '用工具打开失败', description: String(err) });
+      reportError('用工具打开失败', err);
     }
   };
 
@@ -187,26 +191,22 @@ export function ServiceTreeEntry({
           x={contextMenu.x}
           y={contextMenu.y}
           cwd={service.cwd}
+          running={running}
+          failed={failed}
           openToolName={boundTool?.name ?? null}
           toolCommands={toolCommands}
+          onViewLog={onViewLog ? () => { setContextMenu(null); onViewLog(); } : undefined}
+          onStart={() => { setContextMenu(null); void runAction('start'); }}
+          onStop={() => { setContextMenu(null); void runAction('stop'); }}
+          onRestart={() => { setContextMenu(null); void runAction('restart'); }}
           onOpenWithTool={handleOpenWithTool}
-          onOpenInExplorer={async () => {
+          onOpenInExplorer={() => {
             setContextMenu(null);
-            try {
-              await invoke('open_in_explorer', { path: service.cwd });
-            } catch (err) {
-              console.error('打开资源管理器失败:', err);
-              showNotification({ variant: 'error', title: '打开资源管理器失败' });
-            }
+            void openInExplorer(service.cwd);
           }}
-          onOpenTerminal={async () => {
+          onOpenTerminal={() => {
             setContextMenu(null);
-            try {
-              await invoke('open_terminal', { path: service.cwd });
-            } catch (err) {
-              console.error('打开终端失败:', err);
-              showNotification({ variant: 'error', title: '打开终端失败' });
-            }
+            void openTerminal(service.cwd);
           }}
           onRunCommand={handleRunCommand}
           onDelete={() => {
@@ -223,13 +223,77 @@ export function ServiceTreeEntry({
 
 // ── 右键菜单组件 ──────────────────────────────────────────
 
+/** 菜单条目的色调：只给图标与 Hover 底色着色，文案统一用正文色（与菜单既有条目同一套观感） */
+const MENU_TONE = {
+  info: { icon: 'text-nexus-info', hover: 'hover:bg-nexus-info/10' },
+  success: { icon: 'text-nexus-success', hover: 'hover:bg-nexus-success/10' },
+  warning: { icon: 'text-nexus-warning', hover: 'hover:bg-nexus-warning/10' },
+  danger: { icon: 'text-nexus-error', hover: 'hover:bg-nexus-error/10' },
+} as const;
+
+type MenuTone = keyof typeof MENU_TONE;
+
+/** 菜单条目：10×10 图标 + 文案（与下方既有条目同规格） */
+const MenuItem = ({ icon, label, tone, onClick }: {
+  icon: React.ReactNode;
+  label: string;
+  tone: MenuTone;
+  onClick: () => void;
+}) => (
+  <button
+    className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md transition-colors text-left ${MENU_TONE[tone].hover}`}
+    onClick={onClick}
+  >
+    <span className={`flex-shrink-0 ${MENU_TONE[tone].icon}`}>{icon}</span>
+    <span className="text-[12px] text-nexus-text truncate">{label}</span>
+  </button>
+);
+
+/** 查看日志：文档 + 折角（失败态复用同一图标，靠色调区分） */
+const LogIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M2 1.5h3L7.5 4v4.5H2z"/><path d="M5 1.5V4h2.5"/>
+  </svg>
+);
+
+/** 重启：环形箭头（与卡片 ↻ 同义） */
+const RestartIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1">
+    <path d="M8.75 5a3.75 3.75 0 1 1-3.75-3.75c1.05 0 2.05.42 2.81 1.14L8.75 3.33"/>
+    <path d="M8.75 1.25v2.08H6.67"/>
+  </svg>
+);
+
+/** 启动：实心三角（与卡片 ▶ 同形，也和"工具命令"条目同义） */
+const PlayIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+    <polygon points="3,1.2 3,8.8 8.6,5" fill="currentColor"/>
+  </svg>
+);
+
+/** 停止：实心方块（与卡片 ■ 同形） */
+const StopIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+    <rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor"/>
+  </svg>
+);
+
 interface ContextMenuProps {
   x: number;
   y: number;
   cwd: string;
+  /** 运行中：显示 查看日志 / 重启服务 / 停止服务（与卡片按钮一致） */
+  running: boolean;
+  /** 意外失败：显示 查看失败日志 / 重新启动（与卡片按钮一致） */
+  failed: boolean;
   /** 绑定的打开工具名（null = 未绑定，不显示该项） */
   openToolName: string | null;
   toolCommands: ToolCommand[];
+  /** 查看日志（调用方无日志入口时不传，该条目随之隐藏） */
+  onViewLog?: () => void;
+  onStart: () => void;
+  onStop: () => void;
+  onRestart: () => void;
   onOpenWithTool: () => void;
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
@@ -238,7 +302,7 @@ interface ContextMenuProps {
   onClose: () => void;
 }
 
-const ContextMenu = ({ x, y, cwd, openToolName, toolCommands, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
+const ContextMenu = ({ x, y, cwd, running, failed, openToolName, toolCommands, onViewLog, onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal, onRunCommand, onDelete, onClose }: ContextMenuProps) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // 点击外部关闭菜单
@@ -251,21 +315,12 @@ const ContextMenu = ({ x, y, cwd, openToolName, toolCommands, onOpenWithTool, on
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
   }, [onClose]);
-  // 计算菜单位置，确保不超出屏幕
-  const menuStyle = useMemo(() => {
-    // 常量必须与下面 JSX 里的 `w-[180px]` 一致：原实现写 200 而实际渲染 180，
-    // 水平夹取乐观了 20px，菜单最后一项可能落到屏幕外点不到
-    const menuWidth = 180;
-    const menuEdgeGap = 8;
-    /** 菜单项高度（px）：工具分组 33 + 其余每组 36，末尾固定留白 80 */
-    const menuHeight = (openToolName ? 33 : 0) + toolCommands.length * 36 + 80;
-    const maxX = window.innerWidth - menuWidth - menuEdgeGap;
-    const maxY = window.innerHeight - menuHeight - menuEdgeGap;
-    return {
-      left: Math.min(x, maxX),
-      top: Math.min(y, maxY),
-    };
-  }, [x, y, openToolName, toolCommands.length]);
+  // 计算菜单位置，确保不超出内容区
+  // 改用共享定位钩子（原实现手写「固定 180px 宽 + 估算高度」夹取，且只夹到窗口
+  // 边缘——服务列右缘紧邻 AI 面板时，菜单右半会被原生子 WebView 盖住点不到）。
+  // 钩子实测自身尺寸后夹进「窗口 − 面板占用宽度」，宽度常量也不必再与 JSX 同步
+  const anchor = useMemo(() => ({ x, y }), [x, y]);
+  const menuStyle = useContextMenuPosition(menuRef, anchor);
 
   return (
     <div
@@ -273,6 +328,25 @@ const ContextMenu = ({ x, y, cwd, openToolName, toolCommands, onOpenWithTool, on
       className="fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden"
       style={menuStyle}
     >
+      {/* 服务动作：与卡片 Hover 按钮一一对应（运行中=日志/重启/停止，失败=失败日志/重启，未运行=启动）。
+          卡片按钮只在 Hover 时出现，右键是同一批操作的第二入口，两处共用 runAction */}
+      <div className="border-b border-nexus-border/30 py-1.5 px-1.5">
+        {running ? (
+          <>
+            {onViewLog && <MenuItem icon={<LogIcon />} label="查看日志" tone="info" onClick={onViewLog} />}
+            <MenuItem icon={<RestartIcon />} label="重启服务" tone="warning" onClick={onRestart} />
+            <MenuItem icon={<StopIcon />} label="停止服务" tone="danger" onClick={onStop} />
+          </>
+        ) : failed ? (
+          <>
+            {onViewLog && <MenuItem icon={<LogIcon />} label="查看失败日志" tone="danger" onClick={onViewLog} />}
+            <MenuItem icon={<PlayIcon />} label="重新启动" tone="success" onClick={onStart} />
+          </>
+        ) : (
+          <MenuItem icon={<PlayIcon />} label="启动服务" tone="success" onClick={onStart} />
+        )}
+      </div>
+
       {/* 用绑定的工具打开（服务设置中选择，如 IDEA / VS Code） */}
       {openToolName && (
         <div className="py-1.5 px-1.5">

@@ -2,8 +2,14 @@ use notify::{Event, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// 一次去抖窗口内最多合并多少条路径变更。
+///
+/// 上限决定单个 `FileChangeEvent` 的载荷大小：洪泛场景（大型 checkout、构建产物目录）
+/// 不设限时 pending 能涨到几十万条，一次 IPC 事件就能把载荷撑到几十 MB。
+const MAX_PENDING_PATHS: usize = 5000;
 
 pub struct FileWatcher {
     watchers: Mutex<HashMap<String, WatcherState>>,
@@ -93,12 +99,22 @@ impl FileWatcher {
             log::warn!("[nexus] 文件监听：{} 个路径无效已跳过: {:?}", invalid.len(), invalid);
         }
 
-        // channel 用于接收文件事件和停止信号（有界：接收端慢时丢弃旧事件，避免无限堆积）
+        // channel 用于接收文件事件和停止信号（有界）。
+        //
+        // 注意这里必须用 `try_send`：`sync_channel` 的 `send` 在缓冲满时**阻塞**，而该回调
+        // 运行在 notify 的 windows loop 线程里（完成例程持有 handler 锁调用它）——阻塞会让
+        // `Action::Stop`/`Unwatch` 无法被处理（停止监听卡住），后续完成例程排队还会导致
+        // 系统缓冲溢出、事件静默丢失。满时按注释语义丢弃并计数（丢弃数在 flush 时告警）。
         let (event_tx, event_rx) = mpsc::sync_channel::<notify::Result<Event>>(1024);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        // 缓冲满而丢弃的事件数（notify 回调线程与监听线程共享）
+        let dropped_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped_in_cb = Arc::clone(&dropped_events);
 
         let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = event_tx.send(res);
+            if event_tx.try_send(res).is_err() {
+                dropped_in_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }).map_err(|e| format!("创建文件监听器失败: {}", e))?;
 
         // 先把新 watcher 的路径全部注册成功，再替换旧监听：
@@ -115,12 +131,15 @@ impl FileWatcher {
         let svc_map: Vec<ServiceWatchConfig> = services.to_vec();
 
         // 线程命名：排障时能从线程名直接看出是哪个项目的监听
+        let dropped_in_thread = Arc::clone(&dropped_events);
         let listener_handle = std::thread::Builder::new()
             .name(format!("nexus-watch-{}", project_id))
             .spawn(move || {
             let debounce = Duration::from_millis(500);
             let mut pending: HashMap<String, String> = HashMap::new();
             let mut last_flush = Instant::now();
+            // 因 pending 达上限而未入队的路径数（flush 时汇总告警）
+            let mut overflowed: usize = 0;
 
             loop {
                 let mut should_flush = false;
@@ -133,10 +152,15 @@ impl FileWatcher {
                         for path in &event.paths {
                             if path.is_dir() { continue; }
                             // 预过滤：有服务需要该路径才入队（防 node_modules 等全员排除目录洪泛）
-                            if should_queue_event(path, &svc_map) {
-                                let p = path.to_string_lossy().replace('\\', "/");
-                                pending.insert(p, kind.to_string());
+                            if !should_queue_event(path, &svc_map) { continue; }
+                            if pending.len() >= MAX_PENDING_PATHS {
+                                // 上限保护：一次 flush 的载荷大小由 pending 决定，洪泛时
+                                // （大型 checkout / 构建产物目录）不设限会撑出巨大的 IPC 消息
+                                overflowed += 1;
+                                continue;
                             }
+                            let p = path.to_string_lossy().replace('\\', "/");
+                            pending.insert(p, kind.to_string());
                         }
                         // 持续事件流下（recv 从不超时）也要在去抖间隔后及时 flush，
                         // 否则 pending 永不发送且无限累积
@@ -152,6 +176,15 @@ impl FileWatcher {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
                 if should_flush {
+                    // 丢弃/溢出只告警不改变语义：监听本身是"提示性"的，丢事件表现为少提示一次重启
+                    let dropped = dropped_in_thread.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    if dropped > 0 || overflowed > 0 {
+                        log::warn!(
+                            "[nexus] 文件监听事件过载：丢弃 {} 条（缓冲满）、合并上限外 {} 条（本次 {} 条）",
+                            dropped, overflowed, pending.len()
+                        );
+                        overflowed = 0;
+                    }
                     let changes = match_changes(&svc_map, &pending);
                     if !changes.is_empty() {
                         for c in &changes {
@@ -266,11 +299,22 @@ fn normalize_prefix(path: &str) -> String {
 fn glob_match(pattern: &str, name: &str) -> bool {
     if pattern == "*" { return true; }
     if !pattern.contains('*') {
-        return name == pattern || name.starts_with(&format!("{}/", pattern));
+        // 目录前缀匹配不拼 `format!("{}/", pattern)`：这条判定对"每个路径 × 每个服务 ×
+        // 每条排除规则"都要跑一遍，原实现每次分配一个临时字符串（默认 9 条排除规则下
+        // 每路径每服务约 9 次小分配）。改为按字节比较分隔符。
+        if name.len() > pattern.len()
+            && name.as_bytes()[pattern.len()] == b'/'
+            && name.starts_with(pattern)
+        {
+            return true;
+        }
+        return name == pattern;
     }
-    // 简单 glob: *.ext 匹配扩展名
+    // 简单 glob: *.ext 匹配扩展名（ends_with 的构造串同理，属于低频分支，保留）
     if let Some(ext) = pattern.strip_prefix("*.") {
-        return name.ends_with(&format!(".{}", ext));
+        return name.len() > ext.len() + 1
+            && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
+            && name.ends_with(ext);
     }
     false
 }

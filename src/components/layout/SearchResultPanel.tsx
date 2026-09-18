@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { searchFiles, type SearchResultItem } from '../../services/editor';
 import { locateFile, useEditorStore } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
@@ -26,6 +27,26 @@ function renderSnippet(snippet: string, query: string) {
     : <span key={i}>{p.text}</span>);
 }
 
+/**
+ * 片段渲染缓存：同一 (查询词, 片段) 只切分一次。
+ *
+ * 折叠/展开文件头、面板高度拖拽都会让列表重渲染，而 `renderSnippet` 每次都要做
+ * 大小写折叠 + `indexOf` 循环 + 构造 1~41 个 span；结果本身是不变值，缓存掉即可。
+ */
+const snippetCache = new Map<string, React.ReactNode>();
+/** 缓存条目上限（超出整体清空：搜索词换了之后旧条目不再命中，清空成本可接受） */
+const SNIPPET_CACHE_MAX = 2000;
+
+function renderSnippetCached(snippet: string, query: string): React.ReactNode {
+  const key = `${query}\u0000${snippet}`;
+  const cached = snippetCache.get(key);
+  if (cached !== undefined) return cached;
+  const node = renderSnippet(snippet, query);
+  if (snippetCache.size >= SNIPPET_CACHE_MAX) snippetCache.clear();
+  snippetCache.set(key, node);
+  return node;
+}
+
 /** 搜索面板默认高度（浮层，可拖拽调整；不占布局空间、不挤压编辑器/日志） */
 const DEFAULT_PANEL_HEIGHT = 220;
 /** 面板高度拖拽范围 */
@@ -49,6 +70,8 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
   const [extensions, setExtensions] = useState('');
   const [status, setStatus] = useState<'idle' | 'searching' | 'done'>('idle');
   const [results, setResults] = useState<SearchResultItem[]>([]);
+  /** 产出当前结果的查询词（与结果同步更新，见 triggerSearch） */
+  const [resultQuery, setResultQuery] = useState('');
   const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** 折叠的文件路径集合（默认全部展开，点击文件头折叠） */
@@ -127,6 +150,7 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     setExtensions('');
     setStatus('idle');
     setResults([]);
+    setResultQuery('');
     setTruncated(false);
     setError(null);
     setCollapsedPaths(new Set());
@@ -154,12 +178,17 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     }).then(res => {
       if (seq !== seqRef.current) return;
       setResults(res.results);
+      // 生效查询词与结果一起存：展示高亮与点击定位都用它。
+      // 若读当前的输入框内容，用户搜完再改几个字（未回车）就会出现"结果还是旧的、
+      // 高亮/定位却按新词走"（搜索只在回车时执行，两者不同步）
+      setResultQuery(q);
       setTruncated(res.truncated);
       setStatus('done');
       setError(null);
     }).catch((e: unknown) => {
       if (seq !== seqRef.current) return;
       setResults([]);
+      setResultQuery('');
       setTruncated(false);
       setStatus('done');
       setError(String(e));
@@ -179,6 +208,43 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
 
   // 相对搜索 root 的路径（完整绝对路径放 title 悬停查看）
   const relPath = (p: string) => p.startsWith(root + '/') ? p.slice(root.length + 1) : p;
+
+  /**
+   * 扁平化行列表（文件头 + 命中行）：分组结构无法直接虚拟化，先摊平成行数组，
+   * 再由虚拟滚动只渲染可视区的几十行。原来 1000 条命中 + 文件头会全部落在 DOM 里
+   * （约 2000 个容器 + 数千个文本节点），每次折叠/展开都要全量重算。
+   */
+  type ResultRow =
+    | { kind: 'header'; path: string; name: string; count: number }
+    | { kind: 'hit'; path: string; name: string; line: number; snippet: string; index: number };
+  const rows = useMemo<ResultRow[]>(() => {
+    const out: ResultRow[] = [];
+    for (const g of groups) {
+      out.push({ kind: 'header', path: g.path, name: g.name, count: g.hits.length });
+      if (collapsedPaths.has(g.path)) continue;
+      g.hits.forEach((hit, i) => {
+        out.push({ kind: 'hit', path: g.path, name: g.name, line: hit.line, snippet: hit.snippet, index: i });
+      });
+    }
+    return out;
+  }, [groups, collapsedPaths]);
+
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: useCallback((i: number) => (rows[i]?.kind === 'header' ? 26 : 22), [rows]),
+    overscan: 12,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+
+  const toggleCollapsed = useCallback((path: string) => {
+    setCollapsedPaths(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path); else next.add(path);
+      return next;
+    });
+  }, []);
 
   // 日志视图打开时让位（日志优先完整占据区域，搜索面板等同被日志挡住）；
   // open/查询结果保留，关闭日志后自动恢复
@@ -244,8 +310,8 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
         >关闭</button>
       </div>
 
-      {/* 结果列表 */}
-      <div className="flex-1 overflow-auto">
+      {/* 结果列表（虚拟滚动：只渲染可视区的行） */}
+      <div ref={scrollRef} className="flex-1 overflow-auto">
         {status === 'idle' && (
           <div className="flex items-center justify-center h-full text-[12px] text-nexus-muted">
             输入内容后回车或点击「搜索」
@@ -263,49 +329,41 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
             {truncated && <span className="text-[11px] text-nexus-muted/60">（扫描文件过多已中止）</span>}
           </div>
         )}
-        {groups.map(g => {
-          const collapsed = collapsedPaths.has(g.path);
-          return (
-            <div key={g.path}>
-              {/* 文件头：点击展开/折叠 */}
-              <div
-                className="flex items-center gap-1.5 px-3 py-1 cursor-pointer hover:bg-nexus-hover/50 transition-colors"
-                onClick={() => {
-                  setCollapsedPaths(prev => {
-                    const next = new Set(prev);
-                    if (next.has(g.path)) next.delete(g.path); else next.add(g.path);
-                    return next;
-                  });
-                }}
-                title={`${g.path}（${g.hits.length} 处命中）`}
-              >
-                <svg
-                  className={`flex-shrink-0 text-nexus-muted transition-transform ${collapsed ? '' : 'rotate-90'}`}
-                  width="10" height="10" viewBox="0 0 10 10" fill="none"
-                  stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
-                >
-                  <polyline points="3,1 7,5 3,9" />
-                </svg>
-                <span className="flex-1 min-w-0 text-[12px] text-nexus-text font-medium truncate">{relPath(g.path)}</span>
-                <span className="flex-shrink-0 text-[10px] text-nexus-muted bg-nexus-hover/60 rounded px-1 py-0.5">{g.hits.length}</span>
-              </div>
-              {/* 命中行（展开时） */}
-              {!collapsed && g.hits.map((hit, i) => (
+        {results.length > 0 && !error && (
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative', width: '100%' }}>
+            {virtualItems.map(vi => {
+              const row = rows[vi.index];
+              if (!row) return null;
+              return (
                 <div
-                  key={`${g.path}-${hit.line}-${i}`}
-                  className="flex items-start gap-2 pl-7 pr-3 py-0.5 cursor-pointer hover:bg-nexus-hover/50 transition-colors"
-                  onClick={() => locateFile(g.path, g.name, hit.line, query.trim())}
-                  title={`${g.path}:${hit.line}（点击定位到该行）`}
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={virtualizer.measureElement}
+                  className="absolute left-0 top-0 w-full"
+                  style={{ transform: `translateY(${vi.start}px)` }}
                 >
-                  <span className="flex-shrink-0 text-[11px] text-nexus-muted font-mono leading-relaxed">:{hit.line}</span>
-                  <div className="flex-1 min-w-0 text-[11px] text-nexus-text-muted font-mono truncate leading-relaxed">
-                    {renderSnippet(hit.snippet, query.trim())}
-                  </div>
+                  {row.kind === 'header' ? (
+                    <ResultGroupHeader
+                      path={row.path}
+                      label={relPath(row.path)}
+                      count={row.count}
+                      collapsed={collapsedPaths.has(row.path)}
+                      onToggle={toggleCollapsed}
+                    />
+                  ) : (
+                    <ResultHitRow
+                      path={row.path}
+                      name={row.name}
+                      line={row.line}
+                      snippet={row.snippet}
+                      query={resultQuery}
+                    />
+                  )}
                 </div>
-              ))}
-            </div>
-          );
-        })}
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* 底部状态 */}
@@ -317,3 +375,62 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     </div>
   );
 }
+
+/**
+ * 文件头行：`memo` + 回调由父级 `useCallback` 固定引用。
+ * 折叠/展开某个文件时，其余文件头不会因新回调/新 Set 引用而重渲染。
+ */
+const ResultGroupHeader = memo(function ResultGroupHeader({
+  path, label, count, collapsed, onToggle,
+}: {
+  path: string;
+  label: string;
+  count: number;
+  collapsed: boolean;
+  onToggle: (path: string) => void;
+}) {
+  return (
+    <div
+      className="flex items-center gap-1.5 px-3 py-1 cursor-pointer hover:bg-nexus-hover/50 transition-colors"
+      onClick={() => onToggle(path)}
+      title={`${path}（${count} 处命中）`}
+    >
+      <svg
+        className={`flex-shrink-0 text-nexus-muted transition-transform ${collapsed ? '' : 'rotate-90'}`}
+        width="10" height="10" viewBox="0 0 10 10" fill="none"
+        stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
+      >
+        <polyline points="3,1 7,5 3,9" />
+      </svg>
+      <span className="flex-1 min-w-0 text-[12px] text-nexus-text font-medium truncate">{label}</span>
+      <span className="flex-shrink-0 text-[10px] text-nexus-muted bg-nexus-hover/60 rounded px-1 py-0.5">{count}</span>
+    </div>
+  );
+});
+
+/**
+ * 命中行：`memo` + 片段渲染走缓存（见 renderSnippetCached）。
+ * 行内容只由 path/line/snippet/query 决定，重渲染时这几项引用不变即跳过。
+ */
+const ResultHitRow = memo(function ResultHitRow({
+  path, name, line, snippet, query,
+}: {
+  path: string;
+  name: string;
+  line: number;
+  snippet: string;
+  query: string;
+}) {
+  return (
+    <div
+      className="flex items-start gap-2 pl-7 pr-3 py-0.5 cursor-pointer hover:bg-nexus-hover/50 transition-colors"
+      onClick={() => locateFile(path, name, line, query)}
+      title={`${path}:${line}（点击定位到该行）`}
+    >
+      <span className="flex-shrink-0 text-[11px] text-nexus-muted font-mono leading-relaxed">:{line}</span>
+      <div className="flex-1 min-w-0 text-[11px] text-nexus-text-muted font-mono truncate leading-relaxed">
+        {renderSnippetCached(snippet, query)}
+      </div>
+    </div>
+  );
+});

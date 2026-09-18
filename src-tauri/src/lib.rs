@@ -4,6 +4,10 @@ mod database;
 pub mod logger;
 mod models;
 
+/// IPC 字段命名契约测试（响应 snake_case / 请求 camelCase），仅测试构建参与编译
+#[cfg(test)]
+mod contract;
+
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -12,10 +16,13 @@ use crate::core::file_watcher::FileWatcher;
 use crate::core::process::ProcessManager;
 use crate::database::Database;
 
-/// 允许根解析缓存：(原始根字符串列表, 已 canonicalize 的 PathBuf 列表)。
-/// 键为原始列表 → DB 增删服务/模板后自动失效，无需在写入点手动清缓存。
-pub type AllowedRootsCache =
-    std::sync::Mutex<Option<(Vec<String>, std::sync::Arc<Vec<std::path::PathBuf>>)>>;
+/// 允许根解析缓存：(原始根字符串列表, 已 canonicalize 的 PathBuf 列表, 上次核对时间)。
+///
+/// 键为原始列表 → DB 增删服务/模板后自然失效；`Instant` 给出复用窗口（见
+/// `ALLOWED_ROOTS_TTL`）——文件树连续展开时连"查库算原始列表"这一步也省掉。
+pub type AllowedRootsCache = std::sync::Mutex<
+    Option<(Vec<String>, std::sync::Arc<Vec<std::path::PathBuf>>, std::time::Instant)>,
+>;
 
 pub struct AppState {
     pub db: Database,
@@ -23,12 +30,20 @@ pub struct AppState {
     pub file_watcher: FileWatcher,
     // std::sync::Mutex: 仅同步操作，无需跨 .await 持有
     pub project_root: std::sync::Mutex<Option<String>>,
+    /// 本会话内由原生目录选择器确认过的目录（canonicalize 后）。
+    /// 为什么要有它：白名单的根来自 IPC 可写字段，若不收口，调用方（webview）
+    /// 可以自己把任意目录加进白名单。经用户亲自点选的目录才允许成为项目外的新根，
+    /// 见 `commands::editor::ensure_config_dir_allowed`。
+    pub confirmed_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
     /// 允许访问根目录的解析缓存（见 `AllowedRootsCache`）。
     ///
     /// 为什么按"原始列表"做缓存键而不是手动失效：漏一处失效调用就会出现
     /// "新加的服务目录打不开文件"。canonicalize 是这条热路径上真正的开销
     /// （每个根一次文件系统路径解析），而 SQL 只查一张小表且有索引。
     pub allowed_roots_cache: AllowedRootsCache,
+    /// 搜索代数：每次发起内容搜索递增，正在跑的旧搜索据此尽早退出
+    /// （Arc 是为了能把它克隆进 spawn_blocking 的闭包）
+    pub search_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 内嵌 dsh web（AI 助手 iframe 会话）；None = 未运行
     pub ai: std::sync::Mutex<Option<AiSession>>,
     /// 会话代数：每次 start/stop 递增，启动中的进程据此识别「被取代」并自杀
@@ -39,7 +54,11 @@ pub struct AppState {
 ///
 /// 幂等设计：多次调用安全（stop_all 对空集合是 no-op）。
 /// 清理顺序：服务进程 → AI 会话 → 文件监听
-fn cleanup_resources(state: &AppState) {
+///
+/// 调用点：`commands::app::prepare_exit`（独立线程，用户确认关闭后）与
+/// `RunEvent::Exit`（兜底）。**不要**再放回 `WindowEvent::CloseRequested`——
+/// 那里现在只是"请求关闭"，用户可能取消（未保存草稿确认），且同步清理会冻结窗口。
+pub(crate) fn cleanup_resources(state: &AppState) {
     let start = std::time::Instant::now();
 
     // 1. 停止所有服务进程（最高优先级，含 taskkill /T /F + wait）
@@ -128,6 +147,8 @@ pub fn run() {
     {
         if let Some(ref job) = job {
             process_mgr.set_job(job.clone());
+            // 反编译 JVM 等"不经过 ProcessManager"的子进程也要纳入同一 Job（见 core::job_object::shared）
+            crate::core::job_object::set_shared(job.clone());
         }
     }
 
@@ -148,15 +169,19 @@ pub fn run() {
     let app = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
+        // 剪贴板不走 tauri-plugin-clipboard-manager：文件列表粘贴只能由 Rust 侧
+        // clipboard-win 写 CF_HDROP（见 commands/fileops.rs），插件只提供文本/图片 API，
+        // 注册它等于多开一条用不到的 IPC 命令面（含 allow-write-text 等权限位）
         .manage(AppState {
             db,
             process_mgr,
             file_watcher: FileWatcher::new(),
             project_root: std::sync::Mutex::new(None),
+            confirmed_dirs: std::sync::Mutex::new(Vec::new()),
             allowed_roots_cache: std::sync::Mutex::new(None),
             ai: std::sync::Mutex::new(None),
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
+            search_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
         .invoke_handler(tauri::generate_handler![
             commands::editor::read_file,
@@ -218,14 +243,17 @@ pub fn run() {
             commands::ai::ai_upgrade_dsh,
             commands::ai::create_ai_panel_webview,
             commands::ai::ai_panel_focus,
+            commands::app::prepare_exit,
+            commands::app::pick_directory,
         ])
-        .on_window_event(move |window, event| {
+        .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                log::info!("[nexus] CloseRequested → 开始清理...");
-                if let Some(state) = window.try_state::<AppState>() {
-                    cleanup_resources(&state);
-                }
-                log::info!("[nexus] CloseRequested → 清理完成，窗口即将关闭");
+                // 这里**不做**清理：前端注册了 tauri://close-requested 监听后，Tauri 会自动
+                // prevent_close 并把决定权交给前端（未保存草稿确认，见 useAppCloseGuard）。
+                // 用户取消时窗口继续存在——此时停掉所有服务是错的。
+                // 真正的清理由 commands::app::prepare_exit 在独立线程执行（不冻结窗口），
+                // RunEvent::Exit 仍是最后兜底（幂等）。
+                log::info!("[nexus] CloseRequested → 交前端确认（未保存草稿）");
             }
         })
         .build(tauri::generate_context!());

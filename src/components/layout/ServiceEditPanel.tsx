@@ -1,14 +1,37 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { serviceApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
-import { open } from '@tauri-apps/plugin-dialog';
+import { pickDirectory } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
+import { readServiceDraft, serviceDraftKey, useServiceDraftStore } from '../../stores/serviceDraftStore';
 import { ToolsManagerModal } from './ToolsManagerModal';
 import { showNotification } from '../ui/Toast';
+import { reportError } from '../../utils/error';
 
 const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
+
+/**
+ * 遮蔽环境变量文本里的**值**（保留键名与行结构，用户仍能看出配了哪些变量）。
+ *
+ * 只用于**显示**：面板内部状态与保存路径始终是真实值（遮蔽态 textarea 只读，
+ * 不存在"把掩码存进配置"的可能）。`KEY=`（空值）、注释行、无 `=` 的行原样保留。
+ */
+function maskEnvValues(text: string): string {
+  return text
+    .split('\n')
+    .map(line => {
+      const eq = line.indexOf('=');
+      if (eq < 0) return line;
+      const key = line.slice(0, eq);
+      const value = line.slice(eq + 1);
+      if (value.trim() === '') return line;
+      // 固定长度掩码：不泄露原值长度（长度本身也能透露信息）
+      return `${key}=••••••`;
+    })
+    .join('\n');
+}
 
 /** 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致；模板额外带 open_tool_id） */
 type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'> & { open_tool_id?: string };
@@ -27,24 +50,32 @@ interface Props {
 }
 
 export function ServiceEditPanel({ service, onSave, mode = 'service', title, rightOffset = 360, onSavedAsTemplate }: Props) {
-  const [name, setName] = useState(service.name);
-  const [command, setCommand] = useState(service.command);
-  const [cwd, setCwd] = useState(service.cwd);
-  const [watchPaths, setWatchPaths] = useState(service.watch_paths);
-  const [watchInclude, setWatchInclude] = useState(service.watch_include);
-  const [watchExclude, setWatchExclude] = useState(service.watch_exclude);
-  const [envVars, setEnvVars] = useState(service.env_vars);
-  const [restartMode, setRestartMode] = useState(service.restart_mode);
-  const [enabled, setEnabled] = useState(service.enabled);
-  const [showFileTree, setShowFileTree] = useState(service.show_file_tree);
+  /** 草稿键与面板的编辑目标一一对应（见 serviceDraftStore 的六条丢失路径说明） */
+  const draftKey = serviceDraftKey(service.id, mode);
+  /** 挂载时读一次草稿恢复表单；不订阅，避免每次写入草稿导致本组件多渲染一轮 */
+  const [initialDraft] = useState(() => readServiceDraft(draftKey));
+  const [name, setName] = useState(initialDraft?.name ?? service.name);
+  const [command, setCommand] = useState(initialDraft?.command ?? service.command);
+  const [cwd, setCwd] = useState(initialDraft?.cwd ?? service.cwd);
+  const [watchPaths, setWatchPaths] = useState(initialDraft?.watchPaths ?? service.watch_paths);
+  const [watchInclude, setWatchInclude] = useState(initialDraft?.watchInclude ?? service.watch_include);
+  const [watchExclude, setWatchExclude] = useState(initialDraft?.watchExclude ?? service.watch_exclude);
+  const [envVars, setEnvVars] = useState(initialDraft?.envVars ?? service.env_vars);
+  /** 环境变量值是否明文显示（默认遮蔽，见 maskEnvValues） */
+  const [showEnvValues, setShowEnvValues] = useState(false);
+  const [restartMode, setRestartMode] = useState(initialDraft?.restartMode ?? service.restart_mode);
+  const [enabled, setEnabled] = useState(initialDraft?.enabled ?? service.enabled);
+  const [showFileTree, setShowFileTree] = useState(initialDraft?.showFileTree ?? service.show_file_tree);
   const [saving, setSaving] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // 工具命令状态（DB 里的 TEXT 列属不受信数据，用带校验的解析器而不是裸 JSON.parse）
+  // 工具命令状态（DB 里的 TEXT 列属不受信数据，用带校验的解析器而不是裸 JSON.parse）。
+  // 原值快照只算一次：dirty 判定每键都要比较，不能每次渲染重新 parse
   const [toolCommands, setToolCommands] = useState<ToolCommand[]>(
-    () => parseToolCommands(service.tool_commands),
+    () => initialDraft?.toolCommands ?? parseToolCommands(service.tool_commands),
   );
+  const [originalToolCommands] = useState(() => JSON.stringify(parseToolCommands(service.tool_commands)));
   const [editingToolCmd, setEditingToolCmd] = useState<ToolCommand | null>(null);
   const [showToolCmdForm, setShowToolCmdForm] = useState(false);
   const [showToolManager, setShowToolManager] = useState(false);
@@ -54,11 +85,51 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const boundToolId = useToolStore(s => service.id ? s.bindings[service.id] : undefined);
   const bindTool = useToolStore(s => s.bind);
   // 模板模式：默认打开工具存模板字段（随"保存模板"提交，不是即时绑定）
-  const [tplToolId, setTplToolId] = useState(service.open_tool_id ?? '');
+  const [tplToolId, setTplToolId] = useState(initialDraft?.tplToolId ?? service.open_tool_id ?? '');
   // 当前模式生效的工具选择值（服务=store 即时绑定；模板=表单状态）
   const pickerToolId = mode === 'template' ? (tplToolId || undefined) : boundToolId;
   const pickerTool = openTools.find(t => t.id === pickerToolId);
   const pickerToolName = pickerTool?.name;
+
+  /**
+   * 表单是否有未保存修改：与**已持久化的配置**逐字段比较（工具命令按序列化文本比）。
+   * 只有 true 时才写草稿——改回原样会自动清掉草稿与未保存标记。
+   */
+  const formDirty =
+    name !== service.name || command !== service.command || cwd !== service.cwd
+    || watchPaths !== service.watch_paths || watchInclude !== service.watch_include
+    || watchExclude !== service.watch_exclude || envVars !== service.env_vars
+    || restartMode !== service.restart_mode || enabled !== service.enabled
+    || showFileTree !== service.show_file_tree
+    || (mode === 'template' && tplToolId !== (service.open_tool_id ?? ''))
+    || JSON.stringify(toolCommands) !== originalToolCommands;
+
+  // 草稿落地：任何字段变化都同步进 store（面板被卸载/切项目也不丢）。
+  // 显式列出全部字段而不是空依赖：空依赖会因闭包过期而漏写最新值
+  useEffect(() => {
+    useServiceDraftStore.getState().setDraft(draftKey, formDirty ? {
+      name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
+      restartMode, enabled, showFileTree, toolCommands, tplToolId,
+    } : null);
+  }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
+      restartMode, enabled, showFileTree, toolCommands, tplToolId]);
+
+  /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
+  const handleDiscard = () => {
+    setName(service.name);
+    setCommand(service.command);
+    setCwd(service.cwd);
+    setWatchPaths(service.watch_paths);
+    setWatchInclude(service.watch_include);
+    setWatchExclude(service.watch_exclude);
+    setEnvVars(service.env_vars);
+    setRestartMode(service.restart_mode);
+    setEnabled(service.enabled);
+    setShowFileTree(service.show_file_tree);
+    setTplToolId(service.open_tool_id ?? '');
+    setToolCommands(parseToolCommands(service.tool_commands));
+    useServiceDraftStore.getState().setDraft(draftKey, null);
+  };
 
   // 打开方式选择器：自定义浮层（fixed + portal，参考右键菜单模式）。
   // 原生 <select> 的选项样式/展开体验与面板风格割裂，且不可控
@@ -109,8 +180,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       await bindTool(service.id, toolId);
       showNotification({ variant: 'success', title: toolId ? '已绑定打开工具' : '已解除绑定' });
     } catch (err) {
-      console.error('设置打开工具失败:', err);
-      showNotification({ variant: 'error', title: '设置打开工具失败', description: String(err) });
+      reportError('设置打开工具失败', err);
     }
   };
 
@@ -133,7 +203,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   };
 
   const handleSelectCwd = async () => {
-    const selected = await open({ directory: true, title: '选择工作目录', defaultPath: cwd });
+    // 走后端原生选择器：选中的目录会被记为"用户已确认"，项目外目录才允许配置
+    const selected = await pickDirectory({ title: '选择工作目录', defaultPath: cwd });
     if (selected) applyCwd(selected);
   };
 
@@ -152,10 +223,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       } else {
         await serviceApi.update(payload);
       }
+      // 已持久化：草稿使命完成（否则重新打开面板会把旧编辑又"复活"回来）
+      useServiceDraftStore.getState().setDraft(draftKey, null);
       onSave();
     } catch (e: unknown) {
-      console.error('保存配置失败:', e);
-      showNotification({ variant: 'error', title: mode === 'template' ? '保存模板配置失败' : '保存服务配置失败', description: String(e) });
+      reportError(mode === 'template' ? '保存模板配置失败' : '保存服务配置失败', e);
     }
     setSaving(false);
   };
@@ -168,8 +240,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       showNotification({ title: `已保存为模板「${tpl.name}」` });
       onSavedAsTemplate?.();
     } catch (e: unknown) {
-      console.error('保存模板失败:', e);
-      showNotification({ variant: 'error', title: '保存模板失败', description: String(e) });
+      reportError('保存模板失败', e);
     }
     setSavingTemplate(false);
   };
@@ -210,6 +281,20 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       {title && (
         <div className="flex items-center px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
           <span className="text-[13px] text-nexus-text font-medium">{title}</span>
+        </div>
+      )}
+
+      {/* 未保存提示：面板的字段改动会随面板卸载/切项目保留（草稿按 id 存），
+          但没有持久化——这里给一个显式出口，避免用户以为已经保存 */}
+      {formDirty && (
+        <div className="flex items-center gap-2 px-4 h-[28px] flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
+          <span className="w-1.5 h-1.5 rounded-full bg-nexus-warning flex-shrink-0" />
+          <span className="flex-1 text-[11.5px] text-nexus-warning">有未保存的修改（切换服务/面板不会丢失）</span>
+          <button
+            className="text-[11.5px] text-nexus-warning hover:underline"
+            title="回到已保存的配置"
+            onClick={handleDiscard}
+          >放弃修改</button>
         </div>
       )}
       <div className="flex-1 overflow-auto p-3 space-y-3">
@@ -458,9 +543,32 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           </button>
           {showAdvanced && (
             <div className="mt-3">
-              <label className={labelCls}>环境变量</label>
-              <textarea className={`${inputCls} font-mono resize-none mt-1`} rows={4} value={envVars}
-                onChange={e => setEnvVars(e.target.value)} placeholder={'PORT=3000\nNODE_ENV=development'} />
+              <div className="flex items-center justify-between">
+                <label className={labelCls}>环境变量</label>
+                {/* SEC-6：变量值默认遮蔽。服务配置里常放 token/密码（命令日志已掩码，
+                    这里此前是明文直接摊在屏幕上——截图/录屏/共享屏幕即泄露）*/}
+                <button
+                  type="button"
+                  className="text-[11px] text-nexus-muted hover:text-nexus-accent transition-colors"
+                  onClick={() => setShowEnvValues(v => !v)}
+                  title={showEnvValues ? '遮蔽变量值（可防止截图泄露凭据）' : '显示并编辑变量值'}
+                >{showEnvValues ? '遮蔽值' : '显示值'}</button>
+              </div>
+              <textarea
+                className={`${inputCls} font-mono resize-none mt-1`}
+                rows={4}
+                value={showEnvValues ? envVars : maskEnvValues(envVars)}
+                // 遮蔽态只读：否则用户会在掩码文本上编辑，保存时把掩码写进配置
+                readOnly={!showEnvValues}
+                onChange={e => setEnvVars(e.target.value)}
+                placeholder={'PORT=3000\nNODE_ENV=development'}
+                title={showEnvValues ? undefined : '值已遮蔽（点右上「显示值」后可编辑）'}
+              />
+              {!showEnvValues && envVars.trim() !== '' && (
+                <p className="text-[11px] text-nexus-muted mt-1">
+                  值已遮蔽，点右上「显示值」后可查看与编辑；保存时始终写真实值
+                </p>
+              )}
             </div>
           )}
         </div>

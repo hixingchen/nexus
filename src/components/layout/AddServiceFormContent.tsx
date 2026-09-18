@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { serviceApi } from '../../services/service';
-import { open } from '@tauri-apps/plugin-dialog';
-import { showNotification } from '../ui/Toast';
+import { pickDirectory } from '../../services/system';
+import { reportError } from '../../utils/error';
 import { isSubmitEnter } from '../../utils/keyboard';
 
 interface Props {
@@ -20,7 +20,8 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
   useEffect(() => { nameRef.current?.focus(); }, []);
 
   const handleSelectCwd = async () => {
-    const selected = await open({ directory: true, title: '选择工作目录', defaultPath: cwd || projectPath });
+    // 走后端原生选择器：选中即"用户已确认"，项目外目录才允许配置
+    const selected = await pickDirectory({ title: '选择工作目录', defaultPath: cwd || projectPath });
     if (selected) setCwd(selected);
   };
 
@@ -34,7 +35,7 @@ export function AddServiceFormContent({ projectId, projectPath, onDone }: Props)
         toolCommands: '[]',
       });
       onDone();
-    } catch (e: unknown) { console.error('添加服务失败:', e); showNotification({ variant: 'error', title: '添加服务失败', description: String(e) }); }
+    } catch (e: unknown) { reportError('添加服务失败', e); }
     setSaving(false);
   };
 

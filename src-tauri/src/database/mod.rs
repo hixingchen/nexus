@@ -53,7 +53,8 @@ impl Database {
 /// 任何旧版本数据库都能原地升级，禁止再引入 DROP 任何用户表。
 const SCHEMA_VERSION: i32 = 9;
 
-fn init_schema(conn: &Connection) -> Result<(), String> {
+/// 建表 + 迁移（`pub(crate)`：命令层的 SQL 路径测试要自己搭一个内存库，见 commands/service.rs 的 tests）
+pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
         .map_err(|e| format!("初始化数据库 PRAGMA 失败: {}", e))?;
 
@@ -195,22 +196,36 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
+/// services 表按列名取值的共享 SELECT 列表（映射一律用「列名」而不是下标）。
+///
+/// 为什么必须按列名：位置化 `row.get(N)` 一旦与 SELECT 列表顺序不一致，**不会报错**——
+/// 相邻的同类型列会被静默互换（类型正确、编译干净、测试全绿，界面显示错数据）。
+/// 加一个字段要跨 9 个文件 80 处同步，正是这种映射方式的结构成本。
+pub const SERVICE_COLUMNS: &str =
+    "id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
+     restart_mode, enabled, show_file_tree, sort_index, tool_commands";
+
 /// 查询指定项目下的所有服务（共享函数，消除重复 SQL）
 pub fn query_services_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Service>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands
-         FROM services WHERE project_id=?1 ORDER BY sort_index"
+        &format!("SELECT {} FROM services WHERE project_id=?1 ORDER BY sort_index", SERVICE_COLUMNS)
     ).map_err(|e| format!("查询服务列表失败: {}", e))?;
     let rows = stmt.query_map([project_id], |row| {
         Ok(Service {
-            id: row.get(0)?, project_id: row.get(1)?, name: row.get(2)?,
-            command: row.get(3)?, cwd: row.get(4)?, watch_paths: row.get(5)?,
-            watch_include: row.get(6)?, watch_exclude: row.get(7)?,
-            env_vars: row.get(8)?, restart_mode: row.get(9)?,
-            enabled: row.get::<_,i32>(10)? != 0,
-            show_file_tree: row.get::<_,i32>(11)? != 0,
-            sort_index: row.get(12)?,
-            tool_commands: row.get(13)?,
+            id: row.get("id")?,
+            project_id: row.get("project_id")?,
+            name: row.get("name")?,
+            command: row.get("command")?,
+            cwd: row.get("cwd")?,
+            watch_paths: row.get("watch_paths")?,
+            watch_include: row.get("watch_include")?,
+            watch_exclude: row.get("watch_exclude")?,
+            env_vars: row.get("env_vars")?,
+            restart_mode: row.get("restart_mode")?,
+            enabled: row.get::<_, i32>("enabled")? != 0,
+            show_file_tree: row.get::<_, i32>("show_file_tree")? != 0,
+            sort_index: row.get("sort_index")?,
+            tool_commands: row.get("tool_commands")?,
         })
     }).map_err(|e| format!("读取服务数据失败: {}", e))?;
     let mut services = Vec::new();
@@ -295,6 +310,39 @@ mod tests {
         // 版本号更新到当前
         let v: i32 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// 服务行映射逐字段回归：列名取值把我们从一个"换序即静默错列"的结构里挪了出来，
+    /// 但列名本身仍可能与 SELECT 不一致（写错名字会在运行时才报"no such column"）。
+    /// 这里用真实 schema 建一行、逐字段断言，作为映射契约的守门测试。
+    #[test]
+    fn test_query_services_by_project_maps_every_column() {
+        let conn = in_memory();
+        init_schema(&conn).unwrap();
+        conn.execute("INSERT INTO projects (id, name, path) VALUES ('p1', 'P', 'C:/p')", []).unwrap();
+        conn.execute(
+            "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands)
+             VALUES ('s1', 'p1', 'svc', 'npm run dev', 'C:/p/svc', '[\"C:/p/svc\"]', '*.ts', 'node_modules', 'A=1', 2, 1, 1, 7, '[{\"id\":\"c1\"}]')",
+            [],
+        ).unwrap();
+
+        let svcs = query_services_by_project(&conn, "p1").unwrap();
+        assert_eq!(svcs.len(), 1);
+        let s = &svcs[0];
+        assert_eq!(s.id, "s1");
+        assert_eq!(s.project_id, "p1");
+        assert_eq!(s.name, "svc");
+        assert_eq!(s.command, "npm run dev");
+        assert_eq!(s.cwd, "C:/p/svc");
+        assert_eq!(s.watch_paths, "[\"C:/p/svc\"]");
+        assert_eq!(s.watch_include, "*.ts");
+        assert_eq!(s.watch_exclude, "node_modules");
+        assert_eq!(s.env_vars, "A=1");
+        assert_eq!(s.restart_mode, 2);
+        assert!(s.enabled);
+        assert!(s.show_file_tree);
+        assert_eq!(s.sort_index, 7);
+        assert_eq!(s.tool_commands, "[{\"id\":\"c1\"}]");
     }
 
     /// 重复初始化幂等（每次启动都会跑 init_schema）

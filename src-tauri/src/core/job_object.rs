@@ -28,8 +28,18 @@ extern "system" {
         hProcess: HANDLE,
     ) -> BOOL;
 
+    fn OpenProcess(
+        dwDesiredAccess: DWORD,
+        bInheritHandle: BOOL,
+        dwProcessId: DWORD,
+    ) -> HANDLE;
+
     fn CloseHandle(hObject: HANDLE) -> BOOL;
 }
+
+/// AssignProcessToJobObject 要求句柄带 PROCESS_SET_QUOTA 与 PROCESS_TERMINATE
+const PROCESS_SET_QUOTA: DWORD = 0x0100;
+const PROCESS_TERMINATE: DWORD = 0x0001;
 
 pub struct JobObject {
     handle: HANDLE,
@@ -115,6 +125,29 @@ impl JobObject {
         use std::os::windows::io::AsRawHandle;
         self.assign_raw(child.as_raw_handle() as isize, Some(child.id()));
     }
+
+    /// 按 pid 加入 Job Object（不持有 `Child` 的场景：tokio 子进程只在 await 期间存在）。
+    ///
+    /// 为什么需要：`tokio::process::Child` 拿不到 std 的 `Child`，若反编译的 JVM 只在
+    /// `kill_on_drop` 保护下运行，Nexus 被强杀（任务管理器结束进程/崩溃）时它不会随之退出，
+    /// 会留下一个占着几百 MB 的 java 进程。加入共享 Job 后由 KILL_ON_JOB_CLOSE 兜底。
+    ///
+    /// 句柄是我们自己打开的，赋值完必须关闭（关闭本进程的句柄不会把目标移出 Job）。
+    pub fn assign_pid(&self, pid: u32) {
+        unsafe {
+            let handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if handle == 0 {
+                log::warn!(
+                    "[nexus] ⚠ OpenProcess 失败 (pid={}): {}，该进程未纳入 Job Object",
+                    pid,
+                    std::io::Error::last_os_error()
+                );
+                return;
+            }
+            self.assign_raw(handle as isize, Some(pid));
+            CloseHandle(handle);
+        }
+    }
 }
 
 impl Drop for JobObject {
@@ -124,6 +157,23 @@ impl Drop for JobObject {
             log::info!("[nexus] Job Object 已关闭 → KILL_ON_JOB_CLOSE 触发");
         }
     }
+}
+
+/// 进程级共享 Job 句柄。
+///
+/// 主路径是把 Job 传给 `ProcessManager`（服务进程用它），但**不经过 ProcessManager 的子进程**
+/// 也需要纳管（当前是反编译用的 JVM）——那些调用点拿不到 `AppState`，用这个全局出口共享同一
+/// Job，避免为每个子系统各建一个 Job（每个 Job 都会在 Drop 时杀掉自己名下的进程）。
+static SHARED_JOB: std::sync::OnceLock<std::sync::Arc<JobObject>> = std::sync::OnceLock::new();
+
+/// 登记共享 Job（应用启动时调用一次；重复调用忽略）
+pub fn set_shared(job: std::sync::Arc<JobObject>) {
+    let _ = SHARED_JOB.set(job);
+}
+
+/// 取共享 Job（未启用 Job 时返回 None，调用方按"无兜底"降级）
+pub fn shared() -> Option<&'static std::sync::Arc<JobObject>> {
+    SHARED_JOB.get()
 }
 
 // JobObject 包含的 HANDLE 是 isize，自动满足 Send + Sync。

@@ -33,12 +33,12 @@ fn load_service_watch_config(db: &crate::database::Database, project_id: &str, s
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         let mut rows = stmt.query_map(rusqlite::params![service_id, project_id], |row| {
             Ok((
-                row.get::<_,String>(0)?,
-                row.get::<_,String>(1)?,
-                row.get::<_,String>(2)?,
-                row.get::<_,String>(3)?,
-                row.get::<_,String>(4)?,
-                row.get::<_,i32>(5)?,
+                row.get::<_, String>("id")?,
+                row.get::<_, String>("name")?,
+                row.get::<_, String>("watch_paths")?,
+                row.get::<_, String>("watch_include")?,
+                row.get::<_, String>("watch_exclude")?,
+                row.get::<_, i32>("restart_mode")?,
             ))
         }).map_err(|e| format!("读取服务数据失败: {}", e))?;
         match rows.next() {
@@ -75,12 +75,12 @@ fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) 
         ).map_err(|e| format!("查询文件监听服务列表失败: {}", e))?;
         let rows = stmt.query_map([project_id], |row| {
             Ok((
-                row.get::<_,String>(0)?,
-                row.get::<_,String>(1)?,
-                row.get::<_,String>(2)?,
-                row.get::<_,String>(3)?,
-                row.get::<_,String>(4)?,
-                row.get::<_,i32>(5)?,
+                row.get::<_, String>("id")?,
+                row.get::<_, String>("name")?,
+                row.get::<_, String>("watch_paths")?,
+                row.get::<_, String>("watch_include")?,
+                row.get::<_, String>("watch_exclude")?,
+                row.get::<_, i32>("restart_mode")?,
             ))
         }).map_err(|e| format!("读取文件监听服务数据失败: {}", e))?;
         let mut svcs = Vec::new();
@@ -121,7 +121,7 @@ pub async fn start_watching(app: AppHandle, project_id: String, service_id: Opti
         let state = app.state::<AppState>();
         let project_name: String = state.db.with_conn(|conn| {
             conn.query_row("SELECT name FROM projects WHERE id=?1", [&project_id],
-                |row| row.get(0)
+                |row| row.get("name")
             ).map_err(|e| format!("项目不存在: {}", e))
         })?;
 
@@ -182,7 +182,7 @@ pub(crate) fn remove_service_watch(
     }
     let project_name: String = state.db.with_conn(|conn| {
         conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
-            |row| row.get(0)
+            |row| row.get("name")
         ).map_err(|e| format!("项目不存在: {}", e))
     })?;
     state.file_watcher.start_watching(
@@ -222,7 +222,7 @@ pub(crate) fn refresh_service_watch(
     }
     let project_name: String = state.db.with_conn(|conn| {
         conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
-            |row| row.get(0)
+            |row| row.get("name")
         ).map_err(|e| format!("项目不存在: {}", e))
     })?;
     state.file_watcher.start_watching(

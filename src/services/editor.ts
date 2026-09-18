@@ -1,39 +1,26 @@
 import { invoke } from '@tauri-apps/api/core';
 
-/** 读取文件响应：is_binary 时前端改用内建查看器（图片预览 / hex 视图） */
+/**
+ * 读取文件响应：is_binary 时前端改用内建查看器（图片预览 / hex 视图）。
+ *
+ * 字段名与 Rust 侧同名（snake_case）：响应 DTO 不做命名转换（规则见 `src-tauri/src/contract.rs`），
+ * 因此这里直接 `invoke` 拿到即用，不再有中间映射层——少一层手写映射就少一处可漂移的字段。
+ */
 export interface ReadFileResponse {
   content: string;
   is_binary: boolean;
   size: number;
   /** 原始换行风格（保存时按此写回，避免编辑器规范化换行导致 git 误报变更） */
-  lineEnding: 'lf' | 'crlf' | 'cr';
+  line_ending: 'lf' | 'crlf' | 'cr';
   /** 原始编码（'gb18030' 时保存按原编码写回，GBK 文件编辑后字节不变） */
   encoding: 'utf8' | 'gb18030';
   /** 读取时的修改时间（距 UNIX 纪元毫秒）。保存时原样回传，用于检测外部改动 */
   modified: number | null;
 }
 
-/** read_file 的原始返回（Rust 侧无 rename_all，字段为 snake_case） */
-interface RawReadFileResponse {
-  content: string;
-  is_binary: boolean;
-  size: number;
-  line_ending: 'lf' | 'crlf' | 'cr';
-  encoding: 'utf8' | 'gb18030';
-  modified: number | null;
-}
-
-/** 读取文件内容（Tauri 2 返回值保持 Rust snake_case 字段名，这里统一映射为 camelCase） */
+/** 读取文件内容 */
 export async function readFile(path: string): Promise<ReadFileResponse> {
-  const res = await invoke<RawReadFileResponse>('read_file', { path });
-  return {
-    content: res.content,
-    is_binary: res.is_binary,
-    size: res.size,
-    lineEnding: res.line_ending,
-    encoding: res.encoding,
-    modified: res.modified,
-  };
+  return await invoke<ReadFileResponse>('read_file', { path });
 }
 
 /** 读取 .class 源码视图：优先 CFR 反编译（IDEA 级），失败回退字节码视图（无 JRE/超时等） */
@@ -55,7 +42,7 @@ export async function readImageData(path: string): Promise<string> {
 export interface HexPage {
   offset: number;
   bytes: number[];
-  totalSize: number;
+  total_size: number;
 }
 
 /** 分页读取二进制内容（hex 视图按需加载） */
@@ -66,9 +53,9 @@ export async function readHexPage(path: string, offset: number, rows: number): P
 /** jar 条目信息 */
 export interface JarEntryInfo {
   name: string;
-  isDir: boolean;
+  is_dir: boolean;
   size: number;
-  compressedSize: number;
+  compressed_size: number;
 }
 
 /** jar 条目读取结果：kind = text（已解码）/ class（已反编译）/ binary（base64） */

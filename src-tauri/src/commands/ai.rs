@@ -14,14 +14,13 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use crate::AppState;
-use crate::core::ai::AiSession;
+use crate::core::ai::{AiSession, AiTimeouts};
 
-/// 等待 dsh web 输出启动 URL 的超时
-const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// 等待 dsh web 输出启动 URL 的超时（集中定义见 core/ai.rs 的 AiTimeouts）
+const START_TIMEOUT: Duration = AiTimeouts::WEB_START;
 
 /// 会话状态快照
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AiStatus {
     pub running: bool,
     /// 子 WebView 导航目标（host 已规范为 localhost，见 core::ai）
@@ -79,6 +78,10 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             if !std::path::Path::new(dir).is_dir() {
                 return Err(format!("项目目录不存在: {}", dir));
             }
+            // 会话工作目录 = dsh agent 的工作目录（它有文件与命令工具），必须限定在已登记
+            // 项目目录内：否则一次 invoke('ai_start',{cwd:'C:\\'}) 就能在任意目录起一个
+            // 能读写文件、能执行命令的会话，绕过文件白名单（见 editor.rs 的"配置路径收口"）
+            crate::commands::editor::ensure_project_dir_allowed(&state, dir, "AI 会话工作目录")?;
         }
 
         // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
@@ -175,7 +178,6 @@ pub async fn ai_stop(app: AppHandle) -> Result<(), String> {
 
 /// dsh 版本信息（面板「检查更新」）
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DshVersionInfo {
     /// dsh CLI 是否已安装（未安装时 current 为 None）
     pub dsh_found: bool,
@@ -261,8 +263,28 @@ pub async fn create_ai_panel_webview(
     let builder = tauri::webview::WebviewBuilder::new(label, url)
         // HTML5 drag and drop（与 JS 创建时 dragDropEnabled: false 同义）
         .disable_drag_drop_handler()
+        // 导航守卫：面板只允许停留在环回 http(s) 上。
+        // 只校验创建前的 URL 是不够的——加载后页面里的链接、重定向与 JS 导航可以把面板
+        // 带到任意 URL：应用框架内的界面伪装，或指向本机其它环回端口（含 Nexus 自己的 GUI）。
+        // 保留 about:blank（部分引擎初始化时会先导航到它，拦掉会让面板白屏）。
+        .on_navigation(|url| {
+            if url.scheme() == "about" {
+                return true;
+            }
+            let host_ok = matches!(url.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
+            let scheme_ok = matches!(url.scheme(), "http" | "https");
+            if !(host_ok && scheme_ok) {
+                log::warn!("[ai] 面板导航已拦截（非环回 http/https）: {}", url);
+            }
+            host_ok && scheme_ok
+        })
         // 文档创建时注入焦点记忆/恢复脚本（每次导航重新执行，幂等）
-        .initialization_script(include_str!("../scripts/ai_focus_restore.js"));
+        .initialization_script(include_str!("../scripts/ai_focus_restore.js"))
+        // 屏蔽 dsh 页面自带的右键菜单：主界面的全局禁止（src/main.tsx）作用于主文档，
+        // 覆盖不到本子 WebView。用 for_all_frames：iframe 内的右键弹的是该帧自己的
+        // 菜单，父文档的 contextmenu 监听收不到（Windows 上 wry 本就注入所有帧，
+        // 这里只是把各平台语义对齐）
+        .initialization_script_for_all_frames(include_str!("../scripts/ai_disable_context_menu.js"));
     window
         .add_child(
             builder,

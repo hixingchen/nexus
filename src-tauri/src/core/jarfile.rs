@@ -41,7 +41,6 @@ fn read_entry_capped<R: Read>(reader: &mut R, declared: u64, what: &str) -> Resu
 
 /// jar 条目信息
 #[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct JarEntryInfo {
     pub name: String,
     pub is_dir: bool,
@@ -98,11 +97,15 @@ pub fn read_entry(jar_bytes: &[u8], nested: &[String], name: &str) -> Result<Vec
 }
 
 /// 取嵌套链末端的 jar 字节（nested 为空时即外层 jar 自身）
-pub fn innermost_archive(jar_bytes: &[u8], nested: &[String]) -> Result<Vec<u8>, String> {
+///
+/// 接收 `Vec<u8>` 而不是 `&[u8]`：调用方（`list_jar`/`read_jar_entry`）本来就是
+/// `read_file_limited` 读出来的 owned 字节，按值 move 进来可以省掉一次整包拷贝
+/// （原来无论嵌套与否都会先 `to_vec()` 复制一整份——fat jar 上是几十 MB 的白拷贝）。
+pub fn innermost_archive(jar_bytes: Vec<u8>, nested: &[String]) -> Result<Vec<u8>, String> {
     if let Some((last, prefix)) = nested.split_last() {
-        read_entry(jar_bytes, prefix, last)
+        read_entry(&jar_bytes, prefix, last)
     } else {
-        Ok(jar_bytes.to_vec())
+        Ok(jar_bytes)
     }
 }
 
@@ -149,7 +152,8 @@ mod tests {
         let content = read_entry(&outer, &["BOOT-INF/lib/inner.jar".to_string()], "hello.txt").unwrap();
         assert_eq!(content, b"hi");
         // 列嵌套层条目
-        let innermost = innermost_archive(&outer, &["BOOT-INF/lib/inner.jar".to_string()]).unwrap();
+        // 列嵌套层条目（按值传入：函数会 move 走整包字节，省掉一次整包拷贝）
+        let innermost = innermost_archive(outer.clone(), &["BOOT-INF/lib/inner.jar".to_string()]).unwrap();
         let entries = list_entries(&innermost).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");

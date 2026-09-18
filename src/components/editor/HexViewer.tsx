@@ -59,7 +59,7 @@ export function HexViewer({ path }: { path: string }) {
     readHexPage(path, 0, ROWS_PER_PAGE)
       .then(res => {
         if (!alive) return;
-        setTotalSize(res.totalSize);
+        setTotalSize(res.total_size);
         setPages(prev => new Map(prev).set(0, res.bytes));
       })
       .catch(e => {

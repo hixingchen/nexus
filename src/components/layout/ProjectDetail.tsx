@@ -1,5 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { useState, useCallback, useEffect } from 'react';
 import { EditorTabs } from '../editor/EditorTabs';
 import { CodeViewer } from '../editor/CodeViewer';
 import { ImageViewer } from '../editor/ImageViewer';
@@ -29,11 +28,12 @@ import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore } from '../../stores/editor';
 import { useAiStore } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
-import { processApi, serviceApi, layoutApi, type ToolCommandResult, type ToolCommandLogPayload, type Service, type ServiceTemplate } from '../../services/service';
+import { serviceApi, type Service, type ServiceTemplate } from '../../services/service';
+import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
+import { useToolCommandRunner } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
-
-// 工具命令输出最多保留的行数（对齐服务日志上限，防止超长输出卡顿）
-const MAX_TOOL_CMD_LOG_LINES = 2000;
+import { reportError } from '../../utils/error';
+import { pruneServiceDrafts } from '../../stores/serviceDraftStore';
 
 interface Props {
   projectId: string;
@@ -43,24 +43,22 @@ interface Props {
 
 export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel }: Props) {
   const {
-    detail, loading, editingService, setEditingService,
+    detail, services, loading, editingService, setEditingService,
     showAddServiceModal, setShowAddServiceModal,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
-    activeTab, fileContent, load, reorderServicesLocal,
+    activeTab, load, reorderServicesLocal,
     isServiceRunning, isServiceFailed, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
 
-  // 工具命令执行状态（logs 为执行中的实时输出行数组，结束后由 result 兜底）
-  const [toolCommandState, setToolCommandState] = useState<{
-    open: boolean;
-    loading: boolean;
-    commandName: string;
-    runId: string;
-    result: ToolCommandResult | null;
-    logs: string[];
-  }>({ open: false, loading: false, commandName: '', runId: '', result: null, logs: [] });
+  // 工具命令执行（订阅事件流 / 跑命令 / 失败态 / 停止）抽到独立 hook（ARCH-7 ②）
+  const {
+    state: toolCommandState,
+    run: handleRunToolCommand,
+    stop: handleStopToolCommand,
+    close: handleCloseToolCommand,
+  } = useToolCommandRunner();
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -74,25 +72,29 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const topPanelMaxHeight = Math.round(window.innerHeight - 200);
 
   const loadTemplates = useCallback(() => {
-    serviceApi.getServiceTemplates().then(setTemplates).catch(e => console.error('加载模板失败:', e));
+    serviceApi.getServiceTemplates()
+      .then(list => {
+        setTemplates(list);
+        // 模板被删除后其编辑草稿没有意义（还会让关窗确认多算一项）；服务草稿在
+        // useProjectDetail 的 load 里按当前项目的服务列表清理
+        pruneServiceDrafts('template', list.map(t => t.id));
+      })
+      .catch(e => console.error('加载模板失败:', e));
   }, []);
 
   useEffect(() => {
     loadTemplates();
-    layoutApi.load().then(l => {
-      if (l.right_panel_top_height) setTopPanelHeight(Number(l.right_panel_top_height));
-    }).catch((e) => console.error('加载布局失败:', e));
+    // 布局读走 layoutStore（与 MainLayout/AiPanel 共享同一次查库）
+    useLayoutStore.getState().ensureLoaded().then(l => {
+      const h = l[LAYOUT_KEYS.rightPanelTopHeight];
+      if (h) setTopPanelHeight(Number(h));
+    }).catch(() => { /* 读失败用默认高度（ensureLoaded 内部已留痕） */ });
   }, [loadTemplates]);
 
-  // 防抖保存上半区高度（对齐 MainLayout 的布局保存模式）
-  const topHeightTimer = useRef<ReturnType<typeof setTimeout>>();
+  // 防抖保存上半区高度：与其余布局键共用 layoutStore 的防抖窗口（原实现各自一份定时器）
   const persistTopPanelHeight = useCallback((h: number) => {
-    clearTimeout(topHeightTimer.current);
-    topHeightTimer.current = setTimeout(() => {
-      layoutApi.save({ right_panel_top_height: String(h) }).catch(e => console.error('保存布局失败:', e));
-    }, 500);
+    saveLayout({ [LAYOUT_KEYS.rightPanelTopHeight]: String(h) });
   }, []);
-  useEffect(() => () => clearTimeout(topHeightTimer.current), []);
 
   // 拖拽排序持久化：本地立即重排（回弹动画结束后 UI 无缝衔接，不等后端重拉），
   // 异步写入后端；失败才重载恢复后端顺序
@@ -101,7 +103,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     if (!pid) return;
     reorderServicesLocal(orderedIds);
     serviceApi.reorderServices(pid, orderedIds).catch(e => {
-      showNotification({ variant: 'error', title: '保存服务排序失败', description: String(e) });
+      reportError('保存服务排序失败', e);
       load();
     });
   }, [detail?.project?.id, reorderServicesLocal, load]);
@@ -112,52 +114,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       return orderedIds.map(id => byId.get(id)).filter((t): t is ServiceTemplate => !!t);
     });
     serviceApi.reorderServiceTemplates(orderedIds).catch(e => {
-      showNotification({ variant: 'error', title: '保存模板排序失败', description: String(e) });
+      reportError('保存模板排序失败', e);
       loadTemplates();
     });
   }, [loadTemplates]);
 
-  // 执行工具命令（流式：先订阅 tool-command-log 事件实时追加，结束再取完整结果）
-  const handleRunToolCommand = async (serviceId: string, commandId: string, commandName: string) => {
-    const runId = crypto.randomUUID();
-    setToolCommandState({ open: true, loading: true, commandName, runId, result: null, logs: [] });
-    // 订阅放在 try 内：原实现把 `await listen(...)` 放在 try 之外且调用方丢弃 Promise，
-    // 一旦订阅失败就抛出未处理的 rejection 且弹窗永久停在 loading（只能重启应用）
-    let unlisten: (() => void) | null = null;
-    try {
-      unlisten = await listen<ToolCommandLogPayload>('tool-command-log', event => {
-        if (event.payload.run_id !== runId) return;
-        setToolCommandState(prev => {
-          const logs = [...prev.logs, event.payload.data];
-          if (logs.length > MAX_TOOL_CMD_LOG_LINES) logs.splice(0, logs.length - MAX_TOOL_CMD_LOG_LINES);
-          return { ...prev, logs };
-        });
-      });
-      const result = await processApi.runToolCommand(serviceId, commandId, runId);
-      // 以完整结果兜底（含按序号合并的顺序，避免事件流微乱序；同为最新 N 行）
-      const logs = result.output.split('\n').slice(-MAX_TOOL_CMD_LOG_LINES);
-      setToolCommandState(prev => ({ ...prev, loading: false, result, logs }));
-    } catch (err) {
-      console.error('执行工具命令失败:', err);
-      showNotification({ variant: 'error', title: '执行工具命令失败', description: String(err) });
-      // 失败也要让弹窗脱离 loading 态，否则用户看到的是"永远在等待执行"
-      setToolCommandState(prev => ({ ...prev, loading: false }));
-    } finally {
-      unlisten?.();
-    }
-  };
-
-  /** 停止正在执行的工具命令（终止其进程树）：命令随后以失败退出码正常返回并展示 */
-  const handleStopToolCommand = async () => {
-    const { runId } = toolCommandState;
-    if (!runId) return;
-    try {
-      await processApi.stopToolCommand(runId);
-      showNotification({ title: '已停止工具命令', duration: 2000 });
-    } catch (e) {
-      showNotification({ variant: 'error', title: '停止失败', description: String(e) });
-    }
-  };
+  // 执行工具命令：实现见 hooks/useToolCommandRunner.ts（订阅 + 流式输出 + 停止）
 
   // 从模板添加到当前项目（值拷贝，模板不受影响）
   const handleAddTemplate = async (tpl: ServiceTemplate) => {
@@ -167,7 +129,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       showNotification({ title: `已从模板添加「${tpl.name}」` });
       await load();
     } catch (e: unknown) {
-      showNotification({ variant: 'error', title: '添加服务失败', description: String(e) });
+      reportError('添加服务失败', e);
     }
     setAddingTemplate(false);
   };
@@ -186,7 +148,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       loadTemplates();
       showNotification({ variant: 'warning', title: `已删除模板「${deleteTplTarget.name}」` });
     } catch (err) {
-      showNotification({ variant: 'error', title: '删除模板失败', description: String(err) });
+      reportError('删除模板失败', err);
     }
     setDeletingTpl(false);
     setDeleteTplTarget(null);
@@ -211,7 +173,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     );
   }
 
-  const { project, services } = detail;
+  const { project } = detail;
+  // 服务列表来自 hook 的单一来源（svcCacheStore），不再从 detail 里取（ARCH-7 ③）
 
   return (
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
@@ -241,7 +204,6 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                 ) : (
                   <CodeViewer
                     filePath={activeTab.path}
-                    content={fileContent ?? ''}
                     editable={!activeTab.readonly}
                     onChange={(content) => useEditorStore.getState().updateDraft(content)}
                   />
@@ -371,15 +333,16 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         </div>
       </Modal>
 
-      {/* 工具命令执行结果弹窗 */}
+      {/* 工具命令执行结果弹窗（输出行由弹窗自己按 runId 订阅 store） */}
       <ToolCommandResultDialog
         open={toolCommandState.open}
         commandName={toolCommandState.commandName}
+        runId={toolCommandState.runId || null}
         result={toolCommandState.result}
-        logs={toolCommandState.logs}
+        error={toolCommandState.error}
         loading={toolCommandState.loading}
         onStop={handleStopToolCommand}
-        onClose={() => setToolCommandState(prev => ({ ...prev, open: false }))}
+        onClose={handleCloseToolCommand}
       />
     </div>
   );

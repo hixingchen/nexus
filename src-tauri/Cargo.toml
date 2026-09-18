@@ -20,7 +20,9 @@ tauri-plugin-shell = "2.0"
 tauri-plugin-dialog = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
+# 只声明实际用到的 feature：fs（tokio::fs）/ time（超时）/ process（java 反编译）/ io-util（AsyncRead/Seek）
+# / rt-multi-thread（spawn_blocking 的运行时）。此前多列了 sync 与 macros，两者在 src 中零引用。
+tokio = { version = "1.0", features = ["rt-multi-thread", "fs", "time", "process", "io-util"] }
 log = "0.4"
 env_logger = "~0.11"
 chrono = { version = "0.4", features = ["serde"] }
@@ -31,7 +33,6 @@ uuid = { version = "1.0", features = ["v4"] }
 encoding_rs = "0.8"
 base64 = "0.22"
 zip = "2"
-tauri-plugin-clipboard-manager = "2"
 
 [target."cfg(windows)".dependencies]
 clipboard-win = "5.4.1"

@@ -2,7 +2,7 @@ use tauri::{Manager, State};
 use serde::Deserialize;
 use crate::AppState;
 use crate::models::{Service, ServiceTemplate};
-use crate::database::query_services_by_project;
+use crate::database::{query_services_by_project, Database};
 
 /// 默认文件监听排除规则
 const DEFAULT_WATCH_EXCLUDE: &str = "node_modules\n.git\ndist\ntarget\n__pycache__\n.next\nbuild\ncoverage\n*.log";
@@ -66,8 +66,22 @@ pub fn add_service(
             .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
     }
     let cwd = params.cwd.replace('\\', "/");
-    let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
-    state.db.with_conn(|conn| {
+    // 工作目录/监听路径会进入文件访问白名单（见 editor.rs 的"配置路径收口"）：
+    // 必须存在、不是系统/用户敏感目录，且位于项目内或经用户显式选择过
+    crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
+    crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
+    let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
+    insert_service_row(&state.db, &params, &cwd, &tool_commands)
+}
+
+/// 插入服务行（只有 Database 依赖，便于测试；命令侧先做路径收口校验再调它）
+pub(crate) fn insert_service_row(
+    db: &Database,
+    params: &AddServiceParams,
+    cwd: &str,
+    tool_commands: &str,
+) -> Result<Service, String> {
+    db.with_conn(|conn| {
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [&params.project_id], |r| r.get(0)
         ).unwrap_or(false);
@@ -83,9 +97,9 @@ pub fn add_service(
                 "[]".to_string()
             } else {
                 // 用 serde_json 序列化，避免 cwd 含引号/反斜杠时生成非法 JSON
-                serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
+                serde_json::to_string(&vec![cwd.to_string()]).unwrap_or_else(|_| "[]".to_string())
             }
-        } else { params.watch_paths };
+        } else { params.watch_paths.clone() };
         let wi = "*";
         let wx = DEFAULT_WATCH_EXCLUDE;
         conn.execute(
@@ -94,12 +108,12 @@ pub fn add_service(
             rusqlite::params![id, params.project_id, params.name.trim(), params.command, cwd, wp, wi, wx, params.env_vars, params.restart_mode, max_sort + 1, tool_commands],
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
-            id, project_id: params.project_id, name: params.name.trim().to_string(), command: params.command,
-            cwd, watch_paths: wp, watch_include: wi.into(), watch_exclude: wx.into(),
-            env_vars: params.env_vars, restart_mode: params.restart_mode, enabled: true,
+            id, project_id: params.project_id.clone(), name: params.name.trim().to_string(), command: params.command.clone(),
+            cwd: cwd.to_string(), watch_paths: wp, watch_include: wi.into(), watch_exclude: wx.into(),
+            env_vars: params.env_vars.clone(), restart_mode: params.restart_mode, enabled: true,
             show_file_tree: false,
             sort_index: max_sort + 1,
-            tool_commands,
+            tool_commands: tool_commands.to_string(),
         })
     })
 }
@@ -124,35 +138,15 @@ pub async fn update_service(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let cwd = params.cwd.replace('\\', "/");
-        let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
-        let project_id = state.db.with_conn(|conn| {
-            let en = if params.enabled { 1 } else { 0 };
-            let sft = if params.show_file_tree { 1 } else { 0 };
-            // 监听路径跟随工作目录（兜底，覆盖任意保存入口）：
-            // watch_paths 为空/[]，或仍等于旧 cwd（默认跟随状态）→ 自动更新为新 cwd
-            let old: (String, String, String) = conn.query_row(
-                "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
-                [&params.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ).map_err(|e| format!("查询服务失败: {}", e))?;
-            let default_old = serde_json::to_string(&vec![old.0]).unwrap_or_default();
-            let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
-                if cwd.is_empty() { "[]".to_string() } else {
-                    serde_json::to_string(&vec![cwd.clone()]).unwrap_or_else(|_| "[]".to_string())
-                }
-            } else if params.watch_paths.trim() == default_old {
-                // 监听路径仍等于"旧 cwd 拼接值" → 跟随新工作目录更新
-                serde_json::to_string(&vec![cwd.clone()]).unwrap_or(params.watch_paths)
-            } else {
-                params.watch_paths
-            };
-            let affected = conn.execute(
-                "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
-                rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
-            ).map_err(|e| format!("更新服务失败: {}", e))?;
-            if affected == 0 { return Err("服务不存在".into()); }
-            Ok(old.2)
-        })?;
+        // 同 add_service：配置目录会进入文件访问白名单，保存前必须过收口校验
+        crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
+        // 监听路径为"跟随工作目录"的兜底值时不校验（它由上面的 cwd 派生，且 cwd 已校验）
+        let watch_follows_cwd = params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]";
+        if !watch_follows_cwd {
+            crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
+        }
+        let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
+        let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
         // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）；
         // 失败只告警不阻塞保存（保存已成功，监听下次项目级启停时自然重建）
         if let Err(e) = crate::commands::watcher::refresh_service_watch(app.clone(), &state, &project_id, &params.id) {
@@ -162,28 +156,89 @@ pub async fn update_service(
     }).await.map_err(|e| format!("更新服务任务失败: {}", e))?
 }
 
-/// 重排项目服务顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）
-#[tauri::command]
-pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids: Vec<String>) -> Result<(), String> {
-    if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
-    state.db.with_conn_mut(|conn| {
+/// 更新服务行（只有 Database 依赖，便于测试）。
+///
+/// 返回该服务所属项目 id（调用方据此刷新文件监听）。"监听路径跟随工作目录"的兜底逻辑
+/// 也在这里：`watch_paths` 为空/`[]`，或仍等于旧 cwd 的拼接值时，自动跟随新 cwd。
+pub(crate) fn write_service_update(
+    db: &Database,
+    params: &UpdateServiceParams,
+    cwd: &str,
+    tool_commands: &str,
+) -> Result<String, String> {
+    db.with_conn(|conn| {
+        let en = if params.enabled { 1 } else { 0 };
+        let sft = if params.show_file_tree { 1 } else { 0 };
+        let old: (String, String, String) = conn.query_row(
+            "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
+            [&params.id],
+            |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?)),
+        ).map_err(|e| format!("查询服务失败: {}", e))?;
+        let default_old = serde_json::to_string(&vec![old.0.clone()]).unwrap_or_default();
+        let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
+            if cwd.is_empty() { "[]".to_string() } else {
+                serde_json::to_string(&vec![cwd.to_string()]).unwrap_or_else(|_| "[]".to_string())
+            }
+        } else if params.watch_paths.trim() == default_old {
+            // 监听路径仍等于"旧 cwd 拼接值" → 跟随新工作目录更新
+            serde_json::to_string(&vec![cwd.to_string()]).unwrap_or_else(|_| params.watch_paths.clone())
+        } else {
+            params.watch_paths.clone()
+        };
+        let affected = conn.execute(
+            "UPDATE services SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11 WHERE id=?12",
+            rusqlite::params![params.name.trim(), params.command, cwd, wp, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id],
+        ).map_err(|e| format!("更新服务失败: {}", e))?;
+        if affected == 0 { return Err("服务不存在".into()); }
+        Ok(old.2)
+    })
+}
+
+/// 删除服务行（只有 Database 依赖，便于测试；进程停止与监听清理由命令侧负责）
+pub(crate) fn delete_service_row(db: &Database, id: &str) -> Result<(), String> {
+    db.with_conn(|conn| {
+        conn.execute("DELETE FROM services WHERE id=?1", [id]).map_err(|e| format!("删除服务失败: {}", e))?;
+        Ok(())
+    })
+}
+
+/// 按给定顺序重写 sort_index（只有 Database 依赖，便于测试）。
+///
+/// 语义：只写属于 `project_id` 的 id（外来 id 跳过，防御跨项目写入）；下标按**实际写入的
+/// 条数**连续递增（不是 `ordered_ids` 的下标）——这样前端只传来完整列表时结果一致，
+/// 传来部分列表（如只拖动其中几项）也不会在项目内留下空洞或撞号。
+pub(crate) fn write_service_order(
+    db: &Database,
+    project_id: &str,
+    ordered_ids: &[String],
+) -> Result<(), String> {
+    db.with_conn_mut(|conn| {
         let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
         // 校验 id 归属：只更新该项目下的服务，防御跨项目写入
         let mut stmt = tx.prepare("SELECT id FROM services WHERE project_id=?1")
             .map_err(|e| format!("查询服务失败: {}", e))?;
-        let existing: std::collections::HashSet<String> = stmt.query_map([&project_id], |r| r.get::<_, String>(0))
+        let existing: std::collections::HashSet<String> = stmt.query_map([project_id], |r| r.get::<_, String>(0))
             .map_err(|e| format!("查询服务失败: {}", e))?
             .collect::<Result<_, _>>()
             .map_err(|e| format!("查询服务失败: {}", e))?;
         drop(stmt);
-        for (i, id) in ordered_ids.iter().enumerate() {
+        let mut next_index: i32 = 0;
+        for id in ordered_ids.iter() {
             if !existing.contains(id) { continue; }
-            tx.execute("UPDATE services SET sort_index=?1 WHERE id=?2", rusqlite::params![i as i32, id])
+            tx.execute("UPDATE services SET sort_index=?1 WHERE id=?2", rusqlite::params![next_index, id])
                 .map_err(|e| format!("更新服务排序失败: {}", e))?;
+            next_index += 1;
         }
         tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
         Ok(())
     })
+}
+
+/// 重排项目服务顺序（ordered_ids 为新的展示顺序，sort_index 按序重写）
+#[tauri::command]
+pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids: Vec<String>) -> Result<(), String> {
+    if project_id.trim().is_empty() { return Err("项目ID不能为空".into()); }
+    write_service_order(&state.db, &project_id, &ordered_ids)
 }
 
 /// 删除服务
@@ -202,10 +257,7 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）
         let _ = state.process_mgr.stop(&id);
         // 3. 删除数据库记录
-        state.db.with_conn(|conn| {
-            conn.execute("DELETE FROM services WHERE id=?1", [&id]).map_err(|e| format!("删除服务失败: {}", e))?;
-            Ok(())
-        })?;
+        delete_service_row(&state.db, &id)?;
         // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
         if let Some(pid) = project_id {
             // app 已被 state 借用，这里传克隆句柄（AppHandle 克隆是廉价的引用计数）
@@ -228,11 +280,21 @@ pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTempla
              FROM service_templates ORDER BY sort_index, name"
         ).map_err(|e| format!("查询模板失败: {}", e))?;
         let rows = stmt.query_map([], |row| Ok(ServiceTemplate {
-            id: row.get(0)?, name: row.get(1)?, command: row.get(2)?, cwd: row.get(3)?,
-            watch_paths: row.get(4)?, watch_include: row.get(5)?, watch_exclude: row.get(6)?,
-            env_vars: row.get(7)?, restart_mode: row.get(8)?, enabled: row.get(9)?,
-            show_file_tree: row.get(10)?, tool_commands: row.get(11)?,
-            open_tool_id: row.get(12)?, created_at: row.get(13)?,
+            // 按列名取值（不是下标）：SELECT 列表换序不会静默错列，见 database::SERVICE_COLUMNS 的说明
+            id: row.get("id")?,
+            name: row.get("name")?,
+            command: row.get("command")?,
+            cwd: row.get("cwd")?,
+            watch_paths: row.get("watch_paths")?,
+            watch_include: row.get("watch_include")?,
+            watch_exclude: row.get("watch_exclude")?,
+            env_vars: row.get("env_vars")?,
+            restart_mode: row.get("restart_mode")?,
+            enabled: row.get("enabled")?,
+            show_file_tree: row.get("show_file_tree")?,
+            tool_commands: row.get("tool_commands")?,
+            open_tool_id: row.get("open_tool_id")?,
+            created_at: row.get("created_at")?,
         })).map_err(|e| format!("查询模板失败: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("查询模板失败: {}", e))
     })
@@ -248,17 +310,24 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
              FROM services WHERE id=?1",
             [&service_id],
             |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?, row.get::<_, i32>(7)?, row.get::<_, bool>(8)?,
-                row.get::<_, bool>(9)?, row.get::<_, String>(10)?,
+                row.get::<_, String>("name")?,
+                row.get::<_, String>("command")?,
+                row.get::<_, String>("cwd")?,
+                row.get::<_, String>("watch_paths")?,
+                row.get::<_, String>("watch_include")?,
+                row.get::<_, String>("watch_exclude")?,
+                row.get::<_, String>("env_vars")?,
+                row.get::<_, i32>("restart_mode")?,
+                row.get::<_, bool>("enabled")?,
+                row.get::<_, bool>("show_file_tree")?,
+                row.get::<_, String>("tool_commands")?,
             )),
         ).map_err(|e| format!("服务不存在: {}", e))?;
         let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands) = t;
         // 模板随服务带走当前绑定的打开工具（从模板添加服务时复制为新服务绑定）
         let open_tool_id: String = conn.query_row(
             "SELECT tool_id FROM service_open_tools WHERE service_id=?1", [&service_id],
-            |r| r.get(0),
+            |r| r.get("tool_id"),
         ).unwrap_or_default();
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -303,13 +372,25 @@ pub fn add_service_from_template(
              FROM service_templates WHERE id=?1",
             [&template_id],
             |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?, row.get::<_, i32>(7)?, row.get::<_, bool>(8)?,
-                row.get::<_, bool>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?,
+                row.get::<_, String>("name")?,
+                row.get::<_, String>("command")?,
+                row.get::<_, String>("cwd")?,
+                row.get::<_, String>("watch_paths")?,
+                row.get::<_, String>("watch_include")?,
+                row.get::<_, String>("watch_exclude")?,
+                row.get::<_, String>("env_vars")?,
+                row.get::<_, i32>("restart_mode")?,
+                row.get::<_, bool>("enabled")?,
+                row.get::<_, bool>("show_file_tree")?,
+                row.get::<_, String>("tool_commands")?,
+                row.get::<_, String>("open_tool_id")?,
             )),
         ).map_err(|e| format!("模板不存在: {}", e))?;
         let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
+        // 模板里的目录同样是"即将进入白名单的根"：套用同一套收口（历史模板值视为已授权，
+        // 但驱动器根/系统目录一律拒绝——模板可能是从别处导入或被写坏的）
+        crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
+        crate::commands::editor::ensure_watch_paths_allowed(&state, &watch_paths)?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = tx.query_row(
@@ -409,6 +490,9 @@ pub fn update_service_template(
         serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
             .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
     }
+    // 模板目录同样进入白名单根集合：套用配置目录收口（见 editor.rs 的"配置路径收口"）
+    crate::commands::editor::ensure_config_dir_allowed(&state, &cwd, "工作目录")?;
+    crate::commands::editor::ensure_watch_paths_allowed(&state, &params.watch_paths)?;
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
     state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
@@ -420,4 +504,145 @@ pub fn update_service_template(
         if affected == 0 { return Err("模板不存在".into()); }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{init_schema, Database};
+    use std::sync::Mutex;
+
+    /// 内存库 + 一个项目行（ARCH-4：这几条 SQL 路径此前零测试）
+    fn test_db() -> Database {
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库");
+        init_schema(&conn).expect("建表");
+        conn.execute(
+            "INSERT INTO projects (id, name, path, sort_index, created_at) VALUES ('p1','P','C:/p',0,'t')",
+            [],
+        ).expect("插入项目");
+        Database { conn: Mutex::new(conn) }
+    }
+
+    fn add_params(name: &str, cwd: &str) -> AddServiceParams {
+        AddServiceParams {
+            project_id: "p1".into(),
+            name: name.into(),
+            command: "npm run dev".into(),
+            cwd: cwd.into(),
+            watch_paths: String::new(),
+            env_vars: String::new(),
+            restart_mode: 1,
+            tool_commands: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_insert_service_assigns_increasing_sort_index_and_defaults() {
+        let db = test_db();
+        let a = insert_service_row(&db, &add_params("a", "C:/p"), "C:/p", "[]").unwrap();
+        let b = insert_service_row(&db, &add_params("b", "C:/p"), "C:/p", "[]").unwrap();
+        assert_eq!(a.sort_index, 0);
+        assert_eq!(b.sort_index, 1, "新增服务应排在末尾（MAX(sort_index)+1）");
+        // 监听路径缺省跟随工作目录（JSON 数组形式，供前端直接 parse）
+        assert_eq!(a.watch_paths, r#"["C:/p"]"#);
+        assert!(a.enabled, "新建服务默认启用");
+        assert!(!a.show_file_tree);
+        // 项目不存在时拒绝
+        let mut p = add_params("c", "C:/p");
+        p.project_id = "nope".into();
+        assert!(insert_service_row(&db, &p, "C:/p", "[]").is_err());
+    }
+
+    #[test]
+    fn test_update_service_follows_cwd_and_rejects_missing() {
+        let db = test_db();
+        let svc = insert_service_row(&db, &add_params("a", "C:/p"), "C:/p", "[]").unwrap();
+
+        let params = UpdateServiceParams {
+            id: svc.id.clone(),
+            name: "a2".into(),
+            command: "npm start".into(),
+            cwd: "C:/p/sub".into(),
+            // 仍等于"旧 cwd 拼接值" → 应跟随新 cwd
+            watch_paths: r#"["C:/p"]"#.into(),
+            watch_include: "*".into(),
+            watch_exclude: "".into(),
+            env_vars: "K=V".into(),
+            restart_mode: 2,
+            enabled: false,
+            show_file_tree: true,
+            tool_commands: "[]".into(),
+        };
+        let project_id = write_service_update(&db, &params, "C:/p/sub", "[]").unwrap();
+        assert_eq!(project_id, "p1", "应回传所属项目，供调用方刷新监听");
+        let got = db.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT name, cwd, watch_paths, enabled, show_file_tree FROM services WHERE id=?1",
+                [&svc.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)?, r.get::<_, i32>(4)?)),
+            ).unwrap())
+        }).unwrap();
+        assert_eq!(got.0, "a2");
+        assert_eq!(got.1, "C:/p/sub");
+        assert_eq!(got.2, r#"["C:/p/sub"]"#, "监听路径处于跟随状态时应随 cwd 更新");
+        assert_eq!(got.3, 0, "enabled=false 应写 0");
+        assert_eq!(got.4, 1, "show_file_tree=true 应写 1");
+
+        // 自定义监听路径不被 cwd 变化覆盖
+        let params2 = UpdateServiceParams { watch_paths: r#"["C:/other"]"#.into(), cwd: "C:/p/x".into(), ..params };
+        write_service_update(&db, &params2, "C:/p/x", "[]").unwrap();
+        let wp: String = db.with_conn(|c| Ok(c.query_row("SELECT watch_paths FROM services WHERE id=?1", [&svc.id], |r| r.get(0)).unwrap())).unwrap();
+        assert_eq!(wp, r#"["C:/other"]"#, "用户显式配置的监听路径不应被 cwd 覆盖");
+
+        // 不存在的 id：报错而不是静默成功
+        let missing = UpdateServiceParams { id: "nope".into(), ..params2 };
+        assert!(write_service_update(&db, &missing, "C:/p", "[]").is_err());
+    }
+
+    #[test]
+    fn test_write_service_order_only_touches_own_project() {
+        let db = test_db();
+        let a = insert_service_row(&db, &add_params("a", "C:/p"), "C:/p", "[]").unwrap();
+        let b = insert_service_row(&db, &add_params("b", "C:/p"), "C:/p", "[]").unwrap();
+        let c = insert_service_row(&db, &add_params("c", "C:/p"), "C:/p", "[]").unwrap();
+
+        write_service_order(&db, "p1", &[c.id.clone(), a.id.clone(), b.id.clone()]).unwrap();
+        let order = db.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM services WHERE project_id='p1' ORDER BY sort_index").unwrap();
+            let ids: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            Ok(ids)
+        }).unwrap();
+        assert_eq!(order, vec![c.id.clone(), a.id.clone(), b.id.clone()]);
+
+        // 含别的项目的 id：整条被忽略（不写、不报错），下标按"实际写入条数"连续编号，
+        // 因此 b 会落到 0（而不是被外来 id 顶到 1）
+        write_service_order(&db, "p1", &["other-project-svc".into(), b.id.clone()]).unwrap();
+        let order2 = db.with_conn(|conn| {
+            Ok(conn.query_row("SELECT id FROM services WHERE sort_index=0 AND project_id='p1'", [], |r| r.get::<_, String>(0)).unwrap())
+        }).unwrap();
+        assert_eq!(order2, b.id, "外来 id 不参与排序，本项目服务按下标连续重排");
+        let untouched: String = db.with_conn(|conn| {
+            Ok(conn.query_row("SELECT watch_paths FROM services WHERE id=?1", [&c.id], |r| r.get(0)).unwrap())
+        }).unwrap();
+        assert_eq!(untouched, r#"["C:/p"]"#, "未出现在列表中的服务不被改动");
+    }
+
+    #[test]
+    fn test_delete_service_row_removes_only_target() {
+        let db = test_db();
+        let a = insert_service_row(&db, &add_params("a", "C:/p"), "C:/p", "[]").unwrap();
+        let b = insert_service_row(&db, &add_params("b", "C:/p"), "C:/p", "[]").unwrap();
+        delete_service_row(&db, &a.id).unwrap();
+        let left = db.with_conn(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get::<_, i32>(0)).unwrap())
+        }).unwrap();
+        assert_eq!(left, 1);
+        // 删除不存在的行：不报错（幂等，重复删除不应失败）
+        delete_service_row(&db, &a.id).unwrap();
+        delete_service_row(&db, &b.id).unwrap();
+        let left2 = db.with_conn(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get::<_, i32>(0)).unwrap())
+        }).unwrap();
+        assert_eq!(left2, 0);
+    }
 }

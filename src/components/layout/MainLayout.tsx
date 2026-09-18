@@ -7,11 +7,13 @@ import { ProjectList } from './ProjectList';
 import { ProjectDetail } from './ProjectDetail';
 import { RestartConfirm } from './RestartConfirm';
 import { AiPanel } from '../ai/AiPanel';
+import { CloseGuard } from './CloseGuard';
 import { ProjectRail } from './ProjectRail';
-import { layoutApi, securityApi, projectApi } from '../../services/service';
+import { securityApi, projectApi } from '../../services/service';
+import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../stores/layoutStore';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
-import type { LogStream, ServiceLogEvent } from '../../services/logService';
+import type { LogStream, ServiceLogBatchEvent } from '../../services/logService';
 import { showNotification } from '../ui/Toast';
 
 export function MainLayout() {
@@ -28,7 +30,7 @@ export function MainLayout() {
   const logListenerRef = useRef<{ unlisten: () => void } | null>(null);
 
   useEffect(() => {
-    type Item = { serviceKey: string; stream: LogStream; data: string; timestamp?: string };
+    type Item = { serviceKey: string; stream: LogStream; data: string; timestamp?: string; seq: number };
     const batch: Item[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
@@ -39,14 +41,19 @@ export function MainLayout() {
       timer = null;
     };
 
-    listen<ServiceLogEvent>('service-log', (event) => {
+    // 后端每 ~50ms 发一批（`service-log-batch`，载荷是这个窗口内的所有行）。
+    // 这里保留一层 50ms 合帧：多个服务同时刷屏时把它们的批次再合并成一次 store 写入。
+    listen<ServiceLogBatchEvent>('service-log-batch', (event) => {
       if (disposed) return;
-      batch.push({
-        serviceKey: event.payload.service_key,
-        stream: event.payload.stream,
-        data: event.payload.data,
-        timestamp: event.payload.timestamp,
-      });
+      for (const line of event.payload.lines) {
+        batch.push({
+          serviceKey: event.payload.service_key,
+          stream: line.stream,
+          data: line.text,
+          timestamp: line.timestamp,
+          seq: line.seq,
+        });
+      }
       if (!timer) timer = setTimeout(flush, 50);
     }).then(fn => {
       if (disposed) { fn(); return; }
@@ -54,7 +61,7 @@ export function MainLayout() {
     }).catch((e) => {
       // 订阅失败 = 所有服务日志静默停止显示（且 logListenerRef 保持 null、清理变空操作）。
       // 原实现没有 catch：这里既会抛未处理的 rejection，又让用户完全无从察觉。
-      console.error('订阅 service-log 失败:', e);
+      console.error('订阅 service-log-batch 失败:', e);
       showNotification({
         variant: 'error',
         title: '日志订阅失败',
@@ -79,24 +86,18 @@ export function MainLayout() {
     return () => useRunningStore.getState().stopPolling();
   }, []);
 
-  // 防抖保存布局
-  const saveTimer = useRef<ReturnType<typeof setTimeout>>();
-  const saveLayout = useCallback((patch: Record<string, string>) => {
-    clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      layoutApi.save(patch).catch((e) => { console.error('保存布局失败:', e); showNotification({ variant: 'error', title: '保存布局失败' }); });
-    }, 500);
+  // 布局读写统一走 layoutStore（ARCH-6：键名集中、单次查库、统一防抖写）
+  const saveLayout = useCallback((patch: Parameters<typeof saveLayoutFn>[0]) => {
+    saveLayoutFn(patch);
   }, []);
-  // 卸载时清理定时器
-  useEffect(() => () => clearTimeout(saveTimer.current), []);
 
-  // 启动时从 DB 恢复布局
+  // 启动时从 DB 恢复布局（ensureLoaded 保证整个进程只查库一次，与其他读取方共享）
   useEffect(() => {
-    layoutApi.load().then(async (layout) => {
-      if (layout.selected_project_id) {
+    useLayoutStore.getState().ensureLoaded().then(async (layout) => {
+      if (layout[LAYOUT_KEYS.selectedProjectId]) {
         try {
-          const detail = await projectApi.getDetail(layout.selected_project_id);
-          setSelectedProjectId(layout.selected_project_id);
+          const detail = await projectApi.getDetail(layout[LAYOUT_KEYS.selectedProjectId]);
+          setSelectedProjectId(layout[LAYOUT_KEYS.selectedProjectId]);
           setSelectedProjectName(detail.project.name);
           setSelectedProjectPath(detail.project.path);
         } catch {
@@ -104,30 +105,30 @@ export function MainLayout() {
           setSelectedProjectId(null);
           setSelectedProjectName(null);
           setSelectedProjectPath(null);
-          saveLayout({ selected_project_id: '' });
+          saveLayout({ [LAYOUT_KEYS.selectedProjectId]: '' });
         }
       }
-      if (layout.left_panel_width) setLeftPanelWidth(Number(layout.left_panel_width));
-      if (layout.left_panel_collapsed === '1') setLeftPanelCollapsed(true);
-      if (layout.service_panel_collapsed === '1') setServicePanelCollapsed(true);
+      if (layout[LAYOUT_KEYS.leftPanelWidth]) setLeftPanelWidth(Number(layout[LAYOUT_KEYS.leftPanelWidth]));
+      if (layout[LAYOUT_KEYS.leftPanelCollapsed] === '1') setLeftPanelCollapsed(true);
+      if (layout[LAYOUT_KEYS.servicePanelCollapsed] === '1') setServicePanelCollapsed(true);
       setReady(true);
     }).catch(() => setReady(true));
-  }, []);
+  }, [saveLayout]);
 
   // 选中项目变化时保存
   useEffect(() => {
     if (!ready) return;
-    saveLayout({ selected_project_id: selectedProjectId ?? '' });
+    saveLayout({ [LAYOUT_KEYS.selectedProjectId]: selectedProjectId ?? '' });
   }, [selectedProjectId, ready, saveLayout]);
 
   useEffect(() => {
     if (!ready) return;
-    saveLayout({ service_panel_collapsed: servicePanelCollapsed ? '1' : '0' });
+    saveLayout({ [LAYOUT_KEYS.servicePanelCollapsed]: servicePanelCollapsed ? '1' : '0' });
   }, [servicePanelCollapsed, ready, saveLayout]);
 
   useEffect(() => {
     if (!ready) return;
-    saveLayout({ left_panel_collapsed: leftPanelCollapsed ? '1' : '0' });
+    saveLayout({ [LAYOUT_KEYS.leftPanelCollapsed]: leftPanelCollapsed ? '1' : '0' });
   }, [leftPanelCollapsed, ready, saveLayout]);
 
   // 文件监听由 ProjectDetail 统一管理（服务配置变更时需重启监听）
@@ -214,6 +215,7 @@ export function MainLayout() {
         <AiPanel cwd={selectedProjectPath} projectName={selectedProjectName} />
       </div>
       <RestartConfirm />
+      <CloseGuard />
       <StatusBar />
     </div>
   );

@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { openInExplorer } from '../../services/system';
 import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
 import { useSearchModalStore } from '../../stores/searchModal';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { showNotification } from '../ui/Toast';
+import { reportError } from '../../utils/error';
 
 interface Props {
   project: Project;
@@ -37,7 +38,7 @@ export function ProjectListItem({
   // 服务行右键菜单（搜索文件内容）
   const [svcMenu, setSvcMenu] = useState<{ x: number; y: number; svc: Service } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  /** 服务行右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  /** 服务行右键菜单位置（实测尺寸后夹进内容区，见 useContextMenuPosition） */
   const svcMenuPos = useContextMenuPosition(menuRef, svcMenu);
 
   useEffect(() => {
@@ -204,15 +205,10 @@ export function ProjectListItem({
         <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
           <button
             className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md hover:bg-nexus-accent/10 transition-colors group text-left"
-            onClick={async () => {
+            onClick={() => {
               const { cwd } = svcMenu.svc;
               setSvcMenu(null);
-              try {
-                await invoke('open_in_explorer', { path: cwd });
-              } catch (err) {
-                console.error('打开资源管理器失败:', err);
-                showNotification({ variant: 'error', title: '打开资源管理器失败' });
-              }
+              void openInExplorer(cwd);
             }}
           >
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" className="text-nexus-muted group-hover:text-nexus-accent flex-shrink-0">
@@ -229,8 +225,7 @@ export function ProjectListItem({
                 await navigator.clipboard.writeText(cwd);
                 showNotification({ variant: 'success', title: '路径已复制' });
               } catch (err) {
-                console.error('复制路径失败:', err);
-                showNotification({ variant: 'error', title: '复制路径失败', description: String(err) });
+                reportError('复制路径失败', err);
               }
             }}
           >
@@ -249,8 +244,7 @@ export function ProjectListItem({
                 await navigator.clipboard.writeText(name);
                 showNotification({ variant: 'success', title: '文件名已复制' });
               } catch (err) {
-                console.error('复制文件名失败:', err);
-                showNotification({ variant: 'error', title: '复制文件名失败', description: String(err) });
+                reportError('复制文件名失败', err);
               }
             }}
           >

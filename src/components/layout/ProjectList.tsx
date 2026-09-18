@@ -4,8 +4,7 @@ import { CreateProjectModal, EditProjectModal, DeleteProjectModal, DuplicateProj
 import { useProjectList } from '../../hooks/useProjectList';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
-import { invoke } from '@tauri-apps/api/core';
-import { showNotification } from '../ui/Toast';
+import { openInExplorer, openTerminal } from '../../services/system';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 
 interface Props {
@@ -84,22 +83,13 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
         <ContextMenu
           ctx={ctxMenu}
           menuRef={menuRef}
-          onOpenInExplorer={async () => {
-            try {
-              await invoke('open_in_explorer', { path: ctxMenu.path });
-            } catch (err) {
-              console.error('打开资源管理器失败:', err);
-              showNotification({ variant: 'error', title: '打开资源管理器失败' });
-            }
+          onOpenInExplorer={() => {
+            // 失败原因由 openInExplorer 统一提示（白名单拒绝与路径不存在文案一致，都带原因）
+            void openInExplorer(ctxMenu.path);
             setCtxMenu(null);
           }}
-          onOpenTerminal={async () => {
-            try {
-              await invoke('open_terminal', { path: ctxMenu.path });
-            } catch (err) {
-              console.error('打开终端失败:', err);
-              showNotification({ variant: 'error', title: '打开终端失败' });
-            }
+          onOpenTerminal={() => {
+            void openTerminal(ctxMenu.path);
             setCtxMenu(null);
           }}
           onDuplicate={() => { setDuplicateTarget({ id: ctxMenu.id, name: ctxMenu.name }); setCtxMenu(null); }}
@@ -214,7 +204,7 @@ function ContextMenu({ ctx, menuRef, onOpenInExplorer, onOpenTerminal, onDuplica
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  // 菜单位置：按点击点渲染后实测自身尺寸再夹进窗口（条目数会变，固定高度估算会切掉底部条目）
+  // 菜单位置：按点击点渲染后实测自身尺寸再夹进内容区（条目数会变，固定高度估算会切掉底部条目）
   const menuStyle = useContextMenuPosition(menuRef, ctx);
 
   return (

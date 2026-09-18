@@ -22,10 +22,12 @@ export function EditorTabs() {
   /** 批量关闭确认（含未保存标签时） */
   const [confirmMany, setConfirmMany] = useState<{ title: string; ids: string[]; note: string } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  /** 标签右键菜单位置（实测尺寸后夹进窗口，见 useContextMenuPosition） */
+  /** 标签右键菜单位置（实测尺寸后夹进内容区，见 useContextMenuPosition） */
   const tabMenuPos = useContextMenuPosition(menuRef, tabMenu);
   /** 标签滚动区（超出宽度时出现左右滚动按钮） */
   const tabsScrollRef = useRef<HTMLDivElement | null>(null);
+  /** 横向滚动处理的 rAF 合帧句柄（见 onTabsScroll） */
+  const scrollRafRef = useRef<number | null>(null);
   /** 内容溢出（标题栏容不下标签）→ 显示滚动按钮；常驻不随滚动位置消失 */
   const [showScrollBtns, setShowScrollBtns] = useState(false);
   /** 是否已滚到边界（到边界时按钮禁用置灰，但不消失） */
@@ -57,8 +59,22 @@ export function EditorTabs() {
     if (!el) return;
     const ro = new ResizeObserver(updateScrollButtons);
     ro.observe(el);
-    return () => ro.disconnect();
-  }, [tabs.length, updateScrollButtons]);
+    return () => { ro.disconnect(); if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current); };
+  }, [updateScrollButtons]);
+
+  /**
+   * 滚动处理：rAF 合帧。
+   * scroll 事件的派发频率与合成帧挂钩（横滚时每秒可达上百次），而每次都要读
+   * scrollWidth/clientWidth/scrollLeft（强制布局）并触发 3 次 setState——
+   * 一帧最多算一次即可（与 ResizablePanel/SearchResultPanel 的拖拽合帧同策略）。
+   */
+  const onTabsScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      updateScrollButtons();
+    });
+  }, [updateScrollButtons]);
 
   /** 滚动按钮：每次滚 300px（约一个半标签宽），平滑滚动 */
   const scrollTabs = (dir: 1 | -1) => {
@@ -135,7 +151,7 @@ export function EditorTabs() {
         <div
           ref={tabsScrollRef}
           className="flex flex-1 overflow-x-auto"
-          onScroll={updateScrollButtons}
+          onScroll={onTabsScroll}
         >
           {tabs.map(tab => {
           const isActive = activeTabId === tab.id;
