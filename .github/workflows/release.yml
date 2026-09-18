@@ -1,0 +1,73 @@
+name: Release
+
+# 发版：push 一个 v* tag → 在 windows runner 上打包 → 附到 GitHub Release（草稿）
+#
+# 为什么不并进 ci.yml：门禁只需要读代码（那里的"权限最小化"注释是刻意的），而发布必须写
+# contents 才能建 release、传 assets。合在一个文件里，就得把一个只在打 tag 时才跑的能力
+# 变成整个门禁的常驻权限。
+#
+# 触发条件是**打了 tag 之后**：workflow 文件本身要先在 main 上，tag 指向的提交认它。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # 与门禁同一个 runner：这是 Windows 应用（NSIS/MSI 打包 + WebView2），换平台没有意义
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号散在三处（package.json / tauri.conf.json / Cargo.toml），而安装包的文件名取自
+      # tauri.conf.json、release 的 tag 取自这次 push。两者不一致时，发出去的包与 tag 对不上号，
+      # 而 release 一旦公开就难收回（下载链接可能已经被转发）。先挡一道。
+      - name: 校验 tag 与 tauri.conf.json 版本一致
+        shell: bash
+        run: |
+          V=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 tauri.conf.json 的 version $V 不一致（应为 v$V）"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      # 不用另跑前端构建：tauri.conf.json 的 beforeBuildCommand 是 `npm run build`（tsc && vite build）
+      #
+      # 先建成草稿：产物要在 GitHub 上亲眼确认（文件在不在、名字对不对）再点发布——
+      # 这一步是人眼能拦住的最后一道，发布后就没有回头路了
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Nexus ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
+          releaseBody: |
+            Windows 安装包，两个任选其一：
+
+            - **x64-setup.exe** — NSIS 安装器，双击即装
+            - **x64_en-US.msi** — MSI，适合静默 / 批量部署
+
+            系统要求：Windows 10 / 11（依赖系统自带的 WebView2）。
+
+            出问题时日志在 `~/.nexus/logs/nexus.log`。
