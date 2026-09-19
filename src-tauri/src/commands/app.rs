@@ -11,6 +11,17 @@ use tauri_plugin_dialog::DialogExt;
 /// 退出流程是否已启动（幂等：前端按钮可能连点、RunEvent::Exit 也可能兜底再来一次）
 static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// 当前应用版本号（"检查更新"拿它跟 GitHub 上的最新 release 比）。
+///
+/// 为什么由后端答而不是前端读 `package.json`：那是 npm 侧的版本号，跟打包出来的
+/// 安装包未必同步（本项目是同一份改动里改四处才保证一致）；`CARGO_PKG_VERSION`
+/// 才是**这个二进制自己的**版本——用户装的、界面显示的、"有没有新版"比较的，
+/// 从此是同一个数。
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// 发起退出：在**独立线程**里做资源清理，完成后再退出进程。
 ///
 /// 为什么异步：`cleanup_resources` → `stop_all()` 会对每个服务串行执行

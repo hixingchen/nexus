@@ -251,6 +251,7 @@ pub fn run() {
             commands::ai::ai_panel_focus,
             commands::app::prepare_exit,
             commands::app::pick_directory,
+            commands::app::get_app_version,
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
