@@ -319,6 +319,13 @@ export const projectApi = {
 export interface RunningService {
   service_id: string;
   project_id: string;
+  /**
+   * 正在跟随的日志文件（null/缺省 = 没在跟随）。
+   *
+   * 服务用 `start` 另开窗口跑时（Tomcat 的 startup.bat），stdout 拿不到内容，
+   * 面板读的是它自己写的日志文件——这里告诉前端跟的是哪个文件，菜单据此提供"取消跟随"。
+   */
+  followed_log?: string | null;
 }
 
 /** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */
@@ -358,6 +365,10 @@ export const processApi = {
 
   /** 获取运行状态总览（运行中 + 意外失败） */
   getRunning: () => invoke<ProcessStatus>('get_running'),
+
+  /** 取消跟随日志文件（服务本身不受影响）；返回被取消的文件路径 */
+  unfollowLog: (serviceId: string) =>
+    invoke<string | null>('unfollow_service_log', { serviceId }),
 
   /** 执行工具命令 */
   runToolCommand: (serviceId: string, commandId: string, runId: string) =>

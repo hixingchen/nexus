@@ -162,6 +162,16 @@ export function useProjectDetail(projectId: string) {
     return failed.some(f => f.service_id === svc.id);
   }, [failed]);
 
+  /**
+   * 该服务正在跟随的日志文件路径（null = 没在跟随）。
+   *
+   * 数据随运行状态那条 3 秒轮询一起回来（后端 `get_running` 里带上），
+   * 右键菜单据此显示「取消跟随日志文件」并标出跟的是哪个文件。
+   */
+  const followedLogOf = useCallback((svc: Service) => {
+    return running.find(r => r.service_id === svc.id)?.followed_log ?? null;
+  }, [running]);
+
   const handleStartAll = useCallback(async () => {
     if (!detail) return;
     setLoading(p => ({ ...p, __all__: true }));
@@ -230,6 +240,7 @@ export function useProjectDetail(projectId: string) {
     reorderServicesLocal,
     isServiceRunning,
     isServiceFailed,
+    followedLogOf,
     handleStartAll,
     handleStopAll,
     handleDeleteService,

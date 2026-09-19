@@ -257,9 +257,10 @@ fn test_response_dtos_are_snake_case() {
         ])
     );
 
-    // 运行状态总览（前端按 exit_code 去重 + 失败态渲染）
-    let run = RunningService { service_id: "s".into(), project_id: "p".into() };
-    assert_eq!(keys_of(&run), sorted(&["service_id", "project_id"]));
+    // 运行状态总览（前端按 exit_code 去重 + 失败态渲染；followed_log 供右键菜单
+    // 显示「取消跟随日志（文件名）」）
+    let run = RunningService { service_id: "s".into(), project_id: "p".into(), followed_log: None };
+    assert_eq!(keys_of(&run), sorted(&["service_id", "project_id", "followed_log"]));
     let failed = FailedService { service_id: "s".into(), exit_code: Some(1), timestamp: "t".into() };
     assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp"]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };

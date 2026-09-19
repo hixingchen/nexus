@@ -225,6 +225,7 @@ pub fn run() {
             commands::process::start_service,
             commands::process::stop_service,
             commands::process::restart_service,
+            commands::process::unfollow_service_log,
             commands::process::start_project_services,
             commands::process::stop_project_services,
             commands::process::get_running,

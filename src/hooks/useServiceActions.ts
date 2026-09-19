@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react';
 import { processApi, type Service } from '../services/service';
 import { startSingleService, stopSingleService } from '../stores/serviceActions';
 import { reportError } from '../utils/error';
+import { notify } from '../utils/notify';
 
 /** 服务动作：卡片按钮与右键菜单共同的三档操作 */
 export type ServiceActionName = 'start' | 'stop' | 'restart';
@@ -42,5 +43,26 @@ export function useServiceActions(onDone: () => void) {
     setBusyId(null);
   }, [onDone]);
 
-  return { busyId, runAction };
+  /**
+   * 取消跟随日志文件（服务照常运行，只是不再读它的日志文件）。
+   *
+   * 与启停同为共享动作：两个入口（展开态卡片、收起态圆点条）都要能用，
+   * 各写一份的话必然有一处忘了刷新运行状态、菜单里的"取消跟随"项不消失。
+   */
+  const unfollowLog = useCallback(async (service: Service) => {
+    setBusyId(service.id);
+    try {
+      const cancelled = await processApi.unfollowLog(service.id);
+      // 没在跟随时后端返回 null：那是空操作，说一句"没在跟随"比弹出"已取消"更诚实
+      if (cancelled) {
+        notify({ title: '已取消跟随日志', description: cancelled });
+      }
+      onDone();
+    } catch (err: unknown) {
+      reportError('取消跟随日志失败', err);
+    }
+    setBusyId(null);
+  }, [onDone]);
+
+  return { busyId, runAction, unfollowLog };
 }

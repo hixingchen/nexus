@@ -73,7 +73,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
-    isServiceRunning, isServiceFailed, handleStartAll, handleStopAll,
+    isServiceRunning, isServiceFailed, followedLogOf, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
   // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）
@@ -408,6 +408,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         onEditService={openServiceEdit}
         isServiceRunning={isServiceRunning}
         isServiceFailed={isServiceFailed}
+        followedLogOf={followedLogOf}
         setDeleteSvcTarget={setDeleteSvcTarget}
         // 改名自 setShowAddServiceModal：添加服务不再是"开个弹窗"，而是打开右侧编辑面板
         onCreateService={handleCreateService}
@@ -507,6 +508,8 @@ interface ServicePanelProps {
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
+  /** 该服务正在跟随的日志文件（null = 没在跟随） */
+  followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -522,7 +525,7 @@ interface ServicePanelProps {
 
 function ServicePanel({
   services, collapsed, onToggle, splitPanel, editingService, onEditService,
-  isServiceRunning, isServiceFailed, setDeleteSvcTarget,
+  isServiceRunning, isServiceFailed, followedLogOf, setDeleteSvcTarget,
   onCreateService, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
 }: ServicePanelProps) {
@@ -536,6 +539,7 @@ function ServicePanel({
           services={services}
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
+          followedLogOf={followedLogOf}
           onToggle={onToggle}
           onViewLog={handleViewLog}
           onRunToolCommand={handleRunToolCommand}
@@ -554,6 +558,7 @@ function ServicePanel({
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
+          followedLogOf={followedLogOf}
           setDeleteSvcTarget={setDeleteSvcTarget}
           onCreateService={onCreateService}
           handleStartAll={handleStartAll}
@@ -571,11 +576,13 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, isServiceFailed, onToggle, onViewLog, onRunToolCommand, load,
+  services, isServiceRunning, isServiceFailed, followedLogOf, onToggle, onViewLog, onRunToolCommand, load,
 }: {
   services: Service[];
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
+  /** 该服务正在跟随的日志文件（null = 没在跟随） */
+  followedLogOf: (svc: Service) => string | null;
   onToggle: () => void;
   /** 收起态直接查看服务日志（不展开列） */
   onViewLog: (svc: Service) => void;
@@ -594,7 +601,7 @@ function CollapsedView({
   /** 右键菜单指向的服务（null = 菜单没开） */
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   // 动作与展开态的服务卡片共用一份实现（见 useServiceActions 的说明）
-  const { runAction } = useServiceActions(load);
+  const { runAction, unfollowLog } = useServiceActions(load);
   // 服务对象与工具绑定都现查、不快照：菜单可能开着好几秒，期间 services 会重新加载
   const menuSvc = menu ? services.find(s => s.id === menu.id) : undefined;
   const boundToolId = useToolStore(s => (menu ? s.bindings[menu.id] : undefined));
@@ -674,6 +681,7 @@ function CollapsedView({
           cwd={menuSvc.cwd}
           running={isServiceRunning(menuSvc)}
           failed={isServiceFailed(menuSvc)}
+          followedLog={followedLogOf(menuSvc)}
           openToolName={boundTool?.name ?? null}
           toolCommands={menuCommands}
           onViewLog={() => onViewLog(menuSvc)}
@@ -684,6 +692,7 @@ function CollapsedView({
           onOpenInExplorer={() => void openInExplorer(menuSvc.cwd)}
           onOpenTerminal={() => void openTerminal(menuSvc.cwd)}
           onRunCommand={cmd => onRunToolCommand(menuSvc.id, cmd.id, cmd.name)}
+          onUnfollowLog={() => void unfollowLog(menuSvc)}
           onClose={() => setMenu(null)}
         />,
         document.body,
@@ -708,6 +717,8 @@ interface ExpandedViewProps {
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
+  /** 该服务正在跟随的日志文件（null = 没在跟随） */
+  followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -724,7 +735,7 @@ interface ExpandedViewProps {
 
 function ExpandedView({
   services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
-  setDeleteSvcTarget, onCreateService,
+  followedLogOf, setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
   loading, load, onToggle,
@@ -739,6 +750,7 @@ function ExpandedView({
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
+          followedLogOf={followedLogOf}
           setDeleteSvcTarget={setDeleteSvcTarget}
           onCreateService={onCreateService}
           handleStartAll={handleStartAll}
@@ -767,6 +779,8 @@ interface ServiceSectionProps {
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
+  /** 该服务正在跟随的日志文件（null = 没在跟随） */
+  followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -783,7 +797,7 @@ interface ServiceSectionProps {
 
 function ServiceSection({
   services, editingService, onEditService,
-  isServiceRunning, isServiceFailed,
+  isServiceRunning, isServiceFailed, followedLogOf,
   setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
@@ -868,6 +882,7 @@ function ServiceSection({
                 service={svc}
                 running={isServiceRunning(svc)}
                 failed={isServiceFailed(svc)}
+                followedLog={followedLogOf(svc)}
                 isEditing={editingService?.id === svc.id}
                 onEdit={() => onEditService(svc)}
                 onRefresh={load}

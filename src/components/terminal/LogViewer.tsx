@@ -258,7 +258,11 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
  * memo：滚动、拖拽、窗口滑动都不重建行 DOM，只有该行内容或搜索词变化才重渲染
  */
 const LogRow = memo(function LogRow({ line, searchTerm }: { line: ServiceLogLine; searchTerm: string }) {
-  const cls = line.stream === 'system' ? 'log-line log-line-system' : 'log-line';
+  const cls = line.stream === 'system'
+    ? 'log-line log-line-system'
+    : line.stream === 'file'
+      ? 'log-line log-line-file'
+      : 'log-line';
   return (
     <div
       className={cls}

@@ -44,6 +44,10 @@ html, body, #root {
 /* 系统标记行（启动失败/退出码/停止）：黄色斜体，与进程输出区分 */
 .log-line-system { color: #d29922; font-style: italic; }
 
+/* 跟随日志文件的行：青色调。与 stdout 区分开是必要的——
+   "这行来自文件"能解释为什么面板里没有进程输出（服务另开窗口跑了） */
+.log-line-file { color: #79c0ff; }
+
 /* 日志行时间戳列：固定宽度保证对齐，不可选中 */
 .log-ts {
   color: #484f58;

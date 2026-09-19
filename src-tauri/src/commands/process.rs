@@ -211,6 +211,11 @@ pub struct ToolCommandLogBatchPayload {
 pub struct RunningService {
     pub service_id: String,
     pub project_id: String,
+    /// 正在跟随的日志文件（None = 没在跟随）
+    ///
+    /// 跟着运行状态一起返回，前端就能在已有的 3 秒轮询里拿到"在跟哪个文件"，
+    /// 不必为它单独开一条查询：菜单据此显示「取消跟随日志文件」并标出文件名。
+    pub followed_log: Option<String>,
 }
 
 /// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
@@ -249,6 +254,19 @@ pub async fn stop_service(app: tauri::AppHandle, service_id: String) -> Result<(
         let state = app.state::<AppState>();
         state.process_mgr.stop(&service_id)
     }).await.map_err(|e| format!("停止服务任务失败: {}", e))?
+}
+
+/// 取消跟随日志文件（服务本身不受影响）。
+///
+/// 返回被取消的文件路径：前端要能区分"确实取消了一个跟随"与"本来就没在跟随"，
+/// 否则用户点了一下没有任何反馈，不知道是成功了还是没生效。
+#[tauri::command]
+pub async fn unfollow_service_log(app: tauri::AppHandle, service_id: String) -> Result<Option<String>, String> {
+    if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(state.process_mgr.unfollow_log(&service_id))
+    }).await.map_err(|e| format!("取消跟随任务失败: {}", e))?
 }
 
 /// 重启服务（stop + start 两段等待 → 异步执行）
@@ -354,7 +372,10 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
         let state = app.state::<AppState>();
         Ok(ProcessStatus {
             running: state.process_mgr.running().into_iter()
-                .map(|(project_id, service_id)| RunningService { service_id, project_id })
+                .map(|(project_id, service_id)| {
+                    let followed_log = state.process_mgr.followed_log(&service_id);
+                    RunningService { service_id, project_id, followed_log }
+                })
                 .collect(),
             failed: state.process_mgr.failed(),
         })

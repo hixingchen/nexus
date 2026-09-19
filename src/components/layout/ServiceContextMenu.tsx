@@ -37,6 +37,20 @@ const PlayIcon = () => (
   </svg>
 );
 
+/** 跟随日志：文档 + 右下角折线（与"查看日志"区分：那个是折角的文档） */
+const FileIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M2 1.5h3L7.5 4v4.5H2z" /><path d="M5 1.5V4h2.5" />
+    <path d="M3 7.5h1.2l.8-1.4.8 2.2.7-1.1H8" />
+  </svg>
+);
+
+/** 路径最后一段（菜单里显示"跟的是哪个文件"，完整路径太长） */
+function fileNameOf(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 /** 停止：实心方块（与卡片 ■ 同形） */
 const StopIcon = () => (
   <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
@@ -53,6 +67,15 @@ interface ServiceContextMenuProps {
   running: boolean;
   /** 意外失败：显示 查看失败日志 / 重新启动（与卡片按钮一致） */
   failed: boolean;
+  /**
+   * 正在跟随的日志文件路径（null = 没在跟随）。
+   *
+   * 服务用 `start` 另开窗口跑时（Tomcat 的 startup.bat）面板读的是这个文件——
+   * 菜单里显示"跟的是哪个文件"并给一个取消入口，否则用户不知道那些蓝色日志从哪来。
+   */
+  followedLog: string | null;
+  /** 取消跟随日志文件（服务照常运行） */
+  onUnfollowLog: () => void;
   /** 绑定的打开工具名（null = 未绑定，不显示该项） */
   openToolName: string | null;
   toolCommands: ToolCommand[];
@@ -71,9 +94,9 @@ interface ServiceContextMenuProps {
 }
 
 export function ServiceContextMenu({
-  x, y, cwd, running, failed, openToolName, toolCommands, onViewLog,
+  x, y, cwd, running, failed, followedLog, openToolName, toolCommands, onViewLog,
   onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal,
-  onRunCommand, onDelete, onClose,
+  onRunCommand, onUnfollowLog, onDelete, onClose,
 }: ServiceContextMenuProps) {
   /** 所有条目共用的收尾：先执行动作再关菜单（与各站点迁移前的写法一致） */
   const run = (fn: () => void) => { fn(); onClose(); };
@@ -85,6 +108,16 @@ export function ServiceContextMenu({
         {running ? (
           <>
             {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看日志" tone="info" truncate onClick={() => run(onViewLog)} />}
+            {/* 只在真的跟随时出现：文件名写进 label（截断），用户这才知道面板里那批
+                蓝色日志读的是哪个文件 */}
+            {followedLog && (
+              <ContextMenuItem
+                icon={<FileIcon />}
+                label={`取消跟随日志（${fileNameOf(followedLog)}）`}
+                truncate
+                onClick={() => run(onUnfollowLog)}
+              />
+            )}
             <ContextMenuItem icon={<RestartIcon />} label="重启服务" tone="warning" truncate onClick={() => run(onRestart)} />
             <ContextMenuItem icon={<StopIcon />} label="停止服务" tone="error" truncate onClick={() => run(onStop)} />
           </>

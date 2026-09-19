@@ -14,6 +14,8 @@ interface Props {
   running: boolean;
   /** 意外失败（崩溃/秒退/spawn 失败）：显示"失败"按钮，点击可查看日志 */
   failed: boolean;
+  /** 正在跟随的日志文件（null = 没在跟随）：菜单据此给「取消跟随」入口 */
+  followedLog: string | null;
   isEditing: boolean;
   onEdit: () => void;
   onRefresh: () => void;
@@ -23,7 +25,7 @@ interface Props {
 }
 
 export function ServiceTreeEntry({
-  service, running, failed, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
+  service, running, failed, followedLog, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
 }: Props) {
   // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板）
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id });
@@ -55,7 +57,7 @@ export function ServiceTreeEntry({
   );
 
   // 服务动作与"服务列收起后的圆点条"共用一份实现（见 useServiceActions 的说明）
-  const { busyId, runAction } = useServiceActions(onRefresh);
+  const { busyId, runAction, unfollowLog } = useServiceActions(onRefresh);
   const busy = busyId === service.id;
 
   /** 卡片按钮入口：先阻止冒泡（卡片点击 = 打开编辑面板），再走共享动作 */
@@ -171,6 +173,7 @@ export function ServiceTreeEntry({
           cwd={service.cwd}
           running={running}
           failed={failed}
+          followedLog={followedLog}
           openToolName={boundTool?.name ?? null}
           toolCommands={toolCommands}
           onViewLog={onViewLog}
@@ -181,6 +184,7 @@ export function ServiceTreeEntry({
           onOpenInExplorer={() => void openInExplorer(service.cwd)}
           onOpenTerminal={() => void openTerminal(service.cwd)}
           onRunCommand={handleRunCommand}
+          onUnfollowLog={() => void unfollowLog(service)}
           onDelete={() => onContextMenu(service.id, service.name)}
           onClose={() => setContextMenu(null)}
         />,

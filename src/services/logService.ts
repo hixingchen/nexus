@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
-/// 日志来源：stdout/stderr 为进程输出，system 为生命周期标记（启动失败/退出码/停止）
-export type LogStream = 'stdout' | 'stderr' | 'system';
+/// 日志来源：stdout/stderr 为进程输出，system 为生命周期标记（启动失败/退出码/停止），
+/// file 为跟随服务自己写的日志文件（服务用 `start` 另开窗口跑时，stdout 拿不到内容）
+export type LogStream = 'stdout' | 'stderr' | 'system' | 'file';
 
 /// 单条服务日志
 export interface ServiceLogLine {

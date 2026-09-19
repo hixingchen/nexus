@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
+
+use super::logfile;
 
 /// 日志缓冲区 key 类型，使用 Arc<str> 避免热路径 String clone
 type LogKey = Arc<str>;
@@ -113,6 +116,89 @@ where
             break;
         }
     })
+}
+
+/// 解码一行字节：先 UTF-8，失败按 GB18030 回退。
+///
+/// 不能"跳过解不出来的行"——中文 Windows 上 cmd 的报错就是 GBK，跳过它等于把唯一的原因
+/// 删掉（用户看到的是"命令失败（退出码 1）。（无输出）"）。服务 stdout（`BoundedLineReader`）
+/// 与日志文件跟随（`spawn_log_tailer`）共用这一条口径。
+fn decode_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => encoding_rs::GB18030.decode(e.as_bytes()).0.into_owned(),
+    }
+}
+
+/// 文件的身份（Windows：卷序列号 + 文件索引；Unix：设备号 + inode）。
+///
+/// 跟随器用它判断"路径上现在这个文件还是不是我打开的那个"——这是识别轮转的**正确**判据。
+/// 只比大小会在真实情况下失手（实测踩到过）：新文件一上来就比在旧文件里读到的位置大
+/// （小日志轮转很容易撞上），以及复制截断（copytruncate）把同一个文件清零。
+/// 平台拿不到身份时返回 None，调用方退回按大小判断（宁可少识别一次轮转，也不能误判）。
+///
+/// Windows 侧自己调 Win32（`std::os::windows::fs::MetadataExt::file_index` 至今仍是
+/// unstable 的 `windows_by_handle`）：
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    type Handle = isize;
+    type Bool = i32;
+    type Dword = u32;
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    // BY_HANDLE_FILE_INFORMATION：全 DWORD/两 DWORD 的 FILETIME，共 52 字节，无填充
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        attributes: Dword,
+        creation: FileTime,
+        last_access: FileTime,
+        last_write: FileTime,
+        volume_serial: Dword,
+        size_high: Dword,
+        size_low: Dword,
+        links: Dword,
+        index_high: Dword,
+        index_low: Dword,
+    }
+    extern "system" {
+        fn GetFileInformationByHandle(handle: Handle, info: *mut ByHandleFileInformation) -> Bool;
+    }
+    unsafe {
+        let mut info: ByHandleFileInformation = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle() as Handle, &mut info) == 0 {
+            return None;
+        }
+        let index = ((info.index_high as u64) << 32) | info.index_low as u64;
+        Some((info.volume_serial as u64, index))
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn file_identity(_file: &std::fs::File) -> Option<(u64, u64)> {
+    None
+}
+
+/// 把"距 UNIX 纪元的毫秒"换算成 [`SystemTime`]（给"文件修改时间是否晚于服务启动"用）
+fn system_time_from_millis(ms: u64) -> SystemTime {
+    let now = SystemTime::now();
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(ms);
+    now.checked_sub(Duration::from_millis(now_ms.saturating_sub(ms))).unwrap_or(now)
 }
 
 /// 按 char 边界截断超长日志行，防止单行超大输出撑爆缓冲和 IPC payload
@@ -246,12 +332,8 @@ impl<R: BufRead> Iterator for BoundedLineReader<R> {
             }
             // 未以换行结束 = 该行被截断，剩余部分需要在下一轮丢弃
             self.draining = self.buf.last() != Some(&b'\n');
-            // 3. 解码：先 UTF-8，失败回退 GB18030（与编辑器读文件、`node.rs` 解码命令输出同一口径）。
-            //    不能"跳过该行"——中文 Windows 上 cmd 的报错就是 GBK，跳过它等于把唯一的原因删掉
-            let mut s = match String::from_utf8(std::mem::take(&mut self.buf)) {
-                Ok(s) => s,
-                Err(e) => encoding_rs::GB18030.decode(e.as_bytes()).0.into_owned(),
-            };
+            // 3. 解码（与编辑器读文件、`node.rs` 解码命令输出同一口径）
+            let mut s = decode_lossy(std::mem::take(&mut self.buf));
             if s.ends_with('\n') {
                 s.pop();
                 if s.ends_with('\r') {
@@ -451,6 +533,142 @@ fn spawn_log_reader(
         })
 }
 
+/// 起一个日志文件跟随线程：把文件里**新增**的内容按行接进服务日志（`stream = "file"`）。
+///
+/// 用途：服务把真正的进程另开窗口跑（见 `AdoptedChild`）时 stdout 指望不上，
+/// 跟它写的日志文件是唯一能拿到内容的现实路径。
+///
+/// 每条行为都对应一个真实的坑：
+/// - **从末尾开始**：跑了很久的服务日志可能几百 MB，从头发一遍既灌满缓冲又猛刷界面，
+///   而用户要的是"从现在起发生什么"；
+/// - **轮转按大小识别**：Tomcat 每天换个新名字、ActiveMQ 是"改名 + 新建"
+///   （`activemq.log` → `activemq.log.1`）——手里的句柄会一直指向被改名的旧文件，
+///   所以判据是"路径上现在这个文件比读到的位置短"，短了就重开、从头读；
+/// - **残行有界**：最后一行可能只写了一半，要攒着等换行；但必须限长，
+///   否则一个不写换行的程序能让这个缓冲无限涨（超长即丢弃并标记，同 `read_log_lines`）；
+/// - **打开句柄带 `FILE_SHARE_DELETE`**（Rust 默认的共享模式）：不带会**锁住文件**，
+///   让服务自己的轮转失败——"监听日志"把被监听方搞坏是最难查的那种 bug；
+/// - **停止标志**：服务停止或用户取消跟随后立刻退出。否则 `stop_locked` 把日志缓冲
+///   `remove` 之后，跟随线程又把它写回来，那块内存就一直留在表里了。
+///
+/// `file` 与 `offset` 由**调用线程**备好（打开 + 定位到末尾），不在这里做：
+/// 跟随的时间边界必须是"调用 follow_log 的那一刻"。放到线程体里做的话，
+/// "跟随已记下、线程还没被调度"这段窗口内服务写的行会被当成历史丢掉（实测漏过一行）。
+///
+/// 参数多：每一项都是线程要独占的资源（文件句柄、待发行缓冲、两个停止标志、存活计数……），
+/// 与 `spawn_log_reader` 同理——合并成结构体只是把这份清单换个地方列，收益为零。
+#[allow(clippy::too_many_arguments)]
+fn spawn_log_tailer(
+    mut file: std::fs::File,
+    mut offset: u64,
+    path: PathBuf,
+    key: LogKey,
+    log_buffers: LogBuffers,
+    pending: Arc<Mutex<Vec<Arc<LogLine>>>>,
+    alive: Arc<std::sync::atomic::AtomicUsize>,
+    follow_stop: Arc<AtomicBool>,
+    service_stop: Arc<AtomicBool>,
+    done_tx: std::sync::mpsc::Sender<()>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("nexus-logtail-{}", key))
+        .spawn(move || {
+            let mut partial: Vec<u8> = Vec::new();
+            // 从文件中间开始读时第一段是半行：丢到第一个换行为止（开始处 offset > 0 即回看）
+            let mut skip_partial = offset > 0;
+            // 上一段因超长被丢弃：先把该行剩余字节丢到行尾，别再重复输出
+            let mut overflowing = false;
+            // 与进程 stdout 走同一条落库路径：上限、序号、刷新帧合并全部继承
+            let emit = |text: String| {
+                let line = push_log_line(&log_buffers, &key, "file", text, chrono::Utc::now().to_rfc3339(), false);
+                if let Ok(mut p) = pending.lock() {
+                    p.push(line);
+                }
+            };
+            let stopped = || follow_stop.load(Ordering::Relaxed) || service_stop.load(Ordering::Relaxed);
+            loop {
+                if stopped() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(LOG_FOLLOW_POLL_MS));
+                if stopped() {
+                    break;
+                }
+                // 1) 轮转 / 清空 / 落后
+                //
+                // 文件暂时打不开（轮转的空档）：这轮不读——继续读手里那个已被改名的旧文件，
+                // 只会把"旧文件末尾"当成新内容；下一轮再看新文件有没有就位
+                let Ok(current) = std::fs::File::open(&path) else { continue };
+                // 身份不同 = 换了文件（改名 + 新建 / 复制截断 / 换目录都覆盖）；
+                // 同一文件但变短 = 就地清空。两种都换成新句柄、从头跟。
+                let same_file = match (file_identity(&file), file_identity(&current)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true, // 拿不到身份信息：按同一文件处理，靠大小兜底
+                };
+                let len = current.metadata().map(|m| m.len()).unwrap_or(offset);
+                if !same_file || len < offset {
+                    file = current;
+                    offset = 0;
+                    partial.clear();
+                    overflowing = false;
+                    emit("── 日志文件已轮转或被清空，从新文件开头继续 ──".to_string());
+                }
+                if len.saturating_sub(offset) > LOG_FOLLOW_MAX_LAG {
+                    // 追不上了：跳到接近末尾，并说清跳过了多少（不静默丢内容）
+                    let target = len - LOG_FOLLOW_MAX_LAG / 2;
+                    if file.seek(SeekFrom::Start(target)).is_ok() {
+                        let skipped = target.saturating_sub(offset);
+                        offset = target;
+                        partial.clear();
+                        overflowing = false;
+                        emit(format!("── 日志写入快于读取，已跳过 {} 字节 ──", skipped));
+                    }
+                }
+                // 2) 读到 EOF（文件不长时一次就完）
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = match file.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            log::warn!("[nexus] 读取日志文件失败 {}: {}", path.display(), e);
+                            break;
+                        }
+                    };
+                    offset += n as u64;
+                    partial.extend_from_slice(&buf[..n]);
+                    // 3) 切出完整行（残行留在 partial 里等下一轮）
+                    while let Some(pos) = partial.iter().position(|&b| b == b'\n') {
+                        let mut line: Vec<u8> = partial.drain(..=pos).collect();
+                        line.pop(); // '\n'
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        if skip_partial {
+                            skip_partial = false; // 回看起点的半行：丢掉
+                            continue;
+                        }
+                        if overflowing {
+                            overflowing = false; // 该行前半段已标记过，剩余部分丢弃
+                            continue;
+                        }
+                        emit(prepare_log_text(decode_lossy(line), false));
+                    }
+                    // 残行超长：输出截断版并进入"丢到行尾"状态
+                    if partial.len() > MAX_READ_LINE_BYTES {
+                        let text = prepare_log_text(decode_lossy(std::mem::take(&mut partial)), false);
+                        emit(format!("{}… [已截断]", text));
+                        overflowing = true;
+                    }
+                }
+            }
+            // 退出前递减存活计数：发射线程据此收尾（含最后一批）
+            alive.fetch_sub(1, Ordering::SeqCst);
+            drop(done_tx);
+        })
+}
+
 /// 取生命周期锁（NEW-17）。锁中毒同样继续用：进程生命周期离硬件更近，
 /// 让一次无关的 panic 变成"该服务永远起不来"是更坏的结局。
 fn lock_lifecycle<'a>(lock: &'a Arc<Mutex<()>>, key: &str) -> std::sync::MutexGuard<'a, ()> {
@@ -462,24 +680,104 @@ fn lock_lifecycle<'a>(lock: &'a Arc<Mutex<()>>, key: &str) -> std::sync::MutexGu
 
 // ─── 类型别名 ───────────────────────────────────────────────
 
-/// 进程清理条目：(key, pid, child, done_stdout, done_stderr, stop_flag)
-/// done_* 为 reader 线程结束信号：线程退出时发送端 drop，recv 返回 Disconnected
-type ProcessCleanupEntry = (
-    String,
-    u32,
-    Child,
-    Option<Receiver<()>>,
-    Option<Receiver<()>>,
-    Option<Arc<AtomicBool>>,
-);
+/// 跟随文件的轮询间隔。比日志发射窗口（50ms）大得多：查一次文件大小、读一段增量
+/// 没必要那么勤，而每次轮询最多读到 EOF 为止。
+const LOG_FOLLOW_POLL_MS: u64 = 250;
+
+/// 跟随起点的回看字节数：从"文件末尾往前这么多"开始读。
+///
+/// 为什么不直接从末尾读起：服务刚启动那几行恰恰是最想看的（Tomcat 的启动日志、
+/// broker 起没起来），而从末尾读起会让"刚跟上时文件已经写完了"表现为**面板空白** ——
+/// 实测就是这么收到的反馈。回看量有界：既不给跑了几个月的日志灌历史
+/// （缓冲上限本身也会裁），也保证一跟上面板就有内容。
+const LOG_FOLLOW_SEED_BYTES: u64 = 64 * 1024;
+
+/// 允许落后的字节上限。超过就跳到接近末尾并**明说**跳过了多少：
+/// 没有这条，"服务每秒写几 MB、我们每 250ms 读一段"会永远追不上，
+/// 面板显示的是几分钟前的内容却看不出异常。4MB / 250ms ≈ 16MB/s 的消化能力。
+const LOG_FOLLOW_MAX_LAG: u64 = 4 * 1024 * 1024;
+
+/// 认领后找日志文件的采样状态（见 `ProcessManager::probe_log_file`）
+///
+/// 为什么要跨轮保存：判据是"文件在不在长"，那至少要两次采样。只采一次就只能退回
+/// "谁的修改时间最新"——那正是实测选错文件（选中只写两行的次要日志）、面板永远空白的原因。
+struct LogProbe {
+    /// 首次采样：候选与当时的字节数
+    first: Vec<logfile::LogCandidate>,
+}
+
+/// 正在跟随的日志文件
+///
+/// 为什么要有它：`cmd /C startup.bat` 这类服务把真正的进程另开窗口跑（见 `AdoptedChild`），
+/// stdout 不进我们的管道——那种情况下日志文件是**唯一**的内容来源。
+struct LogFollow {
+    /// 被跟随的文件路径（写进日志、供前端显示"在跟哪个文件"）
+    path: String,
+    /// 本跟随自己的停止标志。与服务的 `stop_flag` 是两个：取消跟随不该停服务，
+    /// 停服务要连跟随一起停（见 `spawn_log_tailer` 里的两个判断）
+    stop: Arc<AtomicBool>,
+    /// 跟随线程结束信号：停止时用它限时等待（同 reader 线程的 done_*）
+    done: Option<Receiver<()>>,
+}
+
+/// 认领到的游离进程：服务"另开窗口"跑起来的那个进程。
+///
+/// 为什么要有它：`cmd /C startup.bat` 里 catalina.bat 用的是 cmd 内建命令 `start`，
+/// 它给子进程**新分配一个控制台**（CreateProcess + CREATE_NEW_CONSOLE）。后果有三：
+/// ① 那个进程的输出不进我们的管道（面板看不到，日志只能另找来源）；
+/// ② cmd 不等待它就退出 → 面板随即显示"已退出（退出码 0）"，是**谎报**；
+/// ③ 点"停止"时进程表里已经没有这个服务了，是空操作 —— Tomcat 会一直跑下去。
+/// 认领（按父 pid 链走查 + 启动时刻校验，见 `super::winproc`）之后，服务继续算运行中，
+/// 停止能连同它一起结束，"停止"与"运行状态"两个语义都恢复正确。
+struct AdoptedChild {
+    pid: u32,
+    /// 映像名（`java.exe` 等），只用于日志里说清接管了谁
+    name: String,
+    /// 句柄：判存活与取退出码都不受 pid 复用影响（见 `winproc::OwnedProcess`）
+    handle: super::winproc::OwnedProcess,
+}
+
+/// 进程清理条目：停止 / 退出时交给 `cleanup_process` 的全部信息。
+///
+/// 原为 6 元组；加上认领信息、且 `child` 变成 `Option` 之后，位置已经读不出含义，
+/// 按项目标准（参数 >4 个用结构体，见 `ServiceSpawn`）改为具名字段。
+struct CleanupEntry {
+    key: String,
+    pid: u32,
+    /// 直接子进程的启动时刻（ms）：收游离后代时用它排除 pid 复用
+    started_at: u64,
+    /// 直接子进程；已被认领路径回收（`wait` 过）时为 None
+    child: Option<Child>,
+    /// 认领到的游离进程：停止时与直接子进程一起结束
+    adopted: Vec<AdoptedChild>,
+    /// 正在跟随的日志文件：停止时一并收掉（否则线程会往已清空的缓冲里写）
+    follow: Option<LogFollow>,
+    done_stdout: Option<Receiver<()>>,
+    done_stderr: Option<Receiver<()>>,
+    stop_flag: Option<Arc<AtomicBool>>,
+}
 
 // ─── ProcessManager ─────────────────────────────────────────
 
 struct ProcessInfo {
-    child: Child,
+    /// 直接子进程（cmd / sh）。认领游离进程后置 None（它已退出并被回收）
+    child: Option<Child>,
     pid: u32,
+    /// 直接子进程的启动时刻（ms）。认领游离进程时用它排除 pid 复用：
+    /// 系统会把旧 pid 分给无关进程，"父 pid 恰好指向我们"这件事本身不足以下结论
+    spawn_started_at: u64,
+    /// 认领到的游离进程（见 `AdoptedChild`）
+    adopted: Vec<AdoptedChild>,
+    /// 工作目录：认领后用它去找服务在写的日志文件（见 `core::logfile`）
+    cwd: String,
+    /// 正在跟随的日志文件（见 `LogFollow`）
+    follow: Option<LogFollow>,
+    /// 认领后找日志文件的采样状态（见 `LogProbe`）；None = 还没采过样
+    log_probe: Option<LogProbe>,
     /// 所属项目（供 get_running 返回项目级运行状态）
     project_id: String,
+    /// 日志批量发射端（启动时传入）。跟随日志文件要按需另起发射线程，用它
+    log_sink: LogSink,
     /// reader 线程结束信号（stdout/stderr）
     done_stdout: Option<Receiver<()>>,
     done_stderr: Option<Receiver<()>>,
@@ -725,12 +1023,26 @@ impl ProcessManager {
         if procs.contains_key(key) {
             // TOCTOU 竞态：另一个线程已插入同 key，清理当前创建的资源
             log::warn!("[nexus] TOCTOU 竞态: {} 已在运行中，清理泄漏的子进程", key);
-            cleanup_process(pid, child, done_rx_opt.take(), Some(done_rx2), Some(Arc::clone(&stop_flag)));
+            cleanup_process(CleanupEntry {
+                key: key.to_string(), pid,
+                // 这个进程刚 spawn 出来、还活着，取不到时间的概率极低；取不到记 0，
+                // 只会让"游离后代"的时间校验最宽松（这条路径随后就把它杀掉了）
+                started_at: process_start_time_millis(pid).unwrap_or(0),
+                child: Some(child), adopted: Vec::new(), follow: None,
+                done_stdout: done_rx_opt.take(), done_stderr: Some(done_rx2),
+                stop_flag: Some(Arc::clone(&stop_flag)),
+            });
             return Err(format!("{} 已在运行中", key));
         }
+        // 直接子进程的启动时刻：认领游离进程时用它排除 pid 复用。
+        // 取不到（进程已退出/无权限）时记 0——0 让"晚于它"的校验最宽松，
+        // 而这个分支紧随其后就会被 running() 判成"已退出"，不会留下长期影响
+        let spawn_started_at = process_start_time_millis(pid).unwrap_or(0);
         procs.insert(key.to_string(), ProcessInfo {
-            child, pid,
+            child: Some(child), pid, spawn_started_at, adopted: Vec::new(),
+            cwd: cwd.to_string(), follow: None, log_probe: None,
             project_id: project_id.to_string(),
+            log_sink: Arc::clone(&log_sink),
             done_stdout: done_rx_opt,
             done_stderr: Some(done_rx2),
             stop_flag,
@@ -749,20 +1061,17 @@ impl ProcessManager {
         log::info!("[nexus] 停止服务: {}", key);
 
         // Phase 1: 从 map 中移除 entry，释放锁
-        let entry: Option<ProcessCleanupEntry> = {
+        let entry: Option<CleanupEntry> = {
             let mut procs = self.processes.lock().unwrap_or_else(|e| {
                 log::error!("[nexus] processes 锁已中毒，继续使用: {}", e);
                 e.into_inner()
             });
-            procs.remove(key).map(|mut info| {
-                (key.to_string(), info.pid, info.child,
-                 info.done_stdout.take(), info.done_stderr.take(), Some(info.stop_flag))
-            })
+            procs.remove(key).map(|mut info| take_cleanup_entry(key.to_string(), &mut info))
         };
 
         // Phase 2: 在锁外执行清理
-        if let Some((_key, pid, child, done_stdout, done_stderr, stop_flag)) = entry {
-            cleanup_process(pid, child, done_stdout, done_stderr, stop_flag);
+        if let Some(entry) = entry {
+            cleanup_process(entry);
         } else {
             log::debug!("[nexus] stop: 服务 {} 未在运行，忽略", key);
         }
@@ -812,40 +1121,289 @@ impl ProcessManager {
         }
     }
 
-    /// 返回当前运行中的 (project_id, service_id) 列表
+    /// 跟随某个日志文件：把它的新增内容接进服务日志（`stream = "file"`）。
+    ///
+    /// 已跟随的会被替换（同一个服务只跟一个文件：多来源会让面板没法说清每行来自哪）。
+    /// 文件打不开时**当场报错**，不留到线程里静默失败——前端要能说出为什么。
+    pub fn follow_log(&self, key: &str, path: &str) -> Result<(), String> {
+        // 与 start/stop 同一把生命周期锁：否则"轮询触发的自动跟随"与"用户手动跟随"
+        // 可能同时给一个服务起两个跟随线程
+        let lock = self.lifecycle_lock(key);
+        let _guard = lock_lifecycle(&lock, key);
+        self.unfollow_log_locked(key);
+
+        let (sink, service_stop) = {
+            let procs = self.processes.lock().unwrap_or_else(|e| {
+                log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+                e.into_inner()
+            });
+            let Some(info) = procs.get(key) else {
+                return Err(format!("服务 {} 未在运行，无法跟随日志文件", key));
+            };
+            (Arc::clone(&info.log_sink), Arc::clone(&info.stop_flag))
+        };
+        // 打开 + 定位到末尾都在这里（调用线程）做完，见 `spawn_log_tailer` 的说明：
+        // 跟随的时间边界就是这一刻，之后写进文件的每一行都会进面板
+        let mut file = std::fs::File::open(path).map_err(|e| format!("打开日志文件失败: {}（{}）", path, e))?;
+        let len = file.seek(SeekFrom::End(0)).map_err(|e| format!("定位日志文件末尾失败: {}（{}）", path, e))?;
+        // 回看一段（见 LOG_FOLLOW_SEED_BYTES）：服务刚启动那几行是最想看到的内容。
+        // 必须**无条件** seek：文件比回看窗口小时 offset 为 0，而此刻文件位置还在末尾
+        // （上一步 seek(End) 留下的），不 seek 回去就成了"什么都不带出来"
+        let offset = len.saturating_sub(LOG_FOLLOW_SEED_BYTES);
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("定位日志文件跟随起点失败: {}（{}）", path, e))?;
+
+        let follow_stop = Arc::new(AtomicBool::new(false));
+        let pending: Arc<Mutex<Vec<Arc<LogLine>>>> = Arc::new(Mutex::new(Vec::new()));
+        // 自己的存活计数（初值 1）+ 自己的发射线程：与进程 stdout 的发射线程互不影响
+        // （stdout 那两个 reader 此时早已 EOF 退出，它们的发射线程也已经收尾）
+        let alive = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let log_key: LogKey = Arc::from(key);
+        let flush_sink = Arc::clone(&sink);
+        let flush_key = key.to_string();
+        spawn_log_flush_thread(
+            format!("nexus-followflush-{}", key),
+            Arc::clone(&pending),
+            Arc::clone(&alive),
+            move |batch| {
+                flush_sink(ServiceLogBatchPayload { service_key: flush_key.clone(), lines: batch });
+            },
+        )
+        .map_err(|e| format!("创建日志发射线程失败: {}", e))?;
+        spawn_log_tailer(
+            file,
+            offset,
+            PathBuf::from(path),
+            log_key,
+            Arc::clone(&self.log_buffers),
+            pending,
+            alive,
+            Arc::clone(&follow_stop),
+            service_stop,
+            done_tx,
+        )
+        .map_err(|e| format!("创建日志跟随线程失败: {}", e))?;
+
+        let mut procs = self.processes.lock().unwrap_or_else(|e| {
+            log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+            e.into_inner()
+        });
+        if let Some(info) = procs.get_mut(key) {
+            info.follow = Some(LogFollow {
+                path: path.to_string(),
+                stop: follow_stop,
+                done: Some(done_rx),
+            });
+        }
+        Ok(())
+    }
+
+    /// 取消跟随（服务本身不受影响），返回被取消的文件路径
+    pub fn unfollow_log(&self, key: &str) -> Option<String> {
+        let lock = self.lifecycle_lock(key);
+        let _guard = lock_lifecycle(&lock, key);
+        self.unfollow_log_locked(key)
+    }
+
+    fn unfollow_log_locked(&self, key: &str) -> Option<String> {
+        let mut procs = match self.processes.lock() {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+                e.into_inner()
+            }
+        };
+        let follow = procs.get_mut(key)?.follow.take()?;
+        follow.stop.store(true, Ordering::Relaxed);
+        Some(follow.path)
+    }
+
+    /// 取某服务的 (工作目录, 启动时刻)；服务不在表里时 None
+    fn cwd_and_start_for(&self, key: &str) -> Option<(String, u64)> {
+        let procs = self.processes.lock().ok()?;
+        let info = procs.get(key)?;
+        Some((info.cwd.clone(), info.spawn_started_at))
+    }
+
+    /// 当前跟随的文件路径（前端显示"在跟哪个文件"用）
+    pub fn followed_log(&self, key: &str) -> Option<String> {
+        self.processes
+            .lock()
+            .ok()?
+            .get(key)?
+            .follow
+            .as_ref()
+            .map(|f| f.path.clone())
+    }
+
+    /// 认领到游离进程后：这个服务的 stdout 已经指望不上了，找找它在写哪个日志文件。
+    ///
+    /// **两阶段采样**，不是一次扫描：第一次只记下候选与大小，下一轮再看谁长大了，
+    /// 跟"确实在写"的那个。为什么必须这样（实测踩过）：Tomcat 启动瞬间会一次性创建
+    /// catalina/localhost/host-manager 几个日志文件，按"修改时间最新"选中的是只写了两行
+    /// 就再也不动的 `localhost.log` —— 而跟随线程从文件末尾读起，于是面板**永远是空的**。
+    /// ActiveMQ 同样：`data/` 里 `wrapper.log` 与 `activemq.log` 都在写，谁"最新"是随机的。
+    ///
+    /// 一个都没长（服务还没开写日志）就不表态，下一轮再采样——**一直等下去**：
+    /// Tomcat 要等 JVM 起来才落盘，实测有十几秒才写第一行的情况。
+    fn probe_log_file(&self, key: &str, cwd: &str, since: SystemTime) {
+        if self.followed_log(key).is_some() {
+            return;
+        }
+        let now = logfile::candidate_logs(Path::new(cwd), since);
+        let first = {
+            let mut procs = match self.processes.lock() {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+                    e.into_inner()
+                }
+            };
+            let Some(info) = procs.get_mut(key) else { return };
+            match &mut info.log_probe {
+                // 已有首采：拿它跟这一轮比
+                Some(probe) => probe.first.clone(),
+                None => {
+                    // 首采：这轮只记录，不选（要有两次采样才能看出"谁在长"）
+                    info.log_probe = Some(LogProbe { first: now });
+                    return;
+                }
+            }
+        };
+        let picked = logfile::pick_growing(&first, &now);
+        let Some(path) = picked else {
+            return; // 还没长：下一轮再看
+        };
+        match self.follow_log(key, &path.to_string_lossy()) {
+            Ok(()) => {
+                log::info!("[nexus] 已跟随日志文件（在增长）: {}", path.display());
+                self.append_system_line(key, format!(
+                    "已跟随日志文件：{}（该服务另开窗口运行，面板从文件读取；右键服务可取消跟随）",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                log::warn!("[nexus] 跟随日志文件失败 {}: {}", path.display(), e);
+                self.append_system_line(key, format!("发现日志文件 {} 但跟随失败：{}", path.display(), e));
+            }
+        }
+    }
+
+    /// 返回当前运行中的 (project_id, service_id) 列表。
+    ///
+    /// 比"直接子进程退出即服务结束"多一步**游离进程认领**：直接子进程（cmd）退出后先不
+    /// 下结论，看它有没有留下"另开窗口"跑起来的后代（Tomcat 的 `startup.bat` →
+    /// `catalina.bat start` → `start "Tomcat" java`，见 `AdoptedChild`）。
+    /// 认领到就继续算运行中，认领不到才按退出处理。
     pub fn running(&self) -> Vec<(String, String)> {
-        // Phase 1: 收集已退出进程并从 map 中移除，释放锁。
-        // 锁内只做 try_wait + 摘表：原实现持 processes 锁期间还去拿 log_buffers/failed
-        // 并做字符串格式化（三把锁嵌套 + 非必要持锁，任何一处改成反向顺序即死锁）
-        let mut exited: Vec<(String, Option<i32>)> = Vec::new();
-        let dead: Vec<ProcessCleanupEntry> = {
+        /// 本轮判定为"进程刚结束"的服务
+        struct JustEnded {
+            key: String,
+            pid: u32,
+            started_at: u64,
+            exit_code: Option<i32>,
+            /// true = 直接子进程退出（要走查游离后代）；false = 认领的进程全退了
+            check_survivors: bool,
+        }
+
+        // Phase 1（锁内，只做判定）：child 存活的跳过；child 已退出的记为候选；
+        // 认领模式的看认领到的进程是否已全部退出。
+        let mut ended: Vec<JustEnded> = Vec::new();
+        // 需要去找日志文件的服务：(key, cwd, 服务启动时刻)
+        let mut probe: Vec<(String, String, u64)> = Vec::new();
+        {
             let mut procs = self.processes.lock().unwrap_or_else(|e| {
                 log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
                 e.into_inner()
             });
-            let mut dead_keys = Vec::new();
             for (k, info) in procs.iter_mut() {
-                match info.child.try_wait() {
-                    Ok(Some(status)) => {
-                        exited.push((k.clone(), status.code()));
-                        dead_keys.push(k.clone());
-                    }
-                    Ok(None) => {} // 运行中
-                    Err(e) => {
-                        // 无法检查状态：保守按"仍存活"处理（原实现判为已死 → 摘表 + 标失败，
-                        // 而进程可能仍在运行且此后不再受管理）
-                        log::warn!("[nexus] 查询进程状态失败 ({}): {}（按存活处理）", k, e);
+                match info.child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => ended.push(JustEnded {
+                            key: k.clone(),
+                            pid: info.pid,
+                            started_at: info.spawn_started_at,
+                            exit_code: status.code(),
+                            check_survivors: true,
+                        }),
+                        Ok(None) => {} // 运行中
+                        Err(e) => {
+                            // 无法检查状态：保守按"仍存活"处理（原实现判为已死 → 摘表 + 标失败，
+                            // 而进程可能仍在运行且此后不再受管理）
+                            log::warn!("[nexus] 查询进程状态失败 ({}): {}（按存活处理）", k, e);
+                        }
+                    },
+                    None => {
+                        // 认领模式：认领到的进程全部退出，才算这个服务结束。
+                        // 退出码取第一个认领进程的——多个游离进程时"服务退出码"本就没有单一
+                        // 含义，给一个可读的值即可（拿不到才落到 "?"）
+                        if info.adopted.iter().all(|a| !a.handle.is_alive()) {
+                            ended.push(JustEnded {
+                                key: k.clone(),
+                                pid: info.pid,
+                                started_at: info.spawn_started_at,
+                                exit_code: info.adopted.iter().find_map(|a| a.handle.exit_code()),
+                                check_survivors: false,
+                            });
+                        } else if info.follow.is_none() {
+                            // 认领意味着 stdout 拿不到东西了：找找它在写哪个日志文件。
+                            // **不设尝试上限**：服务"开写第一行日志"可能要好几秒（Tomcat 要等 JVM
+                            // 起来才落盘，实测有过 10 秒以上），设上限就会把这类服务永远排除在外。
+                            // 代价只是每轮读几次目录，而服务一停这条路径就没了
+                            probe.push((k.clone(), info.cwd.clone(), info.spawn_started_at));
+                        }
                     }
                 }
             }
-            dead_keys.into_iter().filter_map(|key| {
-                procs.remove(&key).map(|mut info| {
-                    (key, info.pid, info.child,
-                     info.done_stdout.take(), info.done_stderr.take(), Some(info.stop_flag))
-                })
-            }).collect()
-        };
-        // Phase 1.5: 锁外写日志标记与失败状态（原实现在持锁期间做）
+        }
+
+        // Phase 1.5（锁外）：走查游离后代。系统调用（进程快照 / OpenProcess）放在锁外，
+        // 与"锁内只做 try_wait + 摘表"的既有约定一致。
+        // 用 HashMap 而不是 Vec：`AdoptedChild` 持有进程句柄、**不可 Clone**，
+        // 取出即消费（`remove`）才不会重复持有。
+        let mut survived: HashMap<String, Vec<AdoptedChild>> = ended
+            .iter()
+            .filter(|e| e.check_survivors)
+            .filter_map(|e| {
+                let list = adopt_survivors(e.pid, e.started_at);
+                if list.is_empty() { None } else { Some((e.key.clone(), list)) }
+            })
+            .collect();
+
+        // Phase 2（锁内）：落实。认领成功的摘掉 child（已退出，只回收句柄）并存入 adopted；
+        // 其余摘表，交给 Phase 2.5 收尸。
+        let mut exited: Vec<(String, Option<i32>)> = Vec::new();
+        let mut dead: Vec<CleanupEntry> = Vec::new();
+        let mut adopted_logs: Vec<(String, String)> = Vec::new();
+        {
+            let mut procs = self.processes.lock().unwrap_or_else(|e| {
+                log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+                e.into_inner()
+            });
+            for e in ended {
+                let Some(list) = survived.remove(&e.key) else {
+                    // 没有游离后代：按退出处理
+                    exited.push((e.key.clone(), e.exit_code));
+                    if let Some(mut info) = procs.remove(&e.key) {
+                        dead.push(take_cleanup_entry(e.key, &mut info));
+                    }
+                    continue;
+                };
+                // 认领成功。期间可能已被 stop 摘走 —— 那就什么都不做，
+                // 句柄随 list 在这里 drop（进程已被 stop 结束）
+                let Some(info) = procs.get_mut(&e.key) else { continue };
+                if let Some(mut child) = info.child.take() {
+                    let _ = child.wait(); // 已退出：只回收句柄，不 taskkill
+                }
+                let who = list.iter().map(|a| format!("{} (pid {})", a.name, a.pid))
+                    .collect::<Vec<_>>().join("、");
+                info.adopted = list;
+                adopted_logs.push((e.key, who));
+            }
+        }
+
+        // Phase 2.5（锁外）：写日志标记与失败状态（原实现在持锁期间做）
         for (key, code) in &exited {
             let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             self.append_system_line(key, format!("进程已退出（退出码: {}）", code_str));
@@ -857,19 +1415,37 @@ impl ProcessManager {
                 });
             }
         }
-        // Phase 2: 在锁外收尸已退出进程（已退出的进程不再 taskkill）。
-        // 日志缓冲保留（Phase 1 已追加退出标记行）：崩溃/秒退的报错是诊断关键
-        for (_key, pid, child, done_stdout, done_stderr, stop_flag) in dead {
-            cleanup_process(pid, child, done_stdout, done_stderr, stop_flag);
+        // 认领成功必须**说出来**：否则面板上只有那行"进程已退出（退出码: 0）"，
+        // 用户以为服务没了，而它其实还在跑 —— 这正是本次要修掉的谎报
+        for (key, who) in &adopted_logs {
+            self.append_system_line(key, format!(
+                "直接子进程已退出，但它另开窗口启动的进程仍在运行（{}）；已接管：「停止」会一并结束它们",
+                who
+            ));
+            // 刚认领的服务也立刻找一次日志文件（不用等下一轮轮询）
+            if let Some((cwd, started_at)) = self.cwd_and_start_for(key) {
+                probe.push((key.clone(), cwd, started_at));
+            }
         }
-        // Phase 3: 重新获取锁返回当前运行中的 (project_id, service_id)
+        // 找日志文件（锁外：要读目录、开文件）
+        for (key, cwd, started_at) in probe {
+            self.probe_log_file(&key, &cwd, system_time_from_millis(started_at));
+        }
+
+        // Phase 3（锁外）：收尸已退出进程（已退出的进程不再 taskkill）。
+        // 日志缓冲保留（Phase 2.5 已追加退出标记行）：崩溃/秒退的报错是诊断关键
+        for entry in dead {
+            cleanup_process(entry);
+        }
+
+        // Phase 4: 重新获取锁返回当前运行中的 (project_id, service_id)
         self.processes.lock()
             .map(|procs| procs.iter().map(|(k, v)| (v.project_id.clone(), k.clone())).collect())
             .unwrap_or_default()
     }
 
     pub fn stop_all(&self) {
-        let entries: Vec<ProcessCleanupEntry> = {
+        let entries: Vec<CleanupEntry> = {
             let mut procs = match self.processes.lock() {
                 Ok(guard) => guard,
                 Err(e) => {
@@ -883,13 +1459,13 @@ impl ProcessManager {
             }
             procs.drain().map(|(key, mut info)| {
                 log::debug!("[nexus]   清理 {} (pid={})", key, info.pid);
-                (key, info.pid, info.child,
-                 info.done_stdout.take(), info.done_stderr.take(), Some(info.stop_flag))
+                take_cleanup_entry(key, &mut info)
             }).collect()
         };
 
-        for (key, pid, child, done_stdout, done_stderr, stop_flag) in entries {
-            cleanup_process(pid, child, done_stdout, done_stderr, stop_flag);
+        for entry in entries {
+            let (key, pid) = (entry.key.clone(), entry.pid);
+            cleanup_process(entry);
             log::debug!("[nexus]   已清理 {} (pid={})", key, pid);
         }
 
@@ -912,6 +1488,22 @@ impl ProcessManager {
                 Vec::new()
             }
         }
+    }
+
+    /// 测试用：取某服务当前认领到的游离进程 (pid, 映像名)。
+    ///
+    /// 真实写入路径是 `running()` 轮询里的认领（需要真起一个"另开窗口"的进程才能走到），
+    /// 这里只把结果读出来供断言——不暴露任何内部状态给生产代码。
+    #[cfg(test)]
+    pub(crate) fn adopted_pids_for_test(&self, key: &str) -> Vec<(u32, String)> {
+        self.processes
+            .lock()
+            .map(|procs| {
+                procs.get(key)
+                    .map(|info| info.adopted.iter().map(|a| (a.pid, a.name.clone())).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
 
     /// 测试用：注入一条"意外退出"记录。
@@ -985,44 +1577,146 @@ pub(crate) fn kill_and_reap(child: &mut Child, timeout: Duration) {
     }
 }
 
+/// 把服务表项拆成清理条目（`child` / `adopted` 一并带走：停止要连同它们一起结束）
+fn take_cleanup_entry(key: String, info: &mut ProcessInfo) -> CleanupEntry {
+    CleanupEntry {
+        key,
+        pid: info.pid,
+        started_at: info.spawn_started_at,
+        child: info.child.take(),
+        adopted: std::mem::take(&mut info.adopted),
+        follow: info.follow.take(),
+        done_stdout: info.done_stdout.take(),
+        done_stderr: info.done_stderr.take(),
+        stop_flag: Some(Arc::clone(&info.stop_flag)),
+    }
+}
+
+/// `pid` 名下、创建时刻晚于 `started_at` 的后代 pid（含"另开窗口"跑掉的那些）。
+///
+/// 启动时刻这一关是**防 pid 复用**：系统会把旧 pid 分给无关进程，而新进程可能恰好
+/// 由"复用了我们那条 cmd 的 pid"的进程生出来，此时父链看起来完全合法。
+/// 时间不可能倒流——候选的创建时刻早于我们那条子进程，就一定不是它生出来的。
+///
+/// 非 Windows 上 `snapshot_processes` 返回空表，这里自然也返回空。
+fn candidate_descendants(pid: u32, started_at: u64) -> Vec<u32> {
+    let snapshot = super::winproc::snapshot_processes();
+    super::winproc::descendants(pid, &snapshot)
+        .into_iter()
+        .filter(|&child| {
+            process_start_time_millis(child)
+                .map(|t| t >= started_at)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// 控制台宿主进程名：它们不是服务在跑的东西，而是"另开窗口"时系统给新控制台配的宿主。
+///
+/// 为什么要排除（实测踩到）：
+/// 1. cmd 用 `start` 另开窗口时会拉起 `conhost.exe`，父链上它也是后代，于是被一起认领——
+///    接管名单里混进一个 `conhost.exe`，用户看到的日志像是 Nexus 管错了进程；
+/// 2. 更麻烦的是它**持有被托管进程的句柄**，客户端被结束后对象不会立刻销毁，
+///    于是"进程是否还在"的两种判据（按 pid 查得到 vs taskkill 说找不到）会打架；
+/// 3. 杀掉真正的工作进程时，`taskkill /T` 顺带就会结束它的控制台宿主，不缺这一步。
+///
+/// 名字匹配是启发式，但代价只是"少接管一个控制台宿主"：真出错也不会漏掉工作进程。
+/// `OpenConsole.exe` 是 Windows 11 上 Windows Terminal 作为默认终端时的同类进程。
+fn is_console_host(name: &str) -> bool {
+    name.eq_ignore_ascii_case("conhost.exe") || name.eq_ignore_ascii_case("OpenConsole.exe")
+}
+
+/// 认领游离进程：走查 `pid` 名下仍在运行的后代，逐个打开句柄。
+///
+/// 返回空 = 确实没有游离进程（调用方按服务真的退出处理）。
+/// 只认得下还在跑的：已退出的进程没必要接管，它的退出也不该让"服务"继续算运行中。
+fn adopt_survivors(pid: u32, started_at: u64) -> Vec<AdoptedChild> {
+    let snapshot = super::winproc::snapshot_processes();
+    let mut out = Vec::new();
+    for child_pid in super::winproc::descendants(pid, &snapshot) {
+        if !process_start_time_millis(child_pid).map(|t| t >= started_at).unwrap_or(false) {
+            continue;
+        }
+        let name = super::winproc::name_of(child_pid, &snapshot);
+        if is_console_host(&name) {
+            continue;
+        }
+        let Some(handle) = super::winproc::OwnedProcess::open(child_pid) else {
+            continue; // 已退出 / 无权限：不接管
+        };
+        if !handle.is_alive() {
+            continue;
+        }
+        out.push(AdoptedChild { pid: child_pid, name, handle });
+    }
+    out
+}
+
 /// 清理单个进程条目（在锁外调用）
 ///
-/// 流程：try_wait 确认进程仍存活才 taskkill（已退出时 PID 可能已被系统复用，
-/// 直接 taskkill 会误杀无辜进程）→ 带超时等待退出 → 等待 reader 线程结束
-/// （进程死后管道写端关闭，reader 读到 EOF 自然退出）→ 超时则放弃等待，
-/// 交由 Job Object（KILL_ON_JOB_CLOSE）在应用退出时兜底。
+/// 流程：先结束**认领到的游离进程**（它们不在我们的进程树里，漏掉就等于"停止"没生效）
+/// → try_wait 确认直接子进程仍存活才 taskkill（已退出时 PID 可能已被系统复用，
+/// 直接 taskkill 会误杀无辜进程）→ 顺手收掉直接子进程名下跑出去的游离后代
+/// （停止与下一次 `running()` 轮询之间存在窗口，这个窗口里 stop 也必须收干净）
+/// → 带超时等待退出 → 等待 reader 线程结束（进程死后管道写端关闭，reader 读到 EOF
+/// 自然退出）→ 超时则放弃等待，交由 Job Object（KILL_ON_JOB_CLOSE）在应用退出时兜底。
 ///
 /// 注意：等待 reader 线程用 recv_timeout 而非 join——进程树未全灭时
 /// （taskkill 失败、或孙进程仍持有管道写端）EOF 永不发生，join 会无限阻塞
 /// 同步命令的主线程（stop/get_running 全部卡死、窗口关不掉）。
-fn cleanup_process(
-    pid: u32,
-    mut child: Child,
-    done_stdout: Option<Receiver<()>>,
-    done_stderr: Option<Receiver<()>>,
-    stop_flag: Option<Arc<AtomicBool>>,
-) {
+fn cleanup_process(entry: CleanupEntry) {
+    let CleanupEntry { key: _key, pid, started_at, mut child, adopted, follow, done_stdout, done_stderr, stop_flag } = entry;
     // 先置停止标志：reader 线程立刻停止写缓冲与 emit。
     // 否则进程树未杀净（孙进程持管道）时旧线程会继续往同一个 key 写日志——
     // 表现为"已停止的服务日志还在涨"，重启后新旧进程输出还会串台
     if let Some(flag) = &stop_flag {
         flag.store(true, Ordering::Relaxed);
     }
-    let alive = matches!(child.try_wait(), Ok(None));
+    // 跟随线程同理（它看的是同一个 stop_flag，这里额外等它退出）：
+    // 不等的话，stop 之后它还会往"已被 remove 的日志缓冲"里写——那等于把缓冲又建回来，
+    // 这块内存直到下次启动同 id 的服务才会被替换
+    let mut follow_done = None;
+    if let Some(mut f) = follow {
+        f.stop.store(true, Ordering::Relaxed);
+        follow_done = f.done.take();
+    }
+    // 认领到的游离进程：父进程（cmd）早已退出，它们不在任何人的进程树下，
+    // 必须按 pid 单独结束 —— 漏掉就是"点了停止，Tomcat 还在后台跑"
+    for a in &adopted {
+        log::info!("[nexus] 结束接管进程 {} (pid={})", a.name, a.pid);
+        kill_process_tree(a.pid);
+    }
+    let alive = matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
     if alive {
         kill_process_tree(pid);
     }
-    let exited = wait_with_timeout(&mut child, Duration::from_millis(2000));
+    // 还活着的直接子进程名下，可能已经有"另开窗口"跑出去的后代（此刻它们尚未被认领，
+    // 或刚被认领前就被 stop 撞上）。一并收掉，避免留下占端口的孤儿。
+    for orphan in candidate_descendants(pid, started_at) {
+        log::info!("[nexus] 结束游离孙进程 (pid={})", orphan);
+        kill_process_tree(orphan);
+    }
+    let exited = match child.as_mut() {
+        Some(c) => wait_with_timeout(c, Duration::from_millis(2000)),
+        // 认领路径已经 `wait` 回收过直接子进程：没有可等的东西，也不该再 warn
+        None => true,
+    };
     // 等待 reader 线程结束：正常路径（进程已死）立即返回；异常路径最多等 1 秒后放弃，
     // 线程在进程树最终退出后自然结束（不 join 不会泄漏——线程自行退出即释放资源）
-    for rx in [done_stdout, done_stderr].into_iter().flatten() {
+    for rx in [done_stdout, done_stderr, follow_done].into_iter().flatten() {
         let _ = rx.recv_timeout(Duration::from_millis(1000));
     }
-    if exited {
-        let _ = child.wait();
-    } else {
-        log::warn!("[nexus] 进程 (pid={}) 未能按时退出，已释放句柄，由 Job Object 在应用退出时兜底", pid);
+    match child.as_mut() {
+        Some(c) if exited => {
+            let _ = c.wait();
+        }
+        Some(_) => {
+            log::warn!("[nexus] 进程 (pid={}) 未能按时退出，已释放句柄，由 Job Object 在应用退出时兜底", pid);
+        }
+        None => {}
     }
+    // 认领到的句柄随 `adopted` 在这里 drop（CloseHandle）——进程对象随之释放，
+    // 不留句柄泄漏
 }
 
 /// 进程启动时间（毫秒，距 UNIX 纪元）；进程不存在/无权限时返回 None。
@@ -1807,6 +2501,455 @@ mod tests {
         assert!(!done, "还有读取线程在跑，不能收尾");
     }
 
+    // ── 游离进程认领（"另开窗口"的服务，如 Tomcat 的 startup.bat）──────────
+    //
+    // 这一组是**真起进程**的：认领走查的是系统进程表，只有真进程能验证
+    // （铁律 19：触碰进程/平台的路径必须真跑一次）。
+
+    /// 写一个替身脚本：模拟 `catalina.bat` 的 `:doStart` —— 真正干活的进程被 cmd 内建
+    /// 命令 `start` 另开一个控制台跑掉（见 `core::winproc` 的模块说明），脚本自己随即结束。
+    /// `hold_secs > 0` 时脚本额外存活一段时间（用于测"父进程还活着时的走查"）。
+    ///
+    /// 为什么用 .bat 而不是直接把 `start "标题" "…"` 当命令串传：
+    /// 服务命令是经 `cmd /C <命令串>` 执行的，带引号的串要穿过 Rust 的 argv 转义再被
+    /// cmd 解析一遍，两边规则不同（实测这种形态下 `start` 根本跑不起来）。
+    /// 真实场景（Tomcat/ActiveMQ）也都是 .bat 文件，这样写同时更贴近实际。
+    /// 内容**只用 ASCII**：中文在 GBK 代码页下会被解成乱码（见候选区那条）。
+    #[cfg(windows)]
+    fn write_detach_bat(tag: &str, hold_secs: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("nexus_test_{}_{}.bat", tag, std::process::id()));
+        let mut body = String::from("@echo off\r\n");
+        body.push_str("start \"NexusTestOrphan\" \"%COMSPEC%\" /c \"ping -n 20 127.0.0.1 >nul\"\r\n");
+        if hold_secs > 0 {
+            body.push_str(&format!("ping -n {} 127.0.0.1 >nul\r\n", hold_secs));
+        }
+        std::fs::write(&path, body).expect("应当能写替身脚本");
+        path
+    }
+
+    /// 轮询到认领发生（真实路径由 `running()` 驱动），返回认领到的 (pid, 映像名)
+    #[cfg(windows)]
+    fn wait_for_adoption(mgr: &ProcessManager, key: &str) -> Vec<(u32, String)> {
+        for _ in 0..100 {
+            let _ = mgr.running();
+            let pids = mgr.adopted_pids_for_test(key);
+            if !pids.is_empty() {
+                return pids;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Vec::new()
+    }
+
+    /// 等服务被判定为失败（真实路径：下一轮 `running()`）
+    #[cfg(windows)]
+    fn wait_for_failure(mgr: &ProcessManager) -> Vec<FailedService> {
+        for _ in 0..100 {
+            let _ = mgr.running();
+            let failed = mgr.failed();
+            if !failed.is_empty() {
+                return failed;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Vec::new()
+    }
+
+    /// 等 pid 真的不再运行。
+    ///
+    /// 判据用**句柄**（`GetExitCodeProcess`）而不是 `process_start_time_millis`：
+    /// 后者是"身份未变"的判据，进程被结束后只要还有句柄（例如控制台宿主）没关，
+    /// `OpenProcess` 照样成功——实测就是这么被骗的：taskkill 已经报"没有找到进程"，
+    /// 而按 pid 查启动时间仍能查到一个值。
+    #[cfg(windows)]
+    fn wait_gone(pid: u32) -> bool {
+        for _ in 0..40 {
+            let alive = super::super::winproc::OwnedProcess::open(pid)
+                .map(|h| h.is_alive())
+                .unwrap_or(false);
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// 认领 + 状态 + 停止：一条"另开窗口"的服务走完整生命周期
+    ///
+    /// 这是本功能的核心判据——修的就是三件事：
+    /// 1) 直接子进程退出不等于服务退出（不谎报"已退出（退出码 0）"）
+    /// 2) 日志里必须写明接管了谁（否则用户以为服务没了）
+    /// 3) 「停止」要能真的把这个跑掉的进程结束掉
+    #[cfg(windows)]
+    #[test]
+    fn test_adopts_detached_child_and_stop_kills_it() {
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let script = write_detach_bat("detach", 0);
+        let command = script.to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "detach-1", name: "n",
+            command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+        }).expect("启动应当成功");
+
+        let pids = wait_for_adoption(&mgr, "detach-1");
+        assert!(!pids.is_empty(), "应当认领到另开窗口跑起来的进程（替身命令没生效？）");
+        // 回归：控制台宿主不算服务在跑的东西（实测混进来过，还会让"杀没杀死"的
+        // 两种判据打架，见 is_console_host 的说明）
+        assert!(
+            pids.iter().all(|(_, name)| !is_console_host(name)),
+            "认领名单里不该有控制台宿主：{:?}", pids
+        );
+
+        let running: Vec<String> = mgr.running().into_iter().map(|(_, id)| id).collect();
+        assert!(running.contains(&"detach-1".to_string()), "认领后应仍算运行中，实际 {:?}", running);
+        assert!(mgr.failed().is_empty(), "认领成功不该记成失败");
+        assert!(
+            mgr.get_logs("detach-1").iter().any(|l| l.text.contains("另开窗口启动的进程仍在运行")),
+            "认领必须写一行说明进日志，实际: {:?}",
+            mgr.get_logs("detach-1").iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+
+        // 停止：认领到的进程必须一起结束（否则就是"点了停止，Tomcat 还在跑"）
+        mgr.stop("detach-1").expect("停止应当成功");
+        for (pid, name) in &pids {
+            assert!(wait_gone(*pid), "停止后 pid {} ({}) 仍在运行——认领的游离进程没被结束", pid, name);
+        }
+        assert!(!mgr.running().iter().any(|(_, id)| id == "detach-1"), "停止后不该还在运行列表");
+    }
+
+    /// 回归：没有游离后代的秒退服务照旧判失败（认领不能把它"救活"）
+    ///
+    /// 系统里此刻有大量无关进程（测试进程自己、cmd、各种系统服务），
+    /// 父链走查必须一个都不认——这条同时钉住了"认领不会误伤别人的进程"。
+    #[cfg(windows)]
+    #[test]
+    fn test_quick_exit_without_descendants_still_fails() {
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "quick-1", name: "n",
+            command: "exit /b 3", cwd: &cwd, env_vars: &[], log_sink: sink,
+        }).expect("启动应当成功");
+
+        let failed = wait_for_failure(&mgr);
+        assert_eq!(failed.len(), 1, "秒退服务应记为失败，实际 {:?}", failed.iter().map(|f| &f.service_id).collect::<Vec<_>>());
+        assert_eq!(failed[0].exit_code, Some(3), "退出码应原样带出");
+        assert!(mgr.adopted_pids_for_test("quick-1").is_empty(), "没有游离后代时不该认领任何东西");
+    }
+
+    /// 启动时刻校验：候选的创建时刻早于我们那条子进程时，一律不认领（防 pid 复用）
+    ///
+    /// 直接测走查函数而不是经 `running()`：这里要的是"同一个候选，只因为时间下限不同，
+    /// 一个被认领、一个被挡掉"这一对照，走管理器拿不到这么干净的对照组。
+    #[cfg(windows)]
+    #[test]
+    fn test_adoption_rejects_candidates_created_before_child() {
+        // 父进程自己活 4 秒（脚本末尾那条 ping），期间 `start` 出来的进程是它的游离后代
+        let script = write_detach_bat("guard", 4);
+        let mut parent = std::process::Command::new("cmd")
+            .args(["/C", &script.to_string_lossy()])
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().expect("应当能起替身父进程");
+        let parent_pid = parent.id();
+
+        // 下限 0 = 不做时间校验：应当找到游离后代
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = adopt_survivors(parent_pid, 0);
+            if !found.is_empty() { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!found.is_empty(), "下限为 0 时应当认出游离后代");
+
+        // 下限拉满 = 要求候选比 u64::MAX 还晚创建：不存在，必须一个都不认
+        let rejected = adopt_survivors(parent_pid, u64::MAX);
+        assert!(rejected.is_empty(), "时间校验没挡住：{:?}", rejected.iter().map(|a| a.pid).collect::<Vec<_>>());
+
+        // 收尾：认领到的句柄随 drop 关闭，进程按 pid 结束
+        let pids: Vec<u32> = found.iter().map(|a| a.pid).collect();
+        drop(found);
+        for pid in pids { kill_process_tree(pid); }
+        let _ = parent.kill();
+        let _ = parent.wait();
+    }
+
+    // ── 日志文件跟随 ────────────────────────────────────────────
+    //
+    // 这些用例真起服务、真写文件、真跑跟随线程：跟文件这件事的坑全在
+    // "文件被改名/被清空/半行/停止后还在写"这类时序上，只有真跑才碰得到。
+
+    /// "活着但不干活"的服务命令：跟随要求服务在运行表里
+    #[cfg(windows)]
+    const HOLD_CMD: &str = "ping -n 30 127.0.0.1 >nul";
+    #[cfg(not(windows))]
+    const HOLD_CMD: &str = "sleep 30";
+
+    /// 建一个隔离的临时日志路径（目录名带 pid，避免并行测试互相踩）
+    fn temp_log(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus_tail_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("应当能建临时目录");
+        dir.join("app.log")
+    }
+
+    /// 往文件尾追加内容（跟随线程只认追加）
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).expect("应当能打开日志文件");
+        f.write_all(text.as_bytes()).expect("应当能写日志文件");
+    }
+
+    /// 等日志里出现某段文本（跟随是异步的，必须轮询）
+    fn wait_for_text(mgr: &ProcessManager, key: &str, needle: &str) -> bool {
+        for _ in 0..60 {
+            if mgr.get_logs(key).iter().any(|l| l.text.contains(needle)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// 起一个用于跟随测试的服务，返回 (管理器, 日志文件路径)。
+    /// 日志文件会先建好（空白）：跟随要求文件存在——文件打不开时当场报错，
+    /// 而不是静默等到线程里失败（前端要能说出为什么）
+    fn start_hold_service(key: &str, tag: &str) -> (ProcessManager, PathBuf) {
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: key, name: "n",
+            command: HOLD_CMD, cwd: &cwd, env_vars: &[], log_sink: sink,
+        }).expect("启动应当成功");
+        let log = temp_log(tag);
+        std::fs::write(&log, "").expect("建空日志文件");
+        (mgr, log)
+    }
+
+    /// 跟随从"末尾回看一段"开始：窗口内的最近内容看得到、更早的历史不灌进面板，
+    /// 之后追加的行按顺序到达
+    #[test]
+    fn test_follow_seeds_recent_history_in_order() {
+        let (mgr, log) = start_hold_service("follow-1", "newlines");
+        // 造一段明显超过回看窗口（64KB）的历史
+        let mut history = String::new();
+        for i in 0..8000 {
+            history.push_str(&format!("早先的行-{}
+", i));
+        }
+        std::fs::write(&log, &history).expect("写历史内容");
+        append(&log, "窗口内的最近一行
+");
+        mgr.follow_log("follow-1", &log.to_string_lossy()).expect("跟随应当成功");
+
+        assert!(wait_for_text(&mgr, "follow-1", "窗口内的最近一行"), "回看窗口内的内容应当出现");
+        assert!(
+            !mgr.get_logs("follow-1").iter().any(|l| l.text == "早先的行-0"),
+            "超出回看窗口的历史不该灌进面板"
+        );
+
+        append(&log, "第一行
+第二行
+");
+        assert!(wait_for_text(&mgr, "follow-1", "第一行"), "追加的行应当进日志");
+        assert!(wait_for_text(&mgr, "follow-1", "第二行"));
+        let texts: Vec<String> = mgr.get_logs("follow-1").iter().map(|l| l.text.clone()).collect();
+        let i1 = texts.iter().position(|t| t.contains("第一行")).expect("应有第一行");
+        let i2 = texts.iter().position(|t| t.contains("第二行")).expect("应有第二行");
+        assert!(i1 < i2, "行序应与文件里一致，实际 {:?}", texts);
+        assert!(mgr.followed_log("follow-1").is_some(), "followed_log 应报告正在跟随");
+        mgr.stop("follow-1").expect("停止应当成功");
+    }
+
+    /// 没有换行符的半行不能提前输出（否则停半秒的内容会被拆成两条，
+    /// 而真正的一行到达时又会和前半段错位）
+    #[test]
+    fn test_follow_holds_partial_line_until_newline() {
+        let (mgr, log) = start_hold_service("follow-2", "partial");
+        mgr.follow_log("follow-2", &log.to_string_lossy()).expect("跟随应当成功");
+
+        append(&log, "未完的一行");
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !mgr.get_logs("follow-2").iter().any(|l| l.text.contains("未完的一行")),
+            "没有换行符时不该输出半行"
+        );
+
+        append(&log, " 补完\n");
+        assert!(wait_for_text(&mgr, "follow-2", "未完的一行 补完"), "换行到达后应当输出完整一行");
+        mgr.stop("follow-2").expect("停止应当成功");
+    }
+
+    /// 轮转（改名 + 新建，ActiveMQ 的 RollingFileAppender 就是这个形状）后必须跟到新文件：
+    /// 手里的句柄会一直指向被改名的旧文件，只有比大小才能发现换了文件
+    #[test]
+    fn test_follow_switches_to_rotated_file() {
+        let (mgr, log) = start_hold_service("follow-3", "rotate");
+        mgr.follow_log("follow-3", &log.to_string_lossy()).expect("跟随应当成功");
+
+        append(&log, "轮转前\n");
+        assert!(wait_for_text(&mgr, "follow-3", "轮转前"));
+        std::fs::rename(&log, log.with_file_name("app.log.1")).expect("改名应当成功");
+        std::fs::write(&log, "轮转后\n").expect("新建日志文件");
+
+        assert!(wait_for_text(&mgr, "follow-3", "轮转后"), "轮转后应当跟到新文件");
+        assert!(wait_for_text(&mgr, "follow-3", "已轮转"), "轮转应当在日志里说明（用户要知道读到哪去了）");
+        mgr.stop("follow-3").expect("停止应当成功");
+    }
+
+    /// 取消跟随：服务照常运行，之后写进文件的内容不再进面板
+    #[test]
+    fn test_unfollow_stops_writing_but_service_keeps_running() {
+        let (mgr, log) = start_hold_service("follow-4", "unfollow");
+        mgr.follow_log("follow-4", &log.to_string_lossy()).expect("跟随应当成功");
+        append(&log, "跟随中\n");
+        assert!(wait_for_text(&mgr, "follow-4", "跟随中"));
+
+        assert_eq!(mgr.unfollow_log("follow-4").as_deref(), Some(log.to_string_lossy().as_ref()));
+        assert!(mgr.followed_log("follow-4").is_none(), "取消后不该再报告在跟随");
+        let before = mgr.get_logs("follow-4").len();
+        append(&log, "取消后\n");
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(mgr.get_logs("follow-4").len(), before, "取消跟随后文件内容不该再进日志");
+        assert!(
+            mgr.running().iter().any(|(_, id)| id == "follow-4"),
+            "取消跟随不该影响服务本身"
+        );
+        mgr.stop("follow-4").expect("停止应当成功");
+    }
+
+    /// 停止服务必须让跟随线程一起退出。
+    ///
+    /// 这是"内存留在那儿"那条回归：`stop_locked` 会 `remove` 掉日志缓冲，
+    /// 跟随线程若还在跑，下一行就会把这个 key 的缓冲**重新建出来**——那块内存
+    /// 直到同名服务再次启动才会被替换，中间一直挂在表里。
+    #[test]
+    fn test_stop_stops_follow_and_does_not_recreate_buffer() {
+        let (mgr, log) = start_hold_service("follow-5", "stopfollow");
+        mgr.follow_log("follow-5", &log.to_string_lossy()).expect("跟随应当成功");
+        append(&log, "停止前\n");
+        assert!(wait_for_text(&mgr, "follow-5", "停止前"));
+
+        mgr.stop("follow-5").expect("停止应当成功");
+        append(&log, "停止后\n");
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(
+            mgr.get_logs("follow-5").is_empty(),
+            "停止后跟随线程仍在写：日志缓冲被重新建出来了，实际 {:?}",
+            mgr.get_logs("follow-5").iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 端到端（C + B 串起来）：服务另开窗口跑 → 认领 → 自动发现日志文件 → 跟上面板
+    ///
+    /// 这是用户真实场景的完整链路（Tomcat 的 startup.bat 就是这个形状）：
+    /// 命令立刻结束、真正的进程在别处、面板本该什么都看不到。
+    #[cfg(windows)]
+    #[test]
+    fn test_detached_service_auto_follows_its_log_file() {
+        let root = std::env::temp_dir().join(format!("nexus_detach_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("建服务目录");
+        let script = write_detach_bat("autofollow", 0);
+
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let cwd = root.to_string_lossy().to_string();
+        let command = script.to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "detach-log", name: "n",
+            command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+        }).expect("启动应当成功");
+
+        assert!(!wait_for_adoption(&mgr, "detach-log").is_empty(), "应当认领到游离进程");
+        // 服务启动后才落盘的日志（真实的 Tomcat 就是这样：起来就写 catalina.<日期>.log）
+        let log = root.join("logs").join("catalina.2026-09-19.log");
+        std::fs::create_dir_all(log.parent().unwrap()).expect("建 logs 目录");
+        std::fs::write(&log, "启动完成\n").expect("写日志文件");
+
+        // 轮询驱动自动发现（真实路径就是 get_running 的轮询）
+        let mut followed = None;
+        for _ in 0..40 {
+            let _ = mgr.running();
+            followed = mgr.followed_log("detach-log");
+            if followed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(followed.as_deref(), Some(log.to_string_lossy().as_ref()), "应当跟到刚写的那份日志");
+        assert!(wait_for_text(&mgr, "detach-log", "已跟随日志文件"), "必须写明跟的是哪个文件");
+
+        append(&log, "面板应当看到这一行\n");
+        assert!(
+            wait_for_text(&mgr, "detach-log", "面板应当看到这一行"),
+            "跟随的内容应当进面板；文件大小={:?}，服务日志={:?}",
+            std::fs::metadata(&log).map(|m| m.len()),
+            mgr.get_logs("detach-log").iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+
+        mgr.stop("detach-log").expect("停止应当成功");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 自动跟随要选"在增长"的那个文件，而不是"最新被碰过"的那个
+    ///
+    /// 回归（用户实测报过"面板空白"）：Tomcat 启动时一次性创建 catalina/localhost/
+    /// host-manager 几个日志文件，按"修改时间最新"选中的是只写两行就再也不动的
+    /// localhost.log —— 而跟随从文件末尾读起，于是面板永远是空的。
+    #[cfg(windows)]
+    #[test]
+    fn test_auto_follow_picks_the_file_that_grows() {
+        let root = std::env::temp_dir().join(format!("nexus_growing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("logs")).expect("建 logs 目录");
+        let script = write_detach_bat("growing", 0);
+
+        let mgr = ProcessManager::new();
+        let (sink, _seen) = test_sink();
+        let cwd = root.to_string_lossy().to_string();
+        let command = script.to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: "growing-1", name: "n",
+            command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+        }).expect("启动应当成功");
+        assert!(!wait_for_adoption(&mgr, "growing-1").is_empty(), "应当认领到游离进程");
+
+        // 次要日志：刚被创建（mtime 最新）但之后不再写 —— 正是"最新"判据会选中的那个
+        let main = root.join("logs").join("catalina.2026-09-19.log");
+        let decoy = root.join("logs").join("localhost.2026-09-19.log");
+        std::fs::write(&main, "启动完成
+").expect("写主日志");
+        std::fs::write(&decoy, "").expect("写次要日志");
+
+        let mut followed = None;
+        for i in 0..60 {
+            // 主日志持续在写（真实服务就是这样）
+            append(&main, &format!("主日志第 {} 行
+", i));
+            let _ = mgr.running();
+            followed = mgr.followed_log("growing-1");
+            if followed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let followed = followed.expect("应当自动发现并跟随日志文件");
+        assert!(
+            followed.ends_with("catalina.2026-09-19.log"),
+            "应当跟随在增长的主日志，实际跟了 {}",
+            followed
+        );
+        assert!(wait_for_text(&mgr, "growing-1", "主日志第"), "跟随的内容应当进面板");
+
+        mgr.stop("growing-1").expect("停止应当成功");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 端到端：真实发射线程 + 真实"读取线程"，最后一批必须到达且线程自行退出。
     ///
     /// 用 `alive` 从 1 → 0 的完整过程（而不是预置 0）覆盖"reader 推完最后一行后归零"这条
@@ -1845,3 +2988,5 @@ mod tests {
         );
     }
 }
+
+
