@@ -124,7 +124,12 @@ export const serviceApi = {
   getByProject: (projectId: string) =>
     invoke<Service[]>('get_services', { projectId }),
 
-  /** 给项目添加服务 */
+  /**
+   * 给项目添加服务。
+   *
+   * 后四个字段可选：不传时后端用默认值（监听包含 `*`、排除一套常见目录、启用、
+   * 不显示文件树）。服务面板新建时会全部传上——它要把用户一次填的配置直接落库。
+   */
   add: (params: {
     projectId: string;
     name: string;
@@ -134,6 +139,10 @@ export const serviceApi = {
     envVars: string;
     restartMode: number;
     toolCommands: string;
+    watchInclude?: string;
+    watchExclude?: string;
+    enabled?: boolean;
+    showFileTree?: boolean;
   }) => invoke<Service>('add_service', {
     params: {
       projectId: params.projectId,
@@ -144,6 +153,10 @@ export const serviceApi = {
       envVars: params.envVars,
       restartMode: params.restartMode,
       toolCommands: params.toolCommands,
+      watchInclude: params.watchInclude,
+      watchExclude: params.watchExclude,
+      enabled: params.enabled,
+      showFileTree: params.showFileTree,
     }
   }),
 
@@ -230,7 +243,47 @@ export const serviceApi = {
 
   deleteServiceTemplate: (id: string) =>
     invoke<void>('delete_service_template', { id }),
+
+  /** 在模板库里直接新建模板（不必先有服务再"另存为模板"），返回带 id 的新模板 */
+  createServiceTemplate: (params: {
+    name: string;
+    command: string;
+    cwd: string;
+    watchPaths: string;
+    watchInclude: string;
+    watchExclude: string;
+    envVars: string;
+    restartMode: number;
+    enabled: boolean;
+    showFileTree: boolean;
+    toolCommands: string;
+    openToolId: string;
+  }) => invoke<ServiceTemplate>('create_service_template', { params }),
+
+  /** 导出模板到 JSON 文件（ids 为空 = 全部），返回导出的模板数 */
+  exportServiceTemplates: (path: string, ids: string[] = []) =>
+    invoke<number>('export_service_templates', { path, ids }),
+
+  /** 从 JSON 文件导入模板（重名自动改名，工具按名字匹配本机工具库） */
+  importServiceTemplates: (path: string) =>
+    invoke<ImportTemplatesResult>('import_service_templates', { path }),
 };
+
+/**
+ * 模板导入的结果。
+ *
+ * 字段名与后端 `ImportTemplatesResult` **逐字对应**（响应 DTO 一律 snake_case，
+ * 见 src-tauri/src/contract.rs 顶部的规则与它的契约测试）
+ */
+export interface ImportTemplatesResult {
+  imported: number;
+  /** 与库里已有模板同名的数量（只统计，**不改名**——库里本来就允许同名） */
+  duplicated: number;
+  /** 本机工具库里没有、因而没绑上的工具名 */
+  missing_tools: string[];
+  /** 工作目录在本机不存在的模板名（导入不因此失败，但用户需要知道） */
+  missing_dirs: string[];
+}
 
 // ─── Project API ────────────────────────────────────────────
 

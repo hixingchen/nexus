@@ -19,7 +19,6 @@ import { ServiceTreeEntry } from './ServiceTreeEntry';
 import { ServiceContextMenu } from './ServiceContextMenu';
 import { TemplateTreeEntry } from './TemplateTreeEntry';
 import { SearchResultPanel } from './SearchResultPanel';
-import { AddServiceFormContent } from './AddServiceFormContent';
 import { ServiceEditPanel } from './ServiceEditPanel';
 import {
   DndContext,
@@ -42,8 +41,25 @@ import { useServiceActions } from '../../hooks/useServiceActions';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { useToolCommandRunner } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
+// 模板导入导出用系统文件对话框选路径：后端按"用户显式选择的路径"处理（与打开工具选 exe 同口径）
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { reportError } from '../../utils/error';
 import { pruneServiceDrafts } from '../../stores/serviceDraftStore';
+
+/**
+ * 空白模板：模板库点「新建」时用它打开既有的编辑面板。
+ *
+ * `id` 为空是**约定**而非"缺数据"：ServiceEditPanel 的 handleSave 据此分流——
+ * 有 id 走 updateTemplate，没有则走 createServiceTemplate（id 由后端生成）。
+ */
+const EMPTY_TEMPLATE: ServiceTemplate = {
+  id: '', name: '', command: '', cwd: '',
+  // 留空而不是 '[]' / '{}'：那两串是**建表时的列默认值**，不是给用户看的初始值
+  // （`[]` 摆进「监听路径」框、`{}` 摆进「环境变量」框都只会让人以为要填 JSON）
+  watch_paths: '', watch_include: '*', watch_exclude: '', env_vars: '',
+  restart_mode: 0, enabled: true, show_file_tree: false,
+  tool_commands: '[]', open_tool_id: '', created_at: '',
+};
 
 interface Props {
   projectId: string;
@@ -54,7 +70,6 @@ interface Props {
 export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel }: Props) {
   const {
     detail, services, loading, editingService, setEditingService,
-    showAddServiceModal, setShowAddServiceModal,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
@@ -167,6 +182,90 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     setDeleteTplTarget(null);
   }, [deleteTplTarget, editingTemplate, loadTemplates]);
 
+  /**
+   * 新建服务：用空壳打开右侧面板（与"新建模板"同构——`id` 为空即新建）。
+   *
+   * 为什么不再用弹窗：那个弹窗只有名称/命令/工作目录三个字段，监听规则与两个展示
+   * 开关由后端写死，用户想配全得先把服务建出来、再点开卡片打开**同一个面板**。
+   * 两套字段、两套组件，而且"添加用弹窗、编辑用面板"本身就不一致。
+   */
+  const handleCreateService = useCallback(() => {
+    setEditingTemplate(null);
+    setEditingService(prev => (prev && prev.id === '' ? null : {
+      id: '', project_id: projectId, name: '', command: '', cwd: '',
+      // watch_include 的 `*` 与后端默认一致（就一个字符，两边写死不会漂）；
+      // watch_exclude 留空 = 交给后端填默认——那套排除规则只该有一个来源
+      // 同样留空而不是 '[]'：那是建表默认值。后端把空串与 '[]' 一视同仁（都用 cwd 兜底），
+      // 但用户看到空框才知道"这里我还没配"
+      watch_paths: '', watch_include: '*', watch_exclude: '',
+      // 环境变量留空而不是 '{}'：那串东西既不是 dotenv 格式（KEY=VALUE 每行一条），
+      // 也不是"空"——它只是建表时的列默认值。摆进编辑框只会让人以为要填 JSON
+      env_vars: '', restart_mode: 0, enabled: true, show_file_tree: false,
+      sort_index: 0, tool_commands: '[]',
+    }));
+  }, [projectId, setEditingService, setEditingTemplate]);
+
+  /**
+   * 新建模板：用空壳打开既有的编辑面板。
+   *
+   * `id` 为空是**约定**——`ServiceEditPanel` 据此走 `createServiceTemplate` 而不是
+   * `updateTemplate`（见那边的 handleSave）。模板库此前只能"从服务另存为模板"，
+   * 想建一个还没在项目里跑过的配置得先编一个服务出来。
+   */
+  const handleCreateTemplate = useCallback(() => {
+    setEditingService(null);
+    // 面板正停在「新建」上（id 为空）时再点一次 → 关闭，与点卡片/服务条目的 toggle 一致。
+    //
+    // 不能写成 setEditingTemplate(EMPTY_TEMPLATE)：传的是同一个模块级常量，React 用
+    // Object.is 比较后**直接跳过更新**——再点会毫无反应（用户反馈过这一点）。
+    // 输入不会因此丢：草稿按 id 存，新建的键固定是空 id，重开自动恢复
+    setEditingTemplate(prev => (prev && prev.id === '' ? null : EMPTY_TEMPLATE));
+  }, [setEditingService, setEditingTemplate]);
+
+  /** 导出模板到 JSON 文件。ids 为空 = 全部导出；单个模板走右键菜单传它自己的 id */
+  const handleExportTemplates = useCallback(async (ids: string[] = []) => {
+    try {
+      const path = await saveFileDialog({
+        title: ids.length === 1 ? '导出这个模板' : '导出全部模板',
+        defaultPath: ids.length === 1 ? 'nexus-template.json' : 'nexus-templates.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!path) return; // 用户取消
+      const count = await serviceApi.exportServiceTemplates(path, ids);
+      showNotification({ title: `已导出 ${count} 个模板`, description: path, duration: 4000 });
+    } catch (e: unknown) {
+      reportError('导出模板失败', e);
+    }
+  }, []);
+
+  /** 从 JSON 文件导入模板：重名自动改名、工具按名字匹配本机工具库 */
+  const handleImportTemplates = useCallback(async () => {
+    try {
+      const selected = await openFileDialog({
+        title: '选择模板导出文件',
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (typeof selected !== 'string') return; // 用户取消
+      const res = await serviceApi.importServiceTemplates(selected);
+      loadTemplates();
+      // 如实说明发生了什么。尤其后两类——不说清楚，用户只会看到"导入了但用不了"
+      // （模板的目录是导出方机器上的路径；工具名在本机工具库里没有）
+      const notes: string[] = [];
+      if (res.duplicated > 0) notes.push(`${res.duplicated} 个与现有模板同名（未改名）`);
+      if (res.missing_tools.length > 0) notes.push(`本机没有这些工具、未绑定：${res.missing_tools.join('、')}`);
+      if (res.missing_dirs.length > 0) notes.push(`工作目录在本机不存在：${res.missing_dirs.join('、')}`);
+      showNotification({
+        variant: notes.length > 0 ? 'warning' : 'success',
+        title: `已导入 ${res.imported} 个模板`,
+        description: notes.length > 0 ? notes.join('；') : undefined,
+        duration: notes.length > 0 ? 6000 : 3000,
+      });
+    } catch (e: unknown) {
+      reportError('导入模板失败', e);
+    }
+  }, [loadTemplates]);
+
   // 打开服务/模板编辑面板（互斥：同一时间只开一个）
   const openServiceEdit = useCallback((svc: Service) => {
     setEditingTemplate(null);
@@ -194,7 +293,14 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
       {/* 主区域：代码查看器 / 空状态。
           padding 补偿服务列宽度（瞬时变化，日志只 reflow 一次而非动画期间每帧 reflow） */}
-      <div className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}>
+      {/* paddingBottom 由搜索面板的 CSS 变量驱动（`--nexus-search-panel-h`，见 SearchResultPanel）：
+          面板贴底时给它让出同高的空间，否则滚到底的最后几行永远被盖住。
+          水平方向的让位（pr-*，给服务列）早就在做了，这里补上垂直方向。
+          absolute 定位相对的是 padding box，所以面板自己仍然贴着容器底边 */}
+      <div
+        className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}
+        style={{ paddingBottom: 'var(--nexus-search-panel-h, 0px)' }}
+      >
         {/* ErrorBoundary：CodeMirror/各查看器任何渲染异常都不击穿应用白屏。
             key 随内容变化 → 出错后切文件/日志即自动重置（新内容重试） */}
         <ErrorBoundary key={viewingLog ?? activeTab?.path ?? 'empty'}>
@@ -245,6 +351,11 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
             onSavedAsTemplate={loadTemplates}
+            // 标题栏（服务名 + 关闭）：此前服务面板没有标题栏，退出只能靠"再点一次卡片"
+            // 这个隐蔽操作——用户问过"点开了怎么关"。
+            // 新建时 name 是空的，得给个说法，否则标题栏只剩一个 ✕
+            title={editingService.id ? editingService.name : '添加服务'}
+            onClose={() => setEditingService(null)}
             // 面板右侧偏移 = 服务列宽（absolute 覆盖需让位）
             rightOffset={servicePanelCollapsed ? 32 : 360}
           />
@@ -257,6 +368,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             mode="template"
             title="编辑模板"
             onSave={async () => { await loadTemplates(); setEditingTemplate(null); }}
+            onClose={() => setEditingTemplate(null)}
             rightOffset={servicePanelCollapsed ? 32 : 360}
           />
         )}
@@ -283,6 +395,10 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             onAdd={handleAddTemplate}
             onRequestDelete={requestDeleteTemplate}
             onReorderTemplates={handleReorderTemplates}
+            onCreate={handleCreateTemplate}
+            onImport={() => { void handleImportTemplates(); }}
+            onExportAll={() => { void handleExportTemplates(); }}
+            onExportOne={tpl => { void handleExportTemplates([tpl.id]); }}
           />,
           topHeight: topPanelHeight,
           topMaxHeight: topPanelMaxHeight,
@@ -293,7 +409,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         isServiceRunning={isServiceRunning}
         isServiceFailed={isServiceFailed}
         setDeleteSvcTarget={setDeleteSvcTarget}
-        setShowAddServiceModal={setShowAddServiceModal}
+        // 改名自 setShowAddServiceModal：添加服务不再是"开个弹窗"，而是打开右侧编辑面板
+        onCreateService={handleCreateService}
         handleStartAll={handleStartAll}
         handleStopAll={handleStopAll}
         handleViewLog={(svc) => {
@@ -307,15 +424,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         load={load}
       />
 
-      {/* Modals */}
-      <Modal open={showAddServiceModal} title="添加服务" onClose={() => setShowAddServiceModal(false)}>
-        <AddServiceFormContent
-          projectId={project.id}
-          projectPath={project.path}
-          onDone={() => { setShowAddServiceModal(false); load(); }}
-        />
-      </Modal>
-
+      {/* Modals（"添加服务"不再是弹窗：改用右侧 ServiceEditPanel，与编辑服务、
+          新建模板同一套表单——弹窗那份只有三个字段，配全还得再开一次面板） */}
       <Modal open={!!deleteSvcTarget} title="确认删除" onClose={() => setDeleteSvcTarget(null)}>
         <div className="space-y-4">
           <p className="text-[13px] text-nexus-text">
@@ -398,7 +508,8 @@ interface ServicePanelProps {
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
-  setShowAddServiceModal: (show: boolean) => void;
+  /** 新建服务（打开右侧编辑面板，空 id 即新建） */
+  onCreateService: () => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
@@ -412,7 +523,7 @@ interface ServicePanelProps {
 function ServicePanel({
   services, collapsed, onToggle, splitPanel, editingService, onEditService,
   isServiceRunning, isServiceFailed, setDeleteSvcTarget,
-  setShowAddServiceModal, handleStartAll, handleStopAll, handleViewLog,
+  onCreateService, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
 }: ServicePanelProps) {
   return (
@@ -444,7 +555,7 @@ function ServicePanel({
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
           setDeleteSvcTarget={setDeleteSvcTarget}
-          setShowAddServiceModal={setShowAddServiceModal}
+          onCreateService={onCreateService}
           handleStartAll={handleStartAll}
           handleStopAll={handleStopAll}
           handleViewLog={handleViewLog}
@@ -598,7 +709,8 @@ interface ExpandedViewProps {
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
-  setShowAddServiceModal: (show: boolean) => void;
+  /** 新建服务（打开右侧编辑面板，空 id 即新建） */
+  onCreateService: () => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
@@ -612,7 +724,7 @@ interface ExpandedViewProps {
 
 function ExpandedView({
   services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
-  setDeleteSvcTarget, setShowAddServiceModal,
+  setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
   loading, load, onToggle,
@@ -628,7 +740,7 @@ function ExpandedView({
           isServiceRunning={isServiceRunning}
           isServiceFailed={isServiceFailed}
           setDeleteSvcTarget={setDeleteSvcTarget}
-          setShowAddServiceModal={setShowAddServiceModal}
+          onCreateService={onCreateService}
           handleStartAll={handleStartAll}
           handleStopAll={handleStopAll}
           handleViewLog={handleViewLog}
@@ -656,7 +768,8 @@ interface ServiceSectionProps {
   isServiceRunning: (svc: Service) => boolean;
   isServiceFailed: (svc: Service) => boolean;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
-  setShowAddServiceModal: (show: boolean) => void;
+  /** 新建服务（打开右侧编辑面板，空 id 即新建） */
+  onCreateService: () => void;
   handleStartAll: () => void;
   handleStopAll: () => void;
   handleViewLog: (svc: Service) => void;
@@ -671,7 +784,7 @@ interface ServiceSectionProps {
 function ServiceSection({
   services, editingService, onEditService,
   isServiceRunning, isServiceFailed,
-  setDeleteSvcTarget, setShowAddServiceModal,
+  setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
 }: ServiceSectionProps) {
@@ -719,7 +832,7 @@ function ServiceSection({
           <button
             className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
             title="添加服务"
-            onClick={() => setShowAddServiceModal(true)}
+            onClick={onCreateService}
           >
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
               <line x1="7" y1="2" x2="7" y2="12"/><line x1="2" y1="7" x2="12" y2="7"/>
@@ -743,7 +856,7 @@ function ServiceSection({
             <span className="text-[12px] text-nexus-muted mb-3">暂无服务</span>
             <button
               className="px-4 py-1.5 text-[12px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover"
-              onClick={() => setShowAddServiceModal(true)}
+              onClick={onCreateService}
             >添加服务</button>
           </div>
         )}
@@ -798,9 +911,17 @@ interface TemplateSectionProps {
   onRequestDelete: (tpl: ServiceTemplate) => void;
   /** 模板卡片拖拽排序持久化 */
   onReorderTemplates: (orderedIds: string[]) => void;
+  /** 新建空白模板（打开编辑面板，保存时由编辑面板走 create） */
+  onCreate: () => void;
+  /** 从 JSON 文件导入（重名自动改名） */
+  onImport: () => void;
+  /** 导出全部模板 */
+  onExportAll: () => void;
+  /** 导出单个模板（右键菜单） */
+  onExportOne: (tpl: ServiceTemplate) => void;
 }
 
-function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestDelete, onReorderTemplates }: TemplateSectionProps) {
+function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestDelete, onReorderTemplates, onCreate, onImport, onExportAll, onExportOne }: TemplateSectionProps) {
   // dnd-kit 拖拽排序：长按 250ms 激活（delay 期间移动超过 5px 则取消，视为普通点击），
   // 快速点击照常打开编辑面板
   const sensors = useSensors(
@@ -822,7 +943,42 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" className="text-nexus-muted flex-shrink-0">
           <path d="M7 1.5l1.4 2.9 3.1.4-2.3 2.2.6 3.1L7 8.8l-2.8 1.3.6-3.1L2.5 4.8l3.1-.4L7 1.5z"/>
         </svg>
-        <span className="text-[13px] text-nexus-text font-medium truncate">服务模板库</span>
+        <span className="text-[13px] text-nexus-text font-medium truncate min-w-0">服务模板库</span>
+        {/* 新建 / 导入 / 导出三个入口都放标题栏：它们是同一层级的**库级**操作，
+            混进列表里反而难找（单个模板的导出在它自己的右键菜单里）。
+
+            尺寸与「项目服务」的「+」严格对齐（p-1.5 / rounded-md / 14px 图标 / 描边 1.5）：
+            两块面板上下相邻，图标差 1px、内边距差 0.5 都看得出来 */}
+        <div className="ml-auto flex items-center gap-1 flex-shrink-0">
+          <button
+            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+            title="新建模板"
+            onClick={onCreate}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <line x1="7" y1="2" x2="7" y2="12" /><line x1="2" y1="7" x2="12" y2="7" />
+            </svg>
+          </button>
+          <button
+            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+            title="从文件导入模板（重名自动改名）"
+            onClick={onImport}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 2v7" /><polyline points="4,6.5 7,9.5 10,6.5" /><line x1="2.5" y1="12" x2="11.5" y2="12" />
+            </svg>
+          </button>
+          <button
+            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+            title="导出全部模板"
+            onClick={onExportAll}
+            disabled={templates.length === 0}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 10V3" /><polyline points="4,5.5 7,2.5 10,5.5" /><line x1="2.5" y1="12" x2="11.5" y2="12" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* 模板列表（dnd-kit 拖拽排序：拖手柄排序，整卡点击编辑） */}
@@ -831,7 +987,7 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
           <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
             <span className="text-[24px] opacity-[0.08] select-none font-extralight mb-2">T</span>
             <span className="text-[12px] text-nexus-muted mb-1">暂无模板</span>
-            <span className="text-[11px] text-nexus-muted/60">编辑服务时点「另存为模板」创建</span>
+            <span className="text-[11px] text-nexus-muted/60">点标题栏的「+」新建，或编辑服务时点「另存为模板」</span>
           </div>
         ) : (
           <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
@@ -845,6 +1001,7 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
                   onEdit={onEdit}
                   onAdd={onAdd}
                   onRequestDelete={onRequestDelete}
+                  onExport={onExportOne}
                 />
               ))}
             </SortableContext>

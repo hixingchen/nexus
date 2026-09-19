@@ -17,10 +17,12 @@ interface Props {
   onAdd: (tpl: ServiceTemplate) => void;
   /** 请求删除（父组件弹确认框，与服务删除流程一致） */
   onRequestDelete: (tpl: ServiceTemplate) => void;
+  /** 导出这一个模板到 JSON 文件（右键菜单；发给别人或单独备份） */
+  onExport: (tpl: ServiceTemplate) => void;
 }
 
-/** 模板条目：视觉与服务条目一致（圆点 + 名称 + Hover 操作），点击打开编辑面板，Hover/右键提供「添加到项目 / 删除模板」 */
-export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onRequestDelete }: Props) {
+/** 模板条目：视觉与服务条目一致（圆点 + 名称 + Hover 操作），点击打开编辑面板，Hover/右键提供「添加到项目 / 导出 / 删除模板」 */
+export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onRequestDelete, onExport }: Props) {
   // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板；添加中禁用拖拽）
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: tpl.id,
@@ -102,6 +104,7 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
           onOpenInExplorer={handleOpenInExplorer}
           onOpenTerminal={handleOpenTerminal}
           onDelete={() => { setContextMenu(null); onRequestDelete(tpl); }}
+          onExport={() => { setContextMenu(null); onExport(tpl); }}
           onClose={() => setContextMenu(null)}
         />,
         document.body,
@@ -119,12 +122,13 @@ interface TemplateContextMenuProps {
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
   onDelete: () => void;
+  onExport: () => void;
   onClose: () => void;
 }
 
 // 容器/定位/关闭与行按钮走 ui/ContextMenu 原语：口径与服务条目菜单同源
 // （原实现手写「固定 180px 宽 + 估算高度」夹取，估算偏小会让末尾条目落到屏幕外）
-const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, onDelete, onClose }: TemplateContextMenuProps) => (
+const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, onDelete, onExport, onClose }: TemplateContextMenuProps) => (
   <ContextMenu x={x} y={y} onClose={onClose}>
     {/* 打开资源管理器 / 打开终端 */}
     {hasCwd && (
@@ -145,6 +149,19 @@ const TemplateContextMenu = ({ x, y, hasCwd, onOpenInExplorer, onOpenTerminal, o
         />
       </div>
     )}
+
+    {/* 导出这一个（发给别人 / 单独备份）：与"打开位置"分开一组——那是定位，这是搬运配置。
+        图标走 10×10 坐标系：菜单里其它条目都是这个规格（这条原先用了 14 的坐标系却把
+        宽高写成 10，图被整体缩了一圈，跟旁边的图标不是一个粗细） */}
+    <div className={`py-1.5 px-1.5 ${hasCwd ? 'border-t border-nexus-border/30' : ''}`}>
+      <ContextMenuItem
+        icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M5 7.5V2.5"/><polyline points="2.8,4.7 5,2.5 7.2,4.7"/><line x1="2" y1="8.5" x2="8" y2="8.5"/>
+        </svg>}
+        label="导出这个模板"
+        onClick={onExport}
+      />
+    </div>
 
     {/* 删除 */}
     <div className="border-t border-nexus-border/30 py-1.5 px-1.5">

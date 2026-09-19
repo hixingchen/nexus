@@ -1,5 +1,5 @@
 use tauri::{Manager, State};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::models::{Service, ServiceTemplate};
 use crate::database::{query_services_by_project, Database};
@@ -37,6 +37,20 @@ pub struct AddServiceParams {
     pub env_vars: String,
     pub restart_mode: i32,
     pub tool_commands: String,
+    /// 以下四项不传时用默认值（`None`）。
+    ///
+    /// 为什么要放开：此前"添加服务"只能填名称/命令/工作目录，其余四项在
+    /// `insert_service` 里写死，用户想配监听规则或目录树开关得先把服务建出来、
+    /// 再点开卡片开另一个面板。改成服务面板新建后，一次填写就能配全，所以这里
+    /// 得能接收它们；不传的老调用点行为完全不变。
+    #[serde(default)]
+    pub watch_include: Option<String>,
+    #[serde(default)]
+    pub watch_exclude: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub show_file_tree: Option<bool>,
 }
 
 /// 获取某个项目下的所有服务
@@ -100,8 +114,11 @@ pub(crate) fn insert_service_row(
                 serde_json::to_string(&vec![cwd.to_string()]).unwrap_or_else(|_| "[]".to_string())
             }
         } else { params.watch_paths.clone() };
-        let wi = "*";
-        let wx = DEFAULT_WATCH_EXCLUDE;
+        // 默认值保持与放开参数之前一致（不传 = 旧行为）
+        let wi = params.watch_include.as_deref().unwrap_or("*");
+        let wx = params.watch_exclude.clone().unwrap_or_else(|| DEFAULT_WATCH_EXCLUDE.to_string());
+        let en = params.enabled.unwrap_or(true);
+        let sft = params.show_file_tree.unwrap_or(false);
         conn.execute(
             &format!(
                 "INSERT INTO services ({}) VALUES ({})",
@@ -113,16 +130,16 @@ pub(crate) fn insert_service_row(
                 ":command": params.command, ":cwd": cwd, ":watch_paths": wp,
                 ":watch_include": wi, ":watch_exclude": wx, ":env_vars": params.env_vars,
                 ":restart_mode": params.restart_mode,
-                // 新服务的两个展示开关固定初值：启用、不显示文件树
-                ":enabled": 1, ":show_file_tree": 0,
+                // 两个展示开关：默认"启用 + 不显示文件树"，面板新建时按用户勾的走
+                ":enabled": en, ":show_file_tree": sft,
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
             id, project_id: params.project_id.clone(), name: params.name.trim().to_string(), command: params.command.clone(),
-            cwd: cwd.to_string(), watch_paths: wp, watch_include: wi.into(), watch_exclude: wx.into(),
-            env_vars: params.env_vars.clone(), restart_mode: params.restart_mode, enabled: true,
-            show_file_tree: false,
+            cwd: cwd.to_string(), watch_paths: wp, watch_include: wi.into(), watch_exclude: wx,
+            env_vars: params.env_vars.clone(), restart_mode: params.restart_mode, enabled: en,
+            show_file_tree: sft,
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
         })
@@ -549,6 +566,306 @@ pub fn update_service_template(
     })
 }
 
+/// 新建服务模板参数（与 UpdateServiceTemplateParams 同形，只是没有 id）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateServiceTemplateParams {
+    pub name: String,
+    pub command: String,
+    pub cwd: String,
+    pub watch_paths: String,
+    pub watch_include: String,
+    pub watch_exclude: String,
+    pub env_vars: String,
+    pub restart_mode: i32,
+    pub enabled: bool,
+    pub show_file_tree: bool,
+    pub tool_commands: String,
+    pub open_tool_id: String,
+}
+
+/// 在模板库里直接新建模板（不必先有服务再"另存为模板"）
+#[tauri::command]
+pub fn create_service_template(
+    state: State<AppState>,
+    params: CreateServiceTemplateParams,
+) -> Result<ServiceTemplate, String> {
+    let name = params.name.trim().to_string();
+    if name.is_empty() { return Err("名称不能为空".into()); }
+    if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
+    if !params.tool_commands.trim().is_empty() {
+        serde_json::from_str::<Vec<crate::models::ToolCommand>>(&params.tool_commands)
+            .map_err(|e| format!("工具命令配置不是合法 JSON: {}", e))?;
+    }
+    let cwd = params.cwd.replace('\\', "/");
+    // 与 update_service_template 同一套收口：模板目录同样是"即将进入白名单的根"
+    state.paths.ensure_config_dir_allowed(&state.db, &cwd, "工作目录")?;
+    state.paths.ensure_watch_paths_allowed(&state.db, &params.watch_paths)?;
+    let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
+    // 监听两项留空 = 用默认，与服务新建同口径。
+    //
+    // 为什么归一化放后端而不是让前端填：默认排除规则（node_modules / .git / …）的**唯一
+    // 来源在后端**，前端复制一份迟早与它漂移（前端的 placeholder 只有 4 行、后端 8 行，
+    // 已经不一致了）。编辑模板走 update_service_template，那里直传——所以"就是想清空
+    // 排除规则"在编辑路径上照样做得到，不受这里影响。
+    let watch_include = if params.watch_include.trim().is_empty() { "*".to_string() } else { params.watch_include };
+    let watch_exclude = if params.watch_exclude.trim().is_empty() {
+        DEFAULT_WATCH_EXCLUDE.to_string()
+    } else {
+        params.watch_exclude
+    };
+
+    state.db.with_conn(|conn| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let en = if params.enabled { 1 } else { 0 };
+        let sft = if params.show_file_tree { 1 } else { 0 };
+        // 接在排序末尾（视图是 ORDER BY sort_index, name）：新模板出现在列表最后。
+        // 另存为模板走的是固定 0，两者位置能区分开——用户刚建的模板在末尾好找
+        let next_sort: i32 = conn
+            .query_row("SELECT COALESCE(MAX(sort_index), -1) + 1 FROM service_templates", [], |r| r.get(0))
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![id, name, params.command, cwd, params.watch_paths, watch_include,
+                watch_exclude, params.env_vars, params.restart_mode, en, sft, next_sort,
+                tool_commands, params.open_tool_id],
+        ).map_err(|e| format!("新建模板失败: {}", e))?;
+        let created_at: String = conn
+            .query_row("SELECT created_at FROM service_templates WHERE id=?1", [&id], |r| r.get(0))
+            .unwrap_or_default();
+        Ok(ServiceTemplate {
+            id,
+            name,
+            command: params.command,
+            cwd,
+            watch_paths: params.watch_paths,
+            watch_include,
+            watch_exclude,
+            env_vars: params.env_vars,
+            restart_mode: params.restart_mode,
+            enabled: params.enabled,
+            show_file_tree: params.show_file_tree,
+            tool_commands,
+            open_tool_id: params.open_tool_id,
+            created_at,
+        })
+    })
+}
+
+// ─── 模板导入导出 ───────────────────────────────────────────
+
+/// 导出文件里的单个模板。与 ServiceTemplate 两点不同：
+/// - **没有 id**：导入方自己生成——跨机复制会撞 id，同机重复导入也会与源模板冲突
+/// - **openToolName 而不是 openToolId**：工具 id 是本机工具库的主键，换台机器指向别的
+///   工具或压根不存在（静默指错）。名字是两台机器之间唯一有意义的标识
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportedTemplate {
+    pub name: String,
+    pub command: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub watch_paths: String,
+    #[serde(default)]
+    pub watch_include: String,
+    #[serde(default)]
+    pub watch_exclude: String,
+    #[serde(default)]
+    pub env_vars: String,
+    #[serde(default)]
+    pub restart_mode: i32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub show_file_tree: bool,
+    #[serde(default)]
+    pub tool_commands: String,
+    #[serde(default)]
+    pub open_tool_name: String,
+}
+
+/// 导出文件的顶层结构（带 version：将来加字段时能认出旧文件）
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateExportFile {
+    pub version: u32,
+    pub templates: Vec<ExportedTemplate>,
+}
+
+/// 当前导出格式版本
+const TEMPLATE_EXPORT_VERSION: u32 = 1;
+
+/// 导入结果——要让界面能如实说明"到底发生了什么"，而不是一句"导入成功"。
+///
+/// 响应 DTO 一律 snake_case（见 contract.rs 顶部的规则），前端类型原样对应；
+/// 上面的导出文件结构是**文件格式**不是 IPC 载荷，所以用 camelCase 便于阅读与手工编辑
+#[derive(Serialize)]
+pub struct ImportTemplatesResult {
+    pub imported: usize,
+    /// 与库里已有模板同名的数量（**只统计、不改名**）。
+    ///
+    /// 为什么不像最初那样自动加「(2)」后缀：库里本来就允许同名（`service_templates.name`
+    /// 上没有唯一约束），而同一个功能里的另一个入口——「另存为模板」——从不加后缀。
+    /// 加后缀是导入这边**自己加的**约束，还让用户导入完得挨个改回来。
+    pub duplicated: usize,
+    /// 本机工具库里没有、因而没绑上的工具名（已去重）
+    pub missing_tools: Vec<String>,
+    /// 工作目录在本机不存在的模板名。导入**不会**因此失败（模板只是配置，
+    /// 真正用到目录是在"从模板添加服务"那一步，那里有收口），但用户需要知道
+    /// "导入完为什么不能直接用"
+    pub missing_dirs: Vec<String>,
+}
+
+/// 导出模板到 JSON 文件。`ids` 为空 = 导出全部；否则只导出指定模板
+#[tauri::command]
+pub fn export_service_templates(
+    state: State<AppState>,
+    path: String,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let target = path.trim();
+    if target.is_empty() { return Err("导出路径不能为空".into()); }
+
+    let picked = state.db.with_conn(|conn| collect_export_templates(conn, &ids))?;
+    if picked.is_empty() { return Err("没有可导出的模板".into()); }
+    let count = picked.len();
+
+    let payload = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: picked };
+    let json = serde_json::to_string_pretty(&payload).map_err(|e| format!("生成导出内容失败: {}", e))?;
+    std::fs::write(target, json).map_err(|e| format!("写入文件失败: {}", e))?;
+    Ok(count)
+}
+
+/// 收集要导出的模板（ids 为空 = 全部）。抽出来是为了可单测——
+/// Tauri 命令签名带 `State`，测试构造不出来
+fn collect_export_templates(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+) -> Result<Vec<ExportedTemplate>, String> {
+    // LEFT JOIN 取工具名：没绑工具时 tool_name 为空
+    let mut stmt = conn.prepare(
+        "SELECT t.name, t.command, t.cwd, t.watch_paths, t.watch_include, t.watch_exclude,
+                t.env_vars, t.restart_mode, t.enabled, t.show_file_tree, t.tool_commands,
+                t.id, COALESCE(o.name, '') AS tool_name
+         FROM service_templates t
+         LEFT JOIN open_tools o ON o.id = t.open_tool_id
+         ORDER BY t.sort_index, t.name"
+    ).map_err(|e| format!("查询模板失败: {}", e))?;
+    let rows = stmt.query_map([], |row| Ok((
+        row.get::<_, String>("id")?,
+        ExportedTemplate {
+            name: row.get("name")?,
+            command: row.get("command")?,
+            cwd: row.get("cwd")?,
+            watch_paths: row.get("watch_paths")?,
+            watch_include: row.get("watch_include")?,
+            watch_exclude: row.get("watch_exclude")?,
+            env_vars: row.get("env_vars")?,
+            restart_mode: row.get("restart_mode")?,
+            enabled: row.get("enabled")?,
+            show_file_tree: row.get("show_file_tree")?,
+            tool_commands: row.get("tool_commands")?,
+            open_tool_name: row.get("tool_name")?,
+        },
+    ))).map_err(|e| format!("查询模板失败: {}", e))?;
+    let all = rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("查询模板失败: {}", e))?;
+
+    Ok(if ids.is_empty() {
+        all.into_iter().map(|(_, t)| t).collect()
+    } else {
+        all.into_iter().filter(|(id, _)| ids.contains(id)).map(|(_, t)| t).collect()
+    })
+}
+
+/// 从 JSON 文件导入模板。
+///
+/// **不做目录收口**（与 create/update 不同）：导入的是别人机器上的配置，其 cwd 在本机
+/// 多半不存在，收口会让整个导入失败。收口留给真正用到目录的那一步——
+/// `add_service_from_template` 已经在对模板值做白名单校验（那里的注释也写明"模板可能是
+/// 从别处导入或被写坏的"），所以未收口的模板不会被真的用起来。
+#[tauri::command]
+pub fn import_service_templates(
+    state: State<AppState>,
+    path: String,
+) -> Result<ImportTemplatesResult, String> {
+    let source = path.trim();
+    if source.is_empty() { return Err("导入路径不能为空".into()); }
+    let raw = std::fs::read_to_string(source).map_err(|e| format!("读取文件失败: {}", e))?;
+    let file: TemplateExportFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("不是有效的模板导出文件: {}", e))?;
+    if file.version != TEMPLATE_EXPORT_VERSION {
+        return Err(format!("导出文件版本 {} 不受支持（当前支持 {}）", file.version, TEMPLATE_EXPORT_VERSION));
+    }
+
+    state.db.with_conn_mut(|conn| import_templates_into(conn, &file))
+}
+
+/// 导入的核心逻辑（与命令分开：命令只管读文件与解析，这里拿得到连接、可单测）
+fn import_templates_into(
+    conn: &mut rusqlite::Connection,
+    file: &TemplateExportFile,
+) -> Result<ImportTemplatesResult, String> {
+    let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+    let mut imported = 0usize;
+    let mut duplicated = 0usize;
+    let mut missing_tools: Vec<String> = Vec::new();
+    let mut missing_dirs: Vec<String> = Vec::new();
+
+    // 整批一个事务：导入要么全成、要么全不成。半途失败留下"导了一半"的模板库，
+    // 用户看到的是一堆残缺数据，还不如重来
+    for t in &file.templates {
+        let name = t.name.trim().to_string();
+        if name.is_empty() { continue; } // 没名字的行没法用，跳过（计数里也不含）
+        // 同名照收，名字保持原样（见 ImportTemplatesResult.duplicated 的说明）。
+        // 只统计一下，好让界面能如实告诉用户"有 N 个与现有的同名"
+        let taken: i64 = tx
+            .query_row("SELECT COUNT(*) FROM service_templates WHERE name=?1", [&name], |r| r.get(0))
+            .unwrap_or(0);
+        if taken > 0 { duplicated += 1; }
+
+        // 工具按**名字**在本机工具库里找；找不到就不绑（记下来告诉用户）
+        let tool_id = if t.open_tool_name.trim().is_empty() {
+            String::new()
+        } else {
+            let found = tx
+                .query_row("SELECT id FROM open_tools WHERE name=?1 LIMIT 1", [t.open_tool_name.trim()], |r| r.get::<_, String>(0))
+                .ok();
+            match found {
+                Some(id) => id,
+                None => {
+                    let n = t.open_tool_name.trim().to_string();
+                    if !missing_tools.contains(&n) { missing_tools.push(n); }
+                    String::new()
+                }
+            }
+        };
+
+        let cwd = t.cwd.replace('\\', "/");
+        if !cwd.trim().is_empty() && !std::path::Path::new(cwd.trim()).is_dir() {
+            missing_dirs.push(name.clone());
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let en = if t.enabled { 1 } else { 0 };
+        let sft = if t.show_file_tree { 1 } else { 0 };
+        let tool_commands = if t.tool_commands.trim().is_empty() { "[]".to_string() } else { t.tool_commands.clone() };
+        let next_sort: i32 = tx
+            .query_row("SELECT COALESCE(MAX(sort_index), -1) + 1 FROM service_templates", [], |r| r.get(0))
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![id, name, t.command, cwd, t.watch_paths, t.watch_include, t.watch_exclude,
+                t.env_vars, t.restart_mode, en, sft, next_sort, tool_commands, tool_id],
+        ).map_err(|e| format!("导入模板失败: {}", e))?;
+        imported += 1;
+    }
+
+    tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
+    Ok(ImportTemplatesResult { imported, duplicated, missing_tools, missing_dirs })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,7 +892,263 @@ mod tests {
             env_vars: String::new(),
             restart_mode: 1,
             tool_commands: String::new(),
+            watch_include: None,
+            watch_exclude: None,
+            enabled: None,
+            show_file_tree: None,
         }
+    }
+
+    /// 传了监听规则与两个展示开关时按传的走（不传才用默认）。
+    ///
+    /// 这三项此前在 insert_service_row 里写死——"添加服务"弹窗只能填三个字段，
+    /// 其余由后端补，用户想配全得建完再开一次面板。改成服务面板新建后必须能带全，
+    /// 这条钉住"传了就生效"，同时上面的 add_params 仍覆盖"不传 = 旧行为"。
+    #[test]
+    fn test_add_service_accepts_explicit_watch_rules_and_flags() {
+        let db = test_db();
+        let mut p = add_params("S", "C:/s");
+        p.watch_include = Some("*.ts".into());
+        p.watch_exclude = Some("dist".into());
+        p.enabled = Some(false);
+        p.show_file_tree = Some(true);
+
+        let svc = insert_service_row(&db, &p, "C:/s", "[]").expect("插入服务");
+        assert_eq!(svc.watch_include, "*.ts");
+        assert_eq!(svc.watch_exclude, "dist");
+        assert!(!svc.enabled, "传了 false 就该是不启用");
+        assert!(svc.show_file_tree, "传了 true 就该显示文件树");
+    }
+
+    /// 测试用的空模板：只填必要的名字/命令，其余留空
+    fn exported(name: &str, tool: &str) -> ExportedTemplate {
+        ExportedTemplate {
+            name: name.into(),
+            command: "npm run dev".into(),
+            cwd: String::new(),
+            watch_paths: "[]".into(),
+            watch_include: String::new(),
+            watch_exclude: String::new(),
+            env_vars: String::new(),
+            restart_mode: 0,
+            enabled: true,
+            show_file_tree: false,
+            tool_commands: "[]".into(),
+            open_tool_name: tool.into(),
+        }
+    }
+
+    /// 导出 → 序列化 → 读回 → 导入：配置原样搬过去，**id 不带**（跨机会撞、
+    /// 同机重复导入也会与源模板冲突，所以导出格式里根本没有 id 字段）
+    #[test]
+    fn test_template_export_import_roundtrip() {
+        let db = test_db();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+                 VALUES ('t1','前端 dev','npm run dev','','[]','','','K=V',1,1,0,0,'[]','')",
+                [],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).expect("插入模板");
+
+        let exported_list = db.with_conn(|c| collect_export_templates(c, &[])).expect("导出");
+        assert_eq!(exported_list.len(), 1);
+        assert_eq!(exported_list[0].name, "前端 dev");
+        assert_eq!(exported_list[0].env_vars, "K=V", "配置要原样带出去");
+
+        // 落盘再读回（导出→导入的真实路径）
+        let file = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: exported_list };
+        let json = serde_json::to_string(&file).expect("序列化导出文件");
+        let back: TemplateExportFile = serde_json::from_str(&json).expect("反序列化导出文件");
+
+        // 导入回同一个库：名字会撞上源模板 → 照收、不改名，只在结果里报"有同名"
+        let res = db.with_conn_mut(|c| import_templates_into(c, &back)).expect("导入");
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.duplicated, 1, "同名只统计、不改名");
+        assert!(res.missing_tools.is_empty(), "没绑工具就不该报缺失");
+        assert!(res.missing_dirs.is_empty(), "cwd 为空不算缺失目录");
+
+        db.with_conn(|c| {
+            let n: i64 = c
+                .query_row("SELECT COUNT(*) FROM service_templates WHERE name='前端 dev'", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            assert_eq!(n, 2, "两条都该叫原名");
+            Ok(())
+        }).expect("校验名字保持原样");
+    }
+
+    /// 同名不改名、工具按名字匹配、缺工具与缺目录都要报出来
+    #[test]
+    fn test_import_keeps_duplicate_names_and_matches_tool_by_name() {
+        let db = test_db();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+                 VALUES ('t1','T','c','','[]','','','',0,1,0,0,'[]','')",
+                [],
+            ).map_err(|e| e.to_string())?;
+            c.execute(
+                "INSERT INTO open_tools (id, name, command, executable, args) VALUES ('tool1','IDEA','','idea64.exe','{path}')",
+                [],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).expect("准备数据");
+
+        let mut with_missing_dir = exported("带目录的", "");
+        with_missing_dir.cwd = format!("C:/nexus-ut-nonexistent-{}", std::process::id());
+        let file = TemplateExportFile {
+            version: TEMPLATE_EXPORT_VERSION,
+            templates: vec![
+                exported("T", "IDEA"),          // 名字撞库里的 T；工具在本机有
+                exported("U", "不存在的工具"),   // 名字不撞；工具在本机没有
+                with_missing_dir,                // 目录在本机不存在
+            ],
+        };
+
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.duplicated, 1, "只有与 T 撞名的那条被统计");
+        assert_eq!(res.missing_tools, vec!["不存在的工具".to_string()]);
+        assert_eq!(res.missing_dirs, vec!["带目录的".to_string()]);
+
+        db.with_conn(|c| {
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM service_templates ORDER BY name").map_err(|e| e.to_string())?
+                .query_map([], |r| r.get(0)).map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            // 两条 T 都在、名字一模一样："T"(0x54) < "U"(0x55) < "带"(E5B8A6)
+            assert_eq!(names, vec!["T".to_string(), "T".to_string(), "U".to_string(), "带目录的".to_string()]);
+
+            // 工具按名字绑到本机的 IDEA（不是导出方的 id）
+            let bound: String = c
+                .query_row("SELECT open_tool_id FROM service_templates WHERE name='T' AND open_tool_id<>''", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            assert_eq!(bound, "tool1");
+
+            let unbound: i64 = c
+                .query_row("SELECT COUNT(*) FROM service_templates WHERE name='U' AND open_tool_id=''", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            assert_eq!(unbound, 1, "本机没有同名工具就不绑");
+            Ok(())
+        }).expect("校验落库结果");
+    }
+
+    /// 走**真实文件**的导出→导入：命令里做的就是"收集 → 序列化写盘"，再"读盘 → 反序列化"。
+    /// 只测内存里的序列化会漏掉"落盘后读不回来"这类问题（这正是铁律 19 说的那条路径）
+    #[test]
+    fn test_export_import_through_real_file() {
+        let db = test_db();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
+                 VALUES ('t1','带出去','echo hi','','[]','','','',0,1,0,0,'[]','')",
+                [],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).expect("插入模板");
+
+        let dir = std::env::temp_dir().join(format!("nexus_ut_tpl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let file = dir.join("templates.json");
+
+        // 导出
+        let picked = db.with_conn(|c| collect_export_templates(c, &[])).expect("收集模板");
+        assert_eq!(picked.len(), 1);
+        let payload = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: picked };
+        let json = serde_json::to_string_pretty(&payload).expect("序列化");
+        std::fs::write(&file, &json).expect("写文件");
+        assert!(json.contains("\n  "), "导出文件应当是缩进过的（要能手工看/改）");
+
+        // 读回并导入（导回同一个库，必然同名 → 走改名分支）
+        let raw = std::fs::read_to_string(&file).expect("读文件");
+        let back: TemplateExportFile = serde_json::from_str(&raw).expect("反序列化");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &back)).expect("导入");
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.duplicated, 1, "导回同一个库必然同名 → 只统计不改名");
+        assert!(res.missing_dirs.is_empty(), "cwd 为空不算缺失目录");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 库里是空的、文件里也没有重名时，**一个后缀都不该加**。
+    ///
+    /// 起因是用户反馈"我模板里一个都没有，导入却直接加后缀，还得一个一个改"。
+    /// 把"什么情况下才该加后缀"钉死：只有真的撞名才加，免得日后放宽条件。
+    #[test]
+    fn test_import_without_conflicts_keeps_original_names() {
+        let db = test_db();
+        let file = TemplateExportFile {
+            version: TEMPLATE_EXPORT_VERSION,
+            templates: vec![exported("前端", ""), exported("后端", ""), exported("redis", "")],
+        };
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.duplicated, 0, "没有同名就没有可报的冲突");
+
+        db.with_conn(|c| {
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM service_templates ORDER BY name").map_err(|e| e.to_string())?
+                .query_map([], |r| r.get(0)).map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            // ORDER BY name 是**字节序**："前"(E5 89 8D) < "后"(E5 90 8E)，不是拼音顺序
+            assert_eq!(names, vec!["redis".to_string(), "前端".to_string(), "后端".to_string()]);
+            Ok(())
+        }).expect("校验名字未被改动");
+    }
+
+    /// 导出文件**内部**就有重名时：三条照收，名字**全部保持原样**。
+    ///
+    /// 这是"库里明明空着却被加了后缀"最常见的原因——文件里本身就有几个同名模板
+    /// （同一个项目里几个都叫「前端」的服务，各另存了一次）。加后缀的话，用户导入完
+    /// 还得挨个把「前端 (2)」「前端 (3)」改回来。
+    #[test]
+    fn test_import_keeps_names_when_file_has_duplicates() {
+        let db = test_db();
+        let file = TemplateExportFile {
+            version: TEMPLATE_EXPORT_VERSION,
+            templates: vec![exported("前端", ""), exported("前端", ""), exported("前端", "")],
+        };
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.duplicated, 2, "第 2、3 条与刚落库的第 1 条同名");
+
+        db.with_conn(|c| {
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM service_templates ORDER BY name").map_err(|e| e.to_string())?
+                .query_map([], |r| r.get(0)).map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            assert_eq!(
+                names,
+                vec!["前端".to_string(), "前端".to_string(), "前端".to_string()],
+                "三条都叫原名，一个后缀都不加",
+            );
+            Ok(())
+        }).expect("校验名字");
+    }
+
+    /// 重复导入同一份文件：产生两份**同名**副本（与"把同名服务另存两次"的行为一致），
+    /// 删哪份由用户自己决定
+    #[test]
+    fn test_import_twice_keeps_both_copies_with_same_name() {
+        let db = test_db();
+        let file = TemplateExportFile {
+            version: TEMPLATE_EXPORT_VERSION,
+            templates: vec![exported("同一个模板", "")],
+        };
+        db.with_conn_mut(|c| import_templates_into(c, &file)).expect("第一次导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("第二次导入");
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.duplicated, 1, "第二次与第一次同名 → 统计但不改名");
+
+        db.with_conn(|c| {
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM service_templates ORDER BY name").map_err(|e| e.to_string())?
+                .query_map([], |r| r.get(0)).map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            assert_eq!(names, vec!["同一个模板".to_string(), "同一个模板".to_string()]);
+            Ok(())
+        }).expect("校验");
     }
 
     #[test]

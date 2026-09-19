@@ -17,7 +17,7 @@ use crate::commands::process::{
     ToolCommandResult,
 };
 use crate::commands::search::{SearchParams, SearchResponse, SearchResultItem};
-use crate::commands::service::AddServiceParams;
+use crate::commands::service::{AddServiceParams, ImportTemplatesResult};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
 use crate::core::process::{FailedService, LogLine, ServiceLogBatchPayload};
@@ -112,8 +112,17 @@ fn test_response_dtos_are_snake_case() {
         snippet: "s".into(),
     };
     assert_eq!(keys_of(&item), sorted(&["path", "name", "line", "snippet"]));
-    let resp = SearchResponse { results: vec![], truncated: false };
+    let resp = SearchResponse { results: vec![], truncated: false, skipped: None };
+    // skipped 带 skip_serializing_if：没有原因时它**不出现**在载荷里（前端按可选字段读）
     assert_eq!(keys_of(&resp), sorted(&["results", "truncated"]));
+    let resp_skipped = SearchResponse { results: vec![], truncated: false, skipped: Some("x".into()) };
+    assert_eq!(keys_of(&resp_skipped), sorted(&["results", "truncated", "skipped"]));
+
+    // 模板导入结果（响应 DTO：snake_case；前端的 ImportTemplatesResult 原样对应）
+    let imp = ImportTemplatesResult {
+        imported: 0, duplicated: 0, missing_tools: vec![], missing_dirs: vec![],
+    };
+    assert_eq!(keys_of(&imp), sorted(&["imported", "duplicated", "missing_tools", "missing_dirs"]));
 
     // 编辑器读文件（保存时原样回传 modified 做"外部已改"检测）与 hex 分页
     let read = ReadFileResponse {
@@ -384,6 +393,11 @@ fn test_every_serializable_struct_is_covered() {
         "LogLine", "FailedService", "ServiceLogBatchPayload",
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "Service", "ServiceTemplate", "ProjectDetail",
+        "ImportTemplatesResult",
+        // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
+        // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
+        // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）
+        "ExportedTemplate", "TemplateExportFile",
     ];
     let found = scan_serializable_structs();
     assert!(

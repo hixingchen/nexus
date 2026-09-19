@@ -119,6 +119,12 @@ export interface SearchResultItem {
 export interface SearchResponse {
   results: SearchResultItem[];
   truncated: boolean;
+  /**
+   * 搜索根是一个文件、且它**没有被搜索**时的原因（后端 `SkipReason` 的一句话）。
+   * 只有单文件搜索会带这个字段：目录搜索里跳过的文件成百上千，逐个解释没有意义。
+   * 有它就是"压根没搜"，没有才是"搜过了没命中"。
+   */
+  skipped?: string;
 }
 
 /** 在目录中按内容搜索文件（子串匹配） */

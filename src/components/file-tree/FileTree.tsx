@@ -594,7 +594,7 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} />
         ))}
 
-        {/* 空白区域右键菜单：粘贴到项目根目录 */}
+        {/* 空白区域右键菜单：搜索整个树根 / 粘贴到项目根目录 */}
         {rootMenu && rootPath && (
           <ContextMenu
             x={rootMenu.x}
@@ -602,6 +602,23 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
             onClose={() => setRootMenu(null)}
             className="py-1.5 px-1.5"
           >
+            {/* 搜索整个树根：节点右键只能搜"那一个目录/文件"，这里补上"从根搜"——
+                项目树的根节点没有对应的行（embedded 不渲染根），空白区是另一个自然入口 */}
+            <ContextMenuItem
+              iconBox
+              icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+                <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
+              </svg>}
+              label="搜索文件内容"
+              onClick={() => {
+                setRootMenu(null);
+                // 标题取根目录名（filter(Boolean) 顺带处理结尾斜杠）
+                useSearchModalStore.getState().openSearch(
+                  rootPath,
+                  rootPath.split(/[/\\]/).filter(Boolean).pop() ?? '根目录',
+                );
+              }}
+            />
             <ContextMenuItem
               iconBox
               icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">

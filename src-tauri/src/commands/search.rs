@@ -19,6 +19,14 @@ pub struct SearchResponse {
     pub results: Vec<SearchResultItem>,
     /// 结果/扫描达到上限被截断
     pub truncated: bool,
+    /// 根节点是文件、且因故**没有被搜索**时的原因（供界面解释空结果）。
+    ///
+    /// 只有单文件搜索会填：目录遍历里被跳过的文件成千上万，逐个解释没有意义。
+    /// 但"右键一个文件去搜"时，`results` 为空有**两种完全不同的含义**——搜过了没命中，
+    /// 和压根没搜（二进制 / 超大 / 被扩展名筛掉）。此前两者都显示"未找到匹配内容"，
+    /// 把后者说成了前者。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// 服务文件搜索参数
@@ -129,13 +137,17 @@ fn search_in_dir(
     let real_root = std::fs::canonicalize(&root_path).ok();
     if root_path.is_file() {
         let mut results = Vec::new();
-        let truncated = false;
-        if let Some(bytes) = read_searchable(real_root.as_deref(), &root_path, exts) {
-            if let Some(hits) = search_bytes(&root_path, &bytes, q, case_sensitive, max_results) {
-                results.extend(hits);
+        // 被跳过时把原因带回去：界面要区分"搜过了没命中"与"压根没搜"
+        let skipped = match read_searchable(real_root.as_deref(), &root_path, exts) {
+            Ok(bytes) => {
+                if let Some(hits) = search_bytes(&root_path, &bytes, q, case_sensitive, max_results) {
+                    results.extend(hits);
+                }
+                None
             }
-        }
-        return Ok(SearchResponse { results, truncated });
+            Err(reason) => Some(reason.message()),
+        };
+        return Ok(SearchResponse { results, truncated: false, skipped });
     }
 
     let mut results: Vec<SearchResultItem> = Vec::new();
@@ -177,7 +189,8 @@ fn search_in_dir(
                 // 一次 open：候选判定（大小/扩展名/NUL 探测）与逐行搜索共用同一份字节，
                 // 原实现先 stat + open 读 8KB 探测、再 open 整读一遍——同一文件两次打开、
                 // 前 8KB 读两次（上限 2 万文件时最坏多出 2 万次 open）
-                if let Some(bytes) = read_searchable(real_root.as_deref(), &path, exts) {
+                // 遍历时不关心跳过原因（跳过的文件成千上万，见 SkipReason 的说明）
+                if let Ok(bytes) = read_searchable(real_root.as_deref(), &path, exts) {
                     if let Some(hits) = search_bytes(&path, &bytes, q, case_sensitive, max_results - results.len()) {
                         results.extend(hits);
                     }
@@ -189,7 +202,45 @@ fn search_in_dir(
     }
 
     results.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(SearchResponse { results, truncated })
+    Ok(SearchResponse { results, truncated, skipped: None })
+}
+
+/// 候选文件为何没被搜索。
+///
+/// 目录遍历时原因无关紧要（跳过是常态），但**单文件搜索**必须说清楚：界面要能区分
+/// "搜过了，没有命中"与"这个文件根本没搜"，否则用户会去改搜索词，而真正该改的是
+/// 扩展名筛选框（或他压根不该期待在 png 里搜到文本）。
+#[derive(Debug)]
+enum SkipReason {
+    /// 被扩展名筛选排除
+    Extension,
+    /// 二进制扩展名（图片 / 压缩包 / 可执行文件…）
+    BinaryExt,
+    /// 头部含 NUL 字节，按二进制处理
+    BinaryContent,
+    /// 空文件
+    Empty,
+    /// 超过单文件搜索大小上限
+    TooLarge,
+    /// 打不开，或句柄复核后发现落在搜索根之外（符号链接 / junction 指向外部）
+    Unreadable,
+}
+
+impl SkipReason {
+    /// 给界面看的一句话（只在单文件搜索时使用）
+    fn message(&self) -> String {
+        match self {
+            SkipReason::Extension => "该文件的扩展名不在筛选范围内，检查「扩展名」输入框".to_string(),
+            SkipReason::BinaryExt => "这是二进制文件（图片 / 压缩包 / 可执行文件等），不做内容搜索".to_string(),
+            SkipReason::BinaryContent => "文件内容看起来是二进制（含 NUL 字节），不做内容搜索".to_string(),
+            SkipReason::Empty => "这是一个空文件".to_string(),
+            SkipReason::TooLarge => format!(
+                "文件超过 {} MB 的单文件搜索上限",
+                MAX_SEARCH_FILE_SIZE / 1024 / 1024
+            ),
+            SkipReason::Unreadable => "文件打不开，或不在允许搜索的目录内".to_string(),
+        }
+    }
 }
 
 /// 候选文件读取 + 可搜索判定（一次 open 完成）。
@@ -197,40 +248,42 @@ fn search_in_dir(
 /// 判定顺序：扩展名筛选（不读盘）→ 打开并**按句柄复核真实目标仍在搜索根内**（SEC-4：
 /// 目录遍历与实际读取之间，项目内并发脚本可以把某个路径换成指向外面的 junction，
 /// 若不复核就会把白名单外文件的内容作为命中片段返回给界面）→ 整读（受大小上限约束）
-/// → 头部 NUL 探测。返回 `None` 表示跳过该文件（过大/非目标类型/二进制/读失败/越界）。
+/// → 头部 NUL 探测。返回 `Err(SkipReason)` 表示跳过该文件——原因要带回去给界面用：
+/// 目录遍历忽略它（跳过是常态），单文件搜索拿它解释"为什么没有结果"。
 ///
 /// `real_root` 由调用方算好传入（PERF-16）：它是常量却被原实现在**每个候选文件**上
 /// 重算一次 `canonicalize`（Windows 下每次都是路径解析 + 若干系统调用）。顺带更稳：
 /// 基准在整个遍历期间固定，扫描中途 root 若被换成指向外部的 junction，经它解析出的
 /// 文件不会以旧 root 开头 → 一律拒绝（逐文件重算反而会跟着换后的 root 一起放行）。
-fn read_searchable(real_root: Option<&Path>, path: &Path, exts: &[String]) -> Option<Vec<u8>> {
+fn read_searchable(real_root: Option<&Path>, path: &Path, exts: &[String]) -> Result<Vec<u8>, SkipReason> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ext = Path::new(name).extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     // 先按名字过滤：命中排除项就不必打开文件
-    if !exts.is_empty() && !exts.iter().any(|e| e == &ext) { return None; }
-    if BINARY_EXTENSIONS.contains(&ext.as_str()) { return None; }
+    if !exts.is_empty() && !exts.iter().any(|e| e == &ext) { return Err(SkipReason::Extension); }
+    if BINARY_EXTENSIONS.contains(&ext.as_str()) { return Err(SkipReason::BinaryExt); }
 
     use std::io::Read;
     // 一次 open，后续读取都在这条已复核的句柄上
-    let file = std::fs::File::open(path).ok()?;
-    let real = crate::commands::paths::final_path_of_handle(&file).ok()?;
+    let file = std::fs::File::open(path).map_err(|_| SkipReason::Unreadable)?;
+    let real = crate::commands::paths::final_path_of_handle(&file).map_err(|_| SkipReason::Unreadable)?;
     // 复核基准同样取"内核解析后的根"，两边同为 verbatim 形式才能正确比较。
     // 取不到基准（root 不存在/无权限）→ 无法复核 → 拒绝，与原先一致
-    let real_root = real_root?;
-    if !real.starts_with(real_root) { return None; }
+    let real_root = real_root.ok_or(SkipReason::Unreadable)?;
+    if !real.starts_with(real_root) { return Err(SkipReason::Unreadable); }
 
-    let metadata = file.metadata().ok()?;
-    if metadata.len() == 0 || metadata.len() > MAX_SEARCH_FILE_SIZE { return None; }
+    let metadata = file.metadata().map_err(|_| SkipReason::Unreadable)?;
+    if metadata.len() == 0 { return Err(SkipReason::Empty); }
+    if metadata.len() > MAX_SEARCH_FILE_SIZE { return Err(SkipReason::TooLarge); }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     // 上限 +1 字节：读满即说明文件比 metadata 报的更大，下面按实际长度复核
-    file.take(MAX_SEARCH_FILE_SIZE + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_SEARCH_FILE_SIZE { return None; }
+    file.take(MAX_SEARCH_FILE_SIZE + 1).read_to_end(&mut bytes).map_err(|_| SkipReason::Unreadable)?;
+    if bytes.len() as u64 > MAX_SEARCH_FILE_SIZE { return Err(SkipReason::TooLarge); }
     // 二进制检测：头部含 NUL 视为二进制（原先单独读 8KB 探测，现在用已读入的字节）
     let probe = &bytes[..bytes.len().min(BINARY_PROBE_SIZE)];
-    if probe.contains(&0) { return None; }
-    Some(bytes)
+    if probe.contains(&0) { return Err(SkipReason::BinaryContent); }
+    Ok(bytes)
 }
 
 /// 在单文件的**已读入字节**中逐行搜索，返回命中行
@@ -356,14 +409,53 @@ mod tests {
         let file = dir.join("a.txt");
         std::fs::write(&file, b"hello").expect("写文件");
 
-        assert!(read_searchable(None, &file, &[]).is_none(), "取不到基准必须拒绝");
+        assert!(read_searchable(None, &file, &[]).is_err(), "取不到基准必须拒绝");
 
         let real_root = std::fs::canonicalize(&dir).expect("canonicalize 根");
-        assert!(read_searchable(Some(&real_root), &file, &[]).is_some(), "根内文件应可读");
+        assert!(read_searchable(Some(&real_root), &file, &[]).is_ok(), "根内文件应可读");
 
         // 基准换成另一个目录（不含该文件）→ 越界，拒绝
         let other_root = std::fs::canonicalize(&outside).expect("canonicalize 另一根");
-        assert!(read_searchable(Some(&other_root), &file, &[]).is_none(), "越界文件必须拒绝");
+        assert!(read_searchable(Some(&other_root), &file, &[]).is_err(), "越界文件必须拒绝");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单文件被跳过时必须带回原因：否则界面会把"压根没搜"显示成"未找到匹配内容"，
+    /// 用户接着去改搜索词，而真正该改的是扩展名筛选框（或他本就不该期待在 png 里搜到文本）。
+    #[test]
+    fn test_skip_reason_for_single_file() {
+        let dir = std::env::temp_dir().join(format!("nexus_ut_skip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let real_root = std::fs::canonicalize(&dir).expect("canonicalize 根");
+
+        // 二进制扩展名：按名字即可判定，不必打开文件
+        let png = dir.join("logo.png");
+        std::fs::write(&png, b"not really a png").expect("写文件");
+        assert!(matches!(read_searchable(Some(&real_root), &png, &[]), Err(SkipReason::BinaryExt)));
+
+        // 被扩展名筛选排除：右键一个 md 却把扩展名框填成了 ts（最隐蔽的一种）
+        let md = dir.join("README.md");
+        std::fs::write(&md, b"# hello").expect("写文件");
+        assert!(matches!(
+            read_searchable(Some(&real_root), &md, &["ts".to_string()]),
+            Err(SkipReason::Extension)
+        ));
+
+        // 内容是二进制：扩展名看着像文本，靠头部 NUL 判定
+        let nul = dir.join("weird.txt");
+        std::fs::write(&nul, b"abc\0def").expect("写文件");
+        assert!(matches!(read_searchable(Some(&real_root), &nul, &[]), Err(SkipReason::BinaryContent)));
+
+        // 空文件
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, b"").expect("写文件");
+        assert!(matches!(read_searchable(Some(&real_root), &empty, &[]), Err(SkipReason::Empty)));
+
+        // 正常文本：不该被判成跳过（否则界面会对着有内容的文件说"没搜"）
+        let ok = dir.join("ok.txt");
+        std::fs::write(&ok, b"hello").expect("写文件");
+        assert!(read_searchable(Some(&real_root), &ok, &[]).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

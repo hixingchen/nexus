@@ -73,6 +73,16 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
   /** 产出当前结果的查询词（与结果同步更新，见 triggerSearch） */
   const [resultQuery, setResultQuery] = useState('');
   const [truncated, setTruncated] = useState(false);
+  /** 搜索根是文件、且它压根没被搜索时的原因（后端带回来的，见 SearchResponse.skipped） */
+  const [skipped, setSkipped] = useState<string | null>(null);
+  /**
+   * 键盘选中的结果行（`rows` 下标；-1 = 未选中）。
+   *
+   * 只落在**命中行**上：文件头没有可定位的行号，方向键停在它上面时用户按回车
+   * 不知道会发生什么。改输入框内容即重置——于是"回车 = 提交搜索"与"回车 = 打开
+   * 选中行"不会打架（见输入框的 onKeyDown）。
+   */
+  const [activeIndex, setActiveIndex] = useState(-1);
   const [error, setError] = useState<string | null>(null);
   /** 折叠的文件路径集合（默认全部展开，点击文件头折叠） */
   const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
@@ -141,19 +151,34 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     };
   }, [dragging]);
 
-  // 每次打开：重置状态并聚焦输入框（作废旧请求，防止上次响应污染）
+  /** 上一次打开时的搜索根：用来区分"换了范围"与"又打开同一个地方" */
+  const lastRootRef = useRef<string | null>(null);
+
+  /**
+   * 每次打开：清结果、聚焦输入框（作废旧请求，防止上次响应污染）。
+   *
+   * **同一个根**重开时保留查询词与筛选条件：搜索通常是反复的（看一眼代码、再回来搜
+   * 下一个词），每次清空等于每次重打。换了根则全清——不同的范围配上次的条件只会误导。
+   * 结果无论如何都清：上一次的结果属于上一次的范围，留着比空着更危险。
+   */
   useEffect(() => {
     if (!open) return;
     seqRef.current++;
-    setQuery('');
-    setCaseSensitive(false);
-    setExtensions('');
+    const rootChanged = lastRootRef.current !== root;
+    lastRootRef.current = root;
+    if (rootChanged) {
+      setQuery('');
+      setCaseSensitive(false);
+      setExtensions('');
+    }
     setStatus('idle');
     setResults([]);
     setResultQuery('');
     setTruncated(false);
+    setSkipped(null);
     setError(null);
     setCollapsedPaths(new Set());
+    setActiveIndex(-1);
     setTimeout(() => inputRef.current?.focus(), 50);
   }, [open, root]);
 
@@ -168,6 +193,7 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
     const q = query.trim();
     if (!q) return;
     const seq = ++seqRef.current;
+    setActiveIndex(-1); // 新结果从"未选中"开始，回车回到"提交搜索"的语义
     setStatus('searching');
     searchFiles({
       root,
@@ -183,6 +209,7 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
       // 高亮/定位却按新词走"（搜索只在回车时执行，两者不同步）
       setResultQuery(q);
       setTruncated(res.truncated);
+      setSkipped(res.skipped ?? null);
       setStatus('done');
       setError(null);
     }).catch((e: unknown) => {
@@ -190,6 +217,7 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
       setResults([]);
       setResultQuery('');
       setTruncated(false);
+      setSkipped(null);
       setStatus('done');
       setError(String(e));
     });
@@ -238,6 +266,27 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
   });
   const virtualItems = virtualizer.getVirtualItems();
 
+  /**
+   * 键盘上下移动选中行。**跳过文件头**：它没有可定位的行号，停在它上面时回车无事可做，
+   * 用户会以为是坏了。到头就停住（不循环——循环会让"我已经翻到底了"失去反馈）。
+   */
+  const moveActive = useCallback((delta: number) => {
+    setActiveIndex(prev => {
+      let next = prev;
+      for (let step = 0; step < rows.length; step++) {
+        next += delta;
+        if (next < 0 || next >= rows.length) return prev; // 到头：保持原位
+        if (rows[next].kind === 'hit') return next;
+      }
+      return prev;
+    });
+  }, [rows]);
+
+  // 选中行滚进视野：键盘导航必须看得见自己选到了哪一行（列表是虚拟滚动的）
+  useEffect(() => {
+    if (activeIndex >= 0) virtualizer.scrollToIndex(activeIndex, { align: 'auto' });
+  }, [activeIndex, virtualizer]);
+
   const toggleCollapsed = useCallback((path: string) => {
     setCollapsedPaths(prev => {
       const next = new Set(prev);
@@ -245,6 +294,23 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
       return next;
     });
   }, []);
+
+  /**
+   * 把"该给面板留多高"写到根元素的 CSS 变量上，主内容区拿它做 padding-bottom。
+   *
+   * 为什么不是浮层直接盖在内容上：面板贴底、内容区高度不变时，滚到底的最后几行
+   * **永远**落在面板背后——不是"滚一下就能看见"，而是根本看不见。
+   *
+   * 为什么走 CSS 变量而不把高度提到 store：拖拽调整高度时 `panelHeight` 每帧都在变，
+   * 经 store 传导会让整个内容区（含 CodeMirror）每帧走一遍 React 渲染 + 布局；
+   * 写变量只让浏览器做一次布局，React 这一侧完全不动。
+   */
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty('--nexus-search-panel-h', open && !blocked ? `${panelHeight}px` : '0px');
+    // 卸载（切项目/关面板）时清零，否则内容区会一直空着一块
+    return () => { root.style.setProperty('--nexus-search-panel-h', '0px'); };
+  }, [open, blocked, panelHeight]);
 
   // 日志视图打开时让位（日志优先完整占据区域，搜索面板等同被日志挡住）；
   // open/查询结果保留，关闭日志后自动恢复
@@ -257,6 +323,15 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
       // z-[55]：低于编辑面板 z-[60]、模态遮罩 z-[65]、右键菜单 z-[70]
       className="absolute left-0 bottom-0 z-[55] flex flex-col bg-nexus-surface border-t border-nexus-border shadow-2xl overflow-hidden"
       style={{ height: panelHeight, right: rightOffset }}
+      // Esc 关闭：输入框 / 扩展名框 / 结果区的焦点都能冒泡到这里。
+      // 面板是一次性的浮层，Esc 是搜索界面的肌肉记忆（stopPropagation 免得
+      // 同一个 Esc 再被外层的弹窗处理一次）
+      onKeyDown={e => {
+        if (e.key === 'Escape') {
+          e.stopPropagation();
+          handleClose();
+        }
+      }}
     >
       {/* 拖拽条：上下调整面板高度 */}
       <div
@@ -278,10 +353,23 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
         <input
           ref={inputRef}
           className="flex-1 min-w-[120px] px-2.5 py-1.5 text-[12px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
-          placeholder="输入内容，回车搜索"
+          placeholder="输入内容，回车搜索（↑↓ 选结果，Esc 关闭）"
           value={query}
-          onChange={e => setQuery(e.target.value)}
-          onKeyDown={e => { if (isSubmitEnter(e)) triggerSearch(); }}
+          // 改了内容就丢掉键盘选中：否则回车会变成"打开上一次选中的那行"而不是提交新搜索
+          onChange={e => { setQuery(e.target.value); setActiveIndex(-1); }}
+          onKeyDown={e => {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              // 单行输入框里这两个键本无作用，拦下来做结果选择
+              e.preventDefault();
+              moveActive(e.key === 'ArrowDown' ? 1 : -1);
+              return;
+            }
+            if (isSubmitEnter(e)) {
+              const row = rows[activeIndex];
+              if (row?.kind === 'hit') locateFile(row.path, row.name, row.line, resultQuery);
+              else triggerSearch();
+            }
+          }}
         />
         <button
           className="flex-shrink-0 px-3 py-1.5 text-[12px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover disabled:opacity-40 disabled:cursor-not-allowed font-medium transition-colors"
@@ -297,13 +385,20 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
           onClick={() => setCaseSensitive(v => !v)}
           title={caseSensitive ? '区分大小写（已开启）' : '区分大小写（未开启）'}
         >Aa</button>
-        <input
-          className="w-[110px] flex-shrink-0 px-2 py-1 text-[11px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
-          placeholder="扩展名,如ts,vue"
-          title="扩展名筛选，逗号分隔，留空全部"
-          value={extensions}
-          onChange={e => setExtensions(e.target.value)}
-        />
+        {/* 扩展名筛选带常驻标签：原先只有 placeholder，一输入标签就没了——
+            回头看到这个框会想不起来它是干什么的 */}
+        <label
+          className="flex items-center gap-1 flex-shrink-0 text-[11px] text-nexus-muted"
+          title="扩展名筛选，逗号分隔，留空即全部"
+        >
+          扩展名
+          <input
+            className="w-[96px] px-2 py-1 text-[11px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
+            placeholder="ts,vue"
+            value={extensions}
+            onChange={e => setExtensions(e.target.value)}
+          />
+        </label>
         <button
           className="flex-shrink-0 px-3 py-1.5 text-[12px] text-nexus-muted border border-nexus-border rounded-md hover:text-nexus-text hover:border-nexus-muted transition-colors"
           onClick={handleClose}
@@ -324,8 +419,17 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
           <div className="flex items-center justify-center h-full px-4 text-center text-[12px] text-nexus-error">{error}</div>
         )}
         {status === 'done' && !error && results.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full px-4 text-center">
-            <span className="text-[12px] text-nexus-muted mb-1">未找到匹配内容</span>
+          <div className="flex flex-col items-center justify-center h-full px-4 text-center gap-1">
+            {/* 空结果有两种含义，别把"压根没搜"说成"没找到"：用户在后者会去改搜索词，
+                而真正该改的是扩展名筛选框（或他本就不该期待在 png 里搜到文本） */}
+            {skipped ? (
+              <>
+                <span className="text-[12px] text-nexus-warning">这个文件没有被搜索</span>
+                <span className="text-[11px] text-nexus-muted max-w-[420px]">{skipped}</span>
+              </>
+            ) : (
+              <span className="text-[12px] text-nexus-muted">未找到匹配内容</span>
+            )}
             {truncated && <span className="text-[11px] text-nexus-muted/60">（扫描文件过多已中止）</span>}
           </div>
         )}
@@ -357,6 +461,7 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
                       line={row.line}
                       snippet={row.snippet}
                       query={resultQuery}
+                      active={vi.index === activeIndex}
                     />
                   )}
                 </div>
@@ -413,17 +518,21 @@ const ResultGroupHeader = memo(function ResultGroupHeader({
  * 行内容只由 path/line/snippet/query 决定，重渲染时这几项引用不变即跳过。
  */
 const ResultHitRow = memo(function ResultHitRow({
-  path, name, line, snippet, query,
+  path, name, line, snippet, query, active,
 }: {
   path: string;
   name: string;
   line: number;
   snippet: string;
   query: string;
+  /** 键盘选中态（↑↓ 移动）：与 hover 分开表示，让"回车会打开哪一行"始终看得见 */
+  active: boolean;
 }) {
   return (
     <div
-      className="flex items-start gap-2 pl-7 pr-3 py-0.5 cursor-pointer hover:bg-nexus-hover/50 transition-colors"
+      className={`flex items-start gap-2 pl-7 pr-3 py-0.5 cursor-pointer transition-colors ${
+        active ? 'bg-nexus-accent/15' : 'hover:bg-nexus-hover/50'
+      }`}
       onClick={() => locateFile(path, name, line, query)}
       title={`${path}:${line}（点击定位到该行）`}
     >

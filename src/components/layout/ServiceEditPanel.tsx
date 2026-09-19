@@ -37,8 +37,16 @@ function maskEnvValues(text: string): string {
     .join('\n');
 }
 
-/** 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致；模板额外带 open_tool_id） */
-type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'> & { open_tool_id?: string };
+/**
+ * 编辑对象：服务或模板（模板无 project_id/sort_index，其余字段一致；模板额外带 open_tool_id）。
+ *
+ * `project_id` 是**可选**的：编辑既有对象时后端不需要它，而"新建服务"要靠它确定归属
+ * （见 handleSave 的 add 分支）——服务对象本来就带着它，模板没有。
+ */
+type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'> & {
+  open_tool_id?: string;
+  project_id?: string;
+};
 
 interface Props {
   service: ServiceConfig;
@@ -47,17 +55,25 @@ interface Props {
   mode?: 'service' | 'template';
   /** 面板标题（有值时显示标题栏，区分服务/模板编辑） */
   title?: string;
+  /** 关闭面板（标题栏右端的 ✕）。不传则不渲染 ✕——旧调用点仍可靠"再点一次卡片"关闭 */
+  onClose?: () => void;
   /** 另存为模板成功后的回调（父组件刷新模板库） */
   onSavedAsTemplate?: () => void;
   /** 面板右侧偏移（px）= 服务列宽度：服务列 absolute 覆盖在主区域上，编辑面板需显示在其左侧 */
   rightOffset?: number;
 }
 
-export function ServiceEditPanel({ service, onSave, mode = 'service', title, rightOffset = 360, onSavedAsTemplate }: Props) {
+export function ServiceEditPanel({ service, onSave, mode = 'service', title, rightOffset = 360, onSavedAsTemplate, onClose }: Props) {
   /** 草稿键与面板的编辑目标一一对应（见 serviceDraftStore 的六条丢失路径说明） */
   const draftKey = serviceDraftKey(service.id, mode);
-  /** 挂载时读一次草稿恢复表单；不订阅，避免每次写入草稿导致本组件多渲染一轮 */
-  const [initialDraft] = useState(() => readServiceDraft(draftKey));
+  /**
+   * 挂载时读一次草稿恢复表单；不订阅，避免每次写入草稿导致本组件多渲染一轮。
+   *
+   * **新建时不恢复**（`service.id` 为空）：新建的草稿键是固定的空串，一恢复就会把
+   * 上一次没保存的内容带进来——而用户点「新建」期望的是空表单（用户反馈过
+   * "新增功能要做好清空操作"）。编辑既有对象时草稿照常生效，那是它本来的用途。
+   */
+  const [initialDraft] = useState(() => (service.id ? readServiceDraft(draftKey) : undefined));
   const [name, setName] = useState(initialDraft?.name ?? service.name);
   const [command, setCommand] = useState(initialDraft?.command ?? service.command);
   const [cwd, setCwd] = useState(initialDraft?.cwd ?? service.cwd);
@@ -90,8 +106,18 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const bindTool = useToolStore(s => s.bind);
   // 模板模式：默认打开工具存模板字段（随"保存模板"提交，不是即时绑定）
   const [tplToolId, setTplToolId] = useState(initialDraft?.tplToolId ?? service.open_tool_id ?? '');
-  // 当前模式生效的工具选择值（服务=store 即时绑定；模板=表单状态）
-  const pickerToolId = mode === 'template' ? (tplToolId || undefined) : boundToolId;
+  /**
+   * 新建服务时选中的打开工具。
+   *
+   * 此时服务还没有 id，而绑定 API 要真实 id——直接调会报"服务ID不能为空"
+   * （用户反馈的正是这条）。所以先记在本地，等保存拿到 id 后再真正绑
+   * （见 handleSave 的 add 分支）。`null` = 还没动过这个字段。
+   */
+  const [pendingToolId, setPendingToolId] = useState<string | null>(null);
+  // 当前模式生效的工具选择值（服务=store 即时绑定；新建=本地暂存；模板=表单状态）
+  const pickerToolId = mode === 'template'
+    ? (tplToolId || undefined)
+    : (service.id ? boundToolId : (pendingToolId ?? undefined));
   const pickerTool = openTools.find(t => t.id === pickerToolId);
   const pickerToolName = pickerTool?.name;
 
@@ -169,6 +195,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       setTplToolId(toolId ?? '');
       return;
     }
+    if (!service.id) {
+      // 新建中：还没有 id，绑定 API 会报"服务ID不能为空"。先记本地，保存后补绑
+      setPendingToolId(toolId);
+      return;
+    }
     try {
       await bindTool(service.id, toolId);
       showNotification({ variant: 'success', title: toolId ? '已绑定打开工具' : '已解除绑定' });
@@ -212,7 +243,41 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       };
       if (mode === 'template') {
         // 模板：默认打开工具随保存提交（从模板添加服务时复制为绑定）
-        await serviceApi.updateTemplate({ ...payload, openToolId: tplToolId });
+        if (service.id) {
+          await serviceApi.updateTemplate({ ...payload, openToolId: tplToolId });
+        } else {
+          // id 为空 = 模板库里刚点「新建」出来的空壳，走 create（id 由后端生成）
+          await serviceApi.createServiceTemplate({
+            name: name.trim(), command, cwd, watchPaths, watchInclude, watchExclude,
+            envVars, restartMode, enabled, showFileTree,
+            toolCommands: JSON.stringify(toolCommands),
+            openToolId: tplToolId,
+          });
+        }
+      } else if (!service.id) {
+        // 新建服务：项目里还没有这条记录，走 add。**带全字段**——这正是把"添加服务"
+        // 从弹窗换成面板的理由：那里只能填三个字段，其余四项由后端写死，用户得建完
+        // 再开一次面板补
+        const created = await serviceApi.add({
+          projectId: service.project_id ?? '',
+          name: name.trim(), command, cwd, watchPaths,
+          // 空值 = "还没配" → 不传，由后端填默认。那套默认排除目录的**唯一来源在后端**，
+          // 前端再抄一份迟早与它漂移（现在前端的 placeholder 只有 4 行，后端有 8 行，
+          // 已经不一致了——正好说明不该抄）
+          watchInclude: watchInclude || undefined,
+          watchExclude: watchExclude || undefined,
+          envVars, restartMode, enabled, showFileTree,
+          toolCommands: JSON.stringify(toolCommands),
+        });
+        // 保存拿到 id 之后才能绑：新建时选的打开工具在这里补上
+        if (pendingToolId) {
+          try {
+            await bindTool(created.id, pendingToolId);
+          } catch (err) {
+            // 服务已经建好了——绑定失败不该让整次保存看起来像失败了
+            reportError('服务已创建，但设置打开工具失败', err);
+          }
+        }
       } else {
         await serviceApi.update(payload);
       }
@@ -270,9 +335,26 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   return (
     <div className="absolute top-0 bottom-0 w-[360px] bg-nexus-surface border-l border-nexus-border flex flex-col z-[60] shadow-2xl"
       style={{ right: rightOffset }}>
-      {title && (
-        <div className="flex items-center px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
-          <span className="text-[13px] text-nexus-text font-medium">{title}</span>
+      {/* 标题栏：标题 + 关闭。
+          为什么要有 ✕（用户反馈"点开了怎么关"）：此前退出只有"再点一次同一张卡片"
+          这条隐蔽路径（toggle），面板上看不出任何出口 */}
+      {(title || onClose) && (
+        <div className="flex items-center gap-2 px-4 h-[42px] border-b border-nexus-border flex-shrink-0">
+          <span className="flex-1 min-w-0 text-[13px] text-nexus-text font-medium truncate">{title}</span>
+          {onClose && (
+            <button
+              type="button"
+              className="flex-shrink-0 -mr-1 p-1 text-nexus-muted rounded hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors"
+              // 说清楚"关了不会丢"：下面的未保存提示条也写着同一件事
+              title="关闭（未保存的改动会留作草稿，下次打开还在）"
+              onClick={onClose}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                <line x1="3" y1="3" x2="9" y2="9" />
+                <line x1="9" y1="3" x2="3" y2="9" />
+              </svg>
+            </button>
+          )}
         </div>
       )}
 
@@ -568,7 +650,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
       {/* 底部 */}
       <div className="p-3 border-t border-nexus-border flex-shrink-0 space-y-2">
-        {mode !== 'template' && (
+        {/* 另存为模板：只有**已保存**的服务才能另存（新建中的还没有 id，后端无从取配置） */}
+        {mode !== 'template' && service.id && (
           <button
             className="w-full px-4 py-1.5 text-[12px] text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 disabled:opacity-40 font-medium transition-colors"
             disabled={savingTemplate}

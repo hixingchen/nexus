@@ -25,7 +25,6 @@ export function useProjectDetail(projectId: string) {
   const failed = useRunningStore(s => s.failed);
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [editingService, setEditingService] = useState<Service | null>(null);
-  const [showAddServiceModal, setShowAddServiceModal] = useState(false);
   const [deleteSvcTarget, setDeleteSvcTarget] = useState<{ id: string; name: string } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [viewingLog, setViewingLog] = useState<string | null>(null);
@@ -221,8 +220,6 @@ export function useProjectDetail(projectId: string) {
     loading,
     editingService,
     setEditingService,
-    showAddServiceModal,
-    setShowAddServiceModal,
     deleteSvcTarget,
     setDeleteSvcTarget,
     deleting,

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { createPortal } from 'react-dom';
-import { openInExplorer } from '../../services/system';
+import { openInExplorer, openTerminal } from '../../services/system';
 import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
 import { useSearchModalStore } from '../../stores/searchModal';
@@ -36,6 +36,15 @@ export function ProjectListItem({
 
   // 服务行右键菜单（搜索文件内容）
   const [svcMenu, setSvcMenu] = useState<{ x: number; y: number; svc: Service } | null>(null);
+  /**
+   * 项目目录标题行的右键菜单。
+   *
+   * 为什么需要：项目目录树是 `embedded` 模式，**不渲染根节点那一行**，空白区右键只有
+   * 「粘贴到项目根目录」——于是"在整个项目里搜一段代码"这个最常用的场景，在这个入口里
+   * 做不到，只能挨个儿右键子目录（等于逐目录搜）。标题行是这里**唯一代表"项目根"的可点
+   * 对象**，搜索入口挂它身上最自然。服务行那边早有同名入口（范围 = 该服务的工作目录）。
+   */
+  const [projectMenu, setProjectMenu] = useState<{ x: number; y: number } | null>(null);
   /**
    * 项目自己的目录树是否展开。用本地 state 而不是 store：与服务的树展开态（`expandedSvc`）
    * 同一性质——只活本次会话，重开应用/收起左栏后回到收起态（默认收起才不打扰）。
@@ -140,7 +149,12 @@ export function ProjectListItem({
                   : 'text-nexus-text-muted hover:bg-nexus-hover/30 hover:text-nexus-text'
               }`}
               onClick={() => setProjectTreeOpen(v => !v)}
-              title="项目根目录（不属于任何服务的文件在这里）"
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setProjectMenu({ x: e.clientX, y: e.clientY });
+              }}
+              title="项目根目录（不属于任何服务的文件在这里）· 右键可搜索整个项目"
             >
               <svg
                 className={`flex-shrink-0 text-nexus-muted/60 transition-transform ${projectTreeOpen ? 'rotate-90' : ''}`}
@@ -205,6 +219,51 @@ export function ProjectListItem({
         </div>
       )}
     </div>
+
+    {/* 项目目录标题行右键菜单：范围 = 整个项目根。与服务行（范围 = 该服务的工作目录）对称 */}
+    {projectMenu && createPortal(
+      <ContextMenu x={projectMenu.x} y={projectMenu.y} onClose={() => setProjectMenu(null)}>
+        {/* 搜索文件内容 */}
+        <div className="py-1.5 px-1.5">
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
+            </svg>}
+            label="搜索文件内容"
+            onClick={() => {
+              // 标题用项目名（服务行那边用服务名），范围是项目根
+              openSearch(project.path, project.name);
+              setProjectMenu(null);
+            }}
+          />
+        </div>
+
+        {/* 在资源管理器中打开 / 打开终端（项目根是常用的定位目标） */}
+        <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M1.5 3h2l1-1.5h4a1 1 0 011 1v5.5a1 1 0 01-1 1h-7a1 1 0 01-1-1V3z"/>
+            </svg>}
+            label="在资源管理器中打开"
+            onClick={() => {
+              void openInExplorer(project.path);
+              setProjectMenu(null);
+            }}
+          />
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+            </svg>}
+            label="打开终端"
+            onClick={() => {
+              void openTerminal(project.path);
+              setProjectMenu(null);
+            }}
+          />
+        </div>
+      </ContextMenu>,
+      document.body,
+    )}
 
     {/* 服务行右键菜单：搜索文件内容 / 资源管理器 / 复制 */}
     {svcMenu && createPortal(
