@@ -1,6 +1,6 @@
 [package]
 name = "nexus"
-version = "1.1.0"
+version = "1.2.0"
 description = "Nexus - Development Environment Manager"
 authors = ["Nexus Team"]
 edition = "2021"
