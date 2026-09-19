@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { arrayMove } from '@dnd-kit/sortable';
 import { serviceApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
 import { pickDirectory } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
@@ -329,6 +330,25 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     setShowToolCmdForm(true);
   };
 
+  /**
+   * 工具命令上移/下移。
+   *
+   * 顺序就是数组顺序，也正是右键菜单里的排列顺序（菜单按这个数组渲染），
+   * 所以这里改完跟着表单一起保存即可——`formDirty` 按序列化文本比较，重排会自动算作"未保存的修改"，
+   * 不需要额外的脏标记。
+   *
+   * 用 dnd-kit 的 `arrayMove`（服务卡片与模板的拖拽排序用的是同一个函数）：自己写 splice
+   * 容易在下标越界时静默把元素挪错位，而边界判断只需要在调用点拦一下。
+   */
+  const moveToolCommand = (id: string, delta: number) => {
+    setToolCommands(prev => {
+      const idx = prev.findIndex(c => c.id === id);
+      const to = idx + delta;
+      if (idx < 0 || to < 0 || to >= prev.length) return prev; // 首/尾再移就原地不动
+      return arrayMove(prev, idx, to);
+    });
+  };
+
   const labelCls = "text-[11px] font-semibold text-nexus-muted uppercase tracking-wider";
   const cardCls = "bg-nexus-bg/30 border border-nexus-border/50 rounded-lg p-3.5";
 
@@ -540,7 +560,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
             </div>
           ) : (
             <div className="space-y-1.5">
-              {toolCommands.map(cmd => (
+              {toolCommands.map((cmd, idx) => (
                 <div
                   key={cmd.id}
                   className={`group relative rounded-md border transition-all duration-150 ${
@@ -567,6 +587,27 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                     {/* 操作按钮 */}
                     {editingToolCmd?.id !== cmd.id && (
                       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        {/* 排序：列表顺序 = 右键菜单顺序。首/尾那侧禁用（点了也是原地不动） */}
+                        <button
+                          className="p-1.5 text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 rounded-md transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"
+                          title="上移（列表顺序 = 右键菜单顺序）"
+                          disabled={idx === 0}
+                          onClick={() => moveToolCommand(cmd.id, -1)}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
+                            <path d="M3.5 8.5L7 5l3.5 3.5"/>
+                          </svg>
+                        </button>
+                        <button
+                          className="p-1.5 text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 rounded-md transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"
+                          title="下移（列表顺序 = 右键菜单顺序）"
+                          disabled={idx === toolCommands.length - 1}
+                          onClick={() => moveToolCommand(cmd.id, 1)}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3">
+                            <path d="M3.5 5.5L7 9l3.5-3.5"/>
+                          </svg>
+                        </button>
                         <button
                           className="p-1.5 text-nexus-muted hover:text-nexus-accent hover:bg-nexus-accent/10 rounded-md transition-colors"
                           title="编辑"
@@ -590,6 +631,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                   </div>
                 </div>
               ))}
+              {/* 顺序只在右键菜单里能看出来，这里写明一次，避免"排了不知道排的是什么" */}
+              <p className="text-[10px] text-nexus-muted/30 mt-1.5">列表顺序 = 右键菜单里工具命令的顺序（保存后生效）</p>
             </div>
           )}
 
