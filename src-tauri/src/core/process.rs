@@ -132,11 +132,13 @@ const MAX_READ_LINE_BYTES: usize = MAX_LINE_BYTES * 4;
 
 /// 逐行读取子进程输出（带上限，超长行的剩余部分丢弃而不累积）
 ///
-/// 由服务日志 reader 与 `core::ai` 的命令输出捕获共用（两边都需要"有界 + 非 UTF-8 行跳过"）。
+/// 由服务日志 reader 与 `core::ai` 的命令输出捕获共用（两边都需要"有界 + 坏编码不致命"）。
 ///
 /// 错误处理语义：
-/// - `InvalidData`（非 UTF-8，如 Windows GBK 中文）→ 跳过该行继续读取
-///   （`map_while(Result::ok)` 会在此终止整个 reader 线程，日志永久丢失）
+/// - 非 UTF-8（如 Windows GBK 中文）→ **按 GB18030 解码**，不丢行。
+///   早先的做法是"跳过该行"，理由是不让坏编码终止整个 reader——但代价是中文 Windows 上
+///   cmd 与系统工具的报错（GBK）被整条吃掉，用户看到的是"命令失败（退出码 1）。（无输出）"，
+///   唯一的原因没了（用户报过）。回退解码既保住了原因，也不会终止读取
 /// - 其他 IO 错误（管道损坏、句柄关闭）→ 停止读取，避免空转
 /// - 超长行 → 返回前 `MAX_READ_LINE_BYTES` 字节，剩余部分读到行尾后丢弃
 pub(crate) fn read_log_lines<R: BufRead>(reader: R) -> BoundedLineReader<R> {
@@ -244,22 +246,19 @@ impl<R: BufRead> Iterator for BoundedLineReader<R> {
             }
             // 未以换行结束 = 该行被截断，剩余部分需要在下一轮丢弃
             self.draining = self.buf.last() != Some(&b'\n');
-            // 3. 解码；非 UTF-8 行跳过（继续读下一行）
-            match String::from_utf8(std::mem::take(&mut self.buf)) {
-                Ok(mut s) => {
-                    if s.ends_with('\n') {
-                        s.pop();
-                        if s.ends_with('\r') {
-                            s.pop();
-                        }
-                    }
-                    return Some(s);
-                }
-                Err(e) => {
-                    self.buf = e.into_bytes();
-                    continue;
+            // 3. 解码：先 UTF-8，失败回退 GB18030（与编辑器读文件、`node.rs` 解码命令输出同一口径）。
+            //    不能"跳过该行"——中文 Windows 上 cmd 的报错就是 GBK，跳过它等于把唯一的原因删掉
+            let mut s = match String::from_utf8(std::mem::take(&mut self.buf)) {
+                Ok(s) => s,
+                Err(e) => encoding_rs::GB18030.decode(e.as_bytes()).0.into_owned(),
+            };
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
                 }
             }
+            return Some(s);
         }
     }
 }
@@ -1332,6 +1331,10 @@ pub fn build_command(command_str: &str) -> Command {
         let mut c = Command::new("cmd");
         c.args(["/C", command_str]);
         c.creation_flags(FLAGS);
+        // 补上"启动之后才装的东西"（见 core::winenv）：Windows 只在进程启动时复制一份
+        // 环境块，而用户可能是在 Nexus 运行期间装 nvm / 装 Node 的——不补的话，服务里的
+        // `npm run dev`、`npm install -g dsh` 都会报"找不到 npm"，直到重启 Nexus
+        crate::core::winenv::apply(&mut c);
         c
     }
     #[cfg(not(windows))]
@@ -1502,12 +1505,49 @@ mod tests {
     }
 
     #[test]
-    fn test_read_log_lines_skips_non_utf8_line() {
-        // 非 UTF-8 行跳过而非终止整个 reader（GBK 中文日志不丢后续内容）
-        let mut data = vec![0xff, 0xfe, b'\n'];
+    fn test_read_log_lines_decodes_gbk_instead_of_dropping() {
+        // GBK 的行必须解出来而不是丢掉：中文 Windows 上 cmd 的报错就是 GBK，
+        // 丢掉它，用户看到的是"命令失败（退出码 1）。（无输出）"——唯一的原因没了
+        let mut data = Vec::new();
+        data.extend_from_slice(&encoding_rs::GB18030.encode("'npm' 不是内部或外部命令").0);
+        data.push(b'\n');
         data.extend_from_slice(b"ok\n");
         let lines: Vec<String> = read_log_lines(std::io::Cursor::new(data)).collect();
-        assert_eq!(lines, vec!["ok".to_string()]);
+        assert_eq!(lines, vec!["'npm' 不是内部或外部命令".to_string(), "ok".to_string()]);
+    }
+
+    #[test]
+    fn test_read_log_lines_survives_undecodable_bytes() {
+        // 坏字节：关键行为是"这一行仍然读得出来、后续行不受影响"，不是字节级完全还原——
+        // GB18030 是多字节编码，前导字节可能把后面一个 ASCII 字节一起吃进那个字
+        // （实测 `a \xff \xfe b` 解成 "a�㧏"）。这是回退解码固有的代价，比整行丢掉强：
+        // 丢掉等于把命令失败的原因吃了
+        let mut data = vec![b'a', 0xff, 0xfe, b'b', b'\n'];
+        data.extend_from_slice(b"after\n");
+        let lines: Vec<String> = read_log_lines(std::io::Cursor::new(data)).collect();
+        assert_eq!(lines.len(), 2, "坏字节所在行也要读出来: {:?}", lines);
+        assert!(lines[0].starts_with('a'), "实际: {:?}", lines[0]);
+        assert_eq!(lines[1], "after");
+    }
+
+    /// 真机走一遍：中文 Windows 上 cmd 的报错是 GBK，经整条读取链路必须读得出来
+    /// （这条正是 "命令失败（退出码 1）。（无输出）" 的复现——旧实现把 GBK 行整条丢了）
+    #[test]
+    #[cfg(windows)]
+    fn test_cmd_gbk_error_survives_read_log_lines() {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "nexus-no-such-command-xyz"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("执行 cmd");
+        assert_eq!(out.status.code(), Some(1), "cmd 找不到命令时应当返回 1");
+        let text: String = read_log_lines(std::io::BufReader::new(&out.stderr[..]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("cmd stderr → {:?}", text);
+        assert!(!text.trim().is_empty(), "cmd 的报错必须读得出来（GBK 也要解，不能整行丢掉）");
     }
 
     #[test]

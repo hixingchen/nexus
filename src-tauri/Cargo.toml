@@ -36,3 +36,7 @@ zip = "2"
 
 [target."cfg(windows)".dependencies]
 clipboard-win = "5.4.1"
+# 读注册表里的持久化环境变量（NVM_HOME / NVM_SYMLINK 的兜底，见 commands/node.rs 的
+# persistent_env）。只用到注册表读取，不引 winreg——那个 crate 已在依赖图里，
+# 但它是 tauri 的构建期依赖，用普通依赖引入等于往运行时二进制里多塞一个包
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry"] }

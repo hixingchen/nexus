@@ -447,12 +447,28 @@ fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Res
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                std::thread::sleep(Duration::from_millis(150)); // 等 reader 刷完剩余行
+                // 等 reader 把管道里剩下的读完。固定睡 150ms 在机器繁忙时会读到空 buffer，
+                // 于是"命令失败（退出码 1）。（无输出）"——把唯一的原因丢了（用户报过）。
+                // 改成"长度连续两次不变"：既等得住慢 reader，也不会白等。
+                let mut last_len = usize::MAX;
+                for _ in 0..12 {
+                    let len = captured.lock().map(|g| g.len()).unwrap_or(0);
+                    if len == last_len {
+                        break;
+                    }
+                    last_len = len;
+                    std::thread::sleep(Duration::from_millis(40));
+                }
                 let text = captured.lock().map(|g| g.clone()).unwrap_or_default();
                 if status.success() {
                     return Ok(text);
                 }
-                return Err(format!("命令失败（退出码 {:?}）。输出：{}", status.code(), tail_text(&text)));
+                // 失败要能远程排障：退出码 + 是哪条命令 + 原话，三样一起进日志和界面
+                log::warn!("[ai] 命令失败 exit={:?} cmd={} 输出={}", status.code(), command, text.trim());
+                return Err(format!(
+                    "命令失败（退出码 {:?}）：{}\n输出：{}",
+                    status.code(), command, tail_text(&text)
+                ));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {

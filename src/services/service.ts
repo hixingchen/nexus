@@ -486,6 +486,14 @@ export interface NvmCommandResult {
   output: string;
 }
 
+/** 安装器跑完的结果（退出码 0 = 走完了向导） */
+export interface NvmInstallResult {
+  ok: boolean;
+  code: number | null;
+  /** 安装器在本机的位置 */
+  path: string;
+}
+
 export const nodeApi = {
   getRuntime: () => invoke<NodeRuntimeStatus>('get_node_runtime'),
   /** 拉可安装版本（`nvm list available`，要联网，几秒） */
@@ -493,4 +501,11 @@ export const nodeApi = {
   install: (version: string) => invoke<NvmCommandResult>('install_node_version', { version }),
   uninstall: (version: string) => invoke<NvmCommandResult>('uninstall_node_version', { version }),
   use: (version: string) => invoke<NvmCommandResult>('use_node_version', { version }),
+  /** 配镜像（写 nvm 自己的 settings.txt）：nvm 默认去 nodejs.org 取索引，国内常失败 */
+  setMirrors: (nodeMirror: string, npmMirror: string) =>
+    invoke<NvmCommandResult>('set_nvm_mirrors', { nodeMirror, npmMirror }),
+  /** 下载 nvm-windows 官方安装器到本机（已下过就复用），返回它的路径 */
+  downloadNvmInstaller: () => invoke<string>('download_nvm_installer'),
+  /** 运行已下载的安装器并等它结束（会弹 UAC 与官方向导） */
+  runNvmInstaller: () => invoke<NvmInstallResult>('run_nvm_installer'),
 };

@@ -16,10 +16,14 @@ use std::process::Stdio;
 use serde::Serialize;
 use tauri::command;
 
+use crate::core::winenv::env_or_persistent;
+
 /// 找到的 nvm-windows 安装
 struct NvmInstall {
     /// `nvm.exe` 的绝对路径
     exe: PathBuf,
+    /// nvm 的安装目录（`NVM_HOME`）——nvm.exe 靠这个环境变量找自己的 `settings.txt`
+    home: PathBuf,
     /// 版本存放目录（settings.txt 里的 `root`）
     root: PathBuf,
 }
@@ -62,15 +66,14 @@ pub struct NvmCommandResult {
 /// 找本机的 nvm-windows。
 ///
 /// 三条信息各有各的来路，别混：
-/// - `nvm.exe` 在哪 → `NVM_HOME` 环境变量
+/// - `nvm.exe` 在哪 → `NVM_HOME`（进程环境变量 → 注册表回退，见 `core::winenv`）
 /// - **版本存哪** → 读它自己的 `settings.txt`（`nvm root` 可以改过，环境变量回答不了）
-/// - 当前用哪个 → `NVM_SYMLINK` 软链指向谁
+/// - 当前用哪个 → `NVM_SYMLINK` 软链指向谁（同样有注册表回退）
 fn find_nvm() -> Result<NvmInstall, String> {
-    let home = std::env::var("NVM_HOME").unwrap_or_default();
-    if home.trim().is_empty() {
-        return Err("没有找到 NVM_HOME 环境变量——本机可能没装 nvm-windows".into());
-    }
-    let exe = Path::new(home.trim()).join("nvm.exe");
+    let Some(home) = env_or_persistent("NVM_HOME") else {
+        return Err("没找到 NVM_HOME（进程环境变量与注册表里都没有）——本机可能没装 nvm-windows".into());
+    };
+    let exe = Path::new(&home).join("nvm.exe");
     if !exe.is_file() {
         return Err(format!("{} 不存在，nvm-windows 的安装可能不完整", exe.display()));
     }
@@ -81,11 +84,13 @@ fn find_nvm() -> Result<NvmInstall, String> {
     let root = settings
         .lines()
         .find_map(|l| l.trim().strip_prefix("root:"))
-        .map(|s| s.trim().to_string())
+        // settings.txt 是外部文件，喂给 `Command` 之前洗一遍（NUL 会让 spawn 直接失败，
+        // 报错却是没头没尾的 "nul byte found in provided data"）
+        .map(|s| crate::core::winenv::sanitize_for_spawn(s, "settings.txt 的 root"))
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{} 里没有 root 配置", settings_path.display()))?;
 
-    Ok(NvmInstall { exe, root: PathBuf::from(root) })
+    Ok(NvmInstall { exe, home: PathBuf::from(&home), root: PathBuf::from(root) })
 }
 
 /// 当前生效的版本 = `NVM_SYMLINK` 软链指向哪个目录。
@@ -93,10 +98,7 @@ fn find_nvm() -> Result<NvmInstall, String> {
 /// 读不到就返回空串（软链没建、nvm 没初始化过都算"未设置"），不报错——
 /// 那是正常状态，不是故障。
 fn current_version() -> String {
-    let Ok(link) = std::env::var("NVM_SYMLINK") else { return String::new() };
-    if link.trim().is_empty() {
-        return String::new();
-    }
+    let Some(link) = env_or_persistent("NVM_SYMLINK") else { return String::new() };
     // nvm-windows 建的是 junction；read_link 对两者都能读出目标路径
     let Ok(target) = std::fs::read_link(link.trim()) else { return String::new() };
     target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
@@ -198,6 +200,184 @@ fn parse_available(output: &str) -> AvailableNodeVersions {
     out
 }
 
+// ─── 安装 nvm-windows ───────────────────────────────────────
+
+/// 官方安装器地址，钉在 **1.2.2**（v1 的最后一代）。
+///
+/// 为什么不装当前的 v2.0.0：本面板是按 v1 的接口写的——版本目录来自 `settings.txt`、
+/// 当前版本看 `NVM_SYMLINK` 软链、可安装列表解析 `nvm list available` 的表格；而 v2 把
+/// 配置搬进了注册表（`InstallRoot` / `ActiveVersion`），CLI 也重写过（仓库都换了）。
+/// 没适配就装 v2，用户拿到的是"装上了但面板读不到"，比不装更让人困惑。
+/// 哪天适配完 v2，改这一个常量即可。
+const NVM_SETUP_URL: &str =
+    "https://github.com/nvm-windows/nvm/releases/download/1.2.2/nvm-setup.exe";
+
+/// 安装器大小下限。本机实测 5,612,296 字节；下到一半断线会留下一个短文件，
+/// 拿它去执行，用户看到的是"这个应用无法在你的电脑上运行"这类没头没尾的报错。
+const NVM_SETUP_MIN_BYTES: u64 = 1_000_000;
+
+/// 安装结果（界面据此说清"是装好了还是被取消了"）
+#[derive(Serialize)]
+pub struct NvmInstallResult {
+    /// 安装器退出码为 0（走完了向导）；false 多半是用户点了取消
+    pub ok: bool,
+    pub code: Option<i32>,
+    /// 安装器在本机的位置（出问题时界面能告诉用户它在哪）
+    pub path: String,
+}
+
+/// Windows 自带的 curl（Win10 1803 起内置）。
+///
+/// 用绝对路径而不是裸名，与 `run_nvm` 同一个理由：不依赖 PATH，也不受"先搜当前目录"影响。
+fn system_curl() -> PathBuf {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    Path::new(&sysroot).join("System32").join("curl.exe")
+}
+
+/// 文件像不像个能跑的安装器：够大 + `MZ` 头。
+/// curl 的 `--fail` 挡了 4xx/5xx，但"下到一半断线"仍会留下一个短文件——不验就会把它执行起来。
+fn valid_installer(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() || meta.len() < NVM_SETUP_MIN_BYTES {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut magic = [0u8; 2];
+    std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"MZ"
+}
+
+/// 下载官方安装器（本地已有一份合格的就不再下——安装器可重复运行，没必要重下 5.6 MB）
+fn download_setup(dest: &Path) -> Result<(), String> {
+    if valid_installer(dest) {
+        return Ok(());
+    }
+    let curl = system_curl();
+    if !curl.is_file() {
+        return Err(format!(
+            "找不到 {}（Windows 自带的下载组件）——请手动下载：{}",
+            curl.display(), NVM_SETUP_URL
+        ));
+    }
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {} 失败: {}", dir.display(), e))?;
+    }
+
+    let mut cmd = std::process::Command::new(&curl);
+    // 显式设置收口（spawn_guard 的 GUARD-1）：这里是绝对路径调用，本来就不搜当前目录，
+    // 写上是为了让"新增的进程调用"在守卫里是一次明确决定，而不是漏写
+    cmd.env("NoDefaultCurrentDirectoryInExePath", "1")
+        .args([
+            "-L",                 // release 直链会 302 到 objects.githubusercontent.com
+            "--fail",             // 4xx/5xx 直接算失败，别把错误页当安装包存下来
+            "--retry", "3",       // GitHub 直链在国内偶尔断流，重试几次比让用户重来便宜
+            "--retry-delay", "2",
+            "--connect-timeout", "20",
+            "--max-time", "900",  // 5.6 MB，慢网也够；到点就报错而不是无限等
+            "--silent", "--show-error",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(NVM_SETUP_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let out = cmd.output().map_err(|e| format!("启动下载失败: {}", e))?;
+    if !out.status.success() {
+        let detail = decode_output(&out.stderr);
+        return Err(format!(
+            "下载安装器失败（curl 退出码 {:?}）：{}\n也可以手动下载：{}",
+            out.status.code(),
+            detail.trim(),
+            NVM_SETUP_URL
+        ));
+    }
+    if !valid_installer(dest) {
+        let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        return Err(format!(
+            "下载到的文件不像安装包（{} 字节，期望 ≥ {}）——可手动下载：{}",
+            size, NVM_SETUP_MIN_BYTES, NVM_SETUP_URL
+        ));
+    }
+    Ok(())
+}
+
+/// 跑安装向导并等它结束。
+///
+/// 安装器要求管理员（1.2.2 的 `nvm.iss` 里是 `PrivilegesRequired=admin`），所以这一步会弹
+/// UAC——那一下只能由用户点，我们负责的只是把向导拉起来、等它关掉。
+async fn run_installer(path: &Path) -> Result<NvmInstallResult, String> {
+    let mut child = tokio::process::Command::new(path)
+        .env("NoDefaultCurrentDirectoryInExePath", "1") // 同上：新增进程调用要么收口要么豁免
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动安装向导失败: {}", e))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待安装向导结束失败: {}", e))?;
+    Ok(NvmInstallResult {
+        ok: status.success(),
+        code: status.code(),
+        path: path.display().to_string(),
+    })
+}
+
+/// 安装器的落地路径（`%TEMP%\nexus\nvm-setup-1.2.2.exe`）
+fn setup_path() -> PathBuf {
+    std::env::temp_dir().join("nexus").join("nvm-setup-1.2.2.exe")
+}
+
+/// 下载官方安装器到本机（已有一份合格的直接复用），返回它的路径。
+///
+/// 与下一步（`run_nvm_installer`）**分成两条命令**，是因为界面要分开说这两件事：
+/// "正在下载（可能要一两分钟）" 与 "安装向导已打开、在等你操作"——合成一条命令，界面就
+/// 只能在向导开着的时候继续显示"正在下载"，用户会以为卡住了。
+///
+/// 下载交给**系统自带的 curl.exe**：与 `run_nvm` 同一个路子（绝对路径调用），不为此引
+/// HTTP 客户端；也绕开了 CSP——前端只被允许访问 api.github.com，而安装包在 github.com
+/// 的 release 直链上。
+#[command]
+pub async fn download_nvm_installer() -> Result<String, String> {
+    if !cfg!(windows) {
+        // 用 cfg! 而不是 #[cfg]：这个模块在非 Windows 上也要编译得过（其余命令同理）
+        return Err("nvm-windows 是 Windows 专用的，当前平台装不了".into());
+    }
+    let dest = setup_path();
+    // curl 是阻塞的，别占着异步运行时
+    let target = dest.clone();
+    tokio::task::spawn_blocking(move || download_setup(&target))
+        .await
+        .map_err(|e| format!("下载任务失败: {}", e))??;
+    Ok(dest.display().to_string())
+}
+
+/// 运行已下载的安装器并等它结束。
+///
+/// **跑向导而不是静默安装**：1.2.2 的向导会问 nvm 目录与软链位置，这两处用户可能有自己的
+/// 安排；静默装完再发现路径不合心意，比多点两下更糟。向导要求管理员权限（`nvm.iss` 里是
+/// `PrivilegesRequired=admin`），那一下只能由用户点。
+///
+/// 装完**不必重启应用**：环境变量读不到时会回退到注册表（见 `persistent_env`）。
+#[command]
+pub async fn run_nvm_installer() -> Result<NvmInstallResult, String> {
+    if !cfg!(windows) {
+        return Err("nvm-windows 是 Windows 专用的，当前平台装不了".into());
+    }
+    let path = setup_path();
+    if !valid_installer(&path) {
+        return Err(format!("{} 还没下载好（先下载再运行）", path.display()));
+    }
+    run_installer(&path).await
+}
+
 /// 把命令输出按文本解码。
 ///
 /// 先按 UTF-8 试，失败回退 GB18030——与编辑器读文件同一套口径：中文 Windows 上
@@ -215,9 +395,36 @@ fn decode_output(bytes: &[u8]) -> String {
 /// 一样），二是绝对路径不受 Windows "先搜当前目录"的影响（若走裸名，得跟其他内部命令
 /// 一样加 `NoDefaultCurrentDirectoryInExePath`，见 spawn_guard）。
 fn run_nvm(nvm: &NvmInstall, args: &[&str]) -> Result<NvmCommandResult, String> {
+    // 兜底自检：真出问题时报错必须**指名道姓**。
+    // 用户报过一条 "执行 nvm 失败: nul byte found in provided data"——那是 Rust 的
+    // `Command::spawn` 在说"C 字符串里有 NUL"，但没说哪个值、哪个字段，用户与排障的人都
+    // 只能猜。正常路径上 NUL 已经在源头被洗掉了（见 `winenv::sanitize_for_spawn`），
+    // 这段是"万一还有"，让下一次出现时一眼能定位。
+    let mut parts: Vec<(&str, String)> = vec![
+        ("nvm.exe 路径", nvm.exe.to_string_lossy().to_string()),
+        ("nvm 版本目录", nvm.root.to_string_lossy().to_string()),
+    ];
+    parts.extend(args.iter().map(|a| ("nvm 参数", a.to_string())));
+    for (what, value) in &parts {
+        if value.contains('\0') {
+            return Err(format!(
+                "{} 里含非法字符（NUL），nvm 无法启动：{:?}——这个值来自外部（注册表或 settings.txt），请检查后重试",
+                what, value
+            ));
+        }
+    }
+
     let mut cmd = std::process::Command::new(&nvm.exe);
+    // 子进程要拿到**当前**的 PATH 与 nvm 变量，不能继承 Nexus 启动那一刻的副本（见 core::winenv）：
+    // - nvm.exe 按 `os.Getenv("NVM_HOME")` 找自己的 `settings.txt`（1.2.2 的 `src/nvm.go:59`），
+    //   缺了它就去盘根找 `\settings.txt`——实测报 "ERROR open \settings.txt"
+    // - `nvm use` / `nvm install` 还依赖 PATH 上的 `node`（nvm 内部会跑 `node -v`）
+    crate::core::winenv::apply(&mut cmd);
     cmd.args(args)
         .current_dir(&nvm.root) // 在版本目录里跑：nvm 自己产生的中转文件落这儿
+        // apply 会按注册表给一份 NVM_HOME，这里再用"我们实际用的那个 nvm.exe 所在目录"覆盖一次：
+        // 两者应当一致，但真不一致时，必须跟着这个 exe 走
+        .env("NVM_HOME", &nvm.home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -254,6 +461,36 @@ pub async fn list_available_node_versions() -> Result<AvailableNodeVersions, Str
     })
     .await
     .map_err(|e| format!("查询可安装版本失败: {}", e))?
+}
+
+/// 给 nvm 配镜像（`nvm node_mirror` / `nvm npm_mirror` 会写进它自己的 `settings.txt`）。
+///
+/// 为什么需要这条：`nvm list available` 与 `nvm install` 都要去 `node_mirror`（默认
+/// `https://nodejs.org/dist/`）取版本索引与安装包，国内机器上这一步常常直接失败——
+/// 面板里"拿不到可安装列表"十有八九就是它。地址由前端传（面板给的是 npmmirror），
+/// 这里只负责写入并把 nvm 的原话带回去。
+///
+/// 写的是**用户自己的 nvm 配置**，所以只能由用户点按钮触发，不做自动兜底。
+#[command]
+pub async fn set_nvm_mirrors(node_mirror: String, npm_mirror: String) -> Result<NvmCommandResult, String> {
+    let node = node_mirror.trim().to_string();
+    let npm = npm_mirror.trim().to_string();
+    if node.is_empty() {
+        return Err("node 镜像地址不能为空".into());
+    }
+    let nvm = find_nvm()?;
+    tokio::task::spawn_blocking(move || {
+        let res = run_nvm(&nvm, &["node_mirror", &node])?;
+        if !res.ok {
+            return Ok(res); // 第一步就没成：把 nvm 的原文带回去，别接着写 npm 镜像
+        }
+        if npm.is_empty() {
+            return Ok(res);
+        }
+        run_nvm(&nvm, &["npm_mirror", &npm])
+    })
+    .await
+    .map_err(|e| format!("配置镜像失败: {}", e))?
 }
 
 /// 安装指定版本（`nvm install`）。要下几十兆，界面得给明确的等待提示。
@@ -407,6 +644,53 @@ mod tests {
         // 拦截时的话要能指出下一步（"先切换"），不是只说一句"不行"
         let msg = uninstall_guard("v22.22.1", "v22.22.1").expect("同版本应当拦住");
         assert!(msg.contains("先切换"), "提示要给出下一步，实际: {}", msg);
+    }
+
+    /// 「装完 nvm 不用重启 Nexus」的真正门槛：**子进程**能不能自己找到 nvm。
+    ///
+    /// 复现用户报的那个状态：把 `NVM_HOME` / `NVM_SYMLINK` 从本进程环境里摘掉
+    /// （等价于"Nexus 启动时 nvm 还没装"），再跑一条 nvm 命令。面板读注册表只能让**界面**
+    /// 看到 nvm；而 nvm.exe 是从环境变量找 `settings.txt` 的——摘掉之后就只剩我们显式传参
+    /// 这一条路，所以这条测试就是那个场景的复现。
+    ///
+    /// 手动跑（会改本测试进程的环境变量，影响同进程其它测试，所以单独跑）：
+    /// ```text
+    /// cargo test --lib --manifest-path src-tauri/Cargo.toml -- --ignored nvm_runs_without
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_nvm_runs_without_inherited_env() {
+        std::env::remove_var("NVM_HOME");
+        std::env::remove_var("NVM_SYMLINK");
+
+        // 连"找 nvm"这一步也只能靠注册表兜底了
+        let nvm = find_nvm().expect("环境变量摘掉后，仍应当能从注册表找到 nvm");
+        let res = run_nvm(&nvm, &["root"]).expect("执行 nvm root");
+        println!("nvm root → ok={} output={:?}", res.ok, res.output);
+        assert!(res.ok, "nvm 应当仍能工作（它靠 NVM_HOME 找 settings.txt）: {}", res.output);
+        assert!(
+            res.output.contains(&nvm.root.display().to_string()),
+            "nvm 报的 root 应当是 {}，实际输出: {}",
+            nvm.root.display(),
+            res.output,
+        );
+    }
+
+    /// 下载链路真跑一次：curl 的路径、参数、落盘校验都要走一遍（只下不装）。
+    ///
+    /// 手动跑（会联网、往 %TEMP%\nexus\ 写 5.6 MB）：
+    /// ```text
+    /// cargo test --lib --manifest-path src-tauri/Cargo.toml -- --ignored download_nvm_setup
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_download_nvm_setup() {
+        let dest = std::env::temp_dir().join("nexus").join("nvm-setup-1.2.2.exe");
+        let _ = std::fs::remove_file(&dest); // 从零下，别复用上次的
+        download_setup(&dest).expect("下载官方安装器应当成功");
+        let size = std::fs::metadata(&dest).expect("文件应当存在").len();
+        println!("已下载 {}: {} 字节", dest.display(), size);
+        assert!(valid_installer(&dest), "下载到的文件应当通过校验（大小 + MZ 头）");
     }
 
     /// 对着**本机真实的 nvm 安装**跑一遍探测链路。

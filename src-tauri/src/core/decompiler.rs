@@ -88,6 +88,9 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     // 那种情况下"点开仓库里的一个 .class"就会执行该目录下预置的 java.exe，用户并未表达
     // 任何执行意图。java 由我们完全掌控、不承载用户 shell，故可以安全关掉这一级。
     cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
+    // 与 `build_command` 同一处理：`java` 是裸名、靠 PATH 解析，而本进程的 PATH 是启动
+    // 那一刻的副本——用户在 Nexus 运行期间装了 JDK 的话，这里会"找不到 java"（见 core::winenv）
+    crate::core::winenv::apply(cmd.as_std_mut());
     // -Xmx：CFR 对超大/畸形 class 可能持续膨胀（默认堆上限是物理内存的 1/4），
     // 256m 对正常 class 绰绰有余，超限只会让 JVM 自己 OOM 退出并走前端回退路径
     cmd.arg("-Xmx256m")

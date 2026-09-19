@@ -254,7 +254,10 @@ pub fn run() {
             commands::app::get_app_version,
             // Node 运行时（独立工具，不参与服务配置）
             commands::node::get_node_runtime,
+            commands::node::download_nvm_installer,
+            commands::node::run_nvm_installer,
             commands::node::list_available_node_versions,
+            commands::node::set_nvm_mirrors,
             commands::node::install_node_version,
             commands::node::uninstall_node_version,
             commands::node::use_node_version,
