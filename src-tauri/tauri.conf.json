@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicklasoverworlds/tauri/tauri-v2/crates/tauri-cli/schema.json",
   "productName": "Nexus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "com.nexus.app",
   "build": {
     "frontendDist": "../dist",
