@@ -17,6 +17,7 @@ use crate::commands::process::{
     ToolCommandResult,
 };
 use crate::commands::search::{SearchParams, SearchResponse, SearchResultItem};
+use crate::commands::node::{AvailableNodeVersions, NodeRuntimeStatus, NvmCommandResult};
 use crate::commands::service::{AddServiceParams, ImportTemplatesResult};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
@@ -119,6 +120,18 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(keys_of(&resp_skipped), sorted(&["results", "truncated", "skipped"]));
 
     // 模板导入结果（响应 DTO：snake_case；前端的 ImportTemplatesResult 原样对应）
+    // Node 运行时（左上角「Node 版本」面板）
+    let node_rt = NodeRuntimeStatus {
+        available: true, root: String::new(), installed: vec![], current: String::new(), reason: String::new(),
+    };
+    assert_eq!(keys_of(&node_rt), sorted(&["available", "root", "installed", "current", "reason"]));
+    let avail = AvailableNodeVersions {
+        current: vec![], lts: vec![], old_stable: vec![], old_unstable: vec![],
+    };
+    assert_eq!(keys_of(&avail), sorted(&["current", "lts", "old_stable", "old_unstable"]));
+    let nvm_res = NvmCommandResult { ok: true, output: String::new() };
+    assert_eq!(keys_of(&nvm_res), sorted(&["ok", "output"]));
+
     let imp = ImportTemplatesResult {
         imported: 0, duplicated: 0, missing_tools: vec![], missing_dirs: vec![],
     };
@@ -394,6 +407,7 @@ fn test_every_serializable_struct_is_covered() {
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "Service", "ServiceTemplate", "ProjectDetail",
         "ImportTemplatesResult",
+        "NodeRuntimeStatus", "AvailableNodeVersions", "NvmCommandResult",
         // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
         // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
         // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）

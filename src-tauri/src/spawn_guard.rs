@@ -40,6 +40,13 @@ const EXEMPT: &[(&str, &str, &str)] = &[
         "build_command",
         "用户边界：跑的是用户自己配置的服务命令整串（服务启动的主路径）",
     ),
+    (
+        "commands/node.rs",
+        "run_nvm",
+        "绝对路径调用：nvm.exe 的位置由 NVM_HOME 拼出来（见 find_nvm），不经 PATH 解析，\
+         也不受「先搜当前目录」影响——与 spawn_tool_program 的直启分支同理。\
+         用绝对路径是有意的：Nexus 启动时的 PATH 未必与用户终端一致，裸名可能压根找不到 nvm",
+    ),
 ];
 
 /// 一处 `Command::new(`：所在文件、行号、所属函数、以及该行之后的一小段窗口

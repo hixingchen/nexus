@@ -451,3 +451,46 @@ export const openToolsApi = {
   openWith: (serviceId: string) =>
     invoke<void>('open_service_with_tool', { serviceId }),
 };
+
+// ─── Node 运行时（nvm-windows）─────────────────────────────
+
+/**
+ * 本机 Node 运行时状态。
+ *
+ * 字段名与后端 `NodeRuntimeStatus` 逐字对应（响应 DTO 一律 snake_case，
+ * 见 src-tauri/src/contract.rs 的规则与它的契约测试）。
+ */
+export interface NodeRuntimeStatus {
+  /** 没检测到 nvm-windows 时为 false——界面据此显示引导，而不是当成"一个版本都没装" */
+  available: boolean;
+  /** 版本存放目录 */
+  root: string;
+  /** 已安装的版本（新 → 旧） */
+  installed: string[];
+  /** 当前生效的版本（读 NVM_SYMLINK 软链）；空 = 未设置 */
+  current: string;
+  /** 不可用时的原因原文 */
+  reason: string;
+}
+
+export interface AvailableNodeVersions {
+  current: string[];
+  lts: string[];
+  old_stable: string[];
+  old_unstable: string[];
+}
+
+/** 一条 nvm 命令的结果：**看 ok（退出码）判断成败**，output 是原文，失败时直接展示 */
+export interface NvmCommandResult {
+  ok: boolean;
+  output: string;
+}
+
+export const nodeApi = {
+  getRuntime: () => invoke<NodeRuntimeStatus>('get_node_runtime'),
+  /** 拉可安装版本（`nvm list available`，要联网，几秒） */
+  listAvailable: () => invoke<AvailableNodeVersions>('list_available_node_versions'),
+  install: (version: string) => invoke<NvmCommandResult>('install_node_version', { version }),
+  uninstall: (version: string) => invoke<NvmCommandResult>('uninstall_node_version', { version }),
+  use: (version: string) => invoke<NvmCommandResult>('use_node_version', { version }),
+};
