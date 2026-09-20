@@ -34,6 +34,15 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   const searchRef = useRef<HTMLInputElement>(null);
   /** 暂停开始时的累计新增行数（差值 = 暂停期间新增 N 行） */
   const baseAddedRef = useRef(0);
+  /**
+   * 是否处于「贴底跟随」。由滚动事件维护（见 handleScroll），**不在贴底 effect 里现算**。
+   *
+   * 为什么不能现算：贴底 effect 跑在 DOM 已经长高之后，量到的 distance 里含这一批新增的高度。
+   * 一批超过容差（两行就够）就被误判成"用户在翻历史"→ 不贴底；而误判不会自愈
+   * （distance 只增不减），跟随从此静默停止——面板上没有任何提示（实测：5 行/批即断，
+   * 且未满 2000 行滑窗时常住）。
+   */
+  const stickRef = useRef(true);
 
   const [paused, setPaused] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -128,6 +137,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   useLayoutEffect(() => {
     virtualizer.measure();
     virtualizer.scrollToOffset(0);
+    // 打开/切换服务 = 明确要停在最新一行：旧判据在这里失效（`distanceToBottom` 会是整份日志的长度，
+    // 长于视口的日志会被判成"用户在翻历史"，于是落在最旧的第 1 行）
+    stickRef.current = true;
     // 切换服务：清理上个服务的暂停状态
     useLogStore.getState().resumeLogs(serviceKey);
     // 打开面板：无条件以后端缓冲为准同步（后端清空过则本地缓存一并清掉）
@@ -144,18 +156,22 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // 用 layout effect 让新行与目标滚动位置同帧提交，避免先看到旧位置再跳到底部；
   // 暂停 / 搜索态不贴底（与旧实现一致：暂停冻结视图、搜索时定位由 goMatch 接管）。
   //
-  // 仅在"本来就在底部附近"时才贴底：原实现每个刷新周期（20 次/秒）无条件调
-  // `scrollToEnd()`，在刚 commit 完 DOM 的 layout effect 里读写滚动位置会强制同步布局，
-  // 即使用户正在上翻看历史、或服务已停止输出也照付。
+  // 判据取 `stickRef`（滚动那一刻算出来的），不在这里量滚动位置——见 stickRef 的说明。
+  // 这样"用户在翻历史"能挡住贴底（原实现每个刷新周期 20 次/秒无条件 scrollToEnd），
+  // 而一批新增多少行都不影响判据本身。
   useLayoutEffect(() => {
-    if (paused || searchActive) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distanceToBottom > STICK_TO_BOTTOM_EPSILON) return; // 用户在翻历史：不打断
+    if (paused || searchActive || !stickRef.current) return;
     virtualizer.scrollToEnd();
     // 依赖即触发源：新行/暂停/搜索状态变化时才重贴底；virtualizer 实例跨渲染稳定，不入依赖
   }, [version, rows.length, paused, searchActive]);
+
+  /** 重判是否贴底。只在用户滚动（或程序贴底后的那次滚动）时取一次快照 */
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // 程序贴底也会触发滚动事件 → 在底部 → 判据保持 true，不会自己把自己关掉
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_TO_BOTTOM_EPSILON;
+  }, []);
 
   // ── 暂停 ──────────────────────────────────────────────────
   // 暂停 = 快照当前跟随数据源为暂停视图（独立数据源，满 2000 行后冻结，不会再滚动）；
@@ -163,6 +179,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   const handlePause = useCallback(() => {
     const next = !paused;
+    // 恢复跟随 = 用户明确要回到最新一行：无条件贴底一次。
+    // 少了这句，暂停期间上翻看历史后点「跟随」，按钮承诺的"恢复自动滚动到最新日志"不生效——
+    // `paused` 变 false 触发的贴底 effect 会被"你已经不在底部"的判据挡掉，面板停在旧位置却显示跟随中
+    if (!next) stickRef.current = true;
     setPaused(next);
     if (next) {
       useLogStore.getState().pauseLogs(serviceKey);
@@ -226,7 +246,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
       {/* 文本样式（字体/字号/行高/换行）放在滚动容器上由行继承，与旧 <pre> 的表现一致；
           行高实测值依赖这里的 leading-relaxed，改动需同步 ESTIMATED_ROW_H */}
-      <div ref={scrollRef}
+      <div ref={scrollRef} onScroll={handleScroll}
         className={`overflow-auto bg-[#0d1117] font-mono text-[13px] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
         style={fill ? undefined : { maxHeight: '220px' }}>
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
