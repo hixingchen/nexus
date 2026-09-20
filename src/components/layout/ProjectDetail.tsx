@@ -34,7 +34,8 @@ import { useEditorStore } from '../../stores/editor';
 import { isMarkdownFile } from '../../utils/markdown';
 import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
-import { openToolsApi, parseToolCommands, serviceApi, type Service, type ServiceTemplate } from '../../services/service';
+import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type Service, type ServiceTemplate } from '../../services/service';
+import { failureLabel } from '../../utils/serviceFailure';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
 import { useServiceActions } from '../../hooks/useServiceActions';
@@ -73,7 +74,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
-    isServiceRunning, isServiceFailed, followedLogOf, handleStartAll, handleStopAll,
+    isServiceRunning, failedInfoOf, followedLogOf, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
   // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）
@@ -407,7 +408,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         editingService={editingService}
         onEditService={openServiceEdit}
         isServiceRunning={isServiceRunning}
-        isServiceFailed={isServiceFailed}
+        failedInfoOf={failedInfoOf}
         followedLogOf={followedLogOf}
         setDeleteSvcTarget={setDeleteSvcTarget}
         // 改名自 setShowAddServiceModal：添加服务不再是"开个弹窗"，而是打开右侧编辑面板
@@ -507,7 +508,7 @@ interface ServicePanelProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
-  isServiceFailed: (svc: Service) => boolean;
+  failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
@@ -525,7 +526,7 @@ interface ServicePanelProps {
 
 function ServicePanel({
   services, collapsed, onToggle, splitPanel, editingService, onEditService,
-  isServiceRunning, isServiceFailed, followedLogOf, setDeleteSvcTarget,
+  isServiceRunning, failedInfoOf, followedLogOf, setDeleteSvcTarget,
   onCreateService, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
 }: ServicePanelProps) {
@@ -538,7 +539,7 @@ function ServicePanel({
         <CollapsedView
           services={services}
           isServiceRunning={isServiceRunning}
-          isServiceFailed={isServiceFailed}
+          failedInfoOf={failedInfoOf}
           followedLogOf={followedLogOf}
           onToggle={onToggle}
           onViewLog={handleViewLog}
@@ -557,7 +558,7 @@ function ServicePanel({
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
-          isServiceFailed={isServiceFailed}
+          failedInfoOf={failedInfoOf}
           followedLogOf={followedLogOf}
           setDeleteSvcTarget={setDeleteSvcTarget}
           onCreateService={onCreateService}
@@ -576,11 +577,11 @@ function ServicePanel({
 }
 
 function CollapsedView({
-  services, isServiceRunning, isServiceFailed, followedLogOf, onToggle, onViewLog, onRunToolCommand, load,
+  services, isServiceRunning, failedInfoOf, followedLogOf, onToggle, onViewLog, onRunToolCommand, load,
 }: {
   services: Service[];
   isServiceRunning: (svc: Service) => boolean;
-  isServiceFailed: (svc: Service) => boolean;
+  failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
   onToggle: () => void;
@@ -640,8 +641,8 @@ function CollapsedView({
       <div className="flex-1 flex flex-col items-center gap-1 overflow-y-auto py-2">
         {services.map(svc => {
           const running = isServiceRunning(svc);
-          const failed = isServiceFailed(svc);
-          const clickable = running || failed; // 停止的服务无日志可看
+          const failure = failedInfoOf(svc);
+          const clickable = running || failure !== null; // 停止的服务无日志可看
           return (
             <button
               key={svc.id}
@@ -659,11 +660,11 @@ function CollapsedView({
               className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors ${
                 clickable ? 'hover:bg-nexus-accent/20 cursor-pointer' : 'cursor-default'
               }`}
-              title={`${svc.name}${running ? '（运行中）' : failed ? '（失败）' : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}
+              title={`${svc.name}${running ? '（运行中）' : failure ? `（${failureLabel(failure)}）` : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}
 右键：启停 / 重启、工具、打开位置`}
             >
               <span className={`w-[8px] h-[8px] rounded-full flex-shrink-0 ${
-                running ? 'bg-nexus-success' : failed ? 'bg-nexus-error' : 'bg-nexus-muted/25'
+                running ? 'bg-nexus-success' : failure ? 'bg-nexus-error' : 'bg-nexus-muted/25'
               }`} />
             </button>
           );
@@ -680,7 +681,7 @@ function CollapsedView({
           y={menu.y}
           cwd={menuSvc.cwd}
           running={isServiceRunning(menuSvc)}
-          failed={isServiceFailed(menuSvc)}
+          failed={failedInfoOf(menuSvc) !== null}
           followedLog={followedLogOf(menuSvc)}
           openToolName={boundTool?.name ?? null}
           toolCommands={menuCommands}
@@ -716,7 +717,7 @@ interface ExpandedViewProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
-  isServiceFailed: (svc: Service) => boolean;
+  failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
@@ -734,7 +735,7 @@ interface ExpandedViewProps {
 }
 
 function ExpandedView({
-  services, splitPanel, editingService, onEditService, isServiceRunning, isServiceFailed,
+  services, splitPanel, editingService, onEditService, isServiceRunning, failedInfoOf,
   followedLogOf, setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
@@ -749,7 +750,7 @@ function ExpandedView({
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
-          isServiceFailed={isServiceFailed}
+          failedInfoOf={failedInfoOf}
           followedLogOf={followedLogOf}
           setDeleteSvcTarget={setDeleteSvcTarget}
           onCreateService={onCreateService}
@@ -778,7 +779,7 @@ interface ServiceSectionProps {
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
   isServiceRunning: (svc: Service) => boolean;
-  isServiceFailed: (svc: Service) => boolean;
+  failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
@@ -797,7 +798,7 @@ interface ServiceSectionProps {
 
 function ServiceSection({
   services, editingService, onEditService,
-  isServiceRunning, isServiceFailed, followedLogOf,
+  isServiceRunning, failedInfoOf, followedLogOf,
   setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
@@ -881,7 +882,7 @@ function ServiceSection({
                 key={svc.id}
                 service={svc}
                 running={isServiceRunning(svc)}
-                failed={isServiceFailed(svc)}
+                failure={failedInfoOf(svc)}
                 followedLog={followedLogOf(svc)}
                 isEditing={editingService?.id === svc.id}
                 onEdit={() => onEditService(svc)}

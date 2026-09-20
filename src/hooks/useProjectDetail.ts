@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { projectApi, processApi, serviceApi, type ProjectDetail as PD, type Service } from '../services/service';
+import { projectApi, processApi, serviceApi, type FailedService, type ProjectDetail as PD, type Service } from '../services/service';
 import { useLogStore } from '../stores/logStore';
 import { useEditorStore } from '../stores/editor';
 import { useRunningStore } from '../stores/runningStore';
@@ -157,9 +157,15 @@ export function useProjectDetail(projectId: string) {
     useSvcCacheStore.getState().setCache(projectId, next);
   }, [projectId]);
 
-  /** 服务是否意外失败（崩溃/秒退/spawn 失败）：卡片显示"失败"按钮，日志保留可查看 */
-  const isServiceFailed = useCallback((svc: Service) => {
-    return failed.some(f => f.service_id === svc.id);
+  /**
+   * 服务的失败信息（null = 没失败；崩溃/秒退/spawn 失败都会在这里）。
+   *
+   * 返回对象而不是布尔：卡片徽章要写"已失败 · 退出码 1"、日志面板头部要写同一句，
+   * 而退出码与发生时刻本来就随这条记录一起到了前端——压成 boolean 会让每个展示位
+   * 都只剩"红点"，用户必须点开日志才知道是什么失败（见 utils/serviceFailure 的说明）。
+   */
+  const failedInfoOf = useCallback((svc: Service): FailedService | null => {
+    return failed.find(f => f.service_id === svc.id) ?? null;
   }, [failed]);
 
   /**
@@ -239,7 +245,7 @@ export function useProjectDetail(projectId: string) {
     load,
     reorderServicesLocal,
     isServiceRunning,
-    isServiceFailed,
+    failedInfoOf,
     followedLogOf,
     handleStartAll,
     handleStopAll,

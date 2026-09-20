@@ -6,7 +6,9 @@ import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
 import { includesIgnoreCase } from '../../utils/search';
 import { isSubmitEnter } from '../../utils/keyboard';
+import { failureDetail, failureLabel } from '../../utils/serviceFailure';
 import type { ServiceLogLine } from '../../services/logService';
+import type { FailedService } from '../../services/service';
 
 interface LogViewerProps { serviceKey: string; serviceName?: string; fill?: boolean; onClose?: () => void; }
 
@@ -66,6 +68,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // ── 运行状态 ──────────────────────────────────────────────
 
   const isRunning = useRunningStore(s => s.running.some(r => r.service_id === serviceKey));
+  // 失败信息（null = 没失败）。面板头部由此显示"已失败 · 退出码 1"——
+  // 用户是**从红色的失败卡片点进来**看原因的，头部不能报"未运行"（更早还报的是绿点）
+  const failure = useRunningStore(s => s.failed.find(f => f.service_id === serviceKey) ?? null);
   // 以后端缓冲为权威同步日志：
   // - 空快照（正常停止已清空）→ 清本地缓存，避免展示已清空的旧日志（含失败日志）
   // - 非空快照（崩溃保留 / 运行中）→ 覆盖本地缓存（后端保证先写缓冲再 emit，快照不丢行）
@@ -226,6 +231,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
         serviceName={serviceName}
         lineCount={lines.length}
         isRunning={isRunning}
+        failure={failure}
         onClose={onClose}
         searchTerm={searchTerm}
         setSearchTerm={setSearchTerm}
@@ -305,7 +311,7 @@ function fmtTime(ts: string): string {
 // ── 头部组件 ──────────────────────────────────────────────
 
 function LogHeader({
-  serviceName, lineCount, isRunning, onClose,
+  serviceName, lineCount, isRunning, failure, onClose,
   searchTerm, setSearchTerm, setSearchIdx, searchRef,
   searchActive, searchMatches, searchIdx, onGoMatch,
   paused, onPause, onClear, newSincePause,
@@ -313,6 +319,8 @@ function LogHeader({
   serviceName: string;
   lineCount: number;
   isRunning: boolean;
+  /** 该服务的失败信息（null = 没失败）：状态点与标签据此显示"已失败 · 退出码 N" */
+  failure: FailedService | null;
   onClose?: () => void;
   searchTerm: string;
   setSearchTerm: (s: string) => void;
@@ -335,16 +343,25 @@ function LogHeader({
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
         </button>
       )}
-      {/* 运行态语义色用项目 nexus-success（与服务卡片状态点同源，避免双绿不一致） */}
-      <span className="w-[7px] h-[7px] rounded-full bg-nexus-success flex-shrink-0"/>
+      {/* 状态点：与服务卡片同一套语义色（绿=运行中/红=意外失败/灰=未运行）。
+          原实现是硬编码绿点——从红色的失败卡片点进来看原因，头部却点着一颗绿点 */}
+      <span className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${
+        isRunning ? 'bg-nexus-success' : failure ? 'bg-nexus-error' : 'bg-nexus-muted/40'
+      }`}/>
       <span className="text-[13px] text-[#c9d1d9] font-medium truncate">{serviceName}</span>
-      {/* 状态标签：随运行状态变化（原为硬编码"运行中"，服务停止后显示错误状态） */}
-      <span className={`text-[11px] px-1.5 py-0.5 rounded-md border flex-shrink-0 ${
-        isRunning
-          ? 'bg-nexus-success/15 text-nexus-success border-nexus-success/30'
-          : 'bg-[#8b949e]/10 text-[#8b949e] border-[#30363d]'
-      }`}>
-        {isRunning ? '运行中' : '未运行'}
+      {/* 状态标签：运行中 / 已失败（退出码） / 未运行。
+          文案与卡片徽章同源（utils/serviceFailure），两处必须说同一件事 */}
+      <span
+        className={`text-[11px] px-1.5 py-0.5 rounded-md border flex-shrink-0 ${
+          isRunning
+            ? 'bg-nexus-success/15 text-nexus-success border-nexus-success/30'
+            : failure
+              ? 'bg-nexus-error/15 text-nexus-error border-nexus-error/30'
+              : 'bg-[#8b949e]/10 text-[#8b949e] border-[#30363d]'
+        }`}
+        title={failure ? failureDetail(failure) : undefined}
+      >
+        {isRunning ? '运行中' : failure ? failureLabel(failure) : '未运行'}
       </span>
       <span className="text-[12px] text-[#8b949e] flex-shrink-0" title="当前行数（只保留最新 2000 行）">
         {lineCount.toLocaleString()} 行

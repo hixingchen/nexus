@@ -58,6 +58,13 @@ const StopIcon = () => (
   </svg>
 );
 
+/** 编辑服务：铅笔 */
+const EditIcon = () => (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
+    <path d="M6.8 1.8l1.4 1.4-5.1 5.1-1.9.5.5-1.9z" />
+  </svg>
+);
+
 interface ServiceContextMenuProps {
   x: number;
   y: number;
@@ -88,6 +95,13 @@ interface ServiceContextMenuProps {
   onOpenInExplorer: () => void;
   onOpenTerminal: () => void;
   onRunCommand: (cmd: ToolCommand) => void;
+  /**
+   * 编辑服务：不传即不渲染。
+   *
+   * 失败态需要它：卡片本体被改成"点击看失败日志"（失败后第一诉求是诊断），
+   * 编辑面板的入口就只剩这里了
+   */
+  onEdit?: () => void;
   /** 删除服务：不传即不渲染（服务列收起态就没有这个入口） */
   onDelete?: () => void;
   onClose: () => void;
@@ -96,7 +110,7 @@ interface ServiceContextMenuProps {
 export function ServiceContextMenu({
   x, y, cwd, running, failed, followedLog, openToolName, toolCommands, onViewLog,
   onStart, onStop, onRestart, onOpenWithTool, onOpenInExplorer, onOpenTerminal,
-  onRunCommand, onUnfollowLog, onDelete, onClose,
+  onRunCommand, onUnfollowLog, onEdit, onDelete, onClose,
 }: ServiceContextMenuProps) {
   /** 所有条目共用的收尾：先执行动作再关菜单（与各站点迁移前的写法一致） */
   const run = (fn: () => void) => { fn(); onClose(); };
@@ -124,7 +138,9 @@ export function ServiceContextMenu({
         ) : failed ? (
           <>
             {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看失败日志" tone="error" truncate onClick={() => run(onViewLog)} />}
-            <ContextMenuItem icon={<PlayIcon />} label="重新启动" tone="success" truncate onClick={() => run(onStart)} />
+            <ContextMenuItem icon={<RestartIcon />} label="重新启动" tone="success" truncate onClick={() => run(onStart)} />
+            {/* 卡片本体在失败态下点击 = 看日志，所以编辑入口要在这里补上（不传的站点不渲染） */}
+            {onEdit && <ContextMenuItem icon={<EditIcon />} label="编辑服务" truncate onClick={() => run(onEdit)} />}
           </>
         ) : (
           <ContextMenuItem icon={<PlayIcon />} label="启动服务" tone="success" truncate onClick={() => run(onStart)} />
