@@ -265,7 +265,7 @@ export function ProjectListItem({
       document.body,
     )}
 
-    {/* 服务行右键菜单：搜索文件内容 / 资源管理器 / 复制 */}
+    {/* 服务行右键菜单：搜索文件内容 / 资源管理器 / 终端 / 复制 */}
     {svcMenu && createPortal(
       <ContextMenu x={svcMenu.x} y={svcMenu.y} onClose={() => setSvcMenu(null)}>
         {/* 搜索文件内容 */}
@@ -282,7 +282,9 @@ export function ProjectListItem({
           />
         </div>
 
-        {/* 在资源管理器中打开 / 复制路径 / 复制文件名 */}
+        {/* 在资源管理器中打开 / 打开终端 / 复制路径 / 复制文件名
+            （「打开终端」与「项目目录」那一行逐字一致：两者都代表一棵树的根，
+            工作目录就是那个根，是终端里 cd 过去的第一目标） */}
         <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
           <ContextMenuItem
             icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -293,6 +295,17 @@ export function ProjectListItem({
               const { cwd } = svcMenu.svc;
               setSvcMenu(null);
               void openInExplorer(cwd);
+            }}
+          />
+          <ContextMenuItem
+            icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M1.5 2.5l3.5 2.5-3.5 2.5"/><line x1="6.5" y1="8" x2="8.5" y2="8"/>
+            </svg>}
+            label="打开终端"
+            onClick={() => {
+              const { cwd } = svcMenu.svc;
+              setSvcMenu(null);
+              void openTerminal(cwd);
             }}
           />
           <ContextMenuItem
