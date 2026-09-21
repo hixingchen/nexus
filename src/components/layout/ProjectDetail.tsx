@@ -882,7 +882,7 @@ function ServiceSection({
                 key={svc.id}
                 service={svc}
                 running={isServiceRunning(svc)}
-                failure={failedInfoOf(svc)}
+                failed={failedInfoOf(svc) !== null}
                 followedLog={followedLogOf(svc)}
                 isEditing={editingService?.id === svc.id}
                 onEdit={() => onEditService(svc)}

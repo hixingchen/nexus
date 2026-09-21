@@ -3,23 +3,22 @@ import { createPortal } from 'react-dom';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, parseToolCommands, type FailedService, type Service, type ToolCommand } from '../../services/service';
+import { openToolsApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
 import { useServiceActions, type ServiceActionName } from '../../hooks/useServiceActions';
 import { useToolStore } from '../../stores/toolStore';
 import { reportError } from '../../utils/error';
-import { failureDetail, failureLabel } from '../../utils/serviceFailure';
 import { ServiceContextMenu } from './ServiceContextMenu';
 
 interface Props {
   service: Service;
   running: boolean;
   /**
-   * 意外失败的信息（崩溃/秒退/spawn 失败）；null = 没失败。
+   * 意外失败（崩溃/秒退/spawn 失败）。
    *
-   * 收对象而不是布尔：卡片要写"已失败 · 退出码 1"并把它作为常显状态，
-   * 退出码与发生时刻本来就随这条记录一起到了前端（见 utils/serviceFailure）。
+   * 卡片上只用颜色表达（红点），不写"已失败 · 退出码 N"这类文字——退出码与发生时刻
+   * 在日志面板头部与悬停说明里（见 utils/serviceFailure），那里才是看原因的地方。
    */
-  failure: FailedService | null;
+  failed: boolean;
   /** 正在跟随的日志文件（null = 没在跟随）：菜单据此给「取消跟随」入口 */
   followedLog: string | null;
   isEditing: boolean;
@@ -31,9 +30,8 @@ interface Props {
 }
 
 export function ServiceTreeEntry({
-  service, running, failure, followedLog, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
+  service, running, failed, followedLog, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
 }: Props) {
-  const failed = failure !== null;
   // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板）
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id });
   const style = {
@@ -119,73 +117,44 @@ export function ServiceTreeEntry({
           {/* 名称 */}
           <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{service.name}</span>
 
-          {failure ? (
-            /* 失败时右侧是"状态徽章 + hover 才出现的操作按钮"：徽章常显，不再只有一颗 7px 红点
-               （失败是"本来在跑，掉了"的事件，得先看得见）；hover 时徽章让位给按钮，两者共用
-               这一块位置——包含退出码的完整说明在徽章 title 与日志面板头部里都还在。
-               min-w 固定槽位宽度，避免"让位"把服务名左右拽动 */
-            <div className="flex items-center justify-end gap-1 min-w-[92px] flex-shrink-0">
-              <span
-                className={`px-1.5 py-0.5 text-[11px] rounded border bg-nexus-error/15 text-nexus-error border-nexus-error/30 ${isDragging ? '' : 'group-hover:hidden'}`}
-                title={`${failureDetail(failure)} · 点击卡片查看失败日志`}
-              >{failureLabel(failure)}</span>
-              <div
-                className={`items-center gap-1 ${isDragging ? 'hidden' : 'hidden group-hover:flex'}`}
-                onPointerDown={(e) => e.stopPropagation()}
-              >
-                {/* 与运行态同一套词汇：同一个动作在两处叫同一个名字、同一个颜色 */}
+          {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
+              用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动。
+              运行中与失败共用同一组按钮（日志/重启/停止）——失败态也要能"停止"：
+              它既是收尾（结束残留进程，含另开窗口的游离进程），也是清掉红点的入口 */}
+          <div
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {running || failed ? (
+              <>
                 <button
                   className="px-2 py-1 text-[11px] bg-nexus-info/15 text-nexus-info rounded hover:bg-nexus-info/25 disabled:opacity-40"
                   disabled={busy}
                   onClick={e => { e.stopPropagation(); onViewLog?.(); }}
-                  title="查看失败日志"
+                  title={failed ? '查看失败日志' : '查看日志'}
                 >日志</button>
                 <button
                   className="px-2 py-1 text-[11px] bg-nexus-warning/15 text-nexus-warning rounded hover:bg-nexus-warning/25 disabled:opacity-40"
                   disabled={busy}
-                  onClick={e => handleAction(e, 'start')}
-                  title="重新启动"
+                  onClick={e => handleAction(e, 'restart')}
+                  title="重启"
                 >↻</button>
-              </div>
-            </div>
-          ) : (
-            /* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
-               用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动 */
-            <div
-              className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
-              onPointerDown={(e) => e.stopPropagation()}
-            >
-              {running ? (
-                <>
-                  <button
-                    className="px-2 py-1 text-[11px] bg-nexus-info/15 text-nexus-info rounded hover:bg-nexus-info/25 disabled:opacity-40"
-                    disabled={busy}
-                    onClick={e => { e.stopPropagation(); onViewLog?.(); }}
-                    title="查看日志"
-                  >日志</button>
-                  <button
-                    className="px-2 py-1 text-[11px] bg-nexus-warning/15 text-nexus-warning rounded hover:bg-nexus-warning/25 disabled:opacity-40"
-                    disabled={busy}
-                    onClick={e => handleAction(e, 'restart')}
-                    title="重启"
-                  >↻</button>
-                  <button
-                    className="px-2 py-1 text-[11px] bg-nexus-error/15 text-nexus-error rounded hover:bg-nexus-error/25 disabled:opacity-40"
-                    disabled={busy}
-                    onClick={e => handleAction(e, 'stop')}
-                    title="停止"
-                  >■</button>
-                </>
-              ) : (
                 <button
-                  className="px-2 py-1 text-[11px] bg-nexus-success/15 text-nexus-success rounded hover:bg-nexus-success/25 disabled:opacity-40"
+                  className="px-2 py-1 text-[11px] bg-nexus-error/15 text-nexus-error rounded hover:bg-nexus-error/25 disabled:opacity-40"
                   disabled={busy}
-                  onClick={e => handleAction(e, 'start')}
-                  title="启动"
-                >▶</button>
-              )}
-            </div>
-          )}
+                  onClick={e => handleAction(e, 'stop')}
+                  title="停止"
+                >■</button>
+              </>
+            ) : (
+              <button
+                className="px-2 py-1 text-[11px] bg-nexus-success/15 text-nexus-success rounded hover:bg-nexus-success/25 disabled:opacity-40"
+                disabled={busy}
+                onClick={e => handleAction(e, 'start')}
+                title="启动"
+              >▶</button>
+            )}
+          </div>
         </div>
       </div>
 

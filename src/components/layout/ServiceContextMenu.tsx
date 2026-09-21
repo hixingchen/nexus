@@ -139,6 +139,9 @@ export function ServiceContextMenu({
           <>
             {onViewLog && <ContextMenuItem icon={<LogIcon />} label="查看失败日志" tone="error" truncate onClick={() => run(onViewLog)} />}
             <ContextMenuItem icon={<RestartIcon />} label="重新启动" tone="success" truncate onClick={() => run(onStart)} />
+            {/* 失败态也要能停止：收尾残留进程（含另开窗口的游离进程）并清掉失败标记。
+                与卡片那三个按钮逐项对齐（卡片 hover = 日志 / 重启 / 停止） */}
+            <ContextMenuItem icon={<StopIcon />} label="停止服务" tone="error" truncate onClick={() => run(onStop)} />
             {/* 卡片本体在失败态下点击 = 看日志，所以编辑入口要在这里补上（不传的站点不渲染） */}
             {onEdit && <ContextMenuItem icon={<EditIcon />} label="编辑服务" truncate onClick={() => run(onEdit)} />}
           </>
