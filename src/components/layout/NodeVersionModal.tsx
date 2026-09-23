@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Modal } from '../ui/Modal';
-import { nodeApi, type AvailableNodeVersions, type NodeRuntimeStatus } from '../../services/service';
+import { nodeApi, type NodeRuntimeStatus, type NodeVersionIndex } from '../../services/service';
 import { showNotification } from '../ui/Toast';
 import { reportError, toMessage } from '../../utils/error';
+import { matchNodeVersions, normalizeVersionQuery } from '../../utils/version';
 
 /**
  * 一键配置用的国内镜像（与用户本机 `settings.txt` 里那两条一致）。
@@ -15,17 +16,31 @@ const NODE_MIRROR = 'https://npmmirror.com/mirrors/node/';
 const NPM_MIRROR = 'https://npmmirror.com/mirrors/npm/';
 
 /**
+ * 一次最多渲染多少条搜索结果。
+ *
+ * 搜 `0` 能匹配两百多个（0.x 时代版本多），全渲染会让面板卡一下；截断的同时**必须把实际
+ * 条数说出来**（界面上有那句"匹配 N 个"），不能让它看起来就是全部。
+ */
+const MAX_RESULTS = 200;
+
+/** 搜索框空着时先展示的最新版本数——相当于旧版「可安装」那几列给的信息量 */
+const IDLE_PREVIEW = 30;
+
+/**
  * Node 版本管理面板（nvm-windows 的 GUI）。
  *
  * **它是独立工具，不参与服务配置**：这里改的是全局状态（`nvm use` 动的是软链），
  * 与"某个服务该用哪个 Node"是两件事，别把两者混在一个入口里。
  *
- * 三条刻意的设计：
+ * 四条刻意的设计：
  * 1. **成败看 `ok`（退出码），输出原文照贴**——nvm 的提示是给人看的，措辞会随版本变，
  *    我们转述不如直接给它的话
  * 2. 「设为当前」会改**全局软链**（所有终端里的 node 都跟着变），按钮上必须说清楚
  * 3. **卸载正在使用的版本由我们自己拦**——nvm 不管这事（它反而会先删软链再删目录，
  *    见 handleUninstall），所以"为什么不行、接下来怎么办"都得由我们说出来
+ * 4. **可安装版本是搜出来的**，数据源是 `<node_mirror>index.json`（与 `nvm install` 判定
+ *    版本是否存在用的是同一个文件）——搜索在本地做，筛选即刻生效；`nvm list available`
+ *    那种每列十来条的摘要搜不了"22 这条线有哪些版本"，所以不用它
  */
 
 type Action = 'install' | 'uninstall' | 'use';
@@ -51,16 +66,18 @@ interface Props {
 
 export function NodeVersionModal({ open, onClose, onChanged }: Props) {
   const [runtime, setRuntime] = useState<NodeRuntimeStatus | null>(null);
-  /** 可安装版本：联网拉，失败保持 null（不影响已装列表的使用） */
-  const [available, setAvailable] = useState<AvailableNodeVersions | null>(null);
-  const [loadingAvail, setLoadingAvail] = useState(false);
+  /** 可安装版本索引：联网拉，失败保持 null（不影响已装列表的使用） */
+  const [index, setIndex] = useState<NodeVersionIndex | null>(null);
+  const [loadingIndex, setLoadingIndex] = useState(false);
+  /** 搜索词——筛选是本地做的，敲字不触发请求 */
+  const [query, setQuery] = useState('');
   /**
-   * 拉列表失败时的原文（nvm 的原话，如 "Get https://nodejs.org/dist/index.json: ..."）。
+   * 拉索引失败时的原文（后端拼好的下载报错，含**它去取的地址**）。
    *
    * 之前这里只留一句"拿不到可安装列表"，把后端带回来的原因扔了——用户看到的是泛泛一句，
    * 排不了障，我们也只能猜（用户就是这么撞上的）。失败原因必须露出来。
    */
-  const [availError, setAvailError] = useState('');
+  const [indexError, setIndexError] = useState('');
   /** 正在写镜像配置 */
   const [mirrorBusy, setMirrorBusy] = useState(false);
   /** 正在执行的操作（同时只允许一个：nvm 自己也不是并发安全的） */
@@ -76,26 +93,38 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
     }
   }, []);
 
-  /** 拉可安装版本（`nvm list available`）。失败时把 nvm 的原话留下，别只留一句状态 */
-  const loadAvailable = useCallback(async () => {
-    setLoadingAvail(true);
-    setAvailError('');
+  /** 拉可安装版本索引（`<node_mirror>index.json`）。失败时把原因原文留下，别只留一句状态 */
+  const loadIndex = useCallback(async () => {
+    setLoadingIndex(true);
+    setIndexError('');
     try {
-      setAvailable(await nodeApi.listAvailable());
+      setIndex(await nodeApi.listVersions());
     } catch (e: unknown) {
-      setAvailable(null);
-      setAvailError(toMessage(e));
+      setIndex(null);
+      setIndexError(toMessage(e));
     } finally {
-      setLoadingAvail(false);
+      setLoadingIndex(false);
     }
   }, []);
 
   useEffect(() => {
     if (!open) return;
     void refresh();
-    // 可安装列表要联网（几秒），打开面板时才拉
-    void loadAvailable();
-  }, [open, refresh, loadAvailable]);
+    // 版本索引要联网（几百 KB），打开面板时才拉
+    void loadIndex();
+  }, [open, refresh, loadIndex]);
+
+  /**
+   * 筛选结果。索引拉回来之后搜索是纯本地的——敲一个字发一次请求那种做法，在几百 KB 的
+   * 索引上既没必要，也会让输入框一顿一顿的。
+   */
+  const matched = useMemo(
+    () => matchNodeVersions(index?.versions ?? [], query),
+    [index, query],
+  );
+  const searching = normalizeVersionQuery(query) !== '';
+  /** 没搜索时只给最新的一批，不把 800 条全铺出来 */
+  const shown = matched.slice(0, searching ? MAX_RESULTS : IDLE_PREVIEW);
 
   /**
    * 一键换成国内镜像（写 nvm 自己的 settings.txt，所以只由用户点触发）。
@@ -115,8 +144,9 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
           duration: 8000,
         });
       } else {
-        showNotification({ title: '已配置 npmmirror 镜像', description: '重新拉取可安装列表…' });
-        await loadAvailable();
+        showNotification({ title: '已配置 npmmirror 镜像', description: '重新拉取版本索引…' });
+        // 重拉会重新读 settings.txt（后端每次现读），所以拿到的一定是新镜像上的索引
+        await loadIndex();
       }
     } catch (e: unknown) {
       reportError('配置镜像失败', e);
@@ -307,69 +337,107 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
             )}
           </section>
 
-          {/* 可安装 */}
+          {/* 可安装（搜索） */}
           <section>
-            <div className="flex items-center gap-2 mb-2">
+            <div className="flex items-center justify-between gap-2 mb-2">
               <span className="text-[11px] font-semibold text-nexus-muted uppercase tracking-wider">可安装</span>
-              {loadingAvail && <span className="text-[11px] text-nexus-muted">查询中…</span>}
+              {loadingIndex ? (
+                <span className="text-[11px] text-nexus-muted">读取版本索引…</span>
+              ) : index && (
+                // 从哪取的要说出来：取不到时这句就是排障的起点（多半是镜像配错了）
+                <span className="text-[10px] text-nexus-muted/60 font-mono truncate max-w-[320px]" title={index.index_url}>
+                  {index.index_url}
+                </span>
+              )}
             </div>
-            {available ? (
-              <div className="space-y-2 max-h-[190px] overflow-auto pr-1">
-                {([
-                  ['LTS', available.lts],
-                  ['当前线', available.current],
-                  ['旧稳定版', available.old_stable],
-                  ['旧非稳定版', available.old_unstable],
-                ] as const).map(([label, list]) => list.length > 0 && (
-                  <div key={label}>
-                    <div className="text-[11px] text-nexus-muted mb-1">{label}</div>
-                    <div className="flex flex-wrap gap-1">
-                      {list.map(v => {
-                        const installed = runtime.installed.includes(`v${v}`);
-                        return (
-                          <button
-                            key={v}
-                            className={`px-2 py-0.5 text-[11px] font-mono rounded border transition-colors ${
-                              installed
-                                ? 'border-nexus-border/40 text-nexus-muted/50 cursor-default'
-                                : 'border-nexus-border text-nexus-text hover:border-nexus-accent hover:text-nexus-accent disabled:opacity-40'
-                            }`}
-                            disabled={installed || disabled}
-                            title={installed ? '已安装' : `安装 v${v}（要从镜像下载几十兆，请稍候）`}
-                            onClick={() => void run(`v${v}`, 'install')}
-                          >{v}</button>
-                        );
-                      })}
+
+            <input
+              type="text"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              // 索引还没到也能打字：到了就自动筛（本地筛，不阻塞输入）
+              placeholder="搜版本：22 / 22.23 / 20.11.1，也可搜 LTS 代号（jod）"
+              spellCheck={false}
+              className="w-full px-2 py-1.5 mb-2 text-[12px] font-mono text-nexus-text bg-nexus-bg/50 border border-nexus-border rounded outline-none focus:border-nexus-accent placeholder:text-nexus-muted/60 placeholder:font-sans"
+            />
+
+            {index ? (
+              shown.length === 0 ? (
+                <div className="text-[12px] text-nexus-muted py-2">
+                  没有匹配的版本{searching && '——试试只输主版本号（如 22），或换个 LTS 代号'}
+                </div>
+              ) : (
+                <div className="space-y-1 max-h-[210px] overflow-auto pr-1">
+                  {/* 没搜索时先说一句这是"最新的这些"，免得被当成全部 */}
+                  {!searching && (
+                    <div className="text-[11px] text-nexus-muted/70 pb-1">
+                      最新的 {shown.length} 个（共 {matched.length} 个，输入版本号筛选）
                     </div>
-                  </div>
-                ))}
-              </div>
-            ) : availError ? (
+                  )}
+                  {shown.map(({ version, lts }) => {
+                    const installed = runtime.installed.includes(version);
+                    const busyHere = busy?.version === version;
+                    return (
+                      <div
+                        key={version}
+                        className="flex items-center gap-2 px-2 py-1 rounded border border-nexus-border bg-nexus-bg/30"
+                      >
+                        <span className="flex-1 text-[12px] text-nexus-text font-mono">{version}</span>
+                        {lts && (
+                          <span
+                            className="text-[10px] px-1.5 py-0.5 rounded bg-nexus-accent/15 text-nexus-accent"
+                            title={`LTS 代号 ${lts}`}
+                          >LTS {lts}</span>
+                        )}
+                        {installed ? (
+                          <span className="text-[10px] text-nexus-muted" title="已经装过了">已安装</span>
+                        ) : (
+                          <button
+                            className="px-2 py-0.5 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded hover:bg-nexus-accent/10 disabled:opacity-40"
+                            disabled={disabled}
+                            title={`安装 ${version}（从镜像下载几十兆，请稍候）`}
+                            onClick={() => void run(version, 'install')}
+                          >安装</button>
+                        )}
+                        {busyHere && <span className="text-[11px] text-nexus-muted">安装中…</span>}
+                      </div>
+                    );
+                  })}
+                  {/* 截断了就得说：不说的话，看起来就是"只有这么多"。
+                      只在搜索时补这句——没搜索时上面那行已经写了"最新的 N 个（共 M 个）"，不必说两遍 */}
+                  {searching && matched.length > shown.length && (
+                    <div className="text-[11px] text-nexus-muted/70 pt-1">
+                      匹配 {matched.length} 个，这里只列了前 {shown.length} 个——把版本号写完整些可缩小范围
+                    </div>
+                  )}
+                </div>
+              )
+            ) : indexError ? (
               /* 失败态一直留着（只在首次加载、还没结果时留白）：重试按钮自己显示"重试中…"，
                  否则一次很快就失败的请求看上去像"点了没反应"（用户报过） */
               <div className="text-[12px] text-nexus-muted py-2 space-y-2">
-                <div>拿不到可安装列表（nvm 要去配置的镜像取版本索引）</div>
-                {/* nvm 的原话：网络报错、镜像 404、代理问题全在这里，不贴出来就只能猜 */}
+                <div>拿不到版本索引（面板与 nvm install 都从配置的镜像取 index.json）</div>
+                {/* 后端拼好的原文：里面带**它去取的地址**，网络报错/镜像 404/代理问题全在这里 */}
                 <pre className="text-[11px] text-nexus-muted/80 font-mono whitespace-pre-wrap max-h-[90px] overflow-auto bg-nexus-bg/50 rounded p-2">
-                  {availError}
+                  {indexError}
                 </pre>
                 <div className="flex items-center gap-2">
                   <button
                     className="px-2 py-1 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded hover:bg-nexus-accent/10 disabled:opacity-40"
-                    disabled={disabled || mirrorBusy || loadingAvail}
-                    onClick={() => void loadAvailable()}
-                  >{loadingAvail ? '重试中…' : '重试'}</button>
+                    disabled={disabled || mirrorBusy || loadingIndex}
+                    onClick={() => void loadIndex()}
+                  >{loadingIndex ? '重试中…' : '重试'}</button>
                   <button
                     className="px-2 py-1 text-[11px] text-nexus-text border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent disabled:opacity-40"
-                    disabled={disabled || mirrorBusy || loadingAvail}
+                    disabled={disabled || mirrorBusy || loadingIndex}
                     // 说清副作用：这一下会改 nvm 自己的 settings.txt（默认源是 nodejs.org）
-                    title="把 nvm 的 node/npm 镜像改成 npmmirror 并重拉列表（写 nvm 自己的 settings.txt）"
+                    title="把 nvm 的 node/npm 镜像改成 npmmirror 并重拉索引（写 nvm 自己的 settings.txt）"
                     onClick={() => void applyMirror()}
                   >{mirrorBusy ? '正在配置…' : '改用 npmmirror 镜像'}</button>
                 </div>
               </div>
             ) : (
-              // 首次加载：头部有"查询中…"，这里不必再说什么
+              // 首次加载：头部有"读取版本索引…"，这里不必再说什么
               <div className="text-[12px] text-nexus-muted py-2" />
             )}
           </section>

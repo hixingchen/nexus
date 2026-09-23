@@ -11,14 +11,14 @@
 
 use crate::commands::ai::{AiStatus, DshVersionInfo};
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
-use crate::commands::fileops::PasteFilesResult;
+use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
 use crate::commands::process::{
     ProcessStatus, RunningService, ToolCommandLogBatchPayload, ToolCommandLogLine,
     ToolCommandResult,
 };
 use crate::commands::search::{SearchParams, SearchResponse, SearchResultItem};
 use crate::commands::node::{
-    AvailableNodeVersions, NodeRuntimeStatus, NvmCommandResult, NvmInstallResult,
+    NodeRuntimeStatus, NodeVersionIndex, NodeVersionInfo, NvmCommandResult, NvmInstallResult,
 };
 use crate::commands::service::{AddServiceParams, ImportTemplatesResult};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
@@ -127,10 +127,11 @@ fn test_response_dtos_are_snake_case() {
         available: true, root: String::new(), installed: vec![], current: String::new(), reason: String::new(),
     };
     assert_eq!(keys_of(&node_rt), sorted(&["available", "root", "installed", "current", "reason"]));
-    let avail = AvailableNodeVersions {
-        current: vec![], lts: vec![], old_stable: vec![], old_unstable: vec![],
-    };
-    assert_eq!(keys_of(&avail), sorted(&["current", "lts", "old_stable", "old_unstable"]));
+    // 可安装版本索引（面板上的搜索框筛的就是它；前端 NodeVersionIndex 原样对应）
+    let info = NodeVersionInfo { version: String::new(), lts: String::new() };
+    assert_eq!(keys_of(&info), sorted(&["version", "lts"]));
+    let index = NodeVersionIndex { versions: vec![], index_url: String::new() };
+    assert_eq!(keys_of(&index), sorted(&["versions", "index_url"]));
     let nvm_res = NvmCommandResult { ok: true, output: String::new() };
     assert_eq!(keys_of(&nvm_res), sorted(&["ok", "output"]));
     let nvm_inst = NvmInstallResult { ok: true, code: Some(0), path: String::new() };
@@ -157,9 +158,33 @@ fn test_response_dtos_are_snake_case() {
     let hex = HexPage { offset: 0, bytes: vec![], total_size: 0 };
     assert_eq!(keys_of(&hex), sorted(&["offset", "bytes", "total_size"]));
 
-    // 粘贴结果（created/failed 决定界面提示哪一半成功）
-    let paste = PasteFilesResult { created: vec![], failed: vec![] };
-    assert_eq!(keys_of(&paste), sorted(&["created", "failed"]));
+    // 粘贴结果（created/failed 决定界面提示哪一半成功；skipped 是"复制成功但内容不全"
+    // 的那一类——被跳过的符号链接/联接点，界面必须单独说，不能并进任一边；
+    // replaced 是覆盖时被移入回收站的原项，skipped_by_user 是用户在同名弹框里选「跳过」的）
+    let paste = PasteFilesResult {
+        created: vec![], failed: vec![], skipped: vec![], replaced: vec![], skipped_by_user: vec![],
+    };
+    assert_eq!(
+        keys_of(&paste),
+        sorted(&["created", "failed", "skipped", "replaced", "skipped_by_user"])
+    );
+
+    // 粘贴的两阶段响应：`status` 是判别式，前端靠它分流"弹框"还是"报结果"。
+    // 改名（或丢掉 tag）不会编译报错，只会让界面把两种结局混成一种
+    let done = PasteResponse::Done(paste);
+    assert_eq!(
+        keys_of(&done),
+        sorted(&["status", "created", "failed", "skipped", "replaced", "skipped_by_user"])
+    );
+    let conflict = PasteResponse::Conflict {
+        conflicts: vec![PasteConflict { name: "a.txt".into(), existing_is_dir: false }],
+        sources: vec![],
+    };
+    assert_eq!(keys_of(&conflict), sorted(&["status", "conflicts", "sources"]));
+
+    // 同名冲突项（弹框据此列出"目标里已有哪些同名项目"并说明替换代价）
+    let pc = PasteConflict { name: "a.txt".into(), existing_is_dir: true };
+    assert_eq!(keys_of(&pc), sorted(&["name", "existing_is_dir"]));
 
     // 服务行（前端 Service 类型 14 个字段一一对应）
     let svc = Service {
@@ -324,6 +349,26 @@ fn test_request_params_are_camel_case() {
     assert!(!sp2.case_sensitive, "snake_case 不该被读到");
 }
 
+/// 同名冲突策略的**线上取值**：前端弹框三选一回传的就是这三个字符串。
+///
+/// 只测反序列化——**这才是运行时真正走的方向**（后端从不把策略发回前端）。
+/// 这条路上没有类型检查帮忙：前端写的是字符串常量（见 `utils/pasteResult.ts` 的
+/// `ConflictPolicy`），改一边不会编译报错，只会在用户点下按钮时抛一句 `unknown variant`，
+/// 且**三个选项一起坏**：粘贴从此完全不可用。
+#[test]
+fn test_conflict_policy_wire_values() {
+    use serde_json::json;
+    assert_eq!(serde_json::from_value::<ConflictPolicy>(json!("rename")).unwrap(), ConflictPolicy::Rename);
+    assert_eq!(serde_json::from_value::<ConflictPolicy>(json!("overwrite")).unwrap(), ConflictPolicy::Overwrite);
+    assert_eq!(serde_json::from_value::<ConflictPolicy>(json!("skip")).unwrap(), ConflictPolicy::Skip);
+    // 反面：取值拼错/改名必须**报错**，不能静默落回某个默认策略——
+    // 落回 rename 还算轻（多一个 " (2)"），落回 overwrite 就是用户没选也覆盖
+    assert!(
+        serde_json::from_value::<ConflictPolicy>(json!("replace")).is_err(),
+        "未知取值必须报错，而不是落回默认策略"
+    );
+}
+
 /// 从 `struct X` / `pub struct X` / `pub(crate) struct X` 这类行里取出类型名。
 /// 严格要求行首就是声明（剥掉可见性修饰后必须直接是 `struct `），
 /// 这样注释、`impl X {`、`let x = Foo { … }` 都不会被误判。
@@ -403,7 +448,7 @@ fn test_every_serializable_struct_is_covered() {
     const COVERED: &[&str] = &[
         "AiStatus", "DshVersionInfo",
         "FileEntry", "ReadFileResponse", "HexPage", "JarEntryContent",
-        "PasteFilesResult",
+        "PasteFilesResult", "PasteConflict",
         "ToolCommandResult", "ToolCommandLogLine", "ToolCommandLogBatchPayload",
         "RunningService", "ProcessStatus",
         "SearchResultItem", "SearchResponse",
@@ -412,7 +457,8 @@ fn test_every_serializable_struct_is_covered() {
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "Service", "ServiceTemplate", "ProjectDetail",
         "ImportTemplatesResult",
-        "NodeRuntimeStatus", "AvailableNodeVersions", "NvmCommandResult", "NvmInstallResult",
+        "NodeRuntimeStatus", "NodeVersionInfo", "NodeVersionIndex",
+        "NvmCommandResult", "NvmInstallResult",
         // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
         // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
         // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）

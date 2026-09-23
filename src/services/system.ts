@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { reportError } from '../utils/error';
+import type { ConflictPolicy, PasteResponse } from '../utils/pasteResult';
 import type { FileEntry } from '../types/file';
 
 /**
@@ -49,25 +50,47 @@ export async function openTerminal(path: string): Promise<void> {
   }
 }
 
-/** 粘贴结果：created 为已落盘路径，failed 为逐个源的失败原因（空数组 = 全部成功） */
-export interface PasteFilesResult {
-  created: string[];
-  failed: string[];
-}
+/**
+ * 粘贴结果类型定义在 `utils/pasteResult.ts`（那里零依赖、可被 node 直接测），
+ * 这里只做转发，免得字段名在前后端之外又多出一份手工副本。
+ */
+export type { PasteResponse } from '../utils/pasteResult';
 
 /** 列目录（文件树 / jar 子树用） */
 export function listDirectory(path: string) {
   return invoke<FileEntry[]>('list_directory', { path });
 }
 
-/** 把系统剪贴板里的文件粘贴到目标目录（返回新建与失败清单） */
-export function pasteFiles(targetDir: string) {
-  return invoke<PasteFilesResult>('paste_files', { targetDir });
+/**
+ * 把系统剪贴板里的文件粘贴到目标目录。**两阶段**：
+ *
+ * - `conflictPolicy` 为空 = 探测（后端**一个字节都不落盘**）：有同名冲突就回
+ *   `status: 'conflict'`，交给弹框问用户；没冲突就直接粘完。
+ * - 定好策略后再调一次，并把探测那轮回传的 `expectedSources` 原样带上——后端只拿它跟
+ *   **当前剪贴板**比对（弹框开着时用户可能去别处又复制了一次），**不当作复制输入**
+ *   （理由见 `commands/fileops.rs` 的 `PasteResponse`）。
+ */
+export function pasteFiles(
+  targetDir: string,
+  conflictPolicy: ConflictPolicy | null,
+  expectedSources: string[] | null,
+) {
+  return invoke<PasteResponse>('paste_files', { targetDir, conflictPolicy, expectedSources });
 }
 
 /** 把文件写入系统剪贴板（复制文件本身，不是文本） */
 export function copyFilesToClipboard(paths: string[]) {
   return invoke<void>('copy_files_to_clipboard', { paths });
+}
+
+/**
+ * 删除文件/目录到系统回收站（目录整棵进回收站）。
+ *
+ * 不在这里 catch：调用方要按成败决定"关掉对应标签 + 刷新父目录"还是"留在确认框里重试"，
+ * 所以错误交给它（与 `pasteFiles` 同口径，`openInExplorer` 那种无后续动作的才自带提示）。
+ */
+export function deletePath(path: string) {
+  return invoke<void>('delete_path', { path });
 }
 
 /**

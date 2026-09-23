@@ -36,6 +36,23 @@ const IMAGE_MIME: Record<string, string> = {
 };
 
 /**
+ * 取父目录（纯字符串切分，不保证该目录存在）。
+ *
+ * **两种分隔符都要认**：树里的子路径是「配置里的根**原样** + `/` + 子名」拼出来的，
+ * 根上带的 `\` 会留在字符串里（`D:\work\proj/src/a.ts`）——只按 `/` 找会切出
+ * `D:\work\proj` 之外的东西，只按 `\` 找则会原地不动。
+ *
+ * 路径里一个分隔符都没有时原样返回：树里的路径都是绝对路径，走不到这一支；
+ * 真走到了也让下游尽早炸出来（拿一个文件路径去当粘贴目标，后端会明确报"目标不是目录"），
+ * 比在这里编一个空串或盘符出来更容易查。
+ */
+export function parentDir(p: string): string {
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  if (i < 0) return p;
+  return p.slice(0, i) || p; // i === 0（形如 "/x"）：切出来是空串，退回原值
+}
+
+/**
  * 图片扩展名 → MIME。未知扩展名给 `application/octet-stream`（与既有行为一致）。
  *
  * 为什么提到这里：图片查看器与 Markdown 预览各需要一次，而两份表**不一致时不会报错**，

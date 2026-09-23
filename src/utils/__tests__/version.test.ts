@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compareVersions } from '../version.ts';
+import { compareVersions, matchNodeVersions } from '../version.ts';
 
 /**
  * 版本比较（"检查更新"据此判断有没有新版）。
@@ -60,4 +60,46 @@ test('解析不了返回 null——不能当成"没有新版本"', () => {
   assert.equal(compareVersions('1.0.0', 'latest'), null);
   assert.equal(compareVersions('1.x.0', '1.0.0'), null);
   assert.equal(compareVersions('1..0', '1.0.0'), null);
+});
+
+/**
+ * 可安装版本的搜索（Node 版本面板）。
+ *
+ * 两条规则各自的**反面**都要钉住：搜 `23` 时不能把 `22.23.x` 一起端出来（那是包含匹配的
+ * 典型误伤），搜代号时又不能要求写全。
+ */
+const INDEX = [
+  { version: 'v22.23.2', lts: 'Jod' },
+  { version: 'v22.0.0', lts: 'Jod' },
+  { version: 'v20.11.1', lts: 'Iron' },
+  { version: 'v26.9.0', lts: '' },
+];
+
+test('搜版本号按整段前缀匹配', () => {
+  const v22 = matchNodeVersions(INDEX, '22').map(v => v.version);
+  assert.deepEqual(v22, ['v22.23.2', 'v22.0.0']);
+
+  // 整段：23 不等于 22 这条线，不能命中 v22.23.2
+  assert.deepEqual(matchNodeVersions(INDEX, '23'), []);
+  assert.deepEqual(matchNodeVersions(INDEX, '22.23').map(v => v.version), ['v22.23.2']);
+  // 完整版本号命中它自己
+  assert.deepEqual(matchNodeVersions(INDEX, '22.23.2').map(v => v.version), ['v22.23.2']);
+});
+
+test('前导 v、结尾的点、空白、大小写都不影响搜索', () => {
+  assert.deepEqual(matchNodeVersions(INDEX, 'v22').map(v => v.version), ['v22.23.2', 'v22.0.0']);
+  assert.deepEqual(matchNodeVersions(INDEX, ' 22. ').map(v => v.version), ['v22.23.2', 'v22.0.0']);
+  assert.deepEqual(matchNodeVersions(INDEX, 'jod').map(v => v.version), ['v22.23.2', 'v22.0.0']);
+  assert.deepEqual(matchNodeVersions(INDEX, 'Iron').map(v => v.version), ['v20.11.1']);
+});
+
+test('空搜索词返回全部（展示多少条由界面决定）', () => {
+  assert.equal(matchNodeVersions(INDEX, '').length, INDEX.length);
+  assert.equal(matchNodeVersions(INDEX, '   ').length, INDEX.length);
+  assert.equal(matchNodeVersions(INDEX, 'v').length, INDEX.length, '"v" 应当被当作没有搜索词');
+});
+
+test('搜不到就是空数组，不编出近似结果', () => {
+  assert.deepEqual(matchNodeVersions(INDEX, '19'), []);
+  assert.deepEqual(matchNodeVersions(INDEX, 'argon'), []);
 });

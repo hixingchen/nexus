@@ -3,15 +3,18 @@ import { showNotification } from '../ui/Toast';
 import { useEditorStore, loadAndOpenFile, parseJarVirtualPath } from '../../stores/editor';
 import { useSearchModalStore } from '../../stores/searchModal';
 import { useFileTreeStore } from '../../stores/fileTreeStore';
+import { pasteInto } from '../../stores/pasteActions';
 import { listJar, type JarEntryInfo } from '../../services/editor';
-import { listDirectory, pasteFiles, copyFilesToClipboard, openInExplorer } from '../../services/system';
+import { listDirectory, copyFilesToClipboard, openInExplorer, deletePath } from '../../services/system';
 import { reportError } from '../../utils/error';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
 import { SvgIcon } from '../ui/SvgIcon';
 import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
+import { Modal } from '../ui/Modal';
 import { getDirColorClass } from '../../utils/fileColors';
-import { getExtension } from '../../utils/path';
+import { getExtension, parentDir } from '../../utils/path';
+import { tabsUnderPath } from '../../utils/editorTabs';
 import { copyText } from '../../utils/clipboard';
 import { pickRevealTarget, REVEAL_PRIORITY, type RevealTarget } from '../../utils/fileTree';
 import type { FileEntry } from '../../types/file';
@@ -25,33 +28,29 @@ import type { FileEntry } from '../../types/file';
  */
 const mountedTrees: RevealTarget[] = [];
 
-/**
- * 粘贴系统剪贴板文件到目标目录，随后刷新。
- *
- * 抽出来是因为两处入口（目录右键 / 空白区右键到项目根）此前各写一遍，
- * 且都把"部分成功"报成"已粘贴 N 个项目"——后端现在会回传失败清单，这里统一处理。
- */
-async function pasteInto(targetDir: string, refresh: () => void) {
-  try {
-    const res = await pasteFiles(targetDir);
-    if (res.failed.length > 0) {
-      showNotification({
-        variant: 'error',
-        title: res.created.length > 0
-          ? `已粘贴 ${res.created.length} 个，${res.failed.length} 个失败`
-          : `粘贴失败（${res.failed.length} 个）`,
-        description: res.failed.join('; '),
-      });
-    } else {
-      showNotification({ variant: 'success', title: `已粘贴 ${res.created.length} 个项目` });
-    }
-    refresh();
-  } catch (err) {
-    reportError('粘贴失败', err);
-  }
-}
 const INDENT_STEP = 14;
 const BASE_PADDING = 18;
+
+/** 粘贴图标：目录行「粘贴到此处」与文件行「粘贴到同级」是同一个动作的两个落点，共用一枚 */
+const PASTE_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="2" y="1.2" width="6" height="7.6" rx="0.8"/>
+    <path d="M4.5 2.7h1"/>
+    <path d="M5 4.5v3M3.7 6.2 5 7.5l1.3-1.3"/>
+  </svg>
+);
+
+/**
+ * 删除图标：路径数据抄自 `ProjectContextMenu` 的「删除项目」——同一动作在两处要长得一样。
+ *
+ * 为什么是抄而不是 import：图标在本仓库一律是文件内的常量（启动/停止那两个在项目菜单与
+ * 服务菜单里也各留一份），不为一个图标破这个例。代价是改一处要记得改另一处。
+ */
+const TRASH_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3" />
+  </svg>
+);
 /** 目录展开时初始渲染条数，超出后显示"加载更多" */
 const INITIAL_RENDER_LIMIT = 200;
 
@@ -143,15 +142,32 @@ interface EntryProps {
   onSelect: (path: string) => void;
   /** 子级缩进像素值（indentPx + INDENT_STEP） */
   childIndentPx: number;
+  /**
+   * 重新列出**本节点所在的目录**（删除成功后调用）。
+   *
+   * 为什么由父级下发：被删掉的这一行消失与否，只有父级的 `kids` 说了算——本节点自己
+   * 刷不了自己。根节点的子级由 `FileTree` 传 `loadRoot`，其余由父 `Entry` 传它的 `reloadDir`。
+   */
+  reloadParent: () => void;
 }
 
-const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect, childIndentPx }: EntryProps) {
+const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect, childIndentPx, reloadParent }: EntryProps) {
   const [open, setOpen] = useState(false);
   const [kids, setKids] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [hover, setHover] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * 删除确认框：null = 未打开。`total/dirty` 在**点菜单那一刻**算好存下来。
+   *
+   * 为什么不在渲染时算：那要订阅 `useEditorStore(s => s.tabs)`，而 Entry 是整棵树的一份
+   * ——每次开关/切换标签都会让所有已展开的行重渲染（同 PERF-18 的教训）。
+   */
+  const [pendingDelete, setPendingDelete] = useState<{ total: number; dirty: number } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  /** 正在往本目录粘贴：大目录复制很慢，没有这个的话界面几十秒看起来像没反应 */
+  const [pasting, setPasting] = useState(false);
   /** 展开请求序号：加载中折叠后丢弃过期响应，避免目录被意外重新展开 */
   const toggleSeqRef = useRef(0);
   const entryRef = useRef<HTMLDivElement | null>(null);
@@ -306,7 +322,54 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
   // 粘贴系统剪贴板中的文件到当前目录（成功后刷新目录）
   const handlePaste = async () => {
     setContextMenu(null);
-    await pasteInto(e.path, reloadDir);
+    await pasteInto(e.path, reloadDir, setPasting);
+  };
+
+  /**
+   * 粘贴到「同级」——粘到本行**所在的目录**。
+   *
+   * 文件行没有"里面"可粘，而想在同级放一份（复制出 `x (2).txt`）时，此前只能绕道去
+   * 右键它所在的那个目录；目录被折叠、或滚出视野时那个手势就没了着落。
+   *
+   * 刷新直接复用 `reloadParent`：目标目录正是它负责列出的那个目录
+   * （根层由 FileTree 传 `loadRoot`，其余由父 Entry 传它的 `reloadDir`）。
+   */
+  const handlePasteSibling = async () => {
+    setContextMenu(null);
+    await pasteInto(parentDir(e.path), reloadParent, setPasting);
+  };
+
+  // 打开删除确认框。受影响标签数在这一刻定下来（点了菜单到确认之间界面被遮罩挡住，不会变）
+  const handleDeleteClick = () => {
+    setContextMenu(null);
+    const { tabs, dirtyIds } = useEditorStore.getState();
+    const affected = tabsUnderPath(tabs, e.path);
+    setPendingDelete({
+      total: affected.length,
+      dirty: affected.filter(t => dirtyIds.includes(t.id)).length,
+    });
+  };
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      await deletePath(e.path);
+    } catch (err) {
+      // 失败留在确认框里：用户可以重试，或先去关掉占着它的程序——不必重新右键一次
+      reportError(`删除「${e.name}」失败`, err);
+      setDeleting(false);
+      return;
+    }
+    // 指向它的标签一并关掉。目录被删时是整棵子树的标签——不关的话它们留在那儿，
+    // 点回去只会得到"文件不存在"，而用户刚刚才亲手删掉它
+    const editor = useEditorStore.getState();
+    const affected = tabsUnderPath(editor.tabs, e.path);
+    if (affected.length > 0) editor.closeTabs(affected.map(t => t.id));
+    showNotification({ variant: 'warning', title: `已删除「${e.name}」`, description: '已移入系统回收站' });
+    setPendingDelete(null);
+    setDeleting(false);
+    // 刷新父目录：本行随之从列表里消失，本组件也就卸载了
+    reloadParent();
   };
 
   // 右键菜单
@@ -350,6 +413,19 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
           {e.name}
         </span>
       </div>
+
+      {/* 粘贴进行中：粘贴几百 MB 的目录要跑几十秒，此前这段时间界面上一点动静都没有，
+          看起来像"点了没反应"。行内显示（与展开时的 "…" 同一套视觉），不挡操作 */}
+      {pasting && (
+        <div
+          className="text-[11px] text-nexus-muted py-0.5 relative z-10"
+          // 目录行：对齐它的子级（东西会出现在那儿）；文件行：粘的是「同级」，
+          // 东西落在本行旁边，所以对齐本行
+          style={{ paddingLeft: `${(e.is_dir ? childIndentPx : indentPx) + 20}px` }}
+        >
+          正在粘贴…
+        </div>
+      )}
 
       {/* 右键菜单 */}
       {contextMenu && (
@@ -399,16 +475,21 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
                 onClick={handleCopy}
               />
 
-              {e.is_dir && (
+              {/* 「粘贴」的落点随行类型变：目录行 = 粘进它里面，文件行 = 粘到它旁边
+                  （同一套心智模型：粘到这一行所在的目录） */}
+              {e.is_dir ? (
                 <ContextMenuItem
                   iconBox
-                  icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-                    <rect x="2" y="1.2" width="6" height="7.6" rx="0.8"/>
-                    <path d="M4.5 2.7h1"/>
-                    <path d="M5 4.5v3M3.7 6.2 5 7.5l1.3-1.3"/>
-                  </svg>}
+                  icon={PASTE_ICON}
                   label="粘贴到此处"
                   onClick={handlePaste}
+                />
+              ) : (
+                <ContextMenuItem
+                  iconBox
+                  icon={PASTE_ICON}
+                  label="粘贴到同级"
+                  onClick={handlePasteSibling}
                 />
               )}
             </div>
@@ -447,8 +528,49 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
               onClick={handleCopyName}
             />
           </div>
+
+          {/* 删除：单独一组放最后（破坏性动作不与复制类混排，与项目/服务菜单的排法一致）。
+              jar 虚拟节点不参与——它们在磁盘上没有对应对象 */}
+          {!isJarPath && (
+            <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+              <ContextMenuItem iconBox tone="danger" icon={TRASH_ICON} label="删除" onClick={handleDeleteClick} />
+            </div>
+          )}
         </ContextMenu>
       )}
+
+      {/* 删除确认：写清"进的是回收站"与"会连带关掉哪些标签"，因为这两件用户看不见 */}
+      <Modal open={!!pendingDelete} title="确认删除" onClose={() => setPendingDelete(null)}>
+        <div className="space-y-4">
+          <p className="text-[13px] text-nexus-text">
+            确定要删除{e.is_dir ? '文件夹' : '文件'}{' '}
+            <span className="text-nexus-warning font-medium">「{e.name}」</span> 吗？
+          </p>
+          <p className="text-[12px] text-nexus-muted">
+            {e.is_dir
+              ? '该文件夹及其下的全部内容都会被移入系统回收站，可在回收站中恢复。'
+              : '将移入系统回收站，可在回收站中恢复。'}
+          </p>
+          {pendingDelete !== null && pendingDelete.total > 0 && (
+            <p className={`text-[12px] ${pendingDelete.dirty > 0 ? 'text-nexus-warning' : 'text-nexus-muted'}`}>
+              {pendingDelete.dirty > 0
+                ? `编辑器中已打开的 ${pendingDelete.total} 个标签会一并关闭，其中 ${pendingDelete.dirty} 个有未保存的更改，这些更改将丢失。`
+                : `编辑器中已打开的 ${pendingDelete.total} 个标签会一并关闭。`}
+            </p>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            <button
+              className="px-4 py-1.5 text-[12px] text-nexus-text-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50"
+              onClick={() => setPendingDelete(null)}
+            >取消</button>
+            <button
+              className="px-5 py-1.5 text-[13px] bg-nexus-error text-white rounded hover:bg-nexus-error/80 disabled:opacity-40"
+              disabled={deleting}
+              onClick={handleDelete}
+            >{deleting ? '删除中…' : '确认删除'}</button>
+          </div>
+        </div>
+      </Modal>
 
       {open && expandable && (
         <>
@@ -456,7 +578,7 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             <div className="text-[11px] text-nexus-muted py-0.5 relative z-10" style={{ paddingLeft: `${childIndentPx + 20}px` }}>…</div>
           )}
           {!loading && (showAll ? kids : kids.slice(0, INITIAL_RENDER_LIMIT)).map(k => (
-            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} />
+            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} reloadParent={reloadDir} />
           ))}
           {!loading && !showAll && kids.length > INITIAL_RENDER_LIMIT && (
             <div
@@ -552,11 +674,13 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
 
   /** 空白区域右键菜单（仅根目录存在时）：粘贴系统剪贴板文件到项目根 */
   const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
+  /** 正在往树根粘贴（树根没有对应的行，进行中提示只能挂在列表上） */
+  const [pastingRoot, setPastingRoot] = useState(false);
 
   const handlePasteToRoot = async () => {
     setRootMenu(null);
     if (!rootPath) return;
-    await pasteInto(rootPath, loadRoot);
+    await pasteInto(rootPath, loadRoot, setPastingRoot);
   };
 
   const basePadding = embedded ? 4 : BASE_PADDING;
@@ -584,6 +708,9 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
             <p className="text-[10px] opacity-60">文件 → 打开文件夹</p>
           </div>
         )}
+        {rootPath && pastingRoot && (
+          <div className="px-4 py-1 text-[11px] text-nexus-muted">正在粘贴到根目录…</div>
+        )}
         {rootPath && err && (
           <div className="px-4 py-10 text-center text-[11px] text-nexus-error">{err}</div>
         )}
@@ -591,7 +718,7 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">空目录</div>
         )}
         {!err && entries.map(ent => (
-          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} />
+          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} reloadParent={loadRoot} />
         ))}
 
         {/* 空白区域右键菜单：搜索整个树根 / 粘贴到项目根目录 */}

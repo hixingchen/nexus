@@ -6,6 +6,7 @@ import { ResizablePanel } from './ResizablePanel';
 import { ProjectList } from './ProjectList';
 import { ProjectDetail } from './ProjectDetail';
 import { RestartConfirm } from './RestartConfirm';
+import { PasteConflictModal } from '../file-tree/PasteConflictModal';
 import { AiPanel } from '../ai/AiPanel';
 import { CloseGuard } from './CloseGuard';
 import { ProjectRail } from './ProjectRail';
@@ -226,6 +227,9 @@ export function MainLayout() {
         <AiPanel cwd={selectedProjectPath} projectName={selectedProjectName} />
       </div>
       <RestartConfirm />
+      {/* 粘贴同名冲突弹框：**全局只挂一份**——放 FileTree 里会随"项目树 + 每个服务树"各挂一个，
+          打开时同时渲染出好几层遮罩（见 stores/pasteConflict 的说明） */}
+      <PasteConflictModal />
       <CloseGuard />
       <StatusBar />
     </div>

@@ -33,6 +33,10 @@ uuid = { version = "1.0", features = ["v4"] }
 encoding_rs = "0.8"
 base64 = "0.22"
 zip = "2"
+# 回收站删除（文件树右键「删除」）。走系统 shell 的 IFileOperation 而不是自己实现：
+# 长路径、权限、跨卷、联接点都归它处理。默认 feature 必需——coinit_apartmentthreaded
+# 负责在调用线程初始化 COM（我们在 spawn_blocking 的工作线程里调它）。
+trash = "5.2"
 
 [target."cfg(windows)".dependencies]
 clipboard-win = "5.4.1"

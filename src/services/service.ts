@@ -484,11 +484,24 @@ export interface NodeRuntimeStatus {
   reason: string;
 }
 
-export interface AvailableNodeVersions {
-  current: string[];
-  lts: string[];
-  old_stable: string[];
-  old_unstable: string[];
+/** 索引里的一个可安装版本 */
+export interface NodeVersionInfo {
+  /** 形如 `v22.23.2`（带 v 前缀，与已安装目录名是同一种写法） */
+  version: string;
+  /** LTS 代号（如 `Jod`）；不是 LTS 时为空串 */
+  lts: string;
+}
+
+/**
+ * 可安装的版本索引（整份 `index.json`，界面本地筛）。
+ *
+ * 版本多（800+），所以**一次全拿回来**、搜索在本地做：筛选是即时的，不会每敲一个字发一次请求。
+ */
+export interface NodeVersionIndex {
+  /** 新 → 旧 */
+  versions: NodeVersionInfo[];
+  /** 实际取索引的地址（面板上要能说清"从哪取的"） */
+  index_url: string;
 }
 
 /** 一条 nvm 命令的结果：**看 ok（退出码）判断成败**，output 是原文，失败时直接展示 */
@@ -507,8 +520,8 @@ export interface NvmInstallResult {
 
 export const nodeApi = {
   getRuntime: () => invoke<NodeRuntimeStatus>('get_node_runtime'),
-  /** 拉可安装版本（`nvm list available`，要联网，几秒） */
-  listAvailable: () => invoke<AvailableNodeVersions>('list_available_node_versions'),
+  /** 拉可安装版本索引（`<node_mirror>index.json`，要联网，几百 KB） */
+  listVersions: () => invoke<NodeVersionIndex>('list_node_versions'),
   install: (version: string) => invoke<NvmCommandResult>('install_node_version', { version }),
   uninstall: (version: string) => invoke<NvmCommandResult>('uninstall_node_version', { version }),
   use: (version: string) => invoke<NvmCommandResult>('use_node_version', { version }),

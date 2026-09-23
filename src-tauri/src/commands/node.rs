@@ -43,13 +43,25 @@ pub struct NodeRuntimeStatus {
     pub reason: String,
 }
 
-/// 可安装的版本（`nvm list available` 的四列）
+/// 索引里的一个可安装版本
 #[derive(Serialize)]
-pub struct AvailableNodeVersions {
-    pub current: Vec<String>,
-    pub lts: Vec<String>,
-    pub old_stable: Vec<String>,
-    pub old_unstable: Vec<String>,
+pub struct NodeVersionInfo {
+    /// 形如 `v22.23.2`——原样带 `v`，与已安装目录名、`nvm install` 的入参是同一种写法
+    pub version: String,
+    /// LTS 代号（如 `Jod`）；不是 LTS 时为空串
+    pub lts: String,
+}
+
+/// 可安装的版本索引（整份 `index.json`，界面在本地筛）
+///
+/// 为什么一次把 866 个版本全给前端：索引总共 331 KB，而"搜 22 这条线"要的正是**整条线**
+/// （22.x 有 35 个）——`nvm list available` 那种每列十来条的摘要在这种用法下根本不够。
+#[derive(Serialize)]
+pub struct NodeVersionIndex {
+    /// 新 → 旧
+    pub versions: Vec<NodeVersionInfo>,
+    /// 实际取索引的地址：界面上要能说清"从哪取的"（取不到时那句话里也有它）
+    pub index_url: String,
 }
 
 /// 一条 nvm 命令的执行结果
@@ -73,24 +85,65 @@ fn find_nvm() -> Result<NvmInstall, String> {
     let Some(home) = env_or_persistent("NVM_HOME") else {
         return Err("没找到 NVM_HOME（进程环境变量与注册表里都没有）——本机可能没装 nvm-windows".into());
     };
-    let exe = Path::new(&home).join("nvm.exe");
+    let home = PathBuf::from(home.trim());
+    let exe = home.join("nvm.exe");
     if !exe.is_file() {
         return Err(format!("{} 不存在，nvm-windows 的安装可能不完整", exe.display()));
     }
 
-    let settings_path = Path::new(home.trim()).join("settings.txt");
-    let settings = std::fs::read_to_string(&settings_path)
-        .map_err(|e| format!("读不到 {}: {}", settings_path.display(), e))?;
-    let root = settings
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("root:"))
-        // settings.txt 是外部文件，喂给 `Command` 之前洗一遍（NUL 会让 spawn 直接失败，
-        // 报错却是没头没尾的 "nul byte found in provided data"）
-        .map(|s| crate::core::winenv::sanitize_for_spawn(s, "settings.txt 的 root"))
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{} 里没有 root 配置", settings_path.display()))?;
+    let root = settings_value(&home, "root")?
+        .ok_or_else(|| format!("{} 里没有 root 配置", home.join("settings.txt").display()))?;
 
-    Ok(NvmInstall { exe, home: PathBuf::from(&home), root: PathBuf::from(root) })
+    Ok(NvmInstall { exe, home, root: PathBuf::from(root) })
+}
+
+/// 读 nvm `settings.txt` 里的一项（形如 `root: C:\Users\me\AppData\Roaming\nvm`）。
+///
+/// `Ok(None)` = 文件读到了、但没有这一项；`Err` = 文件读不到。
+/// 值一律先洗一遍：这个文件是外部可编辑的，而 NUL 会让 `Command::spawn` 报一句没头没尾的
+/// "nul byte found in provided data"（见 `winenv::sanitize_for_spawn`）。
+fn settings_value(home: &Path, key: &str) -> Result<Option<String>, String> {
+    let path = home.join("settings.txt");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读不到 {}: {}", path.display(), e))?;
+    let prefix = format!("{}:", key);
+    Ok(text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+        .map(|v| crate::core::winenv::sanitize_for_spawn(v, &format!("settings.txt 的 {}", key)))
+        .filter(|v| !v.is_empty()))
+}
+
+/// nvm 没配镜像时它自己用的地址（`web.go` 里 `nodeBaseAddress` 的初值）。
+///
+/// 结尾的斜杠是有意的：nvm 拼地址是**字符串相加**（`GetFullNodeUrl` = 基址 + `index.json`）。
+const DEFAULT_NODE_MIRROR: &str = "https://nodejs.org/dist/";
+
+/// 版本索引的地址：`<node_mirror>index.json`。
+///
+/// **为什么读 settings.txt 而不是写死 nodejs.org**：`nvm install` 认不认某个版本，是拿它
+/// 自己的 `node_mirror + "index.json"` 对出来的（1.2.2 的 `node.GetAvailable()` 就是这么
+/// 取列表的）。我们读同一份配置、拼同一个地址，才不会出现"列表里有、一点却装不上"。
+///
+/// 拼法**逐字对齐 nvm 的 `web.SetMirrors`**（那里是唯一权威的拼法）：
+/// - 值为空或 `none` → 回到官方默认
+/// - 开头不是 `http` → 前面补 `http://`
+/// - 结尾没 `/` → 补一个
+/// 少补任何一处，我们拉到的地址就与 nvm 实际去的不是同一个（对它真失败，对我们只是查不到）。
+fn node_index_url(home: &Path) -> String {
+    let configured = settings_value(home, "node_mirror").ok().flatten();
+    let mut base = match configured.as_deref() {
+        None | Some("none") => DEFAULT_NODE_MIRROR.to_string(),
+        Some(v) => v.to_string(),
+    };
+    // 不能用 Go 那种 `base[0..4]` 切片：用户手写个短值会 panic，写中文则切在字符中间也 panic
+    if !base.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")) {
+        base = format!("http://{}", base);
+    }
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    format!("{}index.json", base)
 }
 
 /// 当前生效的版本 = `NVM_SYMLINK` 软链指向哪个目录。
@@ -160,44 +213,41 @@ pub fn get_node_runtime() -> NodeRuntimeStatus {
     }
 }
 
-/// 解析 `nvm list available` 的表格。
+/// 解析 `index.json`。
 ///
-/// 它长这样（四列，分隔行由 `---` 组成）：
-/// ```text
-/// |   CURRENT    |     LTS      |  OLD STABLE  | OLD UNSTABLE |
-/// |--------------|--------------|--------------|--------------|
-/// |    26.9.0    |   24.21.0    |   0.12.18    |   0.11.16    |
+/// 它是个数组，每一项长这样（字段只用到两个，其余忽略）：
+/// ```json
+/// {"version":"v22.23.2","date":"2026-08-19","npm":"10.9.4",…,"lts":"Jod"}
 /// ```
-/// 按分隔符切、跳过表头与分隔行，比"按列宽定位"稳——列宽会随内容变。
-fn parse_available(output: &str) -> AvailableNodeVersions {
-    let mut out = AvailableNodeVersions {
-        current: Vec::new(),
-        lts: Vec::new(),
-        old_stable: Vec::new(),
-        old_unstable: Vec::new(),
-    };
-    for line in output.lines() {
-        if !line.trim_start().starts_with('|') {
-            continue;
-        }
-        let cells: Vec<&str> = line.trim().trim_matches('|').split('|').map(|c| c.trim()).collect();
-        if cells.len() < 4 {
-            continue;
-        }
-        // 表头（CURRENT/LTS/…）与分隔行（---）：认得出就跳
-        if cells[0].eq_ignore_ascii_case("CURRENT") || cells[0].starts_with('-') {
-            continue;
-        }
-        let looks_like_version = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_digit());
-        if !looks_like_version(cells[0]) {
-            continue;
-        }
-        out.current.push(cells[0].to_string());
-        out.lts.push(cells[1].to_string());
-        out.old_stable.push(cells[2].to_string());
-        out.old_unstable.push(cells[3].to_string());
+/// `lts` 有两种类型：不是 LTS 时是布尔 `false`、是时候是代号字符串（如 `"Jod"`）——
+/// 按 `Value` 收下再取字符串，比给 `Option<String>` 写自定义反序列化省事。
+fn parse_index(bytes: &[u8]) -> Result<Vec<NodeVersionInfo>, String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        lts: serde_json::Value,
     }
-    out
+
+    let entries: Vec<Entry> = serde_json::from_slice(bytes).map_err(|e| {
+        // 镜像出问题时常见的是"HTTP 200 + 一页 HTML"：只说"解析失败"没法排障，把开头带上
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(120)]).replace(['\r', '\n'], " ");
+        format!("版本索引不是预期的 JSON（{}）：{}", e, head)
+    })?;
+
+    let mut out: Vec<NodeVersionInfo> = entries
+        .into_iter()
+        .filter(|e| e.version.starts_with('v'))
+        .map(|e| NodeVersionInfo {
+            lts: e.lts.as_str().unwrap_or_default().to_string(),
+            version: e.version,
+        })
+        .collect();
+    // 索引本身是新版在前；这里自己再排一次，是不把顺序押在镜像上
+    // （复用「已安装」那份版本比较：同为语义化版本，新版本在前所以参数反过来传）
+    out.sort_by(|a, b| crate::core::ai::version_cmp(&b.version, &a.version).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
 }
 
 // ─── 安装 nvm-windows ───────────────────────────────────────
@@ -246,16 +296,20 @@ fn valid_installer(path: &Path) -> bool {
     std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"MZ"
 }
 
-/// 下载官方安装器（本地已有一份合格的就不再下——安装器可重复运行，没必要重下 5.6 MB）
-fn download_setup(dest: &Path) -> Result<(), String> {
-    if valid_installer(dest) {
-        return Ok(());
-    }
+/// 用系统自带的 curl 把一个 URL 下到本地文件（`max_time` 是整体超时，单位秒）。
+///
+/// 两处下载共用：nvm 安装器（GitHub release 直链）与版本索引（镜像上的 `index.json`）。
+/// 用 curl 而不是引 HTTP 客户端：Rust 侧至今没有 HTTP 依赖，而且**前端也够不着这两个地址**
+/// （CSP 只放开了 api.github.com）——引一个客户端只为下两个文件不划算。
+///
+/// 失败时把 URL 一起写进错误里：这两条地址一个来自常量、一个来自用户的 `settings.txt`，
+/// 出问题时第一件要知道的事就是"到底去哪个地址取的"。
+fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
     let curl = system_curl();
     if !curl.is_file() {
         return Err(format!(
             "找不到 {}（Windows 自带的下载组件）——请手动下载：{}",
-            curl.display(), NVM_SETUP_URL
+            curl.display(), url
         ));
     }
     if let Some(dir) = dest.parent() {
@@ -267,17 +321,17 @@ fn download_setup(dest: &Path) -> Result<(), String> {
     // 写上是为了让"新增的进程调用"在守卫里是一次明确决定，而不是漏写
     cmd.env("NoDefaultCurrentDirectoryInExePath", "1")
         .args([
-            "-L",                 // release 直链会 302 到 objects.githubusercontent.com
-            "--fail",             // 4xx/5xx 直接算失败，别把错误页当安装包存下来
-            "--retry", "3",       // GitHub 直链在国内偶尔断流，重试几次比让用户重来便宜
+            "-L",                 // release 直链会 302 到 objects.githubusercontent.com，镜像也会 302
+            "--fail",             // 4xx/5xx 直接算失败，别把错误页当成正经文件存下来
+            "--retry", "3",       // 国内直连偶尔断流，重试几次比让用户重来便宜
             "--retry-delay", "2",
             "--connect-timeout", "20",
-            "--max-time", "900",  // 5.6 MB，慢网也够；到点就报错而不是无限等
-            "--silent", "--show-error",
-            "-o",
+            "--max-time",
         ])
+        .arg(max_time.to_string())
+        .args(["--silent", "--show-error", "-o"])
         .arg(dest)
-        .arg(NVM_SETUP_URL)
+        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -293,12 +347,22 @@ fn download_setup(dest: &Path) -> Result<(), String> {
     if !out.status.success() {
         let detail = decode_output(&out.stderr);
         return Err(format!(
-            "下载安装器失败（curl 退出码 {:?}）：{}\n也可以手动下载：{}",
+            "下载失败（curl 退出码 {:?}）：{}\n地址：{}",
             out.status.code(),
             detail.trim(),
-            NVM_SETUP_URL
+            url
         ));
     }
+    Ok(())
+}
+
+/// 下载官方安装器（本地已有一份合格的就不再下——安装器可重复运行，没必要重下 5.6 MB）
+fn download_setup(dest: &Path) -> Result<(), String> {
+    if valid_installer(dest) {
+        return Ok(());
+    }
+    // 5.6 MB：慢网也够，到点就报错而不是无限等
+    run_curl(NVM_SETUP_URL, dest, 900)?;
     if !valid_installer(dest) {
         let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
         return Err(format!(
@@ -307,6 +371,24 @@ fn download_setup(dest: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 拉版本索引并解析（联网，约 331 KB）。
+fn fetch_index(url: &str) -> Result<Vec<NodeVersionInfo>, String> {
+    let dest = std::env::temp_dir().join("nexus").join("node-index.json");
+    run_curl(url, &dest, 120)?;
+    let bytes = std::fs::read(&dest)
+        .map_err(|e| format!("读下载到的版本索引 {} 失败: {}", dest.display(), e))?;
+    let versions = parse_index(&bytes)?;
+    // 空索引当成失败而不是"没有可安装的版本"：镜像同步中/被拦掉时返回 `[]` 是常见形态，
+    // 报出来用户知道该重试（nvm 自己也这么处理——它的 `GetAvailable` 见空直接报错退出）
+    if versions.is_empty() {
+        return Err(format!(
+            "{} 里没有任何版本（镜像可能在同步中，稍后重试）",
+            url
+        ));
+    }
+    Ok(versions)
 }
 
 /// 跑安装向导并等它结束。
@@ -448,16 +530,18 @@ fn run_nvm(nvm: &NvmInstall, args: &[&str]) -> Result<NvmCommandResult, String> 
     Ok(NvmCommandResult { ok: out.status.success(), output: text.trim().to_string() })
 }
 
-/// 可安装的版本列表（`nvm list available`，要联网，几秒）
+/// 可安装的版本索引（`<node_mirror>index.json`，要联网，几秒）。
+///
+/// 与旧实现（`nvm list available` 的四列表格）的区别：那个每列只给十来个版本，"想装
+/// 22 这条线的某个版本"根本查不到；这里给的是**整份索引**，界面按前缀筛，搜 `22` 能列出
+/// 全部 35 个 22.x。
 #[command]
-pub async fn list_available_node_versions() -> Result<AvailableNodeVersions, String> {
+pub async fn list_node_versions() -> Result<NodeVersionIndex, String> {
     let nvm = find_nvm()?;
+    let url = node_index_url(&nvm.home);
     tokio::task::spawn_blocking(move || {
-        let res = run_nvm(&nvm, &["list", "available"])?;
-        if !res.ok {
-            return Err(format!("nvm list available 失败：\n{}", res.output));
-        }
-        Ok(parse_available(&res.output))
+        let versions = fetch_index(&url)?;
+        Ok(NodeVersionIndex { versions, index_url: url })
     })
     .await
     .map_err(|e| format!("查询可安装版本失败: {}", e))?
@@ -591,37 +675,97 @@ pub async fn use_node_version(version: String) -> Result<NvmCommandResult, Strin
 mod tests {
     use super::*;
 
-    /// 解析真实输出（从本机 `nvm list available` 抄下来的一段）
+    /// 解析真实索引（从本机拉下来的 `index.json` 抄下来的几项，字段原样保留）
     #[test]
-    fn test_parse_available_table() {
-        let sample = "\
-|   CURRENT    |     LTS      |  OLD STABLE  | OLD UNSTABLE |
-|--------------|--------------|--------------|--------------|
-|    26.9.0    |   24.21.0    |   0.12.18    |   0.11.16    |
-|    26.8.2    |   24.20.0    |   0.12.17    |   0.11.15    |
-";
-        let got = parse_available(sample);
-        assert_eq!(got.current, vec!["26.9.0", "26.8.2"]);
-        assert_eq!(got.lts, vec!["24.21.0", "24.20.0"]);
-        assert_eq!(got.old_stable, vec!["0.12.18", "0.12.17"]);
-        assert_eq!(got.old_unstable, vec!["0.11.16", "0.11.15"]);
+    fn test_parse_index_versions_and_lts() {
+        let sample = r#"[
+{"version":"v22.23.2","date":"2026-08-19","npm":"10.9.4","lts":"Jod"},
+{"version":"v26.9.0","date":"2026-09-16","npm":"11.19.1","lts":false},
+{"version":"v20.11.1","date":"2024-02-14","npm":"10.2.4"}
+]"#;
+        let got = parse_index(sample.as_bytes()).expect("应当解析成功");
+        assert_eq!(
+            got.iter().map(|v| v.version.as_str()).collect::<Vec<_>>(),
+            vec!["v26.9.0", "v22.23.2", "v20.11.1"],
+            "新版在前（镜像万一乱序也由我们排好）",
+        );
+        // lts 是代号字符串 / 布尔 false / 整个字段缺失（老版本没有这个字段）——三种都要收下
+        assert_eq!(got[1].lts, "Jod");
+        assert_eq!(got[0].lts, "");
+        assert_eq!(got[2].lts, "");
     }
 
-    /// 认不出的行要跳过而不是编出假数据：表头、分隔行、空表、列数不足
+    /// 不是索引就该报错，而不是编出一个空列表——空列表会被界面显示成"没有可安装的版本"
     #[test]
-    fn test_parse_available_ignores_noise() {
-        let sample = "\
-| CURRENT | LTS | OLD STABLE | OLD UNSTABLE |
-|---------|-----|------------|--------------|
-|  not a version  |  x  |  y  |  z  |
-| 20.11.1 | 18.20.4 | 0.12.18 | 0.11.16 |
-";
-        let got = parse_available(sample);
-        assert_eq!(got.current, vec!["20.11.1"], "只有真正像版本号的那行该被收下");
-        assert_eq!(got.lts, vec!["18.20.4"]);
+    fn test_parse_index_rejects_garbage() {
+        // 镜像挂掉时最可能的形态：HTTP 200 + 一页 HTML
+        let html = b"<html><head><title>502 Bad Gateway</title></head></html>";
+        match parse_index(html) {
+            // 解析失败的原因要带上原文开头，否则用户只看到"解析失败"，没法判断镜像返回了什么
+            Err(err) => assert!(err.contains("502 Bad Gateway"), "错误里要带上原文开头，实际: {}", err),
+            Ok(v) => panic!("HTML 不该被解析成版本列表，实际拿到 {} 条", v.len()),
+        }
 
-        assert!(parse_available("").current.is_empty(), "空输出不该 panic");
-        assert!(parse_available("nvm 无法联网").current.is_empty(), "非表格输出不该编出条目");
+        assert!(parse_index(b"").is_err(), "空响应应当报错");
+        assert!(parse_index(br#"{"versions":[]}"#).is_err(), "不是数组应当报错");
+    }
+
+    /// 索引地址的拼法必须与 nvm 的 `web.SetMirrors` 逐字一致——**不然我们列出来的版本
+    /// 与 `nvm install` 认的不是同一份**（用户会看到"搜得到、装不上"）。
+    #[test]
+    fn test_node_index_url_matches_nvm_normalization() {
+        let dir = std::env::temp_dir().join(format!("nexus_ut_nvm_url_{}", std::process::id()));
+        let write = |content: &str| {
+            std::fs::create_dir_all(&dir).expect("建目录");
+            std::fs::write(dir.join("settings.txt"), content).expect("写 settings.txt");
+        };
+
+        // settings.txt 里没有 node_mirror：用官方默认（nvm 的 nodeBaseAddress 初值）
+        write("root: C:\\nvm\r\n");
+        assert_eq!(node_index_url(&dir), "https://nodejs.org/dist/index.json");
+
+        // 配了镜像、结尾有斜杠：原样拼
+        write("root: C:\\nvm\r\nnode_mirror: https://npmmirror.com/mirrors/node/\r\n");
+        assert_eq!(node_index_url(&dir), "https://npmmirror.com/mirrors/node/index.json");
+
+        // 少了结尾斜杠：补一个（nvm 也补，不补的话两边地址就不一样了）
+        write("node_mirror: https://npmmirror.com/mirrors/node\r\n");
+        assert_eq!(node_index_url(&dir), "https://npmmirror.com/mirrors/node/index.json");
+
+        // 没写 http：nvm 会补 `http://`，我们照做
+        write("node_mirror: mirrors.example.com/node/\r\n");
+        assert_eq!(node_index_url(&dir), "http://mirrors.example.com/node/index.json");
+
+        // `none` = 不用镜像（与空值同义，见 nvm 的 SetMirrors）
+        write("node_mirror: none\r\n");
+        assert_eq!(node_index_url(&dir), "https://nodejs.org/dist/index.json");
+
+        // 极短/带中文的怪值不能 panic（Go 那边会因为切 `[0:4]` 直接崩）
+        write("node_mirror: 镜像\r\n");
+        assert_eq!(node_index_url(&dir), "http://镜像/index.json");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真去拉一次索引（联网）。手动跑：
+    /// ```text
+    /// cargo test --lib --manifest-path src-tauri/Cargo.toml -- --ignored fetch_node_index
+    /// ```
+    /// 留着它的价值：curl 的路径、参数、落盘、解析、以及"镜像配的是哪个地址"这条链路，
+    /// 单测构造不出来——而它一旦断了，面板上的搜索框就是空的。
+    #[test]
+    #[ignore]
+    fn test_fetch_node_index() {
+        let nvm = find_nvm().expect("本机应当装有 nvm-windows");
+        let url = node_index_url(&nvm.home);
+        let versions = fetch_index(&url).expect("拉取版本索引应当成功");
+        println!("索引 {} → {} 个版本，最新 {}", url, versions.len(), versions[0].version);
+        assert!(versions.len() > 100, "完整索引应当有上百个版本，实际 {}", versions.len());
+        assert!(versions.iter().all(|v| v.version.starts_with('v')), "版本号应当带 v 前缀");
+        assert!(
+            versions.iter().any(|v| !v.lts.is_empty()),
+            "应当有 LTS 版本（代号字段没解析出来？）",
+        );
     }
 
     /// 当前版本不许卸——nvm 自己不拦（见 `uninstall_guard` 的说明），这道判断漏一次

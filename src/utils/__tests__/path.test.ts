@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getExtension } from '../path.ts';
+import { getExtension, parentDir } from '../path.ts';
 
 /**
  * getExtension 刻意保持了各处原先 `split('.').pop() ?? ''` 的语义，
@@ -61,4 +61,33 @@ test('lower: true 对土耳其语 İ 产出两个码元（"i" + U+0307），下�
 test('超长路径不会退化（下游对每个文件项都调一次）', () => {
   const long = `${'a/'.repeat(50_000)}file.ts`;
   assert.equal(getExtension(long, { lower: true }), 'ts');
+});
+
+/**
+ * parentDir 服务的是「粘贴到同级」：右键一个**文件**时，粘贴目标是它所在的目录。
+ * 切错了就会变成一个不存在的路径，粘贴直接失败——而这在界面上只表现为"点了没反应"。
+ */
+test('parentDir：全 `/` 的路径', () => {
+  assert.equal(parentDir('D:/work/proj/src/a.ts'), 'D:/work/proj/src');
+});
+
+test('parentDir：全 `\\` 的路径', () => {
+  assert.equal(parentDir('D:\\work\\proj\\a.ts'), 'D:\\work\\proj');
+});
+
+test('parentDir：混用分隔符时取**最后**一个（树里最常见的形态）', () => {
+  // 树路径 = 配置里的根原样（带 \）+ "/" + 子名，切错就切到根上去了
+  assert.equal(parentDir('D:\\work\\proj/src/a.ts'), 'D:\\work\\proj/src');
+  // 反过来：根是 /，子级用了 \（手工拼出来的路径）
+  assert.equal(parentDir('D:/work/proj\\src\\a.ts'), 'D:/work/proj\\src');
+});
+
+test('parentDir：树根下的第一层文件，父目录就是树根本身', () => {
+  assert.equal(parentDir('D:\\work\\proj/a.ts'), 'D:\\work\\proj');
+  assert.equal(parentDir('D:\\work\\proj\\a.ts'), 'D:\\work\\proj');
+});
+
+test('parentDir：没有分隔符 / 以分隔符开头都不返回空串（空串会被当成"当前目录")', () => {
+  assert.equal(parentDir('a.ts'), 'a.ts', '没有分隔符 → 原样返回，让下游明确报错');
+  assert.equal(parentDir('/a.ts'), '/a.ts', '切出来是空串时退回原值');
 });
