@@ -359,7 +359,7 @@ const ALLOWED_ROOTS_TTL: std::time::Duration = std::time::Duration::from_secs(1)
 /// 任意一端无法 canonicalize（请求路径不存在、根失效）即判否——fail closed。
 /// `PathBuf::starts_with` 按**路径分量**比较，因此 `/root` 不会误命中 `/root-evil`；
 /// `..`、UNC、`\\?\`、8.3 短名、结尾点/空格、ADS 都在 canonicalize 阶段被解析掉。
-pub(crate) fn canonical_path_within(requested: &str, roots: &[PathBuf]) -> bool {
+fn canonical_path_within(requested: &str, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return false;
     }
