@@ -11,7 +11,7 @@
     "build:app": "tauri build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --import ./test/ts-hooks.mjs --test \"src/**/__tests__/*.test.ts\"",
+    "test": "node ./test/test-suite-guard.mjs && node --import ./test/ts-hooks.mjs --test \"src/**/__tests__/*.test.ts\"",
     "lint": "eslint src --max-warnings 6"
   },
   "dependencies": {
@@ -77,10 +77,10 @@
       "esbuild"
     ],
     "overrides": {
-      "nanoid": ">=3.3.18",
-      "postcss": ">=8.5.23",
-      "browserslist": ">=4.28.7",
-      "baseline-browser-mapping": ">=2.11.0"
+      "nanoid": ">=3.3.18 <7",
+      "postcss": ">=8.5.23 <9",
+      "browserslist": ">=4.28.7 <5",
+      "baseline-browser-mapping": ">=2.11.0 <3"
     }
   }
 }

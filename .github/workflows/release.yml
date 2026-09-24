@@ -22,16 +22,33 @@ jobs:
       - uses: actions/checkout@v4
 
       # 版本号散在三处（package.json / tauri.conf.json / Cargo.toml），而安装包的文件名取自
-      # tauri.conf.json、release 的 tag 取自这次 push。两者不一致时，发出去的包与 tag 对不上号，
-      # 而 release 一旦公开就难收回（下载链接可能已经被转发）。先挡一道。
-      - name: 校验 tag 与 tauri.conf.json 版本一致
+      # tauri.conf.json、release 的 tag 取自这次 push、应用内「关于」显示的是 Cargo.toml
+      # （`commands/app.rs` 的 `env!("CARGO_PKG_VERSION")`）。不一致时发出去的包与 tag 对不上号，
+      # 而 release 一旦公开就难收回（下载链接可能已经被转发）。
+      # **只校验一处是最难发现的子集**：漏改 Cargo.toml 时 tag 与安装包名都对、发布顺利，
+      # 只有关于页显示旧版本。所以三处都比对（都与 tag 比，等价于三处互等）。
+      - name: 校验 tag 与三处版本号一致
         shell: bash
         run: |
-          V=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME 与 tauri.conf.json 的 version $V 不一致（应为 v$V）"
-            exit 1
-          fi
+          PKG=$(node -p "require('./package.json').version")
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          # Cargo.toml 里行首的 `version = ` 只有 [package] 那一处（依赖用的是内联 table）
+          CARGO=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/Cargo.toml | head -n 1)
+
+          fail=0
+          for entry in "package.json=$PKG" "src-tauri/tauri.conf.json=$CONF" "src-tauri/Cargo.toml=$CARGO"; do
+            file="${entry%%=*}"
+            ver="${entry#*=}"
+            if [ -z "$ver" ]; then
+              echo "::error::$file 里没有解析出版本号"
+              fail=1
+            elif [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::$file 的 version=$ver 与 tag $GITHUB_REF_NAME 不一致（应为 v$ver）"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+          echo "三处版本号一致：$PKG（tag $GITHUB_REF_NAME）"
 
       # 不带 version：pnpm 版本由 package.json 的 `packageManager` 字段决定（单一来源），
       # 两处都指定会被 action 拒绝（Multiple versions of pnpm specified）
@@ -50,13 +67,40 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # 不用另跑前端构建：tauri.conf.json 的 beforeBuildCommand 是 `npm run build`（tsc && vite build）
+      # ↓ 发布路径上的门禁：与 ci.yml 逐条同款（runner 同为 windows-latest）。
+      #
+      # 为什么必须在这里也跑一遍：tag 可以指向**任何**提交（不保证经过 CI），而发布一旦公开
+      # 就难收回。没有这几步时，前端与后端的整套测试在发布当天全是装饰——唯一的代码检查来自
+      # tauri.conf.json 的 beforeBuildCommand（tsc && vite build）。
+      # 改这里的命令时同步改 ci.yml，别让两处基线漂移。
+      - name: 类型检查（0 错误）
+        run: pnpm exec tsc --noEmit
+
+      - name: lint（0 错误 / ≤6 告警）
+        run: pnpm run lint
+
+      - name: 前端测试
+        run: pnpm test
+
+      - name: 构建（0 警告）
+        run: pnpm exec vite build
+
+      - name: clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 后端单元测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      # tauri.conf.json 的 beforeBuildCommand 是 `npm run build`（tsc && vite build），
+      # 会再构建一次——上面那步是显式的、失败点可归因的那份，这份是打包必需的。
       #
       # 直接发布，不建草稿。
       #
       # 想恢复"先验货再点发布"的话把 releaseDraft 改回 true——那一步是人眼能拦住产物的
       # 最后一道（文件在不在、名字对不对），发布之后就没有回头路了。当前选择是
-      # "push tag 即发布"，代价是产物只经过 CI 的自动检查，没人肉过一眼。
+      # "push tag 即发布"，代价是产物只经过上面这几道自动检查，没人肉过一眼。
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,7 +118,7 @@ jobs:
             - **服务模板库**：把服务配置存成模板跨项目复用，也可以在模板库里**直接新建**；支持**导入导出**（JSON），换机器或分享给同事时工具绑定按名字自动重连
             - **实时日志**：虚拟滚动，每个服务保留最新 2000 行；暂停查看、搜索命中跳转、级别与 URL/IP/时间戳着色；崩溃或秒退的服务标记为「失败」并保留日志供查因
             - **另开窗口的服务**：用 cmd 的 `start` 另开控制台跑的服务（Tomcat 的 `startup.bat`、ActiveMQ 的 wrapper）会被**接管**——状态不再误报「已退出（退出码 0）」、点停止能把它们一并结束；并自动**跟随它自己写的日志文件**进面板（按"确实在写入"挑选文件，回看最近 64KB 后持续追加，右键可取消）
-            - **文件与代码**：文件树浏览与懒加载（右键可**删除**文件与目录，走**系统回收站**，误删可恢复；被删对象的编辑器标签一并关闭）；系统剪贴板复制/粘贴（目录行「粘贴到此处」、文件行「粘贴到同级」；重名自动改号并报出实际落地名，跳过的符号链接/联接点单独说明）；CodeMirror 6 编辑器（20+ 语言），UTF-8 / GB18030 自动识别，按原换行与编码写回（保存不产生 git 误报变更）；内建图片预览、十六进制分页视图、jar 浏览（含嵌套 fat jar）
+            - **文件与代码**：文件树浏览与懒加载（右键可**删除**文件与目录，走**系统回收站**（无法回收的大文件会被永久删除）；被删对象的编辑器标签一并关闭）；系统剪贴板复制/粘贴（目录行「粘贴到此处」、文件行「粘贴到同级」；重名自动改号并报出实际落地名，跳过的符号链接/联接点单独说明）；CodeMirror 6 编辑器（20+ 语言），UTF-8 / GB18030 自动识别，按原换行与编码写回（保存不产生 git 误报变更）；内建图片预览、十六进制分页视图、jar 浏览（含嵌套 fat jar）
             - **Markdown 预览**：标签栏一键在源码与渲染结果之间切换（只读预览，不改动文件）
             - **文件监听**：监听路径变化触发服务重启，关闭 / 确认 / 自动三档，带 2 秒冷却去抖，可排除 node_modules、.git、dist
             - **Node 版本管理**：内置 nvm-windows 面板——列出已装版本、一键切换全局 node（所有终端跟着变）、按需安装 / 卸载；**没装 nvm 时可直接在面板里下载并安装**（官方安装器，含所需提示）；**卸载正在使用的版本会被拦下**并提示先切换到别的版本；装完 nvm / Node 后**不必重启 Nexus** 即可生效

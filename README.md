@@ -26,7 +26,7 @@
 - 文件树浏览、懒加载、jar 虚拟子树展开、系统剪贴板复制/粘贴（目录行「粘贴到此处」、文件行「粘贴到同级」；
   重名**弹框问一次**：保留两者（落成 " (2)"）/ 覆盖（原项移入回收站）/ 跳过，没有重名就直接粘、不多一步；
   报出实际落地名与被替换的原项，被跳过的符号链接/联接点单独说明、不混进"已粘贴 N 个项目"）
-- 文件树右键删除：文件与目录都可删，**移入系统回收站**（可恢复）；指向被删对象的编辑器标签会一并关闭
+- 文件树右键删除：文件与目录都可删，**移入系统回收站**（无法回收时会被永久删除，如超过回收站配额的大文件）；指向被删对象的编辑器标签会一并关闭
 - 代码查看与编辑（CodeMirror 6，20+ 语言），UTF-8/GB18030 自动识别，换行风格与编码按原样写回（编辑保存不产生 git 误报变更）
 - 内建查看器：图片预览、十六进制分页视图、jar 浏览（含嵌套 fat jar）
 - `.class` 文件：CFR 反编译为 Java 源码（无 JRE 时回退字节码视图）
@@ -58,6 +58,22 @@
 | 后端 | Rust（rusqlite / notify / tokio / zstd） |
 | 构建 | Vite + pnpm + cargo |
 
+**依赖版本锁定**：`.npmrc` 的 `save-exact=true` 让直接依赖精确落盘，`pnpm-lock.yaml` 入库，
+CI 与发布流程一律 `pnpm install --frozen-lockfile`。`package.json` 的 `pnpm.overrides` 是四条
+**传递依赖的版本地板**（`package.json` 不支持注释，理由记在这里；四条由提交 `455a603` 的审计收口引入）：
+
+| 被钉的包 | 区间 | 由谁传递引入 | 区间为什么这样写 |
+|---|---|---|---|
+| `nanoid` | `>=3.3.18 <7` | 仅 postcss | 下界是引入时的值；`>=` 是开区间，不加上界会把任何新主版本自动拉进来——实测被拉到 6.0.1，而 postcss 自己声明的是 `^3.3.18`（跨两个主版本，没人验过） |
+| `postcss` | `>=8.5.23 <9` | tailwindcss / vite / postcss-import / postcss-js / postcss-load-config / postcss-nested，同时也是本仓直接 devDependency | 同上；上界取当前 8.5.28 的下一个主版本 |
+| `browserslist` | `>=4.28.7 <5` | autoprefixer、`@babel/helper-compilation-targets`（经 `@vitejs/plugin-react`） | 同上；上界取当前 4.29.0 的下一个主版本 |
+| `baseline-browser-mapping` | `>=2.11.0 <3` | 仅 browserslist | 同上；上界取当前 2.11.25 的下一个主版本 |
+
+> 区间只写在 `package.json` 一处（本表是它的说明，不是第二份可执行配置）。改动区间后
+> `pnpm install --frozen-lockfile` 会先报 `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`——`pnpm-lock.yaml`
+> 的 `overrides:` 段记录的是区间原文，需要 `pnpm install --no-frozen-lockfile` 同步一次
+> （本次同步只改了区间字符串，解析版本与 integrity 未变）。
+
 ## 开发环境
 
 ### 环境要求
@@ -85,9 +101,15 @@ pnpm exec vite build                         # 前端产物必须能构建（0 �
 pnpm test                                    # 前端测试（utils 纯逻辑 + editor store 状态机）
 pnpm lint                                    # eslint（0 错误 / ≤6 条存量告警基线）
 cd src-tauri && cargo test --lib             # 后端单元测试（用例数见输出）
+cd src-tauri && cargo test --lib -- --ignored  # 默认被跳过的本机资源测试（见下）
 cd src-tauri && cargo clippy --all-targets   # 后端静态分析（0 警告）
 ```
 
+> **`--ignored` 那一批会动本机资源**：剪贴板、回收站（真的删文件）、目录联接点、nvm 探测，
+> 所以默认不跑、也不进 CI 的测试步骤（CI 只跑 `cargo test --lib -- --ignored --list`，
+> 保证它们仍能编译，不实际执行）。改动这几个模块（`commands/fileops.rs`、`commands/node.rs`、
+> `core/winenv.rs`）后请在真机上手动跑一次。
+>
 > 用例数**以命令输出为准**，不要照抄文档里的数字（写死的数字正是它出错的原因）。
 > 前端测试只覆盖 `.ts` 模块链（utils / stores / services）——JSX 无法被 Node 的类型擦除处理，
 > 组件仍靠真机点检；解析钩子见 `test/ts-hooks.mjs`。

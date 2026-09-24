@@ -45,6 +45,13 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
+      # `#[ignore]` 那批守的是本机才有的真实行为（剪贴板 / 回收站 / 目录联接 / nvm 探测），
+      # 默认不执行是有意的（会动本机资源，见 README「校验」），但**从不编译**会让它们悄悄失效：
+      # 契约一变红灯永远不亮，而它们看起来覆盖了这些模块。`--list` 只要求仍能编译，不真跑。
+      - name: 被忽略的用例仍能编译（不执行）
+        working-directory: src-tauri
+        run: cargo test --lib -- --ignored --list
+
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -111,7 +118,10 @@ jobs:
           cargo audit
 
       - run: pnpm install --frozen-lockfile
-      # **必须显式指定 registry**：仓库的 .npmrc 指向 npmmirror（国内镜像），而它没有实现
-      # audit 端点 —— 不指定会得到 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS（红得莫名其妙）
+      # **必须显式指定 registry**：镜像来自**开发者本机的用户级配置**（`~/.npmrc` 的
+      # `registry=https://registry.npmmirror.com/`），runner 上不存在；仓库里的 `.npmrc` 只有
+      # `save-exact=true`，别把它当成镜像来源（`git log -p --all -- .npmrc | grep -i registry` 为空）。
+      # 而那类镜像没有实现 audit 端点，一旦被带进来就会得到 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS
+      # （红得莫名其妙），所以这里钉死官方源
       - name: pnpm audit（high 及以上）
         run: pnpm audit --registry=https://registry.npmjs.org/ --audit-level high
