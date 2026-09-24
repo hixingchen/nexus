@@ -113,9 +113,13 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 
 /// 允许 webview 停留的 URL（导航守卫的**唯一判据**，单独成函数以便单测）。
 ///
-/// 允许：`tauri:` 协议（打包态的自身来源，含 `tauri://localhost`）、环回上的 http(s)
-/// （dev 的 Vite 服务与 AI 面板的 dsh 会话都在环回上）、以及 `about:blank`
-/// （部分引擎初始化时会先导航到它，拦掉会让面板白屏）。
+/// 允许三类：
+/// - **应用自身来源**：`tauri://localhost`（macOS/Linux）与 `http(s)://tauri.localhost`
+///   ——**后者才是 Windows 打包版实际用的**（wry 的 workaround 形式，见 tauri 的
+///   `WebviewUrl` 解析）。只放行前者会让打包版被自己的守卫拦下（白屏），而单测照样绿
+///   ——第一版就是这么写的，发布前的复核才发现。
+/// - `about:blank`：部分引擎初始化时会先导航到它，拦掉会让面板白屏
+/// - 环回上的 http(s)：dev 的 Vite 服务与 AI 面板的 dsh 会话都在环回上
 ///
 /// 为什么要有这道闸（SEC-25）：`tauri.conf.json` 的 CSP 只挂在 `tauri://` 协议的资源响应上，
 /// **dev 态的文档来自 Vite、不经该协议，CSP 完全不生效**；而主窗口此前没有任何导航守卫
@@ -126,8 +130,16 @@ fn navigation_allowed(url: &tauri::Url) -> bool {
     if url.scheme() == "about" || url.scheme() == "tauri" {
         return true;
     }
-    let host_ok = matches!(url.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
-    host_ok && matches!(url.scheme(), "http" | "https")
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        // 打包态自身来源（Windows）；`*.localhost` 里只有这一个是我们自己
+        Some("tauri.localhost")
+        // 环回：dev 的 Vite 与 AI 面板的 dsh；`localhost.evil.com` 这类 host 不等，照拦
+        | Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
 }
 
 /// 导航守卫插件：对**所有** webview 生效（主窗口 + AI 子 WebView）。
@@ -372,7 +384,11 @@ mod navigation_guard_tests {
     #[test]
     fn test_navigation_guard_allows_own_origin_and_loopback_only() {
         let url = |s: &str| s.parse::<tauri::Url>().expect("URL 解析");
-        // 自身协议（打包态）与引擎初始化用的 about:blank
+        // **打包态的自身来源必须放行**——漏了它就是"界面全白"。
+        // Windows 上 wry 用的是 http(s)://tauri.localhost（不是 tauri://localhost），
+        // 这一条是发布前复核才补上的：只测 tauri:// 时守卫与测试都"正常"。
+        assert!(navigation_allowed(&url("http://tauri.localhost/")));
+        assert!(navigation_allowed(&url("https://tauri.localhost/index.html")));
         assert!(navigation_allowed(&url("tauri://localhost/index.html")));
         assert!(navigation_allowed(&url("about:blank")));
         // dev 的 Vite 服务与 AI 面板的 dsh 会话都跑在环回上
