@@ -478,7 +478,9 @@ pub async fn run_tool_command(
             run_guard.set_pid(pid);
             #[cfg(windows)]
             if let Some(job) = &job {
-                job.assign_child(&child);
+                if let Err(e) = job.assign_child(&child) {
+                    log::warn!("[nexus] 工具命令进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
+                }
             }
 
             let stdout = match child.stdout.take() {
@@ -516,10 +518,15 @@ pub async fn run_tool_command(
                 Arc::clone(&out.pending),
                 Arc::clone(&out.readers_alive),
                 move |batch| {
-                    let _ = flush_app.emit("tool-command-log-batch", ToolCommandLogBatchPayload {
+                    // 发送失败必须留痕（CQ-29）：同文件的 `service-log-batch` 专门写了 warn 并
+                    // 注释了理由，这里原先却 `let _ =`——工具命令弹窗的**实时流式输出**会静默
+                    // 消失，而它在界面上只有"没有输出"这一种表现，排查时没有任何线索
+                    if let Err(e) = flush_app.emit("tool-command-log-batch", ToolCommandLogBatchPayload {
                         run_id: flush_run_id.clone(),
                         lines: batch,
-                    });
+                    }) {
+                        log::warn!("[nexus] 工具命令日志批量事件发送失败（前端可能尚未注册监听）: {}", e);
+                    }
                 },
             );
             if let Err(e) = flush_started {
@@ -559,8 +566,16 @@ pub async fn run_tool_command(
                         .map(|t| crate::core::process::process_start_time_millis(p) == Some(t))
                         .unwrap_or(true);
                     if identity_ok {
-                        crate::core::process::kill_process_tree(p);
-                        Err(format!("命令执行超时（{} 秒），已终止。长构建类命令请在工具命令上配置更长的超时（或 0 = 不限制）", secs))
+                        // 终止失败必须说出来（CQ-25）：杀不掉时命令仍在跑，而这句话里写着
+                        // "已终止"——只报成功就是撒谎。原实现把 taskkill 的错误吞在 core 里
+                        let kill_note = match crate::core::process::kill_process_tree(p) {
+                            Ok(()) => String::new(),
+                            Err(e) => format!("（终止失败：{}）", e),
+                        };
+                        Err(format!(
+                            "命令执行超时（{} 秒），已终止{}。长构建类命令请在工具命令上配置更长的超时（或 0 = 不限制）",
+                            secs, kill_note
+                        ))
                     } else {
                         Err(format!("命令执行超时（{} 秒），且 pid {} 已被系统复用——未执行终止，请检查是否有残留进程", secs, p))
                     }
@@ -605,6 +620,8 @@ pub async fn stop_tool_command(run_id: String) -> Result<(), String> {
         }
     }
     log::info!("[nexus] 停止工具命令 run_id={} pid={}", run_id, entry.pid);
-    crate::core::process::kill_process_tree(entry.pid);
-    Ok(())
+    // 杀掉失败要上报（CQ-25）：调用方按成败决定提示什么，而"点了停止但命令还在跑"
+    // 此前会被报成成功——用户只能看着输出继续涨
+    crate::core::process::kill_process_tree(entry.pid)
+        .map_err(|e| format!("终止命令进程失败 (pid={}): {}", entry.pid, e))
 }

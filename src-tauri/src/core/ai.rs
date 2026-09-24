@@ -432,7 +432,10 @@ fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Res
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
     #[cfg(windows)]
     if let Some(job) = app.state::<crate::AppState>().process_mgr.job_arc() {
-        job.assign_child(&child);
+        // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
+        if let Err(e) = job.assign_child(&child) {
+            log::warn!("[nexus] dsh 进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
+        }
     }
     let stdout = child.stdout.take().ok_or_else(|| "无法读取命令输出".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "无法读取命令错误输出".to_string())?;
@@ -687,7 +690,10 @@ pub fn spawn_dsh_web(
     // 加入共享 Job Object：应用异常退出时兜底清理（正常退出走显式 stop）
     #[cfg(windows)]
     if let Some(job) = app.state::<crate::AppState>().process_mgr.job_arc() {
-        job.assign_child(&child);
+        // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
+        if let Err(e) = job.assign_child(&child) {
+            log::warn!("[nexus] dsh 进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
+        }
     }
 
     let pid = child.id();

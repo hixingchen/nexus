@@ -218,6 +218,20 @@ impl PathAllowlist {
 
     /// 校验一个"会进入白名单的目录"（项目 path / 服务 cwd / 模板 cwd）
     pub fn ensure_config_dir_allowed(&self, db: &Database, raw: &str, what: &str) -> Result<(), String> {
+        db.with_conn(|conn| self.ensure_config_dir_allowed_with_conn(conn, raw, what))
+    }
+
+    /// `ensure_config_dir_allowed` 的**已持有连接**版本。
+    ///
+    /// 为什么需要它（P0-5）：模板导入跑在 `with_conn_mut` 的事务里，那里再经 `Database`
+    /// 取锁是同一线程重入（本项目对重入是检测到就 panic，而检测器自身还会误报/漏报，
+    /// 见 CQ-26）。校验用的连接与写库用的是同一个，因此也不存在"校验后被换掉"的窗口。
+    pub(crate) fn ensure_config_dir_allowed_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        raw: &str,
+        what: &str,
+    ) -> Result<(), String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(()); // 未配置：由各命令自行决定是否允许为空
@@ -230,7 +244,7 @@ impl PathAllowlist {
             return Err(format!("{}不能是{}（{}）。请选择项目目录或自己的代码目录", what, reason, trimmed));
         }
         let canon = std::fs::canonicalize(p).map_err(|e| format!("{}路径解析失败: {}", what, e))?;
-        let mut bases = registered_dirs(db);
+        let mut bases = registered_dirs_from_conn(conn);
         bases.extend(self.confirmed_dirs());
         if bases.iter().any(|b| canon.starts_with(b)) {
             return Ok(());
@@ -281,7 +295,16 @@ impl PathAllowlist {
 /// 与服务/模板同源查询：三者都是"用户自己登记过、允许前端访问"的目录。
 /// 独立成函数（只依赖 `Database`）是为了能直接用内存库做回归测试——白名单范围是安全关键逻辑。
 fn db_allowed_roots(db: &Database) -> Result<Vec<String>, String> {
-    db.with_conn(|conn| {
+    db.with_conn(db_allowed_roots_from_conn)
+}
+
+/// `db_allowed_roots` 的**连接版**：给"已经持有连接（事务内）"的调用方用。
+///
+/// 为什么必须有它：`Database::conn` 是不可重入的互斥量，事务闭包里再经 `Database`
+/// 取锁是同一线程重入——本项目对重入是检测到就 panic，而检测器自身有误报/漏报
+/// （CQ-26）。模板导入（P0-5）必须在写库的同一个事务里做校验，因此只能走这条。
+fn db_allowed_roots_from_conn(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
+    {
         let mut out: Vec<String> = Vec::new();
         let mut stmt = conn
             .prepare(
@@ -299,12 +322,22 @@ fn db_allowed_roots(db: &Database) -> Result<Vec<String>, String> {
             }
         }
         Ok(out)
-    })
+    }
 }
 
 /// 库中已登记的目录（项目 path + 服务/模板 cwd）：历史配置视为已授权
 fn registered_dirs(db: &Database) -> Vec<PathBuf> {
-    match db_allowed_roots(db) {
+    to_registered_dirs(db_allowed_roots(db))
+}
+
+/// `registered_dirs` 的连接版（理由同 `db_allowed_roots_from_conn`）
+pub(crate) fn registered_dirs_from_conn(conn: &rusqlite::Connection) -> Vec<PathBuf> {
+    to_registered_dirs(db_allowed_roots_from_conn(conn))
+}
+
+/// 原始根字符串 → 已 canonicalize 的目录（解析失败的根直接丢弃，与 `allowed_roots` 同口径）
+fn to_registered_dirs(raw: Result<Vec<String>, String>) -> Vec<PathBuf> {
+    match raw {
         Ok(list) => list.iter().filter_map(|d| std::fs::canonicalize(d).ok()).collect(),
         Err(e) => {
             log::warn!("[nexus] 读取已登记目录失败（本次按无历史授权处理）: {}", e);
@@ -326,7 +359,7 @@ const ALLOWED_ROOTS_TTL: std::time::Duration = std::time::Duration::from_secs(1)
 /// 任意一端无法 canonicalize（请求路径不存在、根失效）即判否——fail closed。
 /// `PathBuf::starts_with` 按**路径分量**比较，因此 `/root` 不会误命中 `/root-evil`；
 /// `..`、UNC、`\\?\`、8.3 短名、结尾点/空格、ADS 都在 canonicalize 阶段被解析掉。
-fn canonical_path_within(requested: &str, roots: &[PathBuf]) -> bool {
+pub(crate) fn canonical_path_within(requested: &str, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return false;
     }

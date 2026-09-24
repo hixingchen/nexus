@@ -82,8 +82,12 @@ impl FileWatcher {
 
         if unique_paths.is_empty() {
             if invalid.is_empty() {
-                // 没有任何服务配置监听路径：正常情况（等价于关闭监听）
-                let _ = self.stop_watching(project_id);
+                // 没有任何服务配置监听路径：正常情况（等价于关闭监听）。
+                // 失败留痕（CQ-30）：这条 Err 只来自 watchers 锁中毒，静默吞掉的话
+                // 用户看到的是"监听已关"而线程仍在跑，日志里一条线索都没有
+                if let Err(e) = self.stop_watching(project_id) {
+                    log::warn!("[nexus] 停止文件监听失败（监听线程可能仍在运行）: {}", e);
+                }
                 return Ok(());
             }
             // 配置了监听路径但一个都不存在：必须报错。
@@ -215,7 +219,12 @@ impl FileWatcher {
         // "map 说 [T]、线程实际监听 [S,T]" 的永久分叉——此后改 S 的目录仍会 emit，
         // 弹出"需要重启 S"，而 S 已被删除 → 点了必然失败。所以调用方**只读**地算剩余
         // 列表（`get_watched_services` + 过滤），提交统一由这里完成，不留回滚逻辑。
-        let _ = self.stop_watching(project_id);
+        //
+        // 停旧的失败要留痕（CQ-30）：这条 Err 只来自 watchers 锁中毒，而锁中毒时下面
+        // 那次 lock 也必然失败——不留痕的话现场只剩"文件监听没生效"，看不出根因
+        if let Err(e) = self.stop_watching(project_id) {
+            log::warn!("[nexus] 重建文件监听前停止旧监听失败: {}", e);
+        }
 
         self.watchers.lock().map_err(|e| format!("FileWatcher watchers 锁获取失败: {}", e))?
             .insert(project_id.to_string(), WatcherState { _watcher: watcher, stop_tx, listener_handle: Some(listener_handle), services: services.to_vec() });

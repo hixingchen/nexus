@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
-use crate::commands::paths::PathAllowlist;
+use crate::commands::paths::{canonical_path_within, PathAllowlist};
 use crate::database::Database;
 use crate::AppState;
 
@@ -69,10 +69,9 @@ pub struct PasteConflict {
 /// 拿到策略后再执行一次。
 ///
 /// 为什么不在一次调用里弹框：源路径只能由后端从**系统剪贴板**读。若让前端把源清单当参数
-/// 传回来直接用作复制输入，被攻陷的 webview 就能把任意路径（`…\.ssh\id_rsa`）复制进项目目录
-/// ——`paste_files` 只校验目标、从不校验源（源本来就来自外部，这是"从外面粘进来"的正当能力，
-/// 而 `copy_files_to_clipboard` 那条源白名单挡不住这一步）。所以第二阶段的源清单**只用于
-/// 和当前剪贴板比对**，不参与复制。
+/// 传回来直接用作复制输入，被攻陷的 webview 就能把任意路径（`…\.ssh\id_rsa`）复制进项目目录。
+/// 所以第二阶段的源清单**只用于和当前剪贴板比对**，不参与复制；真正复制的源来自剪贴板，
+/// 且逐项过白名单根（SEC-21，见 `paste_into` 的 `roots` 参数）。
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum PasteResponse {
@@ -156,9 +155,13 @@ pub async fn paste_files(
 
     #[cfg(windows)]
     {
+        // 源路径的白名单根（**取出 Arc**：阻塞任务要 'static，借不了 `state`）。
+        // 只校验目标等于给"读取范围"开侧门——剪贴板里的任意路径被复制进项目后，
+        // 就能用 `read_file` 读出来（SEC-21，与 read_file/copy_files_to_clipboard 同口径）
+        let roots = state.paths.allowed_roots(&state.db);
         // 剪贴板读取 + 递归复制都在阻塞线程池执行（大目录复制耗时，不占异步 worker）
         tokio::task::spawn_blocking(move || {
-            paste_files_windows(&target, conflict_policy, expected_sources.as_deref())
+            paste_files_windows(&target, conflict_policy, expected_sources.as_deref(), &roots)
         })
         .await
         .map_err(|e| format!("粘贴任务执行失败: {}", e))?
@@ -175,6 +178,7 @@ fn paste_files_windows(
     target: &Path,
     policy: Option<ConflictPolicy>,
     expected_sources: Option<&[String]>,
+    roots: &[PathBuf],
 ) -> Result<PasteResponse, String> {
     use clipboard_win::formats::FileList;
 
@@ -190,7 +194,7 @@ fn paste_files_windows(
             return Err("剪贴板内容已改变，请重新粘贴".into());
         }
     }
-    paste_into(target, policy, &sources)
+    paste_into(target, policy, &sources, roots)
 }
 
 /// 两份源清单是不是同一批文件。只比集合不比顺序——顺序变了但文件没变，用户看到的东西没变
@@ -210,8 +214,33 @@ fn same_file_set(a: &[String], b: &[String]) -> bool {
 /// **源清单是参数而不是自己去读剪贴板**：抽这一层就是为了能脱离真实剪贴板测
 /// （理由与 `write_files_to_clipboard` 从命令里抽出来相同），否则"覆盖真的替换了、
 /// 跳过真的没动"这些结论只能靠手点验证。
-fn paste_into(target: &Path, policy: Option<ConflictPolicy>, sources: &[String]) -> Result<PasteResponse, String> {
+///
+/// `roots` 是源路径的白名单根（与 `check_path_allowed` 的判据同源）：**源也在读取范围内**
+/// （SEC-21）。不校验的话剪贴板里的任意路径都能被复制进项目、再由 `read_file` 读出来——
+/// 只校验目标等于只锁了门的前半扇。
+fn paste_into(
+    target: &Path,
+    policy: Option<ConflictPolicy>,
+    sources: &[String],
+    roots: &[PathBuf],
+) -> Result<PasteResponse, String> {
     let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+
+    // 源的白名单过滤只做一次（SEC-21）：探测、重算、执行三轮必须看**同一批**源，
+    // 否则冲突清单里会混进一个永远不会被复制的项，用户还会被问"要不要覆盖它"。
+    // 越界的源既不复制也不覆盖（更不会走到"覆盖前把同名项移入回收站"那一步），
+    // 逐项进失败清单——"没反应"和"被拒绝"必须能分得出来
+    let mut denied: Vec<String> = Vec::new();
+    let mut allowed: Vec<String> = Vec::new();
+    for s in sources {
+        if canonical_path_within(s, roots) {
+            allowed.push(s.clone());
+        } else {
+            log::warn!("[nexus] 粘贴的源不在允许范围内（非项目/服务目录），拒绝复制: {}", s);
+            denied.push(format!("{}: 源不在允许访问的范围内", s));
+        }
+    }
+    let sources: &[String] = &allowed;
 
     // 探测轮：只读，一个字节都不落盘
     if policy.is_none() {
@@ -297,6 +326,9 @@ fn paste_into(target: &Path, policy: Option<ConflictPolicy>, sources: &[String])
             }
         }
     }
+    // 越界的源在最后并入失败清单：先入列表，下面的"整批都没结果"判定才看得见它们
+    // （全是越界源时该报的是"源不在允许范围内"，而不是一句没头没尾的"没有可粘贴的项目"）
+    failed.append(&mut denied);
     // skipped 也算"有结果"：剪贴板里只有一个联接点时，前几个都空，
     // 但用户该看到的是"跳过了它"，而不是一句没头没尾的"没有可粘贴的项目"
     if created.is_empty() && failed.is_empty() && acc.skipped.is_empty() && skipped_by_user.is_empty() {
@@ -656,6 +688,41 @@ mod tests {
         dir
     }
 
+    /// 测试用的白名单根：用例里的源都在 `base` 之下（`paste_into` 的 roots 参数）
+    fn roots_of(base: &Path) -> Vec<PathBuf> {
+        vec![std::fs::canonicalize(base).expect("canonicalize 测试根")]
+    }
+
+    /// SEC-21：**源**也要在允许范围内，否则粘贴等于给"读取范围"开侧门。
+    ///
+    /// 修复前的路径：剪贴板里的任意文件（`…\.ssh\id_rsa`）都能被复制进项目目录，
+    /// 再由 `read_file` 读出来——只校验目标等于只锁了门的前半扇。这条用例把
+    /// "越界的源既不复制、也不覆盖、还要说出来"钉住。
+    #[test]
+    fn test_paste_rejects_source_outside_roots() {
+        let base = tmp_dir("srcdeny");
+        let target = target_with_a(&base);
+        // 源在 base 之外（另一个临时目录）→ 不在白名单根下
+        let outside = tmp_dir("srcdeny_outside");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+        // 目标里放一个同名项：覆盖策略下若源被放行，这一项会被移进回收站——必须没有
+        std::fs::write(target.join("secret.txt"), "old").unwrap();
+
+        let srcs = [secret.to_string_lossy().into_owned()];
+        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), &srcs, &roots_of(&base)).unwrap());
+
+        assert!(r.created.is_empty(), "越界的源不该被复制进来: {:?}", r.created);
+        assert_eq!(r.failed.len(), 1, "拒绝必须上报原因: {:?}", r.failed);
+        assert!(r.failed[0].contains("范围"), "原因要说清是范围问题: {}", r.failed[0]);
+        assert!(r.replaced.is_empty(), "越界的源不该触发覆盖（那会白白删掉目标里的同名项）");
+        assert_eq!(std::fs::read_to_string(target.join("secret.txt")).unwrap(), "old", "同名项必须原封不动");
+        assert!(!target.join("secret (2).txt").exists(), "没有第二个落点");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     /// 建一个目录联接（junction）。`mklink /J` 不需要管理员权限（符号链接才需要）；
     /// 建不出来（受限环境）返回 false，用例据此跳过
     #[cfg(windows)]
@@ -773,7 +840,7 @@ mod tests {
         let plan = plan_dest(&target, "link", &link, true, &mut claimed).unwrap();
         assert!(plan.replacing.is_none(), "链接源触发覆盖 = 删掉目标里那份再什么都不放");
 
-        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), &srcs).unwrap());
+        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), &srcs, &roots_of(&base)).unwrap());
         assert!(r.created.is_empty(), "没落盘就不该进 created: {:?}", r.created);
         assert_eq!(r.skipped.len(), 1, "它该被记成跳过的链接");
         assert!(r.replaced.is_empty(), "不该动目标里的同名项");
@@ -866,7 +933,7 @@ mod tests {
         let target = target_with_a(&base);
         let (a, b) = two_sources(&base, "s");
 
-        let res = paste_into(&target, None, &[a, b]).unwrap();
+        let res = paste_into(&target, None, &[a, b], &roots_of(&base)).unwrap();
         match res {
             PasteResponse::Conflict { conflicts, sources } => {
                 assert_eq!(conflicts.len(), 1);
@@ -888,7 +955,7 @@ mod tests {
         let target = target_with_a(&base);
         let (a, b) = two_sources(&base, "s");
 
-        let r = done(paste_into(&target, Some(ConflictPolicy::Skip), &[a, b]).unwrap());
+        let r = done(paste_into(&target, Some(ConflictPolicy::Skip), &[a, b], &roots_of(&base)).unwrap());
         assert!(r.failed.is_empty(), "不该有失败: {:?}", r.failed);
         assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "old", "跳过就不该动同名项");
         assert_eq!(r.skipped_by_user.len(), 1, "跳过的源要上报，否则界面会把它报成已粘贴");
@@ -906,7 +973,7 @@ mod tests {
         let target = target_with_a(&base);
         let (a, b) = two_sources(&base, "s");
 
-        let r = done(paste_into(&target, Some(ConflictPolicy::Rename), &[a, b]).unwrap());
+        let r = done(paste_into(&target, Some(ConflictPolicy::Rename), &[a, b], &roots_of(&base)).unwrap());
         assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "old", "原文件必须原样留着");
         assert_eq!(std::fs::read_to_string(target.join("a (2).txt")).unwrap(), "new");
         assert!(r.replaced.is_empty(), "保留两者不该动任何已有数据");
@@ -935,7 +1002,7 @@ mod tests {
         let target = target_with_a(&base);
         let (a, _) = two_sources(&base, "s");
 
-        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), std::slice::from_ref(&a)).unwrap());
+        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), std::slice::from_ref(&a), &roots_of(&base)).unwrap());
         assert!(r.failed.is_empty(), "不该有失败: {:?}", r.failed);
         assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "new", "新内容要落到原名上");
         assert_eq!(r.created.len(), 1);
@@ -945,7 +1012,7 @@ mod tests {
 
         // 两个同名源（来自不同目录）：第二个必须落成 " (2)"，不能把刚落地的第一个盖掉
         let (a2, _) = two_sources(&base, "s2");
-        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), &[a.clone(), a2]).unwrap());
+        let r = done(paste_into(&target, Some(ConflictPolicy::Overwrite), &[a.clone(), a2], &roots_of(&base)).unwrap());
         assert!(r.failed.is_empty(), "不该有失败: {:?}", r.failed);
         assert_eq!(r.replaced.len(), 1, "同一个落点在一次粘贴里只能被覆盖一次");
         assert!(target.join("a (2).txt").exists(), "第二个同名源该落到 a (2).txt");

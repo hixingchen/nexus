@@ -20,7 +20,11 @@ use crate::commands::search::{SearchParams, SearchResponse, SearchResultItem};
 use crate::commands::node::{
     NodeRuntimeStatus, NodeVersionIndex, NodeVersionInfo, NvmCommandResult, NvmInstallResult,
 };
-use crate::commands::service::{AddServiceParams, ImportTemplatesResult};
+use crate::commands::service::{
+    AddServiceParams, CreateServiceTemplateParams, ImportTemplatesResult,
+    UpdateServiceParams, UpdateServiceTemplateParams, UpdateServiceResult,
+};
+use crate::commands::tools::{OpenToolUsage, SaveOpenToolParams};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
 use crate::core::process::{FailedService, LogLine, ServiceLogBatchPayload};
@@ -282,6 +286,15 @@ fn test_response_dtos_are_snake_case() {
         ])
     );
 
+    // 删除工具前的引用清单（UX-4：删除入口是个 11px 图标，而它会级联解除所有服务的绑定）
+    let usage = OpenToolUsage { services: vec![], templates: vec![] };
+    assert_eq!(keys_of(&usage), sorted(&["services", "templates"]));
+
+    // 更新服务的结果：保存本身成功，附带的"文件监听是否热刷新成功"（CQ-35 —— 保存成功
+    // 而监听没生效时界面必须能说出来，所以它不能是一个只表示成败的 `void`）
+    let upd = UpdateServiceResult { watch_refreshed: true, watch_error: String::new() };
+    assert_eq!(keys_of(&upd), sorted(&["watch_refreshed", "watch_error"]));
+
     // 运行状态总览（前端按 exit_code 去重 + 失败态渲染；followed_log 供右键菜单
     // 显示「取消跟随日志（文件名）」）
     let run = RunningService { service_id: "s".into(), project_id: "p".into(), followed_log: None };
@@ -337,6 +350,47 @@ fn test_request_params_are_camel_case() {
     assert_eq!(sp.max_results, 5000, "maxResults 被静默回落到默认 1000");
     assert!(sp.case_sensitive, "caseSensitive 被静默回落到默认 false");
 
+    // ARCH-21：请求侧此前**一个字段断言都没有**（守卫的判据看不见只 derive Deserialize 的
+    // 结构体）。这四个是服务/模板/工具三类编辑弹窗提交的载荷——字段名写错等于"某个设置
+    // 改了不生效"：`rename_all` 丢了会直接报缺字段（响亮），但**字段名与前端对不上**时
+    // 前端传的值会被静默忽略，界面照说"已保存"。
+    let upd: UpdateServiceParams = serde_json::from_value(serde_json::json!({
+        "id": "s1", "name": "svc", "command": "npm run dev", "cwd": "C:/p",
+        "watchPaths": "[\"C:/p\"]", "watchInclude": "*.ts", "watchExclude": "dist",
+        "envVars": "K=V", "restartMode": 2, "enabled": false, "showFileTree": true,
+        "toolCommands": "[{\"id\":\"c1\"}]",
+    })).expect("UpdateServiceParams 应能按驼峰反序列化");
+    assert_eq!(upd.id, "s1");
+    assert_eq!(upd.watch_paths, "[\"C:/p\"]", "watchPaths 被静默忽略");
+    assert_eq!(upd.watch_include, "*.ts", "watchInclude 被静默忽略");
+    assert_eq!(upd.restart_mode, 2, "restartMode 被静默忽略");
+    assert!(!upd.enabled && upd.show_file_tree, "两个展示开关被静默忽略");
+    assert_eq!(upd.tool_commands, "[{\"id\":\"c1\"}]", "toolCommands 被静默忽略");
+
+    let tpl: UpdateServiceTemplateParams = serde_json::from_value(serde_json::json!({
+        "id": "t1", "name": "tpl", "command": "c", "cwd": "C:/p",
+        "watchPaths": "[]", "watchInclude": "*", "watchExclude": "", "envVars": "",
+        "restartMode": 1, "enabled": true, "showFileTree": false,
+        "toolCommands": "[]", "openToolId": "tool1",
+    })).expect("UpdateServiceTemplateParams 应能按驼峰反序列化");
+    assert_eq!(tpl.open_tool_id, "tool1", "openToolId 被静默忽略（模板的默认打开工具会丢）");
+
+    let created: CreateServiceTemplateParams = serde_json::from_value(serde_json::json!({
+        "name": "tpl", "command": "c", "cwd": "C:/p",
+        "watchPaths": "[]", "watchInclude": "*", "watchExclude": "", "envVars": "",
+        "restartMode": 1, "enabled": true, "showFileTree": false,
+        "toolCommands": "[]", "openToolId": "",
+    })).expect("CreateServiceTemplateParams 应能按驼峰反序列化");
+    assert_eq!(created.name, "tpl");
+    assert_eq!(created.restart_mode, 1, "restartMode 被静默忽略");
+
+    // 工具：`id` 为 null 是"新建"语义（见 `save_open_tool`），必须能显式收到 null
+    let tool: SaveOpenToolParams = serde_json::from_value(serde_json::json!({
+        "id": null, "name": "IDEA", "executable": "C:/idea64.exe", "args": "{path}",
+    })).expect("SaveOpenToolParams 应能按驼峰反序列化");
+    assert!(tool.id.is_none(), "id: null 应读成「新建」");
+    assert_eq!(tool.executable, "C:/idea64.exe", "executable 被静默忽略");
+
     // 反面：若真按 snake_case 传，则必然**读不到**（证明上面的断言确实在测驼峰映射）
     let snake = serde_json::json!({
         "root": "C:/p",
@@ -385,12 +439,30 @@ fn struct_name(line: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// 扫 `src/` 下所有「`#[derive(…Serialize…)` 紧跟的结构体」的名字（跳过测试代码段）。
+/// derive 列表里有没有这一项。**按项比对而不是子串包含**：
+/// `"Deserialize".contains("Serialize")` 是 false（大小写不同），而反向的子串匹配又会把
+/// `serde::Serialize` 这类限定路径漏掉——两个方向都错，所以取 `::` 后的最后一段逐项比。
+fn derives(list: &str, name: &str) -> bool {
+    list.split(',')
+        .any(|d| d.trim().rsplit("::").next() == Some(name))
+}
+
+/// 扫描结果：两个方向分开列。
 ///
-/// 启发式，且**故意宽松**：漏报（例如 derive 跨多行）只是退回今天的行为，
+/// 为什么要分（ARCH-21）：原扫描只认 `Serialize`，而请求 DTO 只 derive `Deserialize`——
+/// 于是"新增一个请求 DTO"从来不会让守卫变红（判据见 `scan_ipc_structs` 内的说明）。
+struct IpcStructs {
+    /// 出前端的载荷（响应 DTO / 事件 payload）：字段名一律 snake_case
+    serialize: Vec<String>,
+    /// 前端传进来的参数（请求 DTO）：字段名一律 camelCase
+    deserialize: Vec<String>,
+}
+
+/// 扫 `src/` 下「`#[derive(…Serialize…)` / `#[derive(…Deserialize…)` 紧跟的结构体」的名字
+/// （跳过测试代码段）。启发式，且**故意宽松**：漏报（例如 derive 跨多行）只是退回今天的行为，
 /// 不会造成损害；误报的代价是在豁免清单里加一行。它的目的是提醒，不是证明。
-fn scan_serializable_structs() -> Vec<String> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+fn scan_ipc_structs() -> IpcStructs {
+    fn walk(dir: &std::path::Path, out: &mut IpcStructs) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let p = e.path();
@@ -402,7 +474,12 @@ fn scan_serializable_structs() -> Vec<String> {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
-            let mut saw_serialize = false;
+            // **按 derive 里的类型名判断**（ARCH-21）：原判据是
+            // `t.contains("Serialize")`，而 `"#[derive(Deserialize)]".contains("Serialize")`
+            // 恰好是 **false**（Deserialize 里的 s 是小写）——于是所有只 derive Deserialize 的
+            // **请求 DTO** 对这条守卫完全不可见，守卫给出了虚假保证："仓库里多了一个 DTO"
+            // 会变成一次显式决定，实际只管得住响应侧。这里分开记两个方向。
+            let (mut saw_serialize, mut saw_deserialize) = (false, false);
             // 测试段之后的类型不是 IPC 载荷（守卫只关心生产代码）。
             // 约定：文件里的测试一律在 `#[cfg(test)]` 之后
             let mut in_tests = false;
@@ -415,21 +492,27 @@ fn scan_serializable_structs() -> Vec<String> {
                     continue;
                 }
                 if t.starts_with("#[") {
-                    if t.contains("derive(") {
-                        saw_serialize = t.contains("Serialize");
+                    if let Some(rest) = t.split("derive(").nth(1) {
+                        let list = rest.split(")").next().unwrap_or("");
+                        saw_serialize = derives(list, "Serialize");
+                        saw_deserialize = derives(list, "Deserialize");
                     }
                     continue; // 其余属性（#[serde(…)] 等）不影响判定
                 }
                 if let Some(name) = struct_name(t) {
                     if saw_serialize {
-                        out.push(name.to_string());
+                        out.serialize.push(name.to_string());
+                    }
+                    if saw_deserialize {
+                        out.deserialize.push(name.to_string());
                     }
                 }
                 saw_serialize = false;
+                saw_deserialize = false;
             }
         }
     }
-    let mut out = Vec::new();
+    let mut out = IpcStructs { serialize: Vec::new(), deserialize: Vec::new() };
     walk(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), &mut out);
     out
 }
@@ -441,11 +524,12 @@ fn scan_serializable_structs() -> Vec<String> {
 /// 编译干净、测试全绿，前端拿到的 `undefined` 要到运行时才暴露，而这正是
 /// ARCH-11 描述的失败模式本身。这条测试把"仓库里多了一个 Serialize 结构体"
 /// 变成一次**显式的决定**：要么补断言，要么在这里写明它为什么不是 IPC 载荷。
-#[test]
-fn test_every_serializable_struct_is_covered() {
-    // 与 `test_response_dtos_are_snake_case` / `test_request_params_are_camel_case`
-    // 里的断言一一对应；新增类型必须同步这里（测试会红着提醒你）
-    const COVERED: &[&str] = &[
+///
+/// 响应侧覆盖清单（与 `test_response_dtos_are_snake_case` 的断言一一对应）。
+///
+/// 提到模块级是为了让**请求侧**那条守卫也能看见它（ARCH-21）：同一批结构体（`Service`/
+/// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
+const COVERED_RESPONSE: &[&str] = &[
         "AiStatus", "DshVersionInfo",
         "FileEntry", "ReadFileResponse", "HexPage", "JarEntryContent",
         "PasteFilesResult", "PasteConflict",
@@ -456,31 +540,84 @@ fn test_every_serializable_struct_is_covered() {
         "LogLine", "FailedService", "ServiceLogBatchPayload",
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "Service", "ServiceTemplate", "ProjectDetail",
-        "ImportTemplatesResult",
+        "ImportTemplatesResult", "UpdateServiceResult", "OpenToolUsage",
         "NodeRuntimeStatus", "NodeVersionInfo", "NodeVersionIndex",
         "NvmCommandResult", "NvmInstallResult",
         // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
         // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
         // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）
         "ExportedTemplate", "TemplateExportFile",
-    ];
-    let found = scan_serializable_structs();
+];
+
+#[test]
+fn test_every_serializable_struct_is_covered() {
+    let found = scan_ipc_structs();
     assert!(
-        found.len() >= 20,
+        found.serialize.len() >= 20,
         "扫描只找到 {} 个 Serialize 结构体，解析器很可能失效了（而非仓库里真这么少）",
-        found.len()
+        found.serialize.len()
     );
 
-    let missing: Vec<&String> = found.iter().filter(|n| !COVERED.contains(&n.as_str())).collect();
+    let missing: Vec<&String> = found.serialize.iter().filter(|n| !COVERED_RESPONSE.contains(&n.as_str())).collect();
     assert!(
         missing.is_empty(),
         "以下 Serialize 结构体既没有契约断言、也没登记为豁免：{:?}\n\
          请在 `test_response_dtos_are_snake_case` 里补一条 `keys_of` 断言；\
-         若它确实不是 IPC 载荷（不经 invoke/事件出前端），把它加进 COVERED 并写明理由",
+         若它确实不是 IPC 载荷（不经 invoke/事件出前端），把它加进 COVERED_RESPONSE 并写明理由",
         missing
     );
 
     // 反向：清单里有、源码里已找不到的名字（更名或删除后忘了同步清单）
-    let stale: Vec<&str> = COVERED.iter().copied().filter(|n| !found.iter().any(|f| f == n)).collect();
+    let stale: Vec<&str> = COVERED_RESPONSE.iter().copied().filter(|n| !found.serialize.iter().any(|f| f == n)).collect();
     assert!(stale.is_empty(), "覆盖清单里的这些名字在源码中已不存在（更名/删除了？）：{:?}", stale);
+}
+
+/// ARCH-21：**请求侧**的同一套守卫。
+///
+/// 响应侧那条守卫此前把请求 DTO 整个漏掉了（判据是 `contains("Serialize")`，而
+/// `Deserialize` 里那个 s 是小写），于是 `UpdateServiceParams` / `UpdateServiceTemplateParams` /
+/// `CreateServiceTemplateParams` / `SaveOpenToolParams` 四个结构体**一个字段断言都没有**：
+/// 把某个字段改名（或误删 `rename_all = "camelCase"`）不会红，前端传的字段被静默忽略，
+/// 界面表现是"某个设置改了不生效"。这条把请求侧也变成一次显式决定。
+#[test]
+fn test_every_deserializable_struct_is_covered() {
+    /// 只做**请求方向**的类型：有 `from_value` 断言（且断言到"值与默认不同"）
+    const COVERED_REQUEST_ONLY: &[&str] = &[
+        "SearchParams",                    // ARCH-12：三个 default 字段的静默回落
+        "AddServiceParams",
+        "UpdateServiceParams",
+        "UpdateServiceTemplateParams",
+        "CreateServiceTemplateParams",
+        "SaveOpenToolParams",
+        // 以下不是 IPC 请求载荷：
+        // - `ConflictPolicy`：前端弹框回传的策略枚举（`#[serde(rename_all = "lowercase")]`，
+        //   没有 rename_all = "camelCase" 这条规则的适用面），它的取值由弹框三选一固定
+        // - `ToolCommand`：DB TEXT 列里的 JSON 的元素类型，前端把整串原样存取
+        // - `Entry`（`commands/node.rs::parse_index` 内的局部结构）：反序列化的是**网上拉来的**
+        //   nodejs.org 版本索引 JSON——外部文件格式，字段名由对方决定，我们无权改
+        "ConflictPolicy", "ToolCommand", "Entry",
+    ];
+
+    let found = scan_ipc_structs();
+    assert!(
+        found.deserialize.len() >= 5,
+        "只扫到 {} 个 Deserialize 结构体，解析器很可能失效了",
+        found.deserialize.len()
+    );
+
+    // 两个方向都 derive 的类型（Service/Project/… 既出前端也进库）已由响应侧清单覆盖，
+    // 这里不重复要求——它们的方向规则是"响应 snake_case"，断言在 `test_response_dtos_are_snake_case`
+    let missing: Vec<&String> = found
+        .deserialize
+        .iter()
+        .filter(|n| !COVERED_REQUEST_ONLY.contains(&n.as_str()) && !COVERED_RESPONSE.contains(&n.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "以下 Deserialize 结构体没有契约断言、也没登记为豁免：{:?}\n\
+         请在 `test_request_params_are_camel_case` 里补一条 `from_value` 断言\
+         （断言「读到了与默认值不同的值」，只断言字段存在不够）；\
+         若它不是 IPC 请求载荷（例如库里的 JSON 列格式），把它加进 COVERED_REQUEST_ONLY 并写明理由",
+        missing
+    );
 }

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认权限配置：只保留前端实际调用的项（逐项核对过 src/ 的调用点）。少一项会让对应功能在运行时报错，多一项则无谓扩大 webview 被攻陷后的可达面。",
+  "description": "默认权限配置：只保留前端实际调用的项（逐项核对过 src/ 的调用点）。少一项会让对应功能在运行时报错，多一项则无谓扩大 webview 被攻陷后的可达面。dialog 只给 allow-open（SEC-24）：前端只调 open（选文件），而 dialog:default 还会带进 allow-save 与 allow-message——后者允许被攻陷的 webview 弹出原生消息框，那正是 SEC-17 想消灭的「伪造系统级对话框、把信任锚降级为诱导点击」；导出用的保存对话框现在由 Rust 侧弹（SEC-19 的 pick_save_file），前端本就不需要 allow-save。",
   "windows": ["*"],
   "permissions": [
     "core:default",
@@ -15,6 +15,6 @@
     "core:webview:allow-set-webview-size",
     "core:webview:allow-webview-close",
     "shell:default",
-    "dialog:default"
+    "dialog:allow-open"
   ]
 }

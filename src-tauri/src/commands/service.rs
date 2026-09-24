@@ -146,6 +146,19 @@ pub(crate) fn insert_service_row(
     })
 }
 
+/// `update_service` 的结果：保存本身已经成功，附带"文件监听热刷新"的真实结果。
+///
+/// 为什么要一个结构体而不是 `Ok(())`：热刷新失败是**部分成功**——配置已经落库，
+/// 只是当前这次监听没跟上。原实现把它降级成 `Ok(())` + 一条日志，界面照报"已保存"，
+/// 用户改文件毫无反应（CQ-35）；这正是 `file_watcher.rs` 刚把同一条结论从
+/// `log::warn + Ok(())` 改成 `Err` 要消灭的失败模式。
+#[derive(Serialize)]
+pub struct UpdateServiceResult {
+    pub watch_refreshed: bool,
+    /// 未刷新时的原因（`watch_refreshed=false` 时才有内容）
+    pub watch_error: String,
+}
+
 /// 更新服务配置。
 ///
 /// 异步 + spawn_blocking：DB 写入之后会 `refresh_service_watch`，它要
@@ -155,7 +168,7 @@ pub(crate) fn insert_service_row(
 pub async fn update_service(
     app: tauri::AppHandle,
     params: UpdateServiceParams,
-) -> Result<(), String> {
+) -> Result<UpdateServiceResult, String> {
     if params.id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
@@ -175,12 +188,18 @@ pub async fn update_service(
         }
         let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
         let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
-        // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）；
-        // 失败只告警不阻塞保存（保存已成功，监听下次项目级启停时自然重建）
-        if let Err(e) = crate::commands::watcher::refresh_service_watch(app.clone(), &state, &project_id, &params.id) {
-            log::warn!("更新服务后刷新文件监听失败: {}", e);
-        }
-        Ok(())
+        // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）。
+        // 刷新失败**不阻塞保存**（配置已经落库，监听下次项目级启停时会自然重建），
+        // 但也不吞掉结论——如实回传给界面，让它提示"已保存，但监听未生效"（CQ-35）
+        let (watch_refreshed, watch_error) =
+            match crate::commands::watcher::refresh_service_watch(app.clone(), &state, &project_id, &params.id) {
+                Ok(()) => (true, String::new()),
+                Err(e) => {
+                    log::warn!("更新服务后刷新文件监听失败: {}", e);
+                    (false, e)
+                }
+            };
+        Ok(UpdateServiceResult { watch_refreshed, watch_error })
     }).await.map_err(|e| format!("更新服务任务失败: {}", e))?
 }
 
@@ -287,9 +306,17 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
     if id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        // 1. 查所属项目（文件监听以项目为维度；服务不存在时容忍跳过监听清理）
+        // 1. 查所属项目（文件监听以项目为维度；服务不存在时容忍跳过监听清理）。
+        // **"没有这一行"与"查询本身失败"必须分开**（CQ-31）：原实现用 `.ok()` 把两者都
+        // 变成一个 None，于是查库故障时第 4 步的监听清理被整个跳过——监听线程仍在，
+        // 之后会对一个已删除的服务弹「需要重启 X」，用户点了必然失败，而日志里没有线索
+        // （同函数另两处失败都有 warn）。故障就上报，让用户重试一次即可，别留下孤儿监听。
         let project_id: Option<String> = state.db.with_conn(|conn| {
-            Ok(conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get(0)).ok())
+            match conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get::<_, String>(0)) {
+                Ok(pid) => Ok(Some(pid)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("查询服务所属项目失败: {}", e)),
+            }
         })?;
         // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）。
         // 失败留痕（同 delete_project）：静默丢弃会留下仍在跑的孤儿进程，而服务记录已删、
@@ -375,9 +402,19 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
         let en = if enabled { 1 } else { 0 };
         let sft = if show_file_tree { 1 } else { 0 };
         conn.execute(
-            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)",
-            rusqlite::params![id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, en, sft, tool_commands, open_tool_id],
+            &format!(
+                "INSERT INTO service_templates ({}) VALUES ({})",
+                crate::database::SERVICE_TEMPLATE_COLUMNS,
+                crate::database::named_placeholders(crate::database::SERVICE_TEMPLATE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":id": id, ":name": name, ":command": command, ":cwd": cwd,
+                ":watch_paths": watch_paths, ":watch_include": watch_include,
+                ":watch_exclude": watch_exclude, ":env_vars": env_vars,
+                ":restart_mode": restart_mode, ":enabled": en, ":show_file_tree": sft,
+                // 「另存为模板」固定落 0（模板库「新建」接在末尾，见那里的说明）
+                ":sort_index": 0, ":tool_commands": tool_commands, ":open_tool_id": open_tool_id,
+            },
         ).map_err(|e| format!("保存模板失败: {}", e))?;
         // 回读真实创建时间（原实现返回空串，与查询接口的返回不一致）
         let created_at: String = conn
@@ -625,11 +662,19 @@ pub fn create_service_template(
             .query_row("SELECT COALESCE(MAX(sort_index), -1) + 1 FROM service_templates", [], |r| r.get(0))
             .unwrap_or(0);
         conn.execute(
-            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            rusqlite::params![id, name, params.command, cwd, params.watch_paths, watch_include,
-                watch_exclude, params.env_vars, params.restart_mode, en, sft, next_sort,
-                tool_commands, params.open_tool_id],
+            &format!(
+                "INSERT INTO service_templates ({}) VALUES ({})",
+                crate::database::SERVICE_TEMPLATE_COLUMNS,
+                crate::database::named_placeholders(crate::database::SERVICE_TEMPLATE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":id": id, ":name": name, ":command": params.command, ":cwd": cwd,
+                ":watch_paths": params.watch_paths, ":watch_include": watch_include,
+                ":watch_exclude": watch_exclude, ":env_vars": params.env_vars,
+                ":restart_mode": params.restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":sort_index": next_sort, ":tool_commands": tool_commands,
+                ":open_tool_id": params.open_tool_id,
+            },
         ).map_err(|e| format!("新建模板失败: {}", e))?;
         let created_at: String = conn
             .query_row("SELECT created_at FROM service_templates WHERE id=?1", [&id], |r| r.get(0))
@@ -718,6 +763,11 @@ pub struct ImportTemplatesResult {
 }
 
 /// 导出模板到 JSON 文件。`ids` 为空 = 导出全部；否则只导出指定模板
+///
+/// **写入路径要过收口**（SEC-19，与 `write_file` 同一套）：`path` 来自 IPC，
+/// 原实现直接 `std::fs::write` ——任意路径覆盖写，且写入内容里有攻击者可控的字符串。
+/// 用户挑位置这一步走 `pick_save_file`（Rust 侧弹框，选中的目录当场进 `confirmed_dirs`），
+/// 于是"导出到桌面/文档"照常可用，而凭空指定 `C:/Windows/...` 会被拒。
 #[tauri::command]
 pub fn export_service_templates(
     state: State<AppState>,
@@ -727,13 +777,35 @@ pub fn export_service_templates(
     let target = path.trim();
     if target.is_empty() { return Err("导出路径不能为空".into()); }
 
+    // 与写文件同口径的两道闸：① 路径级校验（目标不存在时按父目录校验，支持新建文件）；
+    // ② 句柄级复核（SEC-4）——校验与写入之间，项目内的并发构建可以把末段换成目录联接
+    state.paths.check_write_path_allowed(&state.db, target)?;
+    let resolved: std::path::PathBuf = {
+        let exists = std::path::Path::new(target).exists();
+        match state.paths.open_verified_file(&state.db, target) {
+            Ok((_f, real)) => real,
+            Err(e) => {
+                if exists {
+                    return Err(e); // 存在但复核不通过：拒绝，不当作"新建"
+                }
+                let p = std::path::Path::new(target);
+                let parent = p.parent().ok_or_else(|| "访问被拒绝".to_string())?;
+                let name = p.file_name().ok_or_else(|| "访问被拒绝".to_string())?;
+                let (_d, real_parent) = state
+                    .paths
+                    .open_verified_dir(&state.db, &parent.to_string_lossy())?;
+                real_parent.join(name)
+            }
+        }
+    };
+
     let picked = state.db.with_conn(|conn| collect_export_templates(conn, &ids))?;
     if picked.is_empty() { return Err("没有可导出的模板".into()); }
     let count = picked.len();
 
     let payload = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: picked };
     let json = serde_json::to_string_pretty(&payload).map_err(|e| format!("生成导出内容失败: {}", e))?;
-    std::fs::write(target, json).map_err(|e| format!("写入文件失败: {}", e))?;
+    std::fs::write(&resolved, json).map_err(|e| format!("写入文件失败: {}", e))?;
     Ok(count)
 }
 
@@ -780,10 +852,14 @@ fn collect_export_templates(
 
 /// 从 JSON 文件导入模板。
 ///
-/// **不做目录收口**（与 create/update 不同）：导入的是别人机器上的配置，其 cwd 在本机
-/// 多半不存在，收口会让整个导入失败。收口留给真正用到目录的那一步——
-/// `add_service_from_template` 已经在对模板值做白名单校验（那里的注释也写明"模板可能是
-/// 从别处导入或被写坏的"），所以未收口的模板不会被真的用起来。
+/// **cwd 收口**（P0-5）：导入的 cwd 若在本机**存在**，必须与 create/update 走同一道闸；
+/// 本机不存在的照旧留着（导入的是别人机器上的配置，收口会让正常导入失败），并记进
+/// `missing_dirs` 提醒用户——那类路径不会成为白名单根，`allowed_roots` 对 canonicalize
+/// 失败的根一律丢弃。
+///
+/// 原实现写着"不做目录收口……未收口的模板不会被真的用起来"，那句推理不成立：
+/// `service_templates.cwd` 本身就是文件白名单的根来源（`paths.rs` 的三表 UNION），
+/// 模板**不需要被用起来**就已经扩大了可读写范围。四个模板写入口里只有导入这条漏了。
 #[tauri::command]
 pub fn import_service_templates(
     state: State<AppState>,
@@ -798,13 +874,15 @@ pub fn import_service_templates(
         return Err(format!("导出文件版本 {} 不受支持（当前支持 {}）", file.version, TEMPLATE_EXPORT_VERSION));
     }
 
-    state.db.with_conn_mut(|conn| import_templates_into(conn, &file))
+    // `paths` 传进去而不是在事务里取：收口要用 confirmed_dirs（会话内确认过的目录）
+    state.db.with_conn_mut(|conn| import_templates_into(conn, &file, &state.paths))
 }
 
 /// 导入的核心逻辑（与命令分开：命令只管读文件与解析，这里拿得到连接、可单测）
 fn import_templates_into(
     conn: &mut rusqlite::Connection,
     file: &TemplateExportFile,
+    paths: &crate::commands::paths::PathAllowlist,
 ) -> Result<ImportTemplatesResult, String> {
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
     let mut imported = 0usize;
@@ -842,8 +920,19 @@ fn import_templates_into(
         };
 
         let cwd = t.cwd.replace('\\', "/");
-        if !cwd.trim().is_empty() && !std::path::Path::new(cwd.trim()).is_dir() {
-            missing_dirs.push(name.clone());
+        let cwd_trim = cwd.trim();
+        if !cwd_trim.is_empty() {
+            if !std::path::Path::new(cwd_trim).is_dir() {
+                // 本机没这个目录：留着，只记一笔（用户随后可以自己改成自己的路径）
+                missing_dirs.push(name.clone());
+            } else {
+                // 存在的目录 = 一个**即将进入白名单的根**，必须与 create/update 同一套收口。
+                // 放在事务里校验（用同一个连接）是为了不让"整批一个事务"的语义出现缺口：
+                // 拒绝时整个导入失败，库里不会留下半截模板
+                paths
+                    .ensure_config_dir_allowed_with_conn(&tx, cwd_trim, "工作目录")
+                    .map_err(|e| format!("模板「{}」的工作目录无法导入：{}", name, e))?;
+            }
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -854,10 +943,18 @@ fn import_templates_into(
             .query_row("SELECT COALESCE(MAX(sort_index), -1) + 1 FROM service_templates", [], |r| r.get(0))
             .unwrap_or(0);
         tx.execute(
-            "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            rusqlite::params![id, name, t.command, cwd, t.watch_paths, t.watch_include, t.watch_exclude,
-                t.env_vars, t.restart_mode, en, sft, next_sort, tool_commands, tool_id],
+            &format!(
+                "INSERT INTO service_templates ({}) VALUES ({})",
+                crate::database::SERVICE_TEMPLATE_COLUMNS,
+                crate::database::named_placeholders(crate::database::SERVICE_TEMPLATE_COLUMNS),
+            ),
+            rusqlite::named_params! {
+                ":id": id, ":name": name, ":command": t.command, ":cwd": cwd,
+                ":watch_paths": t.watch_paths, ":watch_include": t.watch_include,
+                ":watch_exclude": t.watch_exclude, ":env_vars": t.env_vars,
+                ":restart_mode": t.restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":sort_index": next_sort, ":tool_commands": tool_commands, ":open_tool_id": tool_id,
+            },
         ).map_err(|e| format!("导入模板失败: {}", e))?;
         imported += 1;
     }
@@ -869,6 +966,7 @@ fn import_templates_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::paths::PathAllowlist;
     use crate::database::{init_schema, Database};
 
     /// 内存库 + 一个项目行（ARCH-4：这几条 SQL 路径此前零测试）
@@ -963,7 +1061,7 @@ mod tests {
         let back: TemplateExportFile = serde_json::from_str(&json).expect("反序列化导出文件");
 
         // 导入回同一个库：名字会撞上源模板 → 照收、不改名，只在结果里报"有同名"
-        let res = db.with_conn_mut(|c| import_templates_into(c, &back)).expect("导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &back, &PathAllowlist::new())).expect("导入");
         assert_eq!(res.imported, 1);
         assert_eq!(res.duplicated, 1, "同名只统计、不改名");
         assert!(res.missing_tools.is_empty(), "没绑工具就不该报缺失");
@@ -1006,7 +1104,7 @@ mod tests {
             ],
         };
 
-        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("导入");
         assert_eq!(res.imported, 3);
         assert_eq!(res.duplicated, 1, "只有与 T 撞名的那条被统计");
         assert_eq!(res.missing_tools, vec!["不存在的工具".to_string()]);
@@ -1063,7 +1161,7 @@ mod tests {
         // 读回并导入（导回同一个库，必然同名 → 走改名分支）
         let raw = std::fs::read_to_string(&file).expect("读文件");
         let back: TemplateExportFile = serde_json::from_str(&raw).expect("反序列化");
-        let res = db.with_conn_mut(|c| import_templates_into(c, &back)).expect("导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &back, &PathAllowlist::new())).expect("导入");
         assert_eq!(res.imported, 1);
         assert_eq!(res.duplicated, 1, "导回同一个库必然同名 → 只统计不改名");
         assert!(res.missing_dirs.is_empty(), "cwd 为空不算缺失目录");
@@ -1082,7 +1180,7 @@ mod tests {
             version: TEMPLATE_EXPORT_VERSION,
             templates: vec![exported("前端", ""), exported("后端", ""), exported("redis", "")],
         };
-        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("导入");
         assert_eq!(res.imported, 3);
         assert_eq!(res.duplicated, 0, "没有同名就没有可报的冲突");
 
@@ -1109,7 +1207,7 @@ mod tests {
             version: TEMPLATE_EXPORT_VERSION,
             templates: vec![exported("前端", ""), exported("前端", ""), exported("前端", "")],
         };
-        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("导入");
         assert_eq!(res.imported, 3);
         assert_eq!(res.duplicated, 2, "第 2、3 条与刚落库的第 1 条同名");
 
@@ -1136,8 +1234,8 @@ mod tests {
             version: TEMPLATE_EXPORT_VERSION,
             templates: vec![exported("同一个模板", "")],
         };
-        db.with_conn_mut(|c| import_templates_into(c, &file)).expect("第一次导入");
-        let res = db.with_conn_mut(|c| import_templates_into(c, &file)).expect("第二次导入");
+        db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("第一次导入");
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("第二次导入");
         assert_eq!(res.imported, 1);
         assert_eq!(res.duplicated, 1, "第二次与第一次同名 → 统计但不改名");
 
@@ -1149,6 +1247,60 @@ mod tests {
             assert_eq!(names, vec!["同一个模板".to_string(), "同一个模板".to_string()]);
             Ok(())
         }).expect("校验");
+    }
+
+    /// P0-5：导入的 cwd 若在本机**存在**，必须与 create/update 同一套收口。
+    ///
+    /// 修复前的症状：一个 JSON（`{"version":1,"templates":[{"name":"x","command":"y","cwd":"D:/"}]}`）
+    /// 就能把任意已存在目录写进 `service_templates.cwd`，而它是文件读写白名单的**根来源**
+    /// （`paths.rs` 的三表 UNION）——模板根本不需要被"用起来"就已经扩大了可读写范围。
+    #[test]
+    fn test_import_rejects_existing_cwd_outside_allowlist() {
+        let db = test_db();
+        // 一个真实存在、但不在任何已登记目录之下的目录
+        let outside = std::env::temp_dir().join(format!("nexus_ut_import_{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("建临时目录");
+
+        let mut t = exported("投毒模板", "");
+        t.cwd = outside.to_string_lossy().to_string();
+        let file = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: vec![t] };
+
+        let err = match db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())) {
+            Err(e) => e,
+            Ok(r) => panic!("白名单外的已存在目录必须拒绝，实际导入了 {} 条", r.imported),
+        };
+        assert!(err.contains("投毒模板"), "错误要说清是哪个模板: {}", err);
+
+        // 整批拒绝：事务里不能留下半截数据（否则"报错了但库里多了一条"更难查）
+        let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM service_templates", [], |r| r.get(0)).unwrap())).unwrap();
+        assert_eq!(n, 0, "被拒绝的导入不能留下任何模板行");
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// 正面控制：**已登记目录内**的已存在 cwd 照常导入。
+    /// 没有这条，上面的收口可以靠"一律拒绝"通过——那会把正常导入一起打死。
+    #[test]
+    fn test_import_accepts_existing_cwd_inside_registered_dir() {
+        let db = test_db();
+        let project_dir = std::env::temp_dir().join(format!("nexus_ut_proj_{}", std::process::id()));
+        let cwd = project_dir.join("sub");
+        std::fs::create_dir_all(&cwd).expect("建项目子目录");
+        // 把已存在的这个目录登记为项目目录（历史配置视为已授权）
+        let path = project_dir.to_string_lossy().replace('\\', "/");
+        db.with_conn(|c| {
+            c.execute("UPDATE projects SET path=?1 WHERE id='p1'", [&path]).map_err(|e| e.to_string())
+        }).expect("登记项目目录");
+
+        let mut t = exported("正常模板", "");
+        t.cwd = cwd.to_string_lossy().replace('\\', "/");
+        let file = TemplateExportFile { version: TEMPLATE_EXPORT_VERSION, templates: vec![t] };
+
+        let res = db.with_conn_mut(|c| import_templates_into(c, &file, &PathAllowlist::new())).expect("导入应成功");
+        assert_eq!(res.imported, 1);
+        assert!(res.missing_dirs.is_empty(), "目录存在就不该报缺失");
+
+        let _ = std::fs::remove_dir_all(&project_dir);
     }
 
     #[test]

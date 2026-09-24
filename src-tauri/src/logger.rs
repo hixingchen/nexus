@@ -18,6 +18,8 @@ struct FileSink {
     file: File,
     written: u64,
     path: PathBuf,
+    /// 轮转是否已经失败过（失败后不再重试，见 `rotate`）
+    rotate_blocked: bool,
 }
 
 impl FileSink {
@@ -36,7 +38,7 @@ impl FileSink {
             }
         };
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Some(Self { file, written, path })
+        Some(Self { file, written, path, rotate_blocked: false })
     }
 
     fn write_line(&mut self, line_with_newline: &str) {
@@ -50,10 +52,22 @@ impl FileSink {
         }
     }
 
-    /// 轮转：当前文件改名为 `nexus.log.1`（覆盖旧的那份），再重开空文件
+    /// 轮转：当前文件改名为 `nexus.log.1`（覆盖旧的那份），再重开空文件。
+    ///
+    /// **rename 失败就不能把 `written` 清零**（CQ-32）：原实现无条件归零，而那时文件其实
+    /// 是继续追加的——计数归零等于把这个 5MB 上限按失败次数成倍放大（`nexus.log.1` 被以
+    /// 拒绝共享的方式打开、或目录 ACL 只读都会走到这里），而打包版唯一的诊断通道就是这个
+    /// 文件。失败还得说话：重开失败会 eprintln，rename 失败此前完全静默，两条路不一致。
     fn rotate(&mut self) {
+        if self.rotate_blocked {
+            return; // 已失败过：不再每写一行就重试一次（否则 stderr 会被刷屏）
+        }
         let rotated = self.path.with_file_name("nexus.log.1");
-        let _ = std::fs::rename(&self.path, &rotated);
+        if let Err(e) = std::fs::rename(&self.path, &rotated) {
+            self.rotate_blocked = true;
+            eprintln!("[nexus] 日志轮转失败（本次运行内不再重试，日志将继续增长）: {}", e);
+            return;
+        }
         match OpenOptions::new().create(true).append(true).open(&self.path) {
             Ok(f) => {
                 self.file = f;
@@ -112,17 +126,23 @@ pub fn init() {
 mod tests {
     use super::*;
 
+    /// 测试用的 sink：字段列表只写在这里，加字段时不必逐个用例改
+    fn test_sink(path: &std::path::Path, written: u64) -> FileSink {
+        FileSink {
+            file: OpenOptions::new().create(true).append(true).open(path).unwrap(),
+            written,
+            path: path.to_path_buf(),
+            rotate_blocked: false,
+        }
+    }
+
     #[test]
     fn test_rotate_moves_file_and_reopens() {
         let dir = std::env::temp_dir().join(format!("nexus-logger-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nexus.log");
         std::fs::write(&path, "old\n").unwrap();
-        let mut sink = FileSink {
-            file: OpenOptions::new().create(true).append(true).open(&path).unwrap(),
-            written: 4,
-            path: path.clone(),
-        };
+        let mut sink = test_sink(&path, 4);
         sink.rotate();
         assert!(dir.join("nexus.log.1").exists(), "旧文件应被轮转为 nexus.log.1");
         assert!(path.exists(), "轮转后应重开新的 nexus.log");
@@ -135,16 +155,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nexus-logger-w-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nexus.log");
-        let mut sink = FileSink {
-            file: OpenOptions::new().create(true).append(true).open(&path).unwrap(),
-            written: 0,
-            path: path.clone(),
-        };
+        let mut sink = test_sink(&path, 0);
         // 约定：调用方把换行拼进字符串，写入只做一次系统调用
         sink.write_line("hello\n");
         sink.write_line("world\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
         assert_eq!(sink.written, 12, "字节计数应包含换行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CQ-32：轮转**失败**时不能把字节计数清零，也不能一声不吭。
+    ///
+    /// 旧实现 `let _ = std::fs::rename(...)` 之后无条件 `written = 0`，而那一刻文件其实是
+    /// **继续追加**的——于是每失败一次，5MB 的上限就重新攒一遍，实际能长到多少全看失败次数，
+    /// 而打包版唯一的诊断通道就是这个文件（README 承诺的上限因此不成立）。
+    #[test]
+    fn test_rotate_failure_keeps_byte_counter_and_marks_blocked() {
+        let dir = std::env::temp_dir().join(format!("nexus-logger-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nexus.log");
+        std::fs::write(&path, "old\n").unwrap();
+        // 占住 nexus.log.1 这个名字：用一个同名**目录**，rename 到已存在的目录必然失败
+        std::fs::create_dir_all(dir.join("nexus.log.1")).unwrap();
+
+        let mut sink = test_sink(&path, MAX_LOG_BYTES);
+        sink.write_line("more\n");
+
+        assert!(sink.rotate_blocked, "失败要标记：否则每写一行都去 rename 一次并刷屏 stderr");
+        assert!(
+            sink.written > MAX_LOG_BYTES,
+            "笔数要继续累计（实际写入 {} 字节）——清零等于把上限成倍放大",
+            sink.written,
+        );
+        assert!(path.exists(), "轮转失败后仍在写原文件");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

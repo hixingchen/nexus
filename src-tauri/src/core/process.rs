@@ -941,7 +941,15 @@ impl ProcessManager {
 
         #[cfg(windows)]
         if let Some(ref job) = self.job {
-            job.assign_child(&child);
+            // 纳管失败**必须让用户看见**（CQ-27）：它只在"Nexus 被强杀/崩溃"时才有后果
+            // （该服务的进程会残留），而那正是用户最需要线索的时刻——只写进 nexus.log
+            // 等于没有。这里写进服务自己的日志缓冲，日志面板里直接看得到
+            if let Err(e) = job.assign_child(&child) {
+                self.append_system_line(key, format!(
+                    "⚠ 未能纳入 Job Object：{} —— Nexus 异常退出（崩溃/被杀）时该服务的进程可能残留，正常退出不受影响",
+                    e
+                ));
+            }
         }
 
         let pid = child.id();
@@ -1070,11 +1078,12 @@ impl ProcessManager {
         };
 
         // Phase 2: 在锁外执行清理
-        if let Some(entry) = entry {
-            cleanup_process(entry);
+        let outcome = if let Some(entry) = entry {
+            cleanup_process(entry)
         } else {
             log::debug!("[nexus] stop: 服务 {} 未在运行，忽略", key);
-        }
+            CleanupOutcome::default()
+        };
         // 主动停止 = 正常关闭：无论进程是否还在管理表（崩溃的服务已被 running() 移出），
         // 都清除失败标记并清空日志（含失败日志）——项目"全部停止"依赖此语义
         if let Ok(mut failed) = self.failed.lock() {
@@ -1083,6 +1092,12 @@ impl ProcessManager {
         if let Ok(mut buffers) = self.log_buffers.lock() {
             let log_key: LogKey = Arc::from(key);
             buffers.remove(&*log_key);
+        }
+        // **收尸没干净就如实上报**（CQ-25）：表项此时已经被摘掉，`get_running()` 会报它
+        // "未运行"，界面显示已停止，而进程仍在跑并占着端口。上层（stop_project_services /
+        // delete_service）本来就是按"可能失败"写的，这条 Err 才是那些分支的第一个真实来源
+        if !outcome.is_clean() {
+            return Err(format!("停止未完成：{}", outcome.describe()));
         }
         Ok(())
     }
@@ -1095,7 +1110,12 @@ impl ProcessManager {
     pub fn restart(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
         let lock = self.lifecycle_lock(spec.service_id);
         let _guard = lock_lifecycle(&lock, spec.service_id);
-        self.stop_locked(spec.service_id)?;
+        // 旧进程没确认退出**不阻塞重启**（CQ-25）：用户的诉求是"把它跑起来"，而新进程
+        // 起不来时后端会如实报端口/启动错误——那比"重启被拒绝"更接近用户意图。
+        // 但要留痕：这说明旧进程可能还占着端口
+        if let Err(e) = self.stop_locked(spec.service_id) {
+            log::warn!("[nexus] 重启前停止旧进程未完全成功，继续尝试启动: {}", e);
+        }
         self.start_locked(spec)
     }
 
@@ -1433,9 +1453,14 @@ impl ProcessManager {
         }
 
         // Phase 3（锁外）：收尸已退出进程（已退出的进程不再 taskkill）。
-        // 日志缓冲保留（Phase 2.5 已追加退出标记行）：崩溃/秒退的报错是诊断关键
+        // 日志缓冲保留（Phase 2.5 已追加退出标记行）：崩溃/秒退的报错是诊断关键。
+        // 这一支是"进程已经退出"才走到这里的，理论上收尸必然干净；不干净时留痕
+        // （通常意味着 pid 刚被复用，或还有没杀掉的游离后代）
         for entry in dead {
-            cleanup_process(entry);
+            let outcome = cleanup_process(entry);
+            if !outcome.is_clean() {
+                log::warn!("[nexus] 收尸未完全干净: {}", outcome.describe());
+            }
         }
 
         // Phase 4: 重新获取锁返回当前运行中的 (project_id, service_id)
@@ -1465,8 +1490,15 @@ impl ProcessManager {
 
         for entry in entries {
             let (key, pid) = (entry.key.clone(), entry.pid);
-            cleanup_process(entry);
-            log::debug!("[nexus]   已清理 {} (pid={})", key, pid);
+            let outcome = cleanup_process(entry);
+            // 退出路径没有"失败上报"的接收方（进程马上要结束），但仍要留痕：
+            // 残留进程会由 Job Object 在应用退出时兜底，而日志是唯一能解释
+            // "为什么退出后 taskmgr 里还有 java.exe"的地方
+            if !outcome.is_clean() {
+                log::warn!("[nexus]   清理 {} (pid={}) 未完全成功: {}", key, pid, outcome.describe());
+            } else {
+                log::debug!("[nexus]   已清理 {} (pid={})", key, pid);
+            }
         }
 
         if let Ok(mut buffers) = self.log_buffers.lock() {
@@ -1569,7 +1601,10 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {
 /// 应用退出时兜底，这里只保证句柄一定被 `wait` 回收一次。
 pub(crate) fn kill_and_reap(child: &mut Child, timeout: Duration) {
     let pid = child.id();
-    kill_process_tree(pid);
+    // 失败留痕（CQ-25）：这里没有接收方（早退/超时路径），但"没杀掉"必须能在日志里看见
+    if let Err(e) = kill_process_tree(pid) {
+        log::warn!("[nexus] 终止进程树失败 (pid={}): {}", pid, e);
+    }
     if wait_with_timeout(child, timeout) {
         let _ = child.wait();
     } else {
@@ -1664,7 +1699,57 @@ fn adopt_survivors(pid: u32, started_at: u64) -> Vec<AdoptedChild> {
 /// 注意：等待 reader 线程用 recv_timeout 而非 join——进程树未全灭时
 /// （taskkill 失败、或孙进程仍持有管道写端）EOF 永不发生，join 会无限阻塞
 /// 同步命令的主线程（stop/get_running 全部卡死、窗口关不掉）。
-fn cleanup_process(entry: CleanupEntry) {
+/// 一次收尸的结果。
+///
+/// 为什么要有返回值（CQ-25）：上层本来就是**按"stop 可能失败"写的**——
+/// `stop_project_services` 逐个收集失败、`delete_service`/`delete_project` 都留痕，
+/// 而这里此前连返回值都没有、`stop_locked` 只有一个 `Ok(())` 出口，那些 Err 分支
+/// **结构性不可达**。真实后果：taskkill 失败或进程 2 秒内没死时，表项已被摘掉，
+/// `get_running()` 于是报它"未运行"，界面显示已停止，而进程仍在跑并占着端口。
+///
+/// 判据是**复核存活**而不是 taskkill 的退出码：进程不存在时 taskkill 也返回非零，
+/// 而那正是"已经收干净了"。
+#[derive(Default)]
+pub(crate) struct CleanupOutcome {
+    /// 收尸结束时仍存活的 pid（有它 = 这次停止没生效）
+    survivors: Vec<u32>,
+    /// taskkill 的失败原文（诊断上下文；它本身不等于收尸失败）
+    errors: Vec<String>,
+}
+
+impl CleanupOutcome {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.survivors.is_empty()
+    }
+
+    /// 给人看的原因（错误信息里带上，界面与日志都能说清"为什么说没停掉"）
+    pub(crate) fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.survivors.is_empty() {
+            parts.push(format!(
+                "仍有 {} 个进程未退出（{:?}）——可能正在退出中，或被安全软件拦截了终止",
+                self.survivors.len(),
+                self.survivors
+            ));
+        }
+        parts.extend(self.errors.iter().cloned());
+        parts.join("；")
+    }
+}
+
+/// 收尸后复核一批 pid 是否真的没了。
+///
+/// 用 `OwnedProcess::open` 拿到句柄再判存活（而不是 `process_start_time_millis`）：
+/// 句柄身份不受 pid 复用影响，这里刚杀完就复用的概率虽低，但"误报已退出"正是
+/// 本项目最忌讳的错误方向。
+fn survivors_of(pids: &[u32]) -> Vec<u32> {
+    pids.iter()
+        .copied()
+        .filter(|pid| super::winproc::OwnedProcess::open(*pid).map(|h| h.is_alive()).unwrap_or(false))
+        .collect()
+}
+
+fn cleanup_process(entry: CleanupEntry) -> CleanupOutcome {
     let CleanupEntry { key: _key, pid, started_at, mut child, adopted, follow, done_stdout, done_stderr, stop_flag } = entry;
     // 先置停止标志：reader 线程立刻停止写缓冲与 emit。
     // 否则进程树未杀净（孙进程持管道）时旧线程会继续往同一个 key 写日志——
@@ -1682,19 +1767,27 @@ fn cleanup_process(entry: CleanupEntry) {
     }
     // 认领到的游离进程：父进程（cmd）早已退出，它们不在任何人的进程树下，
     // 必须按 pid 单独结束 —— 漏掉就是"点了停止，Tomcat 还在后台跑"
+    let mut outcome = CleanupOutcome::default();
+    let mut kill = |pid: u32, what: &str| {
+        if let Err(e) = kill_process_tree(pid) {
+            log::warn!("[nexus] 结束{}失败 (pid={}): {}", what, pid, e);
+            outcome.errors.push(e);
+        }
+    };
     for a in &adopted {
         log::info!("[nexus] 结束接管进程 {} (pid={})", a.name, a.pid);
-        kill_process_tree(a.pid);
+        kill(a.pid, "接管进程");
     }
     let alive = matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
     if alive {
-        kill_process_tree(pid);
+        kill(pid, "子进程");
     }
     // 还活着的直接子进程名下，可能已经有"另开窗口"跑出去的后代（此刻它们尚未被认领，
     // 或刚被认领前就被 stop 撞上）。一并收掉，避免留下占端口的孤儿。
-    for orphan in candidate_descendants(pid, started_at) {
+    let orphans = candidate_descendants(pid, started_at);
+    for orphan in &orphans {
         log::info!("[nexus] 结束游离孙进程 (pid={})", orphan);
-        kill_process_tree(orphan);
+        kill(*orphan, "游离孙进程");
     }
     let exited = match child.as_mut() {
         Some(c) => wait_with_timeout(c, Duration::from_millis(2000)),
@@ -1715,8 +1808,18 @@ fn cleanup_process(entry: CleanupEntry) {
         }
         None => {}
     }
+    // **复核存活**：直接子进程、接管进程、游离孙进程都再问一遍（用句柄，不受 pid 复用影响）。
+    // 这一步才是"stop 到底成没成"的判据——taskkill 退出码非零可能只是进程本来就不存在
+    // （那正是"已经收干净了"），而一个安静的 taskkill 也可能什么都没杀成（CQ-25）
+    if !exited {
+        outcome.survivors.push(pid);
+    }
+    let mut watch: Vec<u32> = adopted.iter().map(|a| a.pid).collect();
+    watch.extend(orphans.iter().copied());
+    outcome.survivors.extend(survivors_of(&watch));
     // 认领到的句柄随 `adopted` 在这里 drop（CloseHandle）——进程对象随之释放，
     // 不留句柄泄漏
+    outcome
 }
 
 /// 进程启动时间（毫秒，距 UNIX 纪元）；进程不存在/无权限时返回 None。
@@ -1781,38 +1884,47 @@ pub(crate) fn process_start_time_millis(_pid: u32) -> Option<u64> {
 }
 
 /// 终止进程树（taskkill /T /F）。工具命令超时等场景也需要，故设为 pub(crate)
-pub(crate) fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        match Command::new("taskkill")
+        let child = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             // 跳过"当前目录优先"搜索（SEC-14，与 `build_internal_command` 同口径）：
             // taskkill 是我们自己拉起的系统工具、不承载用户 shell，关掉这一级没有副作用，
             // 却能避免"CWD 恰好是一个不可信仓库"时执行到那里预置的 taskkill.exe
             .env("NoDefaultCurrentDirectoryInExePath", "1")
-            .stdout(Stdio::null()).stderr(Stdio::null())
+            // stderr **留管道**：原实现是 `Stdio::null()`，于是"拒绝访问/进程不存在/被安全
+            // 软件拦截"全都拿不到，只剩一句"未按时退出"（CQ-25）。失败要说得清原因
+            .stdout(Stdio::null()).stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-        {
-            Ok(mut child) => {
-                if let Err(e) = child.wait() {
-                    log::error!("[nexus] taskkill wait 失败 (pid={}): {}", pid, e);
-                }
-            }
-            Err(e) => {
-                log::error!("[nexus] taskkill spawn 失败 (pid={}): {}", pid, e);
-            }
+            .map_err(|e| format!("启动 taskkill 失败 (pid={}): {}", pid, e))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("等待 taskkill 失败 (pid={}): {}", pid, e))?;
+        if !out.status.success() {
+            // 注意：进程本来就不存在时 taskkill 也返回非零。**这不代表收尸失败**——
+            // 判"有没有收干净"的是调用方对存活状态的复核（见 `CleanupOutcome`），
+            // 这里的返回值只用于把原因带到错误信息里
+            return Err(format!(
+                "taskkill 退出码 {:?} (pid={}): {}",
+                out.status.code(),
+                pid,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
+        Ok(())
     }
     #[cfg(unix)]
     {
+        let mut first_err: Option<String> = None;
         match Command::new("kill").args(["-TERM", &format!("-{}", pid)])
             .stdout(Stdio::null()).stderr(Stdio::null())
             .spawn()
         {
             Ok(mut child) => { let _ = child.wait(); }
-            Err(e) => { log::error!("[nexus] kill -TERM 失败 (pid={}): {}", pid, e); }
+            Err(e) => first_err = Some(format!("kill -TERM 失败 (pid={}): {}", pid, e)),
         }
         std::thread::sleep(Duration::from_millis(300));
         match Command::new("kill").args(["-KILL", &format!("-{}", pid)])
@@ -1820,8 +1932,15 @@ pub(crate) fn kill_process_tree(pid: u32) {
             .spawn()
         {
             Ok(mut child) => { let _ = child.wait(); }
-            Err(e) => { log::error!("[nexus] kill -KILL 失败 (pid={}): {}", pid, e); }
+            Err(e) => {
+                return Err(match first_err {
+                    Some(prev) => format!("{}；kill -KILL 失败 (pid={}): {}", prev, pid, e),
+                    None => format!("kill -KILL 失败 (pid={}): {}", pid, e),
+                })
+            }
         }
+        if let Some(e) = first_err { log::warn!("[nexus] {}", e); }
+        Ok(())
     }
 }
 
@@ -2068,7 +2187,8 @@ mod tests {
     #[test]
     fn test_kill_process_tree_invalid_pid() {
         // 测试无效 PID 不会 panic
-        kill_process_tree(999999999);
+        // 不存在的 pid：taskkill 会返回非零，这条用例只要求不 panic（返回值这里不关心）
+        let _ = kill_process_tree(999999999);
     }
 
     // ── prepare_log_text（无 ANSI 走快路径 / 刷新帧补前缀 / 超长截断）────
@@ -2672,7 +2792,7 @@ mod tests {
         // 收尾：认领到的句柄随 drop 关闭，进程按 pid 结束
         let pids: Vec<u32> = found.iter().map(|a| a.pid).collect();
         drop(found);
-        for pid in pids { kill_process_tree(pid); }
+        for pid in pids { let _ = kill_process_tree(pid); }
         let _ = parent.kill();
         let _ = parent.wait();
     }

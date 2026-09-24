@@ -16,8 +16,43 @@ fn db_path() -> Result<PathBuf, String> {
 
 pub struct Database {
     pub conn: Mutex<Connection>,
-    /// 最近一次取到连接锁的线程标识（0 = 未记录）。仅供 `lock_conn` 的同线程重入检测使用。
+    /// **此刻**持连接锁的线程标识（0 = 没人持锁）。仅供 `lock_conn` 的同线程重入检测使用。
+    ///
+    /// 由 `ConnGuard` 随守卫写入与清零；"最近一次取到锁的是谁"那种语义会误判（CQ-26）。
     conn_owner: std::sync::atomic::AtomicU64,
+}
+
+/// 连接守卫：让 `conn_owner` 的含义收敛为"**此刻**谁持锁"。
+///
+/// 为什么必须在释放前清零、而不是只在取锁时写一次（CQ-26）：写一次表达的是"最近一次取到锁
+/// 的是谁"，于是 ① 另一个线程经 WouldBlock 分支拿到锁后 owner 仍是上一个持有者，后者下次
+/// `try_lock` 失败会被误判成"同线程重入"而 panic（它根本没持锁，也不存在死锁）；② 线程 B
+/// 经 WouldBlock 持锁期间若真的重入，owner 不等于 B → **不 panic，直接永久阻塞**——
+/// 检测器唯一的用途恰好漏掉。清零与解锁的顺序也不能反：先解锁再清零会留下"锁已空闲、
+/// owner 还写着上一个线程"的窗口，那正是本类型要消灭的误判。
+struct ConnGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Connection>,
+    owner: &'a std::sync::atomic::AtomicU64,
+    /// 自己的线程标识：Drop 时只在"owner 确实还是我"时清零（理论上恒真，
+    /// 但万一有别的写入点，宁可留着上一个值也不要抹掉别人的）
+    key: u64,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ = self.owner.compare_exchange(self.key, 0, Ordering::Relaxed, Ordering::Relaxed);
+        // 到这里仍持锁（guard 字段在 Drop::drop 之后才被丢弃）→ 清零与解锁是原子的
+    }
+}
+
+impl std::ops::Deref for ConnGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { &self.guard }
+}
+
+impl std::ops::DerefMut for ConnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection { &mut self.guard }
 }
 
 /// 当前线程的稳定标识：`ThreadId` 不能原子存取，故用 thread_local 懒分配一个递增序号
@@ -54,23 +89,20 @@ impl Database {
     /// `add_service_from_template` 就是这样踩中的（事务闭包内回调 `registered_dirs`）。
     ///
     /// 这里把它变成一条带修复指引的 panic：开发期一眼可见，而不是用户侧的静默冻死。
-    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    fn lock_conn(&self) -> ConnGuard<'_> {
         use std::sync::atomic::Ordering;
         use std::sync::TryLockError;
-        match self.conn.try_lock() {
-            Ok(guard) => {
-                self.conn_owner.store(thread_key(), Ordering::Relaxed);
-                guard
-            }
+        let key = thread_key();
+        let guard = match self.conn.try_lock() {
+            Ok(guard) => guard,
             // 锁中毒（持锁线程 panic）继续使用内部连接：与 core/process.rs::stop_all 同策略。
             // 此前直接返回错误 → 一次 panic 会让整个数据库功能永久不可用
             Err(TryLockError::Poisoned(poisoned)) => {
                 log::error!("数据库连接锁已中毒，继续使用: {}", poisoned);
-                self.conn_owner.store(thread_key(), Ordering::Relaxed);
                 poisoned.into_inner()
             }
             Err(TryLockError::WouldBlock) => {
-                if self.conn_owner.load(Ordering::Relaxed) == thread_key() {
+                if self.conn_owner.load(Ordering::Relaxed) == key {
                     panic!(
                         "检测到同一线程重入数据库连接锁 —— 这必然死锁。\
                          调用链中有人在 with_conn/with_conn_mut 的闭包内又发起了查库\
@@ -83,7 +115,11 @@ impl Database {
                     e.into_inner()
                 })
             }
-        }
+        };
+        // 取到锁之后**才**记 owner，由守卫在释放前清零——三条分支共用这一个写点，
+        // 正是 CQ-26 缺失的那一步（原先 WouldBlock 分支拿到守卫却不写 owner）
+        self.conn_owner.store(key, Ordering::Relaxed);
+        ConnGuard { guard, owner: &self.conn_owner, key }
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
@@ -264,6 +300,16 @@ pub const SERVICE_UPDATABLE_COLUMNS: &str =
     "name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, \
      enabled, show_file_tree, tool_commands";
 
+/// `service_templates` 的列清单——**唯一来源**（ARCH-20）。
+///
+/// 为什么必须有（照 `SERVICE_COLUMNS` 的形状）：这 14 列此前在 `commands/service.rs` 里
+/// 手写了**三处生产 INSERT**（服务「另存为模板」/ 模板库「新建」/ 导入），加一列要三处同改，
+/// 而**漏一处不是编译错误**——症状是"同一个字段在不同入口有时写进去、有时没有"。
+/// 读侧的 SELECT 也各写各的（`collect_export_templates` / `get_service_templates` 等）。
+pub const SERVICE_TEMPLATE_COLUMNS: &str =
+    "id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
+     restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id";
+
 /// 由列清单生成 `VALUES` 用的命名占位符（`:列名`，顺序与列清单一致）。
 ///
 /// 为什么用命名参数而不是 `?1..?N`：位置化绑定下，"往列清单中间插一列"会让后面的值
@@ -316,6 +362,73 @@ mod tests {
 
     fn db_wrapper() -> Database {
         Database::from_connection(in_memory())
+    }
+
+    /// CQ-26：`conn_owner` 必须表达"**此刻**谁持锁"，而不是"最近一次取到锁的是谁"。
+    ///
+    /// 两半都要对：持锁期间是自己的线程标识，**释放时必须清零**——旧实现只在取锁时写一次、
+    /// 释放时不清零，于是锁空闲时 owner 还写着上一个线程。
+    #[test]
+    fn test_conn_owner_tracks_current_holder_only() {
+        let db = db_wrapper();
+        let me = thread_key();
+        assert_eq!(db.conn_owner.load(std::sync::atomic::Ordering::Relaxed), 0, "未持锁时 owner 必须是 0");
+
+        db.with_conn(|_| {
+            assert_eq!(
+                db.conn_owner.load(std::sync::atomic::Ordering::Relaxed),
+                me,
+                "持锁期间 owner 必须是当前线程（否则重入检测形同虚设）",
+            );
+            Ok::<(), String>(())
+        }).expect("查库");
+
+        assert_eq!(
+            db.conn_owner.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "释放后必须清零：否则锁空闲时 owner 仍指向旧持有者，它下次查库会被误判成重入而 panic",
+        );
+    }
+
+    /// CQ-26：**经 WouldBlock 分支**拿到锁的线程，也必须成为 owner。
+    ///
+    /// 旧实现在这条分支里拿到守卫却不更新 `conn_owner`，于是：
+    /// ① 交班后原持有者再来查库 → 看到 owner == 自己 → **误报重入 panic**（它并没有持锁）；
+    /// ② 新持有者真重入时 owner 不等于它 → 不 panic，**直接永久阻塞**——检测器唯一的用途漏掉。
+    ///
+    /// 这条用例尽力让子线程走 WouldBlock 分支（主线程持锁 → 子线程就位 → 主线程才放锁）；
+    /// 即便某次调度让子线程走了立即可得的路径，"owner 必须是子线程"这个断言依然成立。
+    #[test]
+    fn test_blocked_acquire_records_new_owner() {
+        let db = std::sync::Arc::new(db_wrapper());
+        let me = thread_key();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel::<u64>();
+
+        let child_db = db.clone();
+        let child = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            child_db
+                .with_conn(|_| {
+                    // 主线程此刻已经放锁（它在下面等这条消息），所以这里读到的 owner 就是"交接后"的值
+                    let _ = owner_tx.send(child_db.conn_owner.load(std::sync::atomic::Ordering::Relaxed));
+                    Ok::<(), String>(())
+                })
+                .expect("子线程查库");
+        });
+
+        // 主线程持锁期间等子线程就位；就位后还要给它一点时间去撞 try_lock（见上）
+        let released = db.with_conn(|_| {
+            ready_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("子线程就位");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Ok::<(), String>(())
+        });
+        released.expect("主线程查库");
+
+        let owner_seen = owner_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("子线程拿到锁");
+        assert_ne!(owner_seen, me, "锁已交班，owner 不能还是主线程（旧实现在这条分支上不写 owner）");
+        assert_ne!(owner_seen, 0, "子线程持锁期间 owner 必须是它自己");
+        child.join().expect("子线程不应 panic——误报重入会让它在这里炸掉");
     }
 
     /// 同线程重入连接锁必须是**响亮失败**而不是永久死锁。
@@ -500,6 +613,36 @@ mod tests {
             vec!["id", "project_id", "sort_index"],
             "UPDATE 清单之外的列变了：如果是新增列，请明确它该不该被 update_service 改写\
              （不该改就加进本断言的期望值，该改就加进 SERVICE_UPDATABLE_COLUMNS）"
+        );
+    }
+
+    /// `SERVICE_TEMPLATE_COLUMNS` 必须覆盖 `service_templates` 的**全部**列（ARCH-20）。
+    ///
+    /// 与上面 `services` 那条同源：列清单现在是三处模板写入口（另存为模板 / 模板库新建 /
+    /// 导入）的唯一来源，而"给表加列"与"更新清单"是两处独立编辑——漏了不报错，
+    /// 症状是"同一个字段在不同入口有时写进去、有时没有"。这条把两处编辑绑在一起。
+    #[test]
+    fn test_service_template_column_list_covers_schema() {
+        let conn = in_memory();
+        init_schema(&conn).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(service_templates)").unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let listed: Vec<String> = SERVICE_TEMPLATE_COLUMNS.split(',').map(|c| c.trim().to_string()).collect();
+        // created_at 不进清单：写侧一律交给 DB 默认值（与 services 同口径）
+        let missing: Vec<&String> = actual
+            .iter()
+            .filter(|c| !listed.contains(c) && c.as_str() != "created_at")
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "service_templates 新增了列 {:?}：请同步 SERVICE_TEMPLATE_COLUMNS\
+             （三处模板写入口共用它），漏掉它不会报错——新列会静默取默认值",
+            missing
         );
     }
 

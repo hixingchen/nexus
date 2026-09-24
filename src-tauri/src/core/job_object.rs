@@ -101,8 +101,13 @@ impl JobObject {
         }
     }
 
-    /// 将进程加入 Job Object（通过原始句柄）
-    fn assign_raw(&self, raw_handle: isize, pid: Option<u32>) {
+    /// 将进程加入 Job Object（通过原始句柄）。
+    ///
+    /// **返回失败原因而不是只写一行日志**（CQ-27）：纳管失败此前完全静默——服务照常启动、
+    /// 之后一切"看起来正常"，只有 Nexus 被强杀时才会发现子进程没跟着退出。这正是铁律 21
+    /// （"配置写了 ≠ 生效了"）的形状：没有任何"它真的被纳管了"的观测证据。
+    /// 调用方据此决定把原因写进**服务日志缓冲**（用户能看见）还是只记日志。
+    fn assign_raw(&self, raw_handle: isize, pid: Option<u32>) -> Result<(), String> {
         unsafe {
             let ret = AssignProcessToJobObject(
                 self.handle,
@@ -110,20 +115,20 @@ impl JobObject {
             );
             if ret == 0 {
                 let err = std::io::Error::last_os_error();
-                log::warn!(
-                    "[nexus] ⚠ AssignProcessToJobObject 失败 (pid={:?}): {}",
-                    pid, err
-                );
+                let msg = format!("AssignProcessToJobObject 失败 (pid={:?}): {}", pid, err);
+                log::warn!("[nexus] ⚠ {}", msg);
+                Err(msg)
             } else {
                 log::debug!("[nexus] 进程 pid={:?} 已加入 Job Object", pid);
+                Ok(())
             }
         }
     }
 
     /// 将 std::process::Child 加入 Job Object
-    pub fn assign_child(&self, child: &std::process::Child) {
+    pub fn assign_child(&self, child: &std::process::Child) -> Result<(), String> {
         use std::os::windows::io::AsRawHandle;
-        self.assign_raw(child.as_raw_handle() as isize, Some(child.id()));
+        self.assign_raw(child.as_raw_handle() as isize, Some(child.id()))
     }
 
     /// 按 pid 加入 Job Object（不持有 `Child` 的场景：tokio 子进程只在 await 期间存在）。
@@ -133,19 +138,21 @@ impl JobObject {
     /// 会留下一个占着几百 MB 的 java 进程。加入共享 Job 后由 KILL_ON_JOB_CLOSE 兜底。
     ///
     /// 句柄是我们自己打开的，赋值完必须关闭（关闭本进程的句柄不会把目标移出 Job）。
-    pub fn assign_pid(&self, pid: u32) {
+    pub fn assign_pid(&self, pid: u32) -> Result<(), String> {
         unsafe {
             let handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
             if handle == 0 {
-                log::warn!(
-                    "[nexus] ⚠ OpenProcess 失败 (pid={}): {}，该进程未纳入 Job Object",
+                let msg = format!(
+                    "OpenProcess 失败 (pid={}): {}，该进程未纳入 Job Object",
                     pid,
                     std::io::Error::last_os_error()
                 );
-                return;
+                log::warn!("[nexus] ⚠ {}", msg);
+                return Err(msg);
             }
-            self.assign_raw(handle as isize, Some(pid));
+            let r = self.assign_raw(handle as isize, Some(pid));
             CloseHandle(handle);
+            r
         }
     }
 }

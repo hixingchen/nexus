@@ -112,7 +112,10 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
     #[cfg(windows)]
     if let Some(job) = crate::core::job_object::shared() {
         if let Some(pid) = child.id() {
-            job.assign_pid(pid);
+            if let Err(e) = job.assign_pid(pid) {
+                // 反编译 JVM 没纳管：Nexus 被强杀时它会残留（占几百 MB）。留痕（CQ-27）
+                log::warn!("[nexus] 反编译 JVM 未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
+            }
         }
     }
 

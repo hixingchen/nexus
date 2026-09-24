@@ -111,6 +111,51 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
     }
 }
 
+/// 允许 webview 停留的 URL（导航守卫的**唯一判据**，单独成函数以便单测）。
+///
+/// 允许：`tauri:` 协议（打包态的自身来源，含 `tauri://localhost`）、环回上的 http(s)
+/// （dev 的 Vite 服务与 AI 面板的 dsh 会话都在环回上）、以及 `about:blank`
+/// （部分引擎初始化时会先导航到它，拦掉会让面板白屏）。
+///
+/// 为什么要有这道闸（SEC-25）：`tauri.conf.json` 的 CSP 只挂在 `tauri://` 协议的资源响应上，
+/// **dev 态的文档来自 Vite、不经该协议，CSP 完全不生效**；而主窗口此前没有任何导航守卫
+/// （AI 子 WebView 有，见 `commands/ai.rs`）。导航走的是 webview 自己，不受 CSP 的
+/// `frame-src`/`form-action` 约束——一次 `location = 'http://…'` 就能把整个界面换成
+/// 任意网页（应用框架内的界面伪装）。
+fn navigation_allowed(url: &tauri::Url) -> bool {
+    if url.scheme() == "about" || url.scheme() == "tauri" {
+        return true;
+    }
+    let host_ok = matches!(url.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
+    host_ok && matches!(url.scheme(), "http" | "https")
+}
+
+/// 导航守卫插件：对**所有** webview 生效（主窗口 + AI 子 WebView）。
+///
+/// 为什么用插件而不是给主窗口加 builder 参数：`on_navigation` 在 tauri 2.11 只有 builder
+/// 入口，而主窗口是 `tauri.conf.json` 声明式创建的——为了加一个回调把它改写成
+/// `WebviewWindowBuilder`（decorations/dragDrop/尺寸全要复刻）风险远大于收益。
+/// 插件 trait 的 `on_navigation` 由运行时在每个 webview 导航时调用，返回 false 即拦截。
+struct NavigationGuard;
+
+impl<R: tauri::Runtime> tauri::plugin::Plugin<R> for NavigationGuard {
+    fn name(&self) -> &'static str {
+        "nexus-navigation-guard"
+    }
+
+    fn on_navigation(&mut self, webview: &tauri::Webview<R>, url: &tauri::Url) -> bool {
+        let ok = navigation_allowed(url);
+        if !ok {
+            log::warn!(
+                "[nexus] 已拦截 webview 导航（{} → {}）：只允许留在自身协议与环回地址上",
+                webview.label(), url
+            );
+        }
+        ok
+    }
+}
+
+
 /// 启动致命错误落盘（`<数据目录>/logs/startup-error.log`）后退出。
 ///
 /// 打包版没有控制台，启动期 panic 的表现是"双击后闪退、没有任何线索"；
@@ -164,14 +209,24 @@ pub fn run() {
     // debug（tauri dev）不注册：开发阶段不做单实例限制，也不会与已运行的打包版互相拦截。
     #[cfg(not(debug_assertions))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
+        // 第二进程已被拦截退出，这里唯一的任务就是把第一实例唤到前台——**它失败就等于
+        // 用户双击图标什么都没发生**，而此前三处 `let _ =` 与 None 分支一行日志都没有
+        // （CQ-37），现场只剩"打不开"。与仓库其余位置的惯例一致（Job Object 降级、
+        // logger 禁用都会留痕），这里把每一处失败都说出来。
+        match app.get_webview_window("main") {
+            Some(window) => {
+                if let Err(e) = window.unminimize() { log::warn!("[nexus] 单实例唤醒：取消最小化失败: {}", e); }
+                if let Err(e) = window.show() { log::warn!("[nexus] 单实例唤醒：显示窗口失败: {}", e); }
+                if let Err(e) = window.set_focus() { log::warn!("[nexus] 单实例唤醒：聚焦窗口失败: {}", e); }
+            }
+            None => log::warn!("[nexus] 单实例唤醒：找不到主窗口（窗口可能已销毁），本次唤醒无效"),
         }
     }));
 
     let app = builder
+        // 导航守卫（SEC-25）：dev 态没有 CSP（文档来自 Vite，不经 tauri:// 协议），
+        // 这道闸是那条路径上唯一的防护；打包态同样生效
+        .plugin(NavigationGuard)
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         // 剪贴板不走 tauri-plugin-clipboard-manager：文件列表粘贴只能由 Rust 侧
@@ -238,6 +293,7 @@ pub fn run() {
             commands::tools::list_open_tools,
             commands::tools::save_open_tool,
             commands::tools::delete_open_tool,
+            commands::tools::get_open_tool_usage,
             commands::tools::set_service_open_tool,
             commands::tools::list_service_open_tool_bindings,
             commands::tools::open_service_with_tool,
@@ -253,6 +309,7 @@ pub fn run() {
             commands::ai::ai_panel_focus,
             commands::app::prepare_exit,
             commands::app::pick_directory,
+            commands::app::pick_save_file,
             commands::app::get_app_version,
             // Node 运行时（独立工具，不参与服务配置）
             commands::node::get_node_runtime,
@@ -304,4 +361,28 @@ pub fn run() {
             log::info!("[nexus] RunEvent::Exit → 完成");
         }
     });
+}
+
+#[cfg(test)]
+mod navigation_guard_tests {
+    use super::navigation_allowed;
+
+    /// 守卫放过什么、拦住什么——这条规则写错的两个方向都有代价：
+    /// 太松 = 没有守卫；太严 = dev 的 Vite 刷新或 AI 面板直接被拦成白屏。
+    #[test]
+    fn test_navigation_guard_allows_own_origin_and_loopback_only() {
+        let url = |s: &str| s.parse::<tauri::Url>().expect("URL 解析");
+        // 自身协议（打包态）与引擎初始化用的 about:blank
+        assert!(navigation_allowed(&url("tauri://localhost/index.html")));
+        assert!(navigation_allowed(&url("about:blank")));
+        // dev 的 Vite 服务与 AI 面板的 dsh 会话都跑在环回上
+        assert!(navigation_allowed(&url("http://localhost:1420/")));
+        assert!(navigation_allowed(&url("http://127.0.0.1:49152/?token=x")));
+        // 外部站点：一律拦（链接走 plugin-shell 交给系统浏览器，不经界面内导航）
+        assert!(!navigation_allowed(&url("https://example.com/")));
+        assert!(!navigation_allowed(&url("http://localhost.evil.com/")));
+        // 欺骗性写法：环回不是 host，或协议不是 http(s)
+        assert!(!navigation_allowed(&url("https://127.0.0.1.evil.com/")));
+        assert!(!navigation_allowed(&url("file:///C:/Windows/System32/calc.exe")));
+    }
 }

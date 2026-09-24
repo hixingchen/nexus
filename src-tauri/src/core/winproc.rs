@@ -69,7 +69,17 @@ pub(crate) fn snapshot_processes() -> Vec<ProcEntry> {
         }
         let mut entry: ProcessEntry32 = std::mem::zeroed();
         entry.size = std::mem::size_of::<ProcessEntry32>() as Dword;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
+        // 枚举失败必须留痕（CQ-38）：原实现没有 else 分支，直接返回空表，于是
+        // `adopt_survivors` / `candidate_descendants` 会按"没有游离进程"处理——
+        // 用 `start` 另开窗口跑掉的服务被判成"已退出"、卡片进失败态，而进程其实在跑。
+        // 这是本项目判定最忌讳的"与正常状态混淆"：用户看到"失败"却找不到原因
+        let first = Process32FirstW(snapshot, &mut entry);
+        if first == 0 {
+            log::warn!(
+                "[nexus] Process32FirstW 失败（进程快照为空，本次不做游离进程走查；判定结果可能偏保守）"
+            );
+        }
+        if first != 0 {
             loop {
                 // NUL 截断后转字符串；坏码位不致命（只是日志里显示得难看）
                 let end = entry.exe_file.iter().position(|&c| c == 0).unwrap_or(MAX_PATH);

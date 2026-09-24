@@ -129,9 +129,14 @@ const DEFAULT_NODE_MIRROR: &str = "https://nodejs.org/dist/";
 /// - 值为空或 `none` → 回到官方默认
 /// - 开头不是 `http` → 前面补 `http://`
 /// - 结尾没 `/` → 补一个
+///
 /// 少补任何一处，我们拉到的地址就与 nvm 实际去的不是同一个（对它真失败，对我们只是查不到）。
-fn node_index_url(home: &Path) -> String {
-    let configured = settings_value(home, "node_mirror").ok().flatten();
+fn node_index_url(home: &Path) -> Result<String, String> {
+    // **不吞读失败**（CQ-45）：原实现 `.ok().flatten()` 把"读不到 settings.txt"也当成
+    // "没配镜像"，静默退回官方源——正是上面那段注释极力避免的"两处地址不一样"：
+    // 我们列的是 nodejs.org 的版本，`nvm install` 却去镜像取，症状是"搜得到、装不上"。
+    // 同文件的 `root` 用的是 `?`，这里与它对齐。
+    let configured = settings_value(home, "node_mirror")?;
     let mut base = match configured.as_deref() {
         None | Some("none") => DEFAULT_NODE_MIRROR.to_string(),
         Some(v) => v.to_string(),
@@ -143,7 +148,7 @@ fn node_index_url(home: &Path) -> String {
     if !base.ends_with('/') {
         base.push('/');
     }
-    format!("{}index.json", base)
+    Ok(format!("{}index.json", base))
 }
 
 /// 当前生效的版本 = `NVM_SYMLINK` 软链指向哪个目录。
@@ -286,14 +291,57 @@ fn system_curl() -> PathBuf {
 
 /// 文件像不像个能跑的安装器：够大 + `MZ` 头。
 /// curl 的 `--fail` 挡了 4xx/5xx，但"下到一半断线"仍会留下一个短文件——不验就会把它执行起来。
+/// 官方 nvm-windows 1.2.2 安装器的 SHA-256（SEC-20）。
+///
+/// 为什么必须钉死它：落地路径是 `%TEMP%\nexus\nvm-setup-1.2.2.exe`，而**同用户的任意进程**
+/// （例如克隆来的仓库里的构建脚本——本项目明确假设项目目录不可信）都能往那里预置一个
+/// ≥1MB、以 `MZ` 开头的文件。原实现的"完整性判据"只有"≥1MB + MZ 头"，且**已有合格文件就不
+/// 重新下载**——用户点「运行安装向导」时，Nexus 会跳过下载、直接以**管理员权限**执行它
+/// （nvm 1.2.2 是 `PrivilegesRequired=admin`），而 UAC 框上显示的正是 `nvm-setup-1.2.2.exe`，
+/// 用户没有可分辨的线索。
+///
+/// 这个值的出处与交叉验证（2026-09-24，本机实测）：官方 release 直链下载的 exe 与
+/// **官方公布了 MD5 的** `nvm-setup.zip`（`8a663b9af5836ea1abb2e93b7fbfbaad`，本机复算一致）
+/// 解出的 `nvm-setup.exe` 字节完全相同——即这个哈希有发布方自己的校验和背书，不是"下到什么算什么"。
+const NVM_SETUP_SHA256: &str = "2d5ad523aa6182205da77c0eb8210638aaa8792f4e6a4bc12e1ac854c5455a68";
+
+/// 文件内容的 SHA-256（小写十六进制）。读不动文件时返回 Err（调用方一律按"不合格"处理）。
+fn file_sha256(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打开 {} 失败: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    // 流式读：安装器 5.6MB，一次性读进内存没必要（这里也只是省一次分配）
+    std::io::copy(&mut f, &mut hasher).map_err(|e| format!("读取 {} 失败: {}", path.display(), e))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 缓存里的这份文件是不是**可信的**官方安装器。
+///
+/// 判据是 SHA-256，而不是"够大 + 以 MZ 开头"（SEC-20）——后两者只是**便宜的预筛**：
+/// 先按大小与魔数挡掉明显不是 PE 的文件，免得把几百 MB 的垃圾整个读进来算哈希。
 fn valid_installer(path: &Path) -> bool {
+    valid_installer_with(path, NVM_SETUP_SHA256)
+}
+
+/// 判据本体（期望哈希作参数：让测试能构造"哈希对得上"的正例，而不必真的放一份安装包进仓库）
+fn valid_installer_with(path: &Path, expected_sha256: &str) -> bool {
     let Ok(meta) = std::fs::metadata(path) else { return false };
     if !meta.is_file() || meta.len() < NVM_SETUP_MIN_BYTES {
         return false;
     }
     let Ok(mut f) = std::fs::File::open(path) else { return false };
     let mut magic = [0u8; 2];
-    std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"MZ"
+    if !(std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"MZ") {
+        return false;
+    }
+    match file_sha256(path) {
+        Ok(got) => got.eq_ignore_ascii_case(expected_sha256),
+        // 算不出哈希（读权限/IO 错误）→ 不合格，宁可让用户重下
+        Err(e) => {
+            log::warn!("[nexus] 安装器哈希计算失败（按不合格处理）: {}", e);
+            false
+        }
+    }
 }
 
 /// 用系统自带的 curl 把一个 URL 下到本地文件（`max_time` 是整体超时，单位秒）。
@@ -305,6 +353,25 @@ fn valid_installer(path: &Path) -> bool {
 /// 失败时把 URL 一起写进错误里：这两条地址一个来自常量、一个来自用户的 `settings.txt`，
 /// 出问题时第一件要知道的事就是"到底去哪个地址取的"。
 fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
+    run_curl_raw(url, Some(dest), max_time).map(|_| ())
+}
+
+/// 同上，但结果**直接从 stdout 取**，不落任何文件（CQ-43）。
+///
+/// 为什么要有这一支：版本索引原先下到固定的 `%TEMP%\nexus\node-index.json` 再读回来，
+/// 而两条并发调用（关掉面板再打开就会触发）会同时写它——curl 截断重写时另一路读到半截，
+/// 报出来是"版本索引不是预期的 JSON"这种假错误。索引本来就只是一次性解析，不必落盘。
+fn run_curl_stdout(url: &str, max_time: u32) -> Result<Vec<u8>, String> {
+    run_curl_raw(url, None, max_time).map(|out| out.stdout)
+}
+
+/// curl 调用的公共部分：拼参数、起进程、把非零退出码翻成带地址的错误。
+/// `dest` 为 `None` = 不指定 `-o`，curl 把正文写到 stdout。
+fn run_curl_raw(
+    url: &str,
+    dest: Option<&Path>,
+    max_time: u32,
+) -> Result<std::process::Output, String> {
     let curl = system_curl();
     if !curl.is_file() {
         return Err(format!(
@@ -312,7 +379,7 @@ fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
             curl.display(), url
         ));
     }
-    if let Some(dir) = dest.parent() {
+    if let Some(dir) = dest.and_then(Path::parent) {
         std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {} 失败: {}", dir.display(), e))?;
     }
 
@@ -329,9 +396,11 @@ fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
             "--max-time",
         ])
         .arg(max_time.to_string())
-        .args(["--silent", "--show-error", "-o"])
-        .arg(dest)
-        .arg(url)
+        .args(["--silent", "--show-error"]);
+    if let Some(d) = dest {
+        cmd.arg("-o").arg(d);
+    }
+    cmd.arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -353,11 +422,13 @@ fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
             url
         ));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// 下载官方安装器（本地已有一份合格的就不再下——安装器可重复运行，没必要重下 5.6 MB）
 fn download_setup(dest: &Path) -> Result<(), String> {
+    // "已有一份合格的就不再下"——这里的"合格"现在**包含哈希核对**（SEC-20）：
+    // 同用户进程预置的假安装器在这一步就被挡掉，不会因为"够大 + MZ 头"被放行
     if valid_installer(dest) {
         return Ok(());
     }
@@ -365,20 +436,28 @@ fn download_setup(dest: &Path) -> Result<(), String> {
     run_curl(NVM_SETUP_URL, dest, 900)?;
     if !valid_installer(dest) {
         let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        let got = file_sha256(dest).unwrap_or_else(|e| format!("(算不出: {})", e));
+        // **删掉**：不合格的文件留着的话，下次进这个函数时第一步的"已有合格文件"判断
+        // 会再把它捡回来（它确实"存在"），于是永远走不到重新下载这一步
+        let _ = std::fs::remove_file(dest);
         return Err(format!(
-            "下载到的文件不像安装包（{} 字节，期望 ≥ {}）——可手动下载：{}",
-            size, NVM_SETUP_MIN_BYTES, NVM_SETUP_URL
+            "下载到的文件校验不通过（{} 字节）——已删除该文件。\n期望 SHA-256：{}\n实际 SHA-256：{}\n可手动下载：{}",
+            size, NVM_SETUP_SHA256, got, NVM_SETUP_URL
         ));
     }
     Ok(())
 }
 
 /// 拉版本索引并解析（联网，约 331 KB）。
+///
+/// **不落盘**（CQ-43）：原实现把索引下到固定路径 `%TEMP%\nexus\node-index.json` 再读回来，
+/// 而两条并发调用（关掉面板再打开即可触发，`) effect 是"每次 open 变真就拉一次"、
+/// 在飞请求不取消）会同时写同一个文件——curl 截断重写时另一路读到半截 JSON，
+/// 报出来是"版本索引不是预期的 JSON"这种**假错误**，还留在面板上让人以为是镜像坏了。
+/// curl 直接写 stdout（本来就是 `Stdio::piped()`，只是原先被丢掉了），共享临时文件与
+/// 截断读一起消失。
 fn fetch_index(url: &str) -> Result<Vec<NodeVersionInfo>, String> {
-    let dest = std::env::temp_dir().join("nexus").join("node-index.json");
-    run_curl(url, &dest, 120)?;
-    let bytes = std::fs::read(&dest)
-        .map_err(|e| format!("读下载到的版本索引 {} 失败: {}", dest.display(), e))?;
+    let bytes = run_curl_stdout(url, 120)?;
     let versions = parse_index(&bytes)?;
     // 空索引当成失败而不是"没有可安装的版本"：镜像同步中/被拦掉时返回 `[]` 是常见形态，
     // 报出来用户知道该重试（nvm 自己也这么处理——它的 `GetAvailable` 见空直接报错退出）
@@ -457,7 +536,25 @@ pub async fn run_nvm_installer() -> Result<NvmInstallResult, String> {
     if !valid_installer(&path) {
         return Err(format!("{} 还没下载好（先下载再运行）", path.display()));
     }
+    // **执行前再核对一次**（SEC-20）：下载与点「运行安装向导」之间可以隔着很久，而这一步
+    // 会以管理员权限执行它。校验与执行之间没有 TOCTOU 可钻的缝——校验的就是即将执行的那份文件
+    verify_before_run(&path)?;
     run_installer(&path).await
+}
+
+/// 执行安装器前的最后一道核对（单独成函数是为了能直接测"哈希不对就别执行"）。
+fn verify_before_run(path: &Path) -> Result<(), String> {
+    if valid_installer(path) {
+        return Ok(());
+    }
+    // 走到这里说明文件在下载之后被换掉了（或被手动改过）——这与"还没下载好"是两件事，
+    // 文案要说清，否则用户只会一遍遍点下载而不知道有人动过那个文件
+    let got = file_sha256(path).unwrap_or_else(|e| format!("(算不出: {})", e));
+    let _ = std::fs::remove_file(path);
+    Err(format!(
+        "安装器文件与官方版本不符，已删除：{}\n期望 SHA-256：{}\n实际 SHA-256：{}\n请重新点「下载」再运行",
+        path.display(), NVM_SETUP_SHA256, got
+    ))
 }
 
 /// 把命令输出按文本解码。
@@ -538,7 +635,7 @@ fn run_nvm(nvm: &NvmInstall, args: &[&str]) -> Result<NvmCommandResult, String> 
 #[command]
 pub async fn list_node_versions() -> Result<NodeVersionIndex, String> {
     let nvm = find_nvm()?;
-    let url = node_index_url(&nvm.home);
+    let url = node_index_url(&nvm.home)?;
     tokio::task::spawn_blocking(move || {
         let versions = fetch_index(&url)?;
         Ok(NodeVersionIndex { versions, index_url: url })
@@ -675,6 +772,46 @@ pub async fn use_node_version(version: String) -> Result<NvmCommandResult, Strin
 mod tests {
     use super::*;
 
+    /// SHA-256 的已知答案向量（NIST）：`abc` → ba7816bf…
+    /// 手算哈希写错是**静默**的（每个文件都算出同一个错值，正例反例一起过），所以先钉住实现本身。
+    #[test]
+    fn test_file_sha256_known_answer() {
+        let p = std::env::temp_dir().join(format!("nexus_ut_sha_{}.bin", std::process::id()));
+        std::fs::write(&p, b"abc").expect("写临时文件");
+        assert_eq!(
+            file_sha256(&p).expect("算哈希"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **SEC-20 的正面用例**：一个"够大 + 以 MZ 开头"但内容不对的文件，不能算合格安装器。
+    ///
+    /// 这就是审计描述的攻击现场——同用户进程往 `%TEMP%\nexus\` 预置一个假安装器，
+    /// 而"已有合格文件就不再下载"会把它直接送到管理员权限的执行点上。
+    #[test]
+    fn test_installer_check_rejects_lookalike_with_wrong_hash() {
+        let p = std::env::temp_dir().join(format!("nexus_ut_fake_{}.exe", std::process::id()));
+        // 2MB、以 MZ 开头：旧判据（≥1MB + MZ）会放行它
+        let mut bytes = vec![0u8; 2 * 1024 * 1024];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        std::fs::write(&p, &bytes).expect("写假安装器");
+
+        assert!(!valid_installer(&p), "内容不对就必须拒绝，哪怕它够大、带 MZ 头");
+        // 判据本体（哈希作参数）在哈希对得上时应当放行——否则上面那条可能只是"永远返回 false"
+        let real_hash = file_sha256(&p).expect("算哈希");
+        assert!(valid_installer_with(&p, &real_hash), "哈希一致时应当放行（判据不是恒假）");
+        assert!(!valid_installer_with(&p, NVM_SETUP_SHA256), "与官方哈希不符 → 拒绝");
+
+        // 执行前的那道闸：文件不符时**删除并报出两个哈希**，而不是照常执行
+        let err = verify_before_run(&p).expect_err("不符的文件必须被拦下");
+        assert!(err.contains("与官方版本不符"), "错误要说清是文件被换过: {}", err);
+        assert!(!p.exists(), "拦下之后要删掉它，否则下一次判断又会捡回同一个文件");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 解析真实索引（从本机拉下来的 `index.json` 抄下来的几项，字段原样保留）
     #[test]
     fn test_parse_index_versions_and_lts() {
@@ -722,27 +859,27 @@ mod tests {
 
         // settings.txt 里没有 node_mirror：用官方默认（nvm 的 nodeBaseAddress 初值）
         write("root: C:\\nvm\r\n");
-        assert_eq!(node_index_url(&dir), "https://nodejs.org/dist/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "https://nodejs.org/dist/index.json");
 
         // 配了镜像、结尾有斜杠：原样拼
         write("root: C:\\nvm\r\nnode_mirror: https://npmmirror.com/mirrors/node/\r\n");
-        assert_eq!(node_index_url(&dir), "https://npmmirror.com/mirrors/node/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "https://npmmirror.com/mirrors/node/index.json");
 
         // 少了结尾斜杠：补一个（nvm 也补，不补的话两边地址就不一样了）
         write("node_mirror: https://npmmirror.com/mirrors/node\r\n");
-        assert_eq!(node_index_url(&dir), "https://npmmirror.com/mirrors/node/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "https://npmmirror.com/mirrors/node/index.json");
 
         // 没写 http：nvm 会补 `http://`，我们照做
         write("node_mirror: mirrors.example.com/node/\r\n");
-        assert_eq!(node_index_url(&dir), "http://mirrors.example.com/node/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "http://mirrors.example.com/node/index.json");
 
         // `none` = 不用镜像（与空值同义，见 nvm 的 SetMirrors）
         write("node_mirror: none\r\n");
-        assert_eq!(node_index_url(&dir), "https://nodejs.org/dist/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "https://nodejs.org/dist/index.json");
 
         // 极短/带中文的怪值不能 panic（Go 那边会因为切 `[0:4]` 直接崩）
         write("node_mirror: 镜像\r\n");
-        assert_eq!(node_index_url(&dir), "http://镜像/index.json");
+        assert_eq!(node_index_url(&dir).unwrap(), "http://镜像/index.json");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -757,7 +894,7 @@ mod tests {
     #[ignore]
     fn test_fetch_node_index() {
         let nvm = find_nvm().expect("本机应当装有 nvm-windows");
-        let url = node_index_url(&nvm.home);
+        let url = node_index_url(&nvm.home).expect("读 settings.txt");
         let versions = fetch_index(&url).expect("拉取版本索引应当成功");
         println!("索引 {} → {} 个版本，最新 {}", url, versions.len(), versions[0].version);
         assert!(versions.len() > 100, "完整索引应当有上百个版本，实际 {}", versions.len());

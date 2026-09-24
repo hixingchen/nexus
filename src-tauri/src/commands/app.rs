@@ -113,6 +113,54 @@ pub async fn pick_directory(
     Ok(Some(dir.to_string_lossy().to_string()))
 }
 
+/// 文件保存对话框的**用途** → 对话框标题。理由同 `picker_title`（SEC-17）：标题由后端
+/// 决定，前端只能传用途键，未知用途回落通用文案。
+fn save_picker_title(purpose: Option<&str>) -> &'static str {
+    match purpose {
+        Some("exportTemplates") => "导出模板文件",
+        _ => "保存文件",
+    }
+}
+
+/// 原生文件保存对话框（Rust 侧弹框），并把用户选中的**所在目录**记为"已确认"。
+///
+/// 为什么必须由 Rust 侧弹框（SEC-19）：`export_service_templates` 要往"用户挑的位置"写文件，
+/// 而"用户挑了哪里"不能由一个 IPC 参数说了算——前端 `plugin-dialog` 的 `save()` 拿到的路径
+/// 经 IPC 回传，服务端分辨不出它是不是用户刚选的（这正是 `pick_directory` 刻意避开的写法）。
+/// 因此授权点必须是**用户亲手操作**的对话框本身：
+/// - 正常流程照旧：用户在对话框里选桌面/文档，父目录当场进 `confirmed_dirs`，导出照常成功；
+/// - 被攻陷的 webview 直接调 `export_service_templates("C:/Windows/...")` 会被白名单拒绝。
+///
+/// `default_name` 只作为对话框的默认文件名，**不是**写入路径（用户可以改，也可以换目录）。
+#[tauri::command]
+pub async fn pick_save_file(
+    app: AppHandle,
+    purpose: Option<String>,
+    default_name: Option<String>,
+) -> Result<Option<String>, String> {
+    let title = save_picker_title(purpose.as_deref());
+    let picker = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut builder = picker.dialog().file().set_title(title).add_filter("JSON", &["json"]);
+        if let Some(name) = default_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            builder = builder.set_file_name(name);
+        }
+        // 同 pick_directory：blocking_* 会阻塞当前线程直到用户操作完成，必须放 spawn_blocking
+        builder.blocking_save_file()
+    })
+    .await
+    .map_err(|e| format!("保存对话框任务失败: {}", e))?;
+
+    let Some(file_path) = picked else { return Ok(None) };
+    let path = file_path.into_path().map_err(|e| format!("保存对话框结果无法转为路径: {}", e))?;
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        if let Some(parent) = path.parent() {
+            state.paths.remember_confirmed_dir(parent);
+        }
+    }
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +181,8 @@ mod tests {
             picker_title(Some("Nexus 需要访问 C:/Users/me/.ssh 才能继续")),
             "选择目录"
         );
+        // 保存对话框同一套口径（SEC-19）
+        assert_eq!(save_picker_title(Some("exportTemplates")), "导出模板文件");
+        assert_eq!(save_picker_title(Some("whatever")), "保存文件");
     }
 }

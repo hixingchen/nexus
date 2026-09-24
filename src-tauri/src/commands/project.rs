@@ -147,8 +147,12 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
             }
         }
 
-        // 3. 停止文件监听（避免已删除项目的 watcher 线程泄漏并持续发送事件）
-        let _ = state.file_watcher.stop_watching(&id);
+        // 3. 停止文件监听（避免已删除项目的 watcher 线程泄漏并持续发送事件）。
+        // 失败必须留痕（CQ-30）：残留的 watcher 线程会对**已删除**的项目继续发变更事件、
+        // 弹「需要重启 X」，而项目已不存在、UI 里再没有入口关掉它
+        if let Err(e) = state.file_watcher.stop_watching(&id) {
+            log::warn!("删除项目 {} 时停止文件监听失败（残留监听会对已删除的项目报变更）：{}", id, e);
+        }
 
         // 4. 删除数据库记录（级联删除服务）
         state.db.with_conn(|conn| {

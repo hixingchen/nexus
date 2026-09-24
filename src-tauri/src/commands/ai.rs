@@ -261,10 +261,13 @@ pub async fn create_ai_panel_webview(
     // URL 白名单：本命令在内嵌浏览器里加载任意 URL——不校验等于把"能渲染任意网页的
     // 窗口"开放给调用方（钓鱼/本地服务探测）。用 tauri::Url 解析而非字符串前缀匹配：
     // 前缀匹配挡不住 `http://localhost.evil.com`、`@` 用户信息段等写法。
-    let parsed: tauri::Url = url.parse().map_err(|e| format!("URL 解析失败 ({}): {}", url, e))?;
+    //
+    // 回显一律走 `url_hint`（SEC-27）：这个 URL 带 dsh 的一次性 token（`?token=…`），
+    // 而错误串会被渲染到 AI 面板上——用户截图或贴 issue 时就顺手把它带出去了
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("URL 解析失败 ({}): {}", url_hint(&url), e))?;
     let host_ok = matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
     if !host_ok || !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("AI 面板 URL 不允许: {}", url));
+        return Err(format!("AI 面板 URL 不允许: {}", url_hint(&url)));
     }
     let url = tauri::WebviewUrl::External(parsed);
     // 几何值来自前端 invoke 参数：非有限值（NaN/±inf）与负坐标会让 WebView 创建失败
@@ -442,6 +445,21 @@ unsafe extern "system" fn enum_proc(hwnd: isize, l_param: isize) -> i32 {
     1
 }
 
+/// 从原始 URL 串里取出**可安全回显**的部分：`scheme://host`，路径与查询串一律丢掉。
+///
+/// 存在理由（SEC-27）：AI 面板的 URL 带 dsh 的一次性 token（`?token=…`），而这个命令的
+/// 错误串会被渲染到面板上（`PanelMessage detail=…`）——用户截图、贴 issue 时就把凭据带
+/// 出去了。定位问题只需要 scheme 与 host，`user:pass@host` 这种写法也一并切掉。
+/// 连 `://` 都没有的串不回显原文：它可能整串就是凭据。
+fn url_hint(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.trim().split_once("://") else {
+        return "(无法识别为 URL)".to_string();
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    format!("{}://{}", scheme, host)
+}
+
 #[cfg(windows)]
 extern "system" {
     fn EnumChildWindows(
@@ -453,4 +471,27 @@ extern "system" {
     fn GetWindowRect(hwnd: isize, lp_rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: isize, lp_point: *mut Point) -> i32;
     fn SetFocus(hwnd: isize) -> isize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-27：错误串里**不能**出现 token。
+    ///
+    /// 这条守的是"用户截图/贴 issue 时不顺带泄露凭据"——面板 URL 里 `?token=…` 是一次性的，
+    /// 但一次性不等于泄露无害（它同时是 dsh 的会话凭据）。改动若把 `url_hint` 换回原串，
+    /// 最后一条断言会红。
+    #[test]
+    fn test_url_hint_drops_token_and_credentials() {
+        let real = "http://127.0.0.1:49152/?token=abc123secret";
+        assert_eq!(url_hint(real), "http://127.0.0.1:49152");
+        assert!(!url_hint(real).contains("abc123secret"));
+        // 用户信息段（user:pass@host）同样不进提示
+        assert_eq!(url_hint("https://user:pw@example.com/x?y=1"), "https://example.com");
+        // 路径/片段/查询只按第一个分隔符切
+        assert_eq!(url_hint("http://localhost:8080#frag"), "http://localhost:8080");
+        // 解析不出 scheme：不回显原文（它可能整串就是凭据）
+        assert_eq!(url_hint("token=abc123secret"), "(无法识别为 URL)");
+    }
 }

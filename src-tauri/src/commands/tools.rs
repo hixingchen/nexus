@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::AppState;
 use crate::models::{OpenTool, ServiceOpenToolBinding};
@@ -70,6 +70,52 @@ pub fn save_open_tool(state: State<AppState>, params: SaveOpenToolParams) -> Res
             .map_err(|e| format!("添加打开工具失败: {}", e))
     })?;
     Ok(OpenTool { id, name, command: String::new(), executable, args })
+}
+
+/// 某个打开工具当前的引用情况。
+///
+/// 为什么要它（UX-4）：删除工具会**级联解除所有服务的绑定**，而删除入口是一个 11px 的
+/// 垃圾桶图标——不先告诉用户"这一下会影响哪些服务的「用 XX 打开」"，误点的代价就是
+/// 跨项目的一次静默配置丢失（界面只回一句"已删除工具「X」"）。
+#[derive(Serialize)]
+pub struct OpenToolUsage {
+    /// 绑定它的服务（`项目名 / 服务名`，跨项目）
+    pub services: Vec<String>,
+    /// 默认打开工具指向它的**模板**名（删除时同样会清空）
+    pub templates: Vec<String>,
+}
+
+/// 查一个工具被谁引用（只读，供删除前的确认框使用）
+#[tauri::command]
+pub fn get_open_tool_usage(state: State<AppState>, id: String) -> Result<OpenToolUsage, String> {
+    if id.trim().is_empty() { return Err("工具ID不能为空".into()); }
+    open_tool_usage(&state.db, id.trim())
+}
+
+/// 上面那条命令的 DB 部分（抽出来以便测试）
+pub(crate) fn open_tool_usage(db: &crate::database::Database, id: &str) -> Result<OpenToolUsage, String> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT p.name, s.name FROM service_open_tools b \
+             JOIN services s ON s.id = b.service_id \
+             JOIN projects p ON p.id = s.project_id \
+             WHERE b.tool_id = ?1 ORDER BY p.name, s.name"
+        ).map_err(|e| format!("查询工具绑定失败: {}", e))?;
+        let services: Vec<String> = stmt
+            .query_map([&id], |row| Ok(format!("{} / {}", row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("查询工具绑定失败: {}", e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("查询工具绑定失败: {}", e))?;
+        drop(stmt);
+        let mut stmt = conn.prepare("SELECT name FROM service_templates WHERE open_tool_id=?1 ORDER BY name")
+            .map_err(|e| format!("查询模板引用失败: {}", e))?;
+        let templates: Vec<String> = stmt
+            .query_map([&id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("查询模板引用失败: {}", e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("查询模板引用失败: {}", e))?;
+        Ok(OpenToolUsage { services, templates })
+    })
 }
 
 /// 删除工具（service_open_tools 级联清理绑定；模板上的引用一并清空）
@@ -478,6 +524,36 @@ mod tests {
         // 没有绑定的项目返回空表而不是报错（前端据此判断"没绑定"）
         let empty = list_bindings_for_project(&db, "p1-none").expect("空项目不应失败");
         assert!(empty.is_empty());
+    }
+
+    /// UX-4：删除工具前的引用清单必须**跨项目**给出，且带上项目名。
+    ///
+    /// 删除工具是级联的（`service_open_tools` 的 `ON DELETE CASCADE` + 模板引用清空），
+    /// 而入口只是一个 11px 的垃圾桶图标。这条守住"确认框里能说清会影响哪些服务"——
+    /// 漏了项目名，用户在有多个同名服务的项目里根本认不出是哪一条。
+    #[test]
+    fn test_open_tool_usage_lists_services_across_projects_and_templates() {
+        use crate::database::{init_schema, Database};
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库");
+        init_schema(&conn).expect("建表");
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path) VALUES ('p1', '甲项目', 'C:/a'), ('p2', '乙项目', 'C:/b');
+             INSERT INTO services (id, project_id, name) VALUES ('s1', 'p1', 'web'), ('s2', 'p2', 'web'), ('s3', 'p1', '未绑定');
+             INSERT INTO open_tools (id, name, executable) VALUES ('t1', 'IDEA', 'C:/idea64.exe'), ('t2', 'VSCode', 'C:/code.exe');
+             INSERT INTO service_open_tools (service_id, tool_id) VALUES ('s1', 't1'), ('s2', 't1'), ('s3', 't2');
+             INSERT INTO service_templates (id, name, command, open_tool_id) VALUES ('tpl1', '常用服务', 'npm start', 't1');",
+        ).expect("填测试数据");
+        let db = Database::from_connection(conn);
+
+        let usage = open_tool_usage(&db, "t1").expect("查询引用不应失败");
+        // ORDER BY 按字节序：乙(U+4E59) 在 甲(U+7532) 之前。顺序不重要，**跨项目都在**才重要
+        assert_eq!(usage.services, vec!["乙项目 / web".to_string(), "甲项目 / web".to_string()],
+            "两个项目下的服务都要列出来，且带项目名（同名服务否则分不清）");
+        assert_eq!(usage.templates, vec!["常用服务".to_string()], "模板上的引用同样会在删除时被清空");
+
+        // 没有引用时是空表而不是报错
+        let none = open_tool_usage(&db, "t-none").expect("没有引用不应失败");
+        assert!(none.services.is_empty() && none.templates.is_empty());
     }
 }
 

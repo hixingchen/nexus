@@ -14,6 +14,10 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 zstd = "0.13"
+# SHA-256（SEC-20：nvm 安装器下载后与执行前各校验一次）。树里本来就有它
+# （tauri-codegen 与 wry 都依赖 sha2），这里只是把传递依赖提成直接依赖，
+# 不新增任何需要下载/审计的包——比手写一份 SHA-256 更不容易出错
+sha2 = "0.10"
 tauri = { version = "2.0", features = ["unstable"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2.0"
