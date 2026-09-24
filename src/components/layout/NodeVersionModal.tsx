@@ -82,13 +82,24 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
   const [mirrorBusy, setMirrorBusy] = useState(false);
   /** 正在执行的操作（同时只允许一个：nvm 自己也不是并发安全的） */
   const [busy, setBusy] = useState<{ version: string; action: Action } | null>(null);
+  /**
+   * 读取运行时状态失败的原因（空 = 没失败）。
+   *
+   * 为什么要它（UX-17）：失败时 `runtime` 仍是 null，而面板把 null 当成"读取中…"——
+   * 于是失败后**永远**显示"读取中…"，原因只在一条 8 秒后消失的 toast 里出现过一次。
+   */
+  const [runtimeError, setRuntimeError] = useState('');
   /** 最近一次命令的输出原文，失败时是排查的唯一线索 */
   const [lastOutput, setLastOutput] = useState('');
 
   const refresh = useCallback(async () => {
     try {
       setRuntime(await nodeApi.getRuntime());
+      setRuntimeError('');
     } catch (e: unknown) {
+      // 失败也要把原因**留在面板上**（UX-17）：原实现只 reportError，而 runtime 仍是 null
+      // → 面板永远显示"读取中…"，用户等下去也不会有结果（原因只在 8 秒的 toast 里出现过）
+      setRuntimeError(toMessage(e));
       reportError('读取 Node 运行时状态失败', e);
     }
   }, []);
@@ -245,7 +256,22 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
   return (
     <Modal open={open} title="Node 版本" onClose={onClose} width="560px">
       {!runtime ? (
-        <div className="py-10 text-center text-[12px] text-nexus-muted">读取中…</div>
+        runtimeError ? (
+          /* 失败态与"读取中"必须分开（UX-17）：否则用户会一直等一个不会来的结果。
+             排版照抄下面 indexError 那一块（同一份错误呈现，不另造一套） */
+          <div className="py-8 px-2 text-center space-y-2">
+            <div className="text-[12px] text-nexus-muted">读取 Node 运行时状态失败</div>
+            <pre className="text-[11px] text-nexus-muted/80 font-mono whitespace-pre-wrap max-h-[90px] overflow-auto bg-nexus-bg/50 rounded p-2 text-left">
+              {runtimeError}
+            </pre>
+            <button
+              className="px-2 py-1 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded hover:bg-nexus-accent/10"
+              onClick={() => void refresh()}
+            >重试</button>
+          </div>
+        ) : (
+          <div className="py-10 text-center text-[12px] text-nexus-muted">读取中…</div>
+        )
       ) : !runtime.available ? (
         /* 没装 nvm 是正常情况，给引导而不是报错——而且要**直接给装的入口**：
            "你自己去查这东西怎么下"是这一步最不该留给用户的事（用户原话） */

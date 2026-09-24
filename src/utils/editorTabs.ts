@@ -41,12 +41,17 @@ export function tabsUnderPath<T extends PathHolder>(tabs: readonly T[], path: st
   if (!base) return [];
   return tabs.filter((t) => {
     const p = normalize(t.path);
-    return (
-      p === base ||
-      p.startsWith(base + '/') ||
-      // jar 内条目：`jar://<jar 路径>!/<条目>`（见 stores/editor.ts 的 openJarEntry）。
-      // 删掉磁盘上那个 jar，指向它内部条目的标签同样失效
-      p.startsWith(`jar://${base}!/`)
-    );
+    if (p === base || p.startsWith(base + '/')) return true;
+    // jar 内条目：`jar://<jar 路径>!/<条目>`（见 stores/editor.ts 的 openJarEntry）。
+    // 删掉磁盘上那个 jar，指向它内部条目的标签同样失效。
+    //
+    // 剥掉 `jar://` 之后必须按**同一套分量规则**再比一次（CQ-44）：原先只比
+    // `jar://${base}!/`，于是"删掉装着 jar 的那个目录"命不中——`jar://D:/p/lib/app.jar!/a/B.class`
+    // 既不以 `D:/p/lib` 开头、也不以 `D:/p/lib/` 开头，标签留着，用户点回去看到的正是
+    // "文件不存在"——而"不留这种标签"就是本规则存在的全部理由
+    if (!p.startsWith('jar://')) return false;
+    // 取最外层那个 jar 的磁盘路径（嵌套 fat jar 形如 `jar://x.jar!/inner.jar!/a/B.class`）
+    const jarPath = p.slice('jar://'.length).split('!/')[0] ?? '';
+    return jarPath === base || jarPath.startsWith(base + '/');
   });
 }

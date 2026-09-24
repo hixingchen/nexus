@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { projectApi, processApi, serviceApi, type FailedService, type ProjectDetail as PD, type Service } from '../services/service';
+import { projectApi, serviceApi, type FailedService, type ProjectDetail as PD, type Service } from '../services/service';
 import { useLogStore } from '../stores/logStore';
 import { useEditorStore } from '../stores/editor';
 import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
+import { toMessage } from '../utils/message';
 import { useToolStore } from '../stores/toolStore';
 import { startProjectServices, stopProjectServices } from '../stores/serviceActions';
 import { showNotification } from '../components/ui/Toast';
@@ -28,11 +29,17 @@ export function useProjectDetail(projectId: string) {
   const [deleteSvcTarget, setDeleteSvcTarget] = useState<{ id: string; name: string } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [viewingLog, setViewingLog] = useState<string | null>(null);
+  /**
+   * 详情加载失败的原因（null = 没有失败）。
+   *
+   * 为什么要单独一个状态（UX-17）：失败时 `detail` 同样是 null，而界面把 null 一律当成
+   * "加载中…"——于是加载失败后主区域**永远停在"加载中"**，真正的原因只在一条 8 秒后
+   * 消失的 toast 里出现过一次。原因是留了，但没留在持久可见的地方。
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // 请求序号：项目切换时旧请求的响应被丢弃，避免错项目数据
   const loadSeqRef = useRef(0);
-  /** 最近一次活动标签 id（打开/切换文件时若在日志面板则自动关闭——文件内容优先） */
-  const lastTabIdRef = useRef<string | null>(null);
   // running 首次加载成功后才允许 pruneInactive，避免挂载瞬间误清日志
   const runningLoadedRef = useRef(false);
 
@@ -48,10 +55,7 @@ export function useProjectDetail(projectId: string) {
   const load = useCallback(async () => {
     const seq = ++loadSeqRef.current;
     try {
-      const [d, r] = await Promise.all([
-        projectApi.getDetail(projectId),
-        processApi.getRunning(),
-      ]);
+      const d = await projectApi.getDetail(projectId);
       if (seq !== loadSeqRef.current) return; // 已被更新的请求取代，丢弃过期响应
       // 并行刷新打开工具绑定（服务增删后右键"用 XX 打开"显示才准）
       useToolStore.getState().loadProject(projectId).catch((e) => reportError('加载项目工具绑定失败', e));
@@ -60,12 +64,21 @@ export function useProjectDetail(projectId: string) {
       // 服务已被删除时其编辑草稿没有意义（还会让关窗确认多算一项）；模板草稿由模板库加载时清理
       pruneServiceDrafts('service', d.services.map(s => s.id));
       setDetail(d);
-      useRunningStore.getState().setRunning(r.running, r.failed);
-      runningLoadedRef.current = true;
+      setLoadError(null);
+      // 运行状态**不在这里单独拉**（ARCH-28）：`runningStore` 自己每 3 秒轮询，而
+      // `get_running` 是全项目最重的命令（逐服务 try_wait + 一次全系统进程快照 +
+      // 未认领服务各扫 7 个日志目录）——「启动全部」原先要付两遍。
+      // 这里只让它刷新，数据从订阅进来；与 `setRunning` 一样走同一套代际判定。
+      void useRunningStore.getState().refresh();
+      // "运行态已就绪"只在 store 真有数据时才置位：否则 `pruneInactive` 会拿一份空表
+      // 判"哪些服务不在运行"，把正在跑的服务的日志缓冲清掉（这就是这个 ref 存在的理由）
+      if (useRunningStore.getState().loaded) runningLoadedRef.current = true;
     } catch (e) {
       if (seq !== loadSeqRef.current) return;
       // 失败也要保持"无详情"：否则 load 失败后界面继续显示上一个项目并可对其操作
       setDetail(null);
+      // 同时记下原因：主区域据此显示**持久的**失败态与「重试」，而不是永远"加载中…"（UX-17）
+      setLoadError(toMessage(e));
       reportError('加载项目详情失败', e);
     }
   }, [projectId]);
@@ -87,16 +100,22 @@ export function useProjectDetail(projectId: string) {
 
   // ── 日志管理 ──────────────────────────────────────────────
 
-  // 打开/切换文件时自动关闭日志面板（日志与文件区互斥，文件优先）。
-  // 仅当活动标签 id 变化才关：点"日志"按钮本身不触发（id 未变），避免日志打不开
+  // 用户请求打开文件时自动关闭日志面板（日志与文件区互斥，文件优先）。
+  //
+  // 信号取 `openRequestSeq` 而不是活动标签 id：后者只在**标签真的换了**的时候才变，
+  // 而点文件树里**当前已经打开的那个文件**不会换标签（`setActiveTabId` 设的是同一个值），
+  // 于是那次点击对日志毫无影响——表现为"要切到别的文件，日志才收"。
+  // `loadAndOpenFile` 是所有打开路径的唯一入口（文件树 / 搜索结果 / Markdown 内链），
+  // 它在入口处递增这个信号，每次请求都算。
+  //
+  // **依赖数组里只能放这个信号**：效果里不读 `viewingLog`，只是无条件把它按回 null
+  // （本来就是 null 时 React 会跳过重渲染）。若把 `viewingLog` 也列进去，点「日志」按钮
+  // 引起的状态变化会重新触发本效果、把刚打开的日志面板立刻关掉——那正是原实现要拿
+  // `lastTabIdRef` 挡住的事，这里改从依赖上根除，不再需要那个 ref。
+  const openRequestSeq = useEditorStore(s => s.openRequestSeq);
   useEffect(() => {
-    const id = activeTabId ?? null;
-    const changed = id !== lastTabIdRef.current;
-    lastTabIdRef.current = id;
-    if (changed && viewingLog) {
-      setViewingLog(null);
-    }
-  }, [activeTabId, viewingLog, setViewingLog]);
+    setViewingLog(null);
+  }, [openRequestSeq]);
 
   // ── 服务列表（单一来源：svcCacheStore） ─────────────────────
   //
@@ -196,6 +215,10 @@ export function useProjectDetail(projectId: string) {
 
   const handleStopAll = useCallback(async () => {
     if (!detail) return;
+    // 与「全部启动」对称（UX-15）：停止是**串行收尸**（每个服务最长等数秒），
+    // 期间按钮外观此前毫无变化，用户会以为没点上而连点——连点就是一次又一次串行停止。
+    // 同一份 `loading.__all__` 既禁用按钮也用来显示"停止中…"。
+    setLoading(p => ({ ...p, __all__: true }));
     try {
       // 停止逻辑（含项目级监听与日志清理）统一在动作层；服务清单取自单一来源（缓存）
       const errors = await stopProjectServices(detail.project.id, cachedServices);
@@ -206,6 +229,7 @@ export function useProjectDetail(projectId: string) {
     } catch (e: unknown) {
       reportError('停止服务失败', e);
     }
+    setLoading(p => ({ ...p, __all__: false }));
   }, [detail, cachedServices, load]);
 
   const handleDeleteService = useCallback(async () => {
@@ -230,6 +254,8 @@ export function useProjectDetail(projectId: string) {
 
   return {
     detail,
+    /** 加载失败的原因（非 null 时界面显示失败态而不是"加载中…"，见 loadError 的说明） */
+    loadError,
     /** 服务列表（单一来源：svcCacheStore）——组件一律用这个，不要再从 detail 里取 */
     services: cachedServices,
     running,

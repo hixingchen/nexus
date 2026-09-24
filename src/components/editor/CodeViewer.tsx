@@ -49,6 +49,11 @@ function stateCacheSet(key: string, st: EditorState): void {
   const prev = stateCache.get(key);
   if (prev !== undefined) {
     stateCacheBytes -= prev.doc.length * 2 * 8;
+    // 先删再设（PERF-35）：Map 的迭代顺序是**插入序**，而下面的淘汰按插入序取"最旧"。
+    // 不删就直接 set 的话，一个被反复编辑的 key 会永久停在第 1 位——淘汰时先失去的
+    // 恰恰是**正在用的那份撤销历史**（编辑一小时的文件先于刚打开 5 分钟的被清掉）。
+    // 一次 delete 就把它排到队尾，FIFO 由此变成 LRU。
+    stateCache.delete(key);
   }
   const bytes = st.doc.length * 2 * 8;
   stateCacheBytes += bytes;
@@ -67,6 +72,53 @@ function stateCacheSet(key: string, st: EditorState): void {
  * 重建编辑器（撤销历史清空）；标签切换不递增 → 缓存命中、历史保留 */
 function cacheKey(filePath: string, editable: boolean, openSeq: number): string {
   return `${editable ? 'e' : 'r'}:${openSeq}:${filePath}`;
+}
+
+/**
+ * 每个文件**上次看到哪儿**的滚动快照（模块级，跨组件实例与跨会话存活）。
+ *
+ * 为什么光有 `stateCache` 不够：滚动位置**不在 EditorState 里**（它挂在 DOM 上），
+ * 而切标签、开日志面板都会把这个 view 销毁重建——缓存命中能保住撤销历史与光标，
+ * 却保不住"我看到第几百行"，于是切回来就回到第一行。
+ *
+ * 为什么按**路径**存而不是按 `cacheKey`：cacheKey 里含 fileOpenSeq，从文件树重新打开
+ * 同一个文件会换 key（那是**有意**的——新会话清撤销历史），但"重新看同一个文件"
+ * 不该顺带把人送回文件顶部。清历史是设计，回顶部是连带的误伤。
+ *
+ * 存的是 `scrollSnapshot()`：它记的是**文档位置**（锚点行 + 行内偏移）而不是裸的
+ * scrollTop，所以文件内容变了之后仍然站得住；锚点越界由构造函数内的 `clip` 兜底
+ * （见下面的 scrollTo）。
+ */
+const scrollByPath = new Map<string, ReturnType<EditorView['scrollSnapshot']>>();
+
+/**
+ * 开始跟踪这个 view 的滚动位置，返回停止跟踪的函数。
+ *
+ * 为什么是**持续跟踪**而不是"销毁前读一把"：读一把在 React 里根本没有安全的时机。
+ * 这个编辑器是随文件切换**整体卸载重挂**的（`ProjectDetail` 那层 ErrorBoundary 的 key
+ * 含文件路径），而 React 删除组件时先把 DOM 摘掉——`commitDeletionEffectsOnFiber` 的顺序是
+ * `onCommitUnmount`（layout 清理）→ 递归子节点 → `removeChild`，**被动清理（useEffect 的
+ * cleanup）跑在摘除之后**，那时 `scrollDOM` 已脱离文档，读到的永远是 0。
+ * 症状极具误导性：每次都忠实地还原到"第一行"。
+ *
+ * 挂在滚动事件上就没有"什么时候读"这个问题——位置在用户滚动的那一刻就记下了，
+ * 之后谁、什么时候销毁 view 都不影响它。
+ */
+function trackScroll(filePath: string, view: EditorView): () => void {
+  const onScroll = () => {
+    // 先删再设：让它排到 Map 末尾，下面按插入序淘汰最旧的
+    scrollByPath.delete(filePath);
+    scrollByPath.set(filePath, view.scrollSnapshot());
+    // 快照很小，淘汰策略不必像 stateCache 那样按字节算，复用同一个条目上限即可
+    while (scrollByPath.size > MAX_CACHED_STATES) {
+      const oldest = scrollByPath.keys().next().value;
+      if (oldest === undefined) break;
+      scrollByPath.delete(oldest);
+    }
+  };
+  // passive：滚动是高频事件，我们只是记录，不阻止默认行为
+  view.scrollDOM.addEventListener('scroll', onScroll, { passive: true });
+  return () => view.scrollDOM.removeEventListener('scroll', onScroll);
 }
 
 /**
@@ -656,6 +708,14 @@ function createEditorState(
    */
   onDocChange: (state: EditorState) => void,
   onMatchMarks: (marks: MatchMarks | null) => void,
+  /**
+   * 上次看到的位置（文档偏移）：新会话时用它初始化光标。
+   *
+   * 为什么不能只恢复滚动位置：光标的默认落点是文档开头，而 CodeMirror 在用户输入时
+   * 会把光标滚进视野——"滚动回第 500 行、光标在第 0 行"的后果是**敲第一个字整页跳回顶部**。
+   * 视图位置的两半（滚动 + 光标）必须一起恢复。
+   */
+  initialAnchor?: number,
 ) {
   // 上次扫描的选中文本：updateListener 据此跳过重复全文档扫描
   let lastMarkText: string | null = null;
@@ -853,7 +913,14 @@ function createEditorState(
     extensions.push(EditorState.readOnly.of(true));
   }
 
-  return EditorState.create({ doc: content, extensions });
+  return EditorState.create({
+    doc: content,
+    // 越界由 clamp 兜底：文件可能比上次看的时候短了（外部改动 / 重新读盘）
+    selection: initialAnchor === undefined
+      ? undefined
+      : { anchor: Math.max(0, Math.min(initialAnchor, content.length)) },
+    extensions,
+  });
 }
 
 /**
@@ -923,6 +990,8 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     const key = cacheKey(filePath, editable, openSeq);
     const currentContent = contentRef.current;
     const cached = stateCache.get(key);
+    // 上次看到哪儿。缓存命中时光标已随 state 一起保住，只有重建时才需要它
+    const snapshot = scrollByPath.get(filePath);
     let state: EditorState;
     if (cached && cached.doc.toString() === currentContent) {
       // 缓存命中且内容未被外部修改 → 复用（保留撤销历史与光标位置）
@@ -934,14 +1003,18 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
         filePath,
         editable,
         (newState) => {
-          const text = newState.doc.toString();
           // EditorState 不可变：每次编辑产生新 state 对象，缓存里的引用会过期
           // （doc 对比失败 → 切换回来重建 → 撤销历史丢失）。编辑后把最新
           // state 写回缓存，切换回来 doc 对比命中、Ctrl+Z 历史保留
           stateCacheSet(key, newState);
-          if (text.length <= INSTANT_EMIT_MAX_LENGTH) {
+          // 分档判据用 `doc.length`，**不能先 `doc.toString()`**（PERF-34）：`Text.length`
+          // 是构造时算好的字段（O(1)），而 `toString()` 会把整篇文档物化一遍。原实现把
+          // 它放在分档之前，于是"大文档不在这里物化"这句注释与代码正好相反——10MB 文件
+          // 每键仍付 ~4.5ms 与上百 MB/s 的垃圾，只是物化完就丢掉了
+          if (newState.doc.length <= INSTANT_EMIT_MAX_LENGTH) {
             // 小文档（绝大多数）：照旧每键写回 store。物化 256KB 的成本在 0.1ms 量级，
             // 而同步写回意味着"store 里永远是最新内容"——没有 flush 时机的负担
+            const text = newState.doc.toString();
             lastEmittedRef.current = text;
             onChangeRef.current?.(text);
             return;
@@ -957,6 +1030,7 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
           }
         },
         setMatchMarks,
+        snapshot?.value.range.head,
       );
       stateCacheSet(key, state);
     }
@@ -964,8 +1038,13 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     viewRef.current = new EditorView({
       state,
       parent: editorRef.current,
+      // 上次看到哪儿就回到哪儿（切标签 / 开日志面板都会把这个 view 销毁重建）。
+      // 没有记录时传 undefined——构造函数有 `config.scrollTo && …` 的守卫。
+      // 构造函数内部会拿这份快照对新文档 clip 一次，锚点落在文档外不会抛
+      scrollTo: scrollByPath.get(filePath),
     });
     activeEditorView = viewRef.current;
+    const untrackScroll = trackScroll(filePath, viewRef.current);
 
     // 把"未合帧的编辑"登记到 store（PERF-13）：登记的是 (tabId, 取文本) 一对，
     // 于是即便结算发生在用户切走之后，内容也会落到**当时那个标签**头上。
@@ -1006,6 +1085,9 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       }
       settlePendingEdit();
       clearPendingEditSource();
+      // 这里**不**再抢救滚动位置：被动清理跑在 React 摘 DOM 之后，那时读到的永远是 0，
+      // 存进去只会把 trackScroll 记下的真实位置覆盖掉（见 trackScroll 的说明）
+      untrackScroll();
       if (activeEditorView === viewRef.current) activeEditorView = null;
       viewRef.current?.destroy();
     };

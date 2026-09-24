@@ -133,7 +133,13 @@ export async function searchFiles(params: {
   query: string;
   extensions?: string[];
   caseSensitive?: boolean;
-  maxResults?: number;
+  /**
+   * 最多返回多少条命中。**必传**（ARCH-31）：这里原先有个 `?? 200` 的默认值，而唯一的
+   * 调用点永远显式传 1000——那个 200 从来没生效过，却和后端的 `default_max_results()`
+   * （1000）构成了同一件事的**第二、第三个**默认值。默认值只留后端一处：真要不传，
+   * 就该让后端说了算，而不是前端悄悄换个数。
+   */
+  maxResults: number;
 }): Promise<SearchResponse> {
   return await invoke('search_files', {
     params: {
@@ -141,7 +147,7 @@ export async function searchFiles(params: {
       query: params.query,
       extensions: params.extensions ?? [],
       caseSensitive: params.caseSensitive ?? false,
-      maxResults: params.maxResults ?? 200,
+      maxResults: params.maxResults,
     },
   });
 }

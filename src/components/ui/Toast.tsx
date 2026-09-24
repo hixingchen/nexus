@@ -116,6 +116,7 @@ export function showNotification({
 
         {/* 关闭按钮 */}
         <button
+          aria-label="关闭通知"
           className="p-1 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
           onClick={() => toast.dismiss(t)}
         >

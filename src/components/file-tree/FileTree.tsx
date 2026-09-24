@@ -365,7 +365,7 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
     const editor = useEditorStore.getState();
     const affected = tabsUnderPath(editor.tabs, e.path);
     if (affected.length > 0) editor.closeTabs(affected.map(t => t.id));
-    showNotification({ variant: 'warning', title: `已删除「${e.name}」`, description: '已移入系统回收站' });
+    showNotification({ variant: 'warning', title: `已删除「${e.name}」`, description: '已移入系统回收站（无法回收的大文件会被永久删除）' });
     setPendingDelete(null);
     setDeleting(false);
     // 刷新父目录：本行随之从列表里消失，本组件也就卸载了
@@ -546,10 +546,13 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             确定要删除{e.is_dir ? '文件夹' : '文件'}{' '}
             <span className="text-nexus-warning font-medium">「{e.name}」</span> 吗？
           </p>
+          {/* 不承诺"一定能找回"（CQ-42）：后端走的是 `FOF_ALLOWUNDO`，语义是"**能**回收才回收"，
+              超过回收站配额的单个大文件、网络驱动器上的文件会被直接永久删除，而
+              `FOF_NO_UI` 连 shell 本要弹的那句警告也一并压掉了——用户看不到第二次机会 */}
           <p className="text-[12px] text-nexus-muted">
             {e.is_dir
-              ? '该文件夹及其下的全部内容都会被移入系统回收站，可在回收站中恢复。'
-              : '将移入系统回收站，可在回收站中恢复。'}
+              ? '该文件夹及其下的全部内容都会被移入系统回收站；无法回收时（如超过回收站配额的大文件）会被永久删除。'
+              : '将移入系统回收站；无法回收时（如超过回收站配额的大文件）会被永久删除。'}
           </p>
           {pendingDelete !== null && pendingDelete.total > 0 && (
             <p className={`text-[12px] ${pendingDelete.dirty > 0 ? 'text-nexus-warning' : 'text-nexus-muted'}`}>

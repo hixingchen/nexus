@@ -1,4 +1,4 @@
-import { cloneElement, isValidElement, useMemo, useRef } from 'react';
+import { cloneElement, isValidElement, useEffect, useMemo, useRef } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useClickOutside } from '../../hooks/useClickOutside';
@@ -19,9 +19,16 @@ import { useClickOutside } from '../../hooks/useClickOutside';
  * 将来谁需要再照着钩子的选项加，加的时候能看见这里为什么当初没加。
  */
 
-/** 菜单容器：6 处容器逐字相同（编辑器标签那份是 z-[200] w-[170px]，语义不同故未并入） */
+/**
+ * 菜单容器：6 处容器逐字相同（编辑器标签那份是 z-[200] w-[170px]，语义不同故未并入）。
+ *
+ * `overflow-y-auto max-h-[calc(100vh-16px)]`（UX-13）：原先是 `overflow-hidden`，而
+ * `useContextMenuPosition` 的夹取只能把菜单**整体上移**、不能缩小它——条目多到超过视口时
+ * 顶部被压到 8px、底部溢出，且因为没有滚动条，**末尾条目既看不见也点不到**
+ * （`ServiceContextMenu` 最后一项正是「删除服务」）。窗口最小高度 600px 时就够触发。
+ */
 const MENU_BOX =
-  'fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-hidden';
+  'fixed z-[70] w-[180px] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl overflow-y-auto max-h-[calc(100vh-16px)]';
 
 /** 图标盒：20×20 底衬（文件树 / 项目列表的条目用） */
 const ICON_BOX =
@@ -109,11 +116,60 @@ export function ContextMenu({ x, y, onClose, className, children }: ContextMenuP
   const anchor = useMemo(() => ({ x, y }), [x, y]);
   const style = useContextMenuPosition(menuRef, anchor);
 
+  /**
+   * 打开即把焦点交给第一个可用条目（UX-5）。
+   *
+   * 为什么必须做：这些菜单此前**键盘完全够不着**——菜单被 portal 到 `document.body` 末尾，
+   * 键盘用户按 Tab 要走到底才能碰到它，而「工具命令」「取消跟随日志（xxx.log）」
+   * 「导出这个模板」在界面上**没有别的入口**。鼠标右键触发时程序化 focus 通常不匹配
+   * `:focus-visible`，所以鼠标用户看不到多余焦点环，键盘用户则拿到可见焦点。
+   */
+  useEffect(() => {
+    menuItems(menuRef.current)[0]?.focus();
+  }, []);
+
+  /** 方向键 / Home / End 在条目间移动，Escape 关闭，Tab 关闭（标准菜单语义） */
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation(); // 别让 Esc 继续冒泡去关别的东西（模态框/面板）
+      onClose();
+      return;
+    }
+    if (e.key === 'Tab') {
+      // 菜单内的 Tab 不用于在条目间走位（那是方向键的事）：直接关掉，
+      // 焦点交还给页面顺序里的下一个元素
+      onClose();
+      return;
+    }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
+    const items = menuItems(menuRef.current);
+    if (items.length === 0) return;
+    e.preventDefault();
+    const current = items.findIndex(el => el === document.activeElement);
+    const next = e.key === 'Home' ? 0
+      : e.key === 'End' ? items.length - 1
+      : e.key === 'ArrowDown' ? (current + 1 + items.length) % items.length
+      : (current - 1 + items.length) % items.length;
+    items[next]?.focus();
+  };
+
   return (
-    <div ref={menuRef} className={className ? `${MENU_BOX} ${className}` : MENU_BOX} style={style}>
+    <div
+      ref={menuRef}
+      role="menu"
+      onKeyDown={onKeyDown}
+      className={className ? `${MENU_BOX} ${className}` : MENU_BOX}
+      style={style}
+    >
       {children}
     </div>
   );
+}
+
+/** 菜单里可聚焦的条目：**跳过禁用项**（它们 focus() 不进去，会让方向键看起来卡住） */
+function menuItems(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'));
 }
 
 interface ContextMenuItemProps {
@@ -140,6 +196,7 @@ export function ContextMenuItem({ label, icon, iconBox, tone = 'accent', truncat
 
   return (
     <button
+      role="menuitem"
       className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md ${t.hover} transition-colors${group} text-left${disabledCls}`}
       disabled={disabled}
       onClick={onClick}

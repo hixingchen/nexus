@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { type Project, type Service } from '../../services/service';
@@ -31,7 +31,12 @@ export function ProjectListItem({
   project, selected, isExpanded, expanding, services, isRunning, actingId, expandedSvc,
   onSelect, onToggleExpand, onContextMenu, onStart, onStop, onTogglePin, onToggleSvcExpand,
 }: Props) {
-  const showTreeServices = services.filter(s => s.show_file_tree && s.cwd);
+  // useMemo（PERF-38）：本组件没有 memo，而父级的每次 running / svcCache / 搜索输入变化
+  // 都会重渲**全部项目行**；这里每渲一次就 filter 一遍服务列表，乘上项目数就是白跑
+  const showTreeServices = useMemo(
+    () => services.filter(s => s.show_file_tree && s.cwd),
+    [services],
+  );
   const openSearch = useSearchModalStore(s => s.openSearch);
 
   // 服务行右键菜单（搜索文件内容）

@@ -17,6 +17,15 @@ import { useRunningStore } from '../../stores/runningStore';
 import type { LogStream, ServiceLogBatchEvent } from '../../services/logService';
 import { reportError } from '../../utils/error';
 
+/**
+ * 后端是否明确说"项目不存在"——与"读不到"的其它原因（数据库忙、WAL 锁超时、IPC 失败）
+ * 区分开。只用在恢复上次选中项目那一处（CQ-34）：只有**确认项目真的没了**才把"取消选中"
+ * 落库，瞬时故障落库是不可逆的数据变更。
+ */
+function isMissingProject(msg: string): boolean {
+  return msg.includes('项目不存在');
+}
+
 export function MainLayout() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
@@ -36,10 +45,13 @@ export function MainLayout() {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
 
+    // 注意早退分支也要清 timer（CQ-39）：排程判据是 `if (!timer)`，留着一个已触发的
+    // 定时器句柄会让**此后所有批次都不再排程**——日志从此静默停止刷新，而界面只是"不再更新"。
+    // 当前 `batch` 只在 flush 里清空，这条早退够不着；一旦有人在这中间加一句过滤/丢弃就立刻可达
     const flush = () => {
+      timer = null;
       if (batch.length === 0) return;
       useLogStore.getState().bulkAppend(batch.splice(0));
-      timer = null;
     };
 
     // 后端每 ~50ms 发一批（`service-log-batch`，载荷是这个窗口内的所有行）。
@@ -98,19 +110,41 @@ export function MainLayout() {
           setSelectedProjectId(layout[LAYOUT_KEYS.selectedProjectId]);
           setSelectedProjectName(detail.project.name);
           setSelectedProjectPath(detail.project.path);
-        } catch {
-          // 项目可能已删除或数据库重建，清除选中状态
+        } catch (e: unknown) {
+          // **失败不等于"项目已删除"**（CQ-34）：这里的 catch 覆盖"项目不存在"与
+          // "数据库忙 / WAL 锁超时 / 查询失败"两类，而后者是**瞬时**故障。原实现两件事都做：
+          // 清掉内存状态 + `saveLayout({selectedProjectId: ''})` **落库**——一次瞬时读失败
+          // 就把"用户上次选中的项目"永久取消选中，没有任何提示、连控制台都没有。
+          // 现在：先留痕（不沉默失败），且**只有确认项目真的不存在时才落库**；
+          // 其余错误保持 DB 里的值不动，用户重开一次应用就能恢复。
+          const msg = String(e);
+          reportError('恢复上次选中的项目失败', e, {
+            variant: 'warning',
+            silent: isMissingProject(msg),
+            title: '未能恢复上次选中的项目',
+            description: '读取项目详情失败，本次未自动选中（配置里记的项目没有被改动）',
+          });
           setSelectedProjectId(null);
           setSelectedProjectName(null);
           setSelectedProjectPath(null);
-          saveLayout({ [LAYOUT_KEYS.selectedProjectId]: '' });
+          // 后端在项目不存在时给的是"项目不存在"（commands/project.rs）；其余错误
+          // 一律当作临时故障，不把结论写进数据库
+          if (isMissingProject(msg)) {
+            saveLayout({ [LAYOUT_KEYS.selectedProjectId]: '' });
+          }
         }
       }
       if (layout[LAYOUT_KEYS.leftPanelWidth]) setLeftPanelWidth(Number(layout[LAYOUT_KEYS.leftPanelWidth]));
       if (layout[LAYOUT_KEYS.leftPanelCollapsed] === '1') setLeftPanelCollapsed(true);
       if (layout[LAYOUT_KEYS.servicePanelCollapsed] === '1') setServicePanelCollapsed(true);
       setReady(true);
-    }).catch(() => setReady(true));
+    }).catch((e: unknown) => {
+      // 兜底（正常到不了）：`ensureLoaded` 内部已 catch，所以这里只可能接住**上面这段回调
+      // 自身**抛出的异常。留着它是因为后果不对称——漏掉这一行，界面会永远停在"加载中"，
+      // 而用户看到的只是一片空白，没有任何线索
+      reportError('恢复上次布局时出错（已按默认布局继续）', e);
+      setReady(true);
+    });
   }, [saveLayout]);
 
   // 选中项目变化时保存

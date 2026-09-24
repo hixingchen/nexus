@@ -19,19 +19,37 @@ export interface ToolCommand {
  */
 export function parseToolCommands(raw: string | null | undefined): ToolCommand[] {
   if (!raw) return [];
+  // 丢弃必须留痕（CQ-33）：这是全项目唯一真实的"不受信数据跨边界"点，而它此前是
+  // 完全静默的——用户在界面上只看到"工具命令右键菜单变空了"，排查方向完全错
+  // （会去查服务配置、查工具库，而问题在那一列 JSON 上）。控制台给得出原始片段与条数。
+  const warn = (reason: string, extra?: unknown) => {
+    console.warn(
+      `[nexus] 工具命令配置${reason}，本次按空处理（服务配置本身没有被改动）:`,
+      typeof raw === 'string' ? raw.slice(0, 200) : raw,
+      extra ?? '',
+    );
+  };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (e) {
+    warn('不是合法 JSON', e);
     return [];
   }
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter((it): it is ToolCommand => {
+  if (!Array.isArray(parsed)) {
+    warn(`不是数组（实际是 ${typeof parsed}）`);
+    return [];
+  }
+  const kept = parsed.filter((it): it is ToolCommand => {
     if (typeof it !== 'object' || it === null) return false;
     const o = it as Record<string, unknown>;
     return typeof o.id === 'string' && typeof o.name === 'string' && typeof o.command === 'string'
       && (o.timeout_secs === undefined || typeof o.timeout_secs === 'number');
   });
+  if (kept.length !== parsed.length) {
+    warn(`里有 ${parsed.length - kept.length} 条缺少 id/name/command（已丢弃）`);
+  }
+  return kept;
 }
 
 export interface Service {
@@ -160,7 +178,13 @@ export const serviceApi = {
     }
   }),
 
-  /** 更新服务配置 */
+  /**
+   * 更新服务配置。
+   *
+   * 返回的不只是成败：**保存成功但文件监听没跟上**是可能发生的（CQ-35），
+   * 那时若只回一个 Ok，界面会照着"已保存"提示，而用户改文件毫无反应——
+   * 与 `file_watcher.rs` 专门把同类失败从 `Ok(())` 改成 `Err` 要消灭的症状同一个。
+   */
   update: (params: {
     id: string;
     name: string;
@@ -174,7 +198,7 @@ export const serviceApi = {
     enabled: boolean;
     showFileTree: boolean;
     toolCommands: string;
-  }) => invoke<void>('update_service', {
+  }) => invoke<{ watch_refreshed: boolean; watch_error: string }>('update_service', {
     params: {
       id: params.id,
       name: params.name,
@@ -447,8 +471,16 @@ export const openToolsApi = {
   save: (tool: { id?: string | null; name: string; executable: string; args: string }) =>
     invoke<OpenTool>('save_open_tool', { params: tool }),
 
-  /** 删除工具（服务绑定级联解除） */
+  /**
+   * 删除工具（服务绑定级联解除、模板上的默认引用一并清空）。
+   *
+   * 删除前先调 usage —— 这一步的代价只有一次查询，换来的是确认框能说清
+   * "会影响哪些服务"（UX-4：删除入口是个 11px 图标，而后果跨项目）
+   */
   delete: (id: string) => invoke<void>('delete_open_tool', { id }),
+
+  /** 工具被谁引用（删除确认框用）：跨项目的「项目名 / 服务名」+ 模板名 */
+  usage: (id: string) => invoke<{ services: string[]; templates: string[] }>('get_open_tool_usage', { id }),
 
   /** 绑定/解绑服务与工具（toolId 为 null → 解绑） */
   bindService: (serviceId: string, toolId: string | null) =>

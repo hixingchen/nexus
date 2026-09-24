@@ -6,6 +6,7 @@ import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
 import { includesIgnoreCase } from '../../utils/search';
 import { isSubmitEnter } from '../../utils/keyboard';
+import { isStickToBottom } from '../../utils/logFollow';
 import { failureDetail, failureLabel } from '../../utils/serviceFailure';
 import type { ServiceLogLine } from '../../services/logService';
 import type { FailedService } from '../../services/service';
@@ -20,8 +21,6 @@ const ESTIMATED_ROW_H = 21;
 const OVERSCAN = 12;
 /** 日志上下内边距（交给 virtualizer 的 paddingStart/End，贴底计算与真实滚动高度同一口径） */
 const PAD_Y = 12;
-/** 判定"用户是否在底部"的容差（px）：小于它视为跟随中，可以贴底 */
-const STICK_TO_BOTTOM_EPSILON = 24;
 /** 搜索输入防抖间隔 */
 const SEARCH_DEBOUNCE_MS = 200;
 
@@ -175,7 +174,11 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
     const el = scrollRef.current;
     if (!el) return;
     // 程序贴底也会触发滚动事件 → 在底部 → 判据保持 true，不会自己把自己关掉
-    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_TO_BOTTOM_EPSILON;
+    stickRef.current = isStickToBottom({
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+    });
   }, []);
 
   // ── 暂停 ──────────────────────────────────────────────────
@@ -338,7 +341,8 @@ function LogHeader({
   return (
     <div className="flex-shrink-0 flex items-center h-12 px-4 border-b border-[#30363d] bg-[#161b22] gap-3 select-none">
       {onClose && (
-        <button className="h-7 w-7 flex items-center justify-center rounded-lg text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
+        <button aria-label="关闭日志面板"
+          className="h-7 w-7 flex items-center justify-center rounded-lg text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
           onClick={onClose}>
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
         </button>

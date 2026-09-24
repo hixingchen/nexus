@@ -58,6 +58,26 @@ test('jar 内条目的标签随磁盘上的那个 jar 一起关掉', () => {
   assert.deepEqual(paths(tabsUnderPath(tabs, 'D:/libs/app.jar')), ['jar://D:/libs/app.jar!/com/A.class']);
 });
 
+test('jar 内条目的标签随磁盘上的那个 jar 一起关掉', () => {
+  const tabs = [tab('jar://D:/libs/app.jar!/com/A.class'), tab('D:/libs/other.jar')];
+  assert.deepEqual(paths(tabsUnderPath(tabs, 'D:/libs/app.jar')), ['jar://D:/libs/app.jar!/com/A.class']);
+});
+
+test('删掉**装着 jar 的目录**，jar 内的条目标签也要一起关（CQ-44）', () => {
+  const tabs = [
+    tab('jar://D:/proj/lib/app.jar!/com/A.class'),
+    tab('jar://D:/proj/lib/app.jar!/inner.jar!/com/B.class'),
+    tab('D:/proj/lib/other.txt'),          // 目录里的普通文件
+    tab('jar://D:/proj/other/lib.jar!/x'), // 兄弟目录里的 jar：不能误伤
+  ];
+  // paths() 会排序，故这里也按排序后的顺序写
+  assert.deepEqual(paths(tabsUnderPath(tabs, 'D:/proj/lib')), [
+    'D:/proj/lib/other.txt',
+    'jar://D:/proj/lib/app.jar!/com/A.class',
+    'jar://D:/proj/lib/app.jar!/inner.jar!/com/B.class',
+  ]);
+});
+
 test('空路径 / 无匹配 → 空数组（空路径不得退化成"命中一切"）', () => {
   const tabs = [tab('D:/work/proj/a.ts')];
   assert.deepEqual(tabsUnderPath(tabs, ''), []);

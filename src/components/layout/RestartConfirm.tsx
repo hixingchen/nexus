@@ -130,6 +130,7 @@ export function RestartConfirm() {
           >{item.restarting ? '重启中…' : '重启服务'}</button>
 
           <button
+            aria-label="忽略这条重启提示"
             className="p-1.5 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
             onClick={() => handleDismiss(item.serviceId)}
           >

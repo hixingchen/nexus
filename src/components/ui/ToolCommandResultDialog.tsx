@@ -123,6 +123,7 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
             )}
           </div>
           <button
+            aria-label="关闭结果窗口"
             className="w-7 h-7 flex items-center justify-center rounded-lg text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50"
             onClick={onClose}
           >

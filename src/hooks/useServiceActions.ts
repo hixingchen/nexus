@@ -17,13 +17,27 @@ export type ServiceActionName = 'start' | 'stop' | 'restart';
  *
  * `busyId` 是 id 而不是布尔：收起态那一列圆点要按服务分别禁用，卡片那边用
  * `busyId === service.id` 即可，两种用法同一个来源。
+ *
+ * **是一组 id 而不是单个**（CQ-40）：单值时快速点服务 A 的「启动」再点 B 的，B 会把 A 顶掉；
+ * A 先返回就 `setBusyId(null)` 把 B 重新点亮——**B 还在执行中，它的按钮却已可用**，
+ * 于是同一个动作可以被重复发起（启动两次 = 两个进程抢同一个端口）。
  */
 export function useServiceActions(onDone: () => void) {
-  /** 正在执行动作的服务 id：调用方据此禁用按钮/菜单项，避免第二次点击 */
-  const [busyId, setBusyId] = useState<string | null>(null);
+  /** 正在执行动作的服务 id 集合：调用方据此禁用按钮/菜单项，避免第二次点击 */
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
+  const isBusy = useCallback((id: string) => busyIds.has(id), [busyIds]);
+
+  /** 标记开始/结束。用函数式更新，避免闭包拿到过期的集合 */
+  const mark = (id: string, busy: boolean) => {
+    setBusyIds(prev => {
+      const next = new Set(prev);
+      if (busy) next.add(id); else next.delete(id);
+      return next;
+    });
+  };
 
   const runAction = useCallback(async (service: Service, action: ServiceActionName) => {
-    setBusyId(service.id);
+    mark(service.id, true);
     try {
       if (action === 'start') {
         // 共享动作层：启动进程 + 追加该服务的文件监听（口径与详情页一致）
@@ -40,7 +54,7 @@ export function useServiceActions(onDone: () => void) {
       // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
       if (action === 'start') onDone();
     }
-    setBusyId(null);
+    mark(service.id, false);
   }, [onDone]);
 
   /**
@@ -50,7 +64,7 @@ export function useServiceActions(onDone: () => void) {
    * 各写一份的话必然有一处忘了刷新运行状态、菜单里的"取消跟随"项不消失。
    */
   const unfollowLog = useCallback(async (service: Service) => {
-    setBusyId(service.id);
+    mark(service.id, true);
     try {
       const cancelled = await processApi.unfollowLog(service.id);
       // 没在跟随时后端返回 null：那是空操作，说一句"没在跟随"比弹出"已取消"更诚实
@@ -61,8 +75,8 @@ export function useServiceActions(onDone: () => void) {
     } catch (err: unknown) {
       reportError('取消跟随日志失败', err);
     }
-    setBusyId(null);
+    mark(service.id, false);
   }, [onDone]);
 
-  return { busyId, runAction, unfollowLog };
+  return { isBusy, runAction, unfollowLog };
 }

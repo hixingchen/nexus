@@ -36,14 +36,14 @@ import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../sto
 import { RobotIcon } from '../ai/RobotIcon';
 import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type Service, type ServiceTemplate } from '../../services/service';
 import { failureLabel } from '../../utils/serviceFailure';
-import { openInExplorer, openTerminal } from '../../services/system';
+import { openInExplorer, openTerminal, pickSaveFile } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
 import { useServiceActions } from '../../hooks/useServiceActions';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { useToolCommandRunner } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
 // 模板导入导出用系统文件对话框选路径：后端按"用户显式选择的路径"处理（与打开工具选 exe 同口径）
-import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { reportError } from '../../utils/error';
 import { pruneServiceDrafts } from '../../stores/serviceDraftStore';
 
@@ -70,7 +70,7 @@ interface Props {
 
 export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel }: Props) {
   const {
-    detail, services, loading, editingService, setEditingService,
+    detail, loadError, services, loading, editingService, setEditingService,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
@@ -226,10 +226,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   /** 导出模板到 JSON 文件。ids 为空 = 全部导出；单个模板走右键菜单传它自己的 id */
   const handleExportTemplates = useCallback(async (ids: string[] = []) => {
     try {
-      const path = await saveFileDialog({
-        title: ids.length === 1 ? '导出这个模板' : '导出全部模板',
-        defaultPath: ids.length === 1 ? 'nexus-template.json' : 'nexus-templates.json',
-        filters: [{ name: 'JSON', extensions: ['json'] }],
+      // 保存对话框走**后端**（SEC-19）：选中的目录会被记为"用户已确认"，
+      // 导出命令据此校验写入路径。前端自弹对话框的话，路径只是 IPC 里的一个字符串，
+      // 服务端无从分辨它是不是用户选的
+      const path = await pickSaveFile({
+        purpose: 'exportTemplates',
+        defaultName: ids.length === 1 ? 'nexus-template.json' : 'nexus-templates.json',
       });
       if (!path) return; // 用户取消
       const count = await serviceApi.exportServiceTemplates(path, ids);
@@ -280,6 +282,21 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   }, [setEditingService, setEditingTemplate]);
 
   if (!detail) {
+    // 失败态必须与"加载中"分开（UX-17）：原实现把 detail 为 null 一律当成加载中，
+    // 加载失败后主区域就**永远**停在"加载中…"（原因只在 8 秒后消失的 toast 里出现过一次）。
+    // 这里给出持久的原因 + 重试入口，用户不必猜也不必重开应用
+    if (loadError) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full gap-3 text-[12px]">
+          <p className="text-nexus-error">项目详情加载失败</p>
+          <p className="text-nexus-muted max-w-[420px] text-center break-all">{loadError}</p>
+          <button
+            className="px-3 py-1.5 text-[12px] bg-nexus-accent/15 text-nexus-accent rounded-md hover:bg-nexus-accent/25 font-medium"
+            onClick={() => void load()}
+          >重试</button>
+        </div>
+      );
+    }
     return (
       <div className="flex items-center justify-center h-full text-[12px] text-nexus-muted">
         加载中…
@@ -903,11 +920,13 @@ function ServiceSection({
           disabled={loading.__all__ || services.length === 0}
           onClick={handleStartAll}
         >▶ 全部启动</button>
+        {/* 与「全部启动」共用 `loading.__all__`（UX-15）：停止是串行收尸，可能数秒，
+            期间必须禁用并显示进行中——否则用户会连点，而每次连点都排一轮停止 */}
         <button
           className="flex-1 px-3 py-1.5 text-[12px] bg-nexus-error/15 text-nexus-error rounded-md hover:bg-nexus-error/25 disabled:opacity-40 font-medium"
-          disabled={services.length === 0}
+          disabled={loading.__all__ || services.length === 0}
           onClick={handleStopAll}
-        >■ 全部停止</button>
+        >{loading.__all__ ? '处理中…' : '■ 全部停止'}</button>
       </div>
     </div>
   );

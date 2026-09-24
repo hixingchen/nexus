@@ -13,10 +13,14 @@ import { markdownImageSrc, resolveMdLink, headingSlug } from '../../utils/markdo
  *
  * **`DOMPurify` 是这里的安全边界，不是可选项**：预览的内容来自文件本身，而文件可能来自
  * 克隆的第三方仓库——`dangerouslySetInnerHTML` 直接吃它等于把 webview 交给文件内容。
- * 具体地：CSP 已经挡住 `<script>`、内联事件处理器（`onerror=` 之类）、`javascript:`
- * 导航、iframe/object/form，但 **`style-src 'unsafe-inline'` 允许注入 `<style>`**
- * （可以拿它做 UI 覆盖/伪装）——`FORBID_TAGS: ['style']` 正是为这一条写的。
+ * 具体地：**打包态**下 CSP 已经挡住 `<script>`、内联事件处理器（`onerror=` 之类）、
+ * `javascript:` 导航、iframe/object/form，但 **`style-src 'unsafe-inline'` 允许注入
+ * `<style>`**（可以拿它做 UI 覆盖/伪装）——`FORBID_TAGS: ['style']` 正是为这一条写的。
  * 另外只放行 HTML profile（不含 SVG/MathML）：预览不需要它们，而它们带得动脚本向量。
+ *
+ * ⚠️ **dev 态没有 CSP**（SEC-25）：CSP 挂在 `tauri://` 协议的资源响应上，而 dev 的文档
+ * 来自 Vite、不经过它——"被绕过时由 CSP 兜底"这层在开发环境下**不存在**，那一层由
+ * `lib.rs` 的导航守卫与这里的 DOMPurify 顶上。别按"CSP 已经挡住了"来推 dev 的行为。
  *
  * 链接与图片**不由浏览器直接处理**（见 `utils/markdown.ts`）：hre 来自被预览的文件，
  * 放它导航就等于让文件决定 webview 去哪儿。这里全部拦下来自己分发。
@@ -27,7 +31,13 @@ const SANITIZE_CONFIG: PurifyConfig = {
   // `<style>` 元素与 `style="…"` 属性。DOMPurify 的 CSS 清洗只管"危险取值"
   // （url(javascript:) 之类），**不管"布局接管"**——`position:fixed;inset:0` 加个底色
   // 就能盖住整个界面做伪装。预览里的 md 不需要内联样式来承载内容。
-  FORBID_TAGS: ['style'],
+  //
+  // `form` 一并禁掉（SEC-26）：html profile 的白名单里**含 form/input/textarea/button/
+  // select**（见 dompurify 的 html$1 数组），于是任意仓库的 md 都能在窗口里渲染出一个
+  // 可交互的假登录框——UI 伪装。打包态 `form-action 'none'` 只挡提交，dev 态连提交也放行。
+  // **不能顺手把 input 也禁掉**：任务列表（`- [x] 完成`）正是渲染成 `<input type=checkbox>`，
+  // 禁了会把正常内容一起弄没。
+  FORBID_TAGS: ['style', 'form'],
   FORBID_ATTR: ['style'],
 };
 

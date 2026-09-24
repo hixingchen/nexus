@@ -196,7 +196,7 @@ export function EditorTabs() {
               )}
               <button
                 className={`flex-shrink-0 w-[18px] h-[18px] flex items-center justify-center rounded-full hover:bg-nexus-error/10 text-nexus-muted hover:text-nexus-error transition-all ${
-                  isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                  isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
                 }`}
                 onClick={(e) => handleCloseClick(e, tab)}
                 title={isDirty ? '关闭（未保存的更改将丢失）' : '关闭（或中键点击标签）'}

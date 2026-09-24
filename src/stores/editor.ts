@@ -36,6 +36,16 @@ interface EditorStore {
    * 标签切换（switchToTab）不递增（保留历史）。修复"输入一个字符 Ctrl+Z 应回到打开时状态"
    */
   fileOpenSeq: Record<string, number>;
+
+  /**
+   * 打开请求信号：**每次 `loadAndOpenFile` 都 +1**，包括重新打开当前已激活的那个文件。
+   *
+   * 为什么调用方不能拿活动标签 id 当"用户刚看了某个文件"的信号：点**当前已经打开的那个
+   * 文件**时 id 不变（`setActiveTabId` 设的是同一个值），那次点击看起来像没发生——
+   * 症状是日志面板"要点别的文件才收"。与 `revealSeq` / `hitSeq` 同一个套路：
+   * 不信"状态变没变"，直接数请求。
+   */
+  openRequestSeq: number;
   /** 同步操作：打开标签页并设置内容 */
   openTab: (tab: FileTab, content: string, activate?: boolean) => void;
   closeTab: (id: string) => void;
@@ -225,6 +235,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   dirtyIds: [],
   mdPreview: false,
   fileOpenSeq: {},
+  openRequestSeq: 0,
   locate: null,
   hitSeq: 0,
   revealPath: null,
@@ -385,6 +396,9 @@ const editSeqByTab = new Map<string, number>();
  * 由组件调用，store 不直接执行异步操作
  */
 export async function loadAndOpenFile(path: string, name: string): Promise<void> {
+  // 打开请求信号：必须挂在**所有提前返回之前**——下面就有一条 jar 虚拟路径的 return，
+  // 挂它后面的话，从文件树点开 jar 里的条目会漏掉这次"用户要看文件"
+  useEditorStore.setState(s => ({ openRequestSeq: s.openRequestSeq + 1 }));
   // jar 虚拟路径（树内展开的 jar 条目）：路由到 jar 条目打开，不读磁盘
   if (path.startsWith('jar://')) {
     const { jarPath, nested, name: entryName } = parseJarVirtualPath(path);
@@ -634,13 +648,25 @@ export function clearPendingEditSource(): void {
  * 物化并落库未合帧的编辑（无待处理内容时是 no-op）。**所有读取内容的路径都必须先经这里。**
  *
  * 先取出再物化：`take()` 可能触发 store 写入（进而重入本函数），清空槽位可避免重复落库。
+ *
+ * **`take()` 返回 null ≠ 端口作废**（P0-6）：没有待物化内容时它只是个空结算，而空结算在
+ * 一条正常的挂载路径上必然发生至少一次（编辑器挂载那一拍 `pendingStateRef` 必然是
+ * null，紧随其后的同步 effect 就会调一次；切 Markdown 预览同理）。原实现在这里把端口
+ * 一起销毁了，此后再没有任何代码重新登记——于是大文档（>256KB，走合帧路径）的**每一次**
+ * 编辑都拿不回来：`dirtyIds` 恒不含该标签 ⇒ Ctrl+S 静默无效、标签不显示未保存圆点、
+ * 关窗不弹确认直接丢弃。空结算就把端口放回去，端口只在**取到了内容**之后才作废。
  */
 export function settlePendingEdit(): void {
   const p = pendingEdit;
   if (!p) return;
+  // 先清槽再物化：`take()` 期间的任何重入都只看得到空槽，不会重复落库
   pendingEdit = null;
   const text = p.take();
-  if (text === null) return;
+  if (text === null) {
+    // 槽位若已被别人重新登记（理论上只有编辑器挂载会登记）就不动它
+    if (pendingEdit === null) pendingEdit = p;
+    return;
+  }
   applyDraft(p.tabId, text, useEditorStore.setState, useEditorStore.getState);
 }
 

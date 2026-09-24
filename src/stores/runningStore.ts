@@ -10,6 +10,17 @@ const POLL_INTERVAL_MS = 3000;
 let intervalId: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * 是否已有一个 refresh 在飞。**只用于轮询的在途保护**（PERF-20）。
+ *
+ * 为什么需要：`get_running` 是后端最重的命令——它要 `try_wait` 每个服务、跑一遍
+ * `adopt_survivors` 的全系统进程快照、对每个未认领的服务扫 7 个日志目录；停尸路径
+ * 最坏单服务 ~5s。3 秒一次无条件再发，会让多个阻塞任务在 tokio 线程池里排队。
+ * 跳过这一拍没有正确性代价：数据下一次就回来（不拦**用户动作**触发的 refresh，
+ * 那条必须立刻可见）。
+ */
+let refreshInFlight = false;
+
+/**
  * 状态代际号：每次"被采纳的写入"（轮询响应或动作后的主动刷新）都 +1。
  *
  * 为什么需要：轮询响应在途时，一次用户动作（启停服务）会走 `load()` → `setRunning` 拿到
@@ -31,7 +42,15 @@ function sameStatus(a: RunningService[], b: RunningService[], af: FailedService[
     && af.length === bf.length
     && a.every((x, i) => {
       const y = b[i];
-      return y && x.service_id === y.service_id && x.project_id === y.project_id;
+      // **三个字段都要比**（CQ-24）：`followed_log` 是**异步出现**的——后端每次
+      // `get_running` 都驱动两阶段采样，服务启动时要等日志文件"在长"才认领，于是
+      // "成员与顺序都没变、只是它从 null 变成了路径"是常见形态。漏比它就会被判成
+      // "没变化"而早退，`followedLogOf` 恒为 null，「取消跟随日志（xxx.log）」入口
+      // 永远不出现。failed 分支本来就是逐字段全比的，这里与它对齐。
+      return y
+        && x.service_id === y.service_id
+        && x.project_id === y.project_id
+        && (x.followed_log ?? null) === (y.followed_log ?? null);
     })
     && af.every((x, i) => {
       const y = bf[i];
@@ -69,6 +88,7 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
   /** 拉取一次最新状态（失败只记录日志：后端故障时每 3 秒弹 toast 会刷屏） */
   refresh: async () => {
     const reqSeq = statusSeq; // 请求发出时的代际
+    refreshInFlight = true;
     try {
       const r = await processApi.getRunning();
       // 期间有更新的写入（动作结果 / 更晚的刷新）→ 丢弃这次过期响应
@@ -83,6 +103,8 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
       // 只留控制台：3 秒轮询的后台请求，失败时保留上一次状态即可（下次轮询自愈），
       // 弹 toast 会变成「后端一抖动就刷屏」
       console.error('获取运行状态失败:', e);
+    } finally {
+      refreshInFlight = false;
     }
   },
 
@@ -90,7 +112,11 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
   startPolling: () => {
     if (intervalId !== null) return;
     void get().refresh();
-    intervalId = setInterval(() => { void get().refresh(); }, POLL_INTERVAL_MS);
+    intervalId = setInterval(() => {
+      // 上一拍还没回来就跳过（PERF-20）：后端那三个阶段是重活，堆起来只会互相拖慢
+      if (refreshInFlight) return;
+      void get().refresh();
+    }, POLL_INTERVAL_MS);
   },
 
   stopPolling: () => {

@@ -65,8 +65,10 @@ export function ServiceTreeEntry({
   );
 
   // 服务动作与"服务列收起后的圆点条"共用一份实现（见 useServiceActions 的说明）
-  const { busyId, runAction, unfollowLog } = useServiceActions(onRefresh);
-  const busy = busyId === service.id;
+  // 按 id 问"这条在忙吗"，而不是拿单个 busyId 比（CQ-40：同时操作两条服务时，
+  // 单个值会被后来者顶掉，先前那条返回时还会把后者重新点亮）
+  const { isBusy, runAction, unfollowLog } = useServiceActions(onRefresh);
+  const busy = isBusy(service.id);
 
   /** 卡片按钮入口：先阻止冒泡（卡片点击 = 打开编辑面板），再走共享动作 */
   const handleAction = (e: React.MouseEvent, action: ServiceActionName) => {
@@ -122,7 +124,7 @@ export function ServiceTreeEntry({
               运行中与失败共用同一组按钮（日志/重启/停止）——失败态也要能"停止"：
               它既是收尾（结束残留进程，含另开窗口的游离进程），也是清掉红点的入口 */}
           <div
-            className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 focus-within:opacity-100 ${isDragging ? '' : 'group-hover:opacity-100'}`}
             onPointerDown={(e) => e.stopPropagation()}
           >
             {running || failed ? (

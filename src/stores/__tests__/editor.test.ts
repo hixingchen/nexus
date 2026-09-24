@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   useEditorStore,
+  loadAndOpenFile,
   saveActiveFile,
   commitReloadedContent,
   settlePendingEdit,
@@ -186,4 +187,68 @@ test('取到的内容是空串也照常落库（清空文件的编辑不能被�
   assert.equal(st.fileContent, '');
   assert.deepEqual(st.dirtyIds, [tab.id], '清空文件同样是未保存改动');
   clearPendingEditSource();
+});
+
+/**
+ * P0-6：**空结算不得销毁端口**。
+ *
+ * 症状是静默丢内容，且三个出口同时失效。编辑器挂载那一拍 `pendingStateRef` 必然是 null，
+ * 紧随其后的同步 effect 就会调一次 `settlePendingEdit()`（切 Markdown 预览同理）——
+ * 那次空结算若把端口吃掉，之后**再没有任何代码重新登记**：大文档（>256KB，走合帧路径）
+ * 的编辑从此拿不回来，`dirtyIds` 恒不含该标签 ⇒ Ctrl+S 静默无效且提示"成功"、
+ * 标签不显示未保存圆点、关窗不弹确认直接丢弃。
+ */
+test('空结算不销毁端口：其后的编辑仍能被结算落库（P0-6）', () => {
+  resetStore();
+  const tab = openTab('/p/big-empty.ts', 'A'.repeat(10));
+  // 编辑器挂载时登记的端口：此刻还没有任何未合帧内容
+  let pending: string | null = null;
+  setPendingEditSource(tab.id, () => {
+    const t = pending;
+    pending = null;
+    return t;
+  });
+
+  // 挂载那一拍的同步 effect（无内容可物化）
+  assert.equal(unsavedDraftCount(), 0, '空结算不该凭空造出未保存改动');
+
+  // 用户在合帧窗口里敲了一个字，还没写回 store
+  pending = 'A'.repeat(10) + 'B';
+  assert.equal(unsavedDraftCount(), 1, '端口被空结算吃掉的话这里数到 0 → 关窗直接丢编辑');
+  assert.deepEqual(useEditorStore.getState().dirtyIds, [tab.id]);
+  assert.equal(useEditorStore.getState().fileContent, 'A'.repeat(10) + 'B', '内容必须落到 store');
+
+  // 取到内容之后端口才作废：再模拟一次新的未合帧编辑需要重新登记（编辑器只会登记一次，
+  // 但这里顺手钉住"取过就不再重复取"的语义没有被放回去的端口破坏）
+  assert.equal(pending, null, '内容已被取走');
+  clearPendingEditSource();
+});
+
+/**
+ * 打开请求信号（`openRequestSeq`）：日志面板靠它判断"用户刚请求看了某个文件"。
+ *
+ * 守的是一个具体症状——点文件树里**当前已经打开的那个文件**时，活动标签 id 保持不变
+ * （`setActiveTabId` 设的是同一个值），拿它当信号的那段逻辑就完全不动作，
+ * 表现为"日志面板要点别的文件才收"（用户报的就是这个）。信号因此改成数请求次数。
+ */
+test('重开当前已激活的文件也算一次打开请求（活动标签 id 没变，但请求发生了）', async () => {
+  resetStore();
+  const tab = openTab('/p/again.ts', 'x');
+  useEditorStore.getState().setActiveTabId(tab.id);
+  const before = useEditorStore.getState().openRequestSeq;
+
+  // 读盘在测试进程里必然失败（没有 Tauri IPC），但信号在函数入口就递增了；
+  // 断言紧跟在调用之后 = 断言"递增发生在任何 await 之前"
+  const p = loadAndOpenFile(tab.path, tab.name);
+  assert.equal(useEditorStore.getState().openRequestSeq, before + 1);
+  await p.catch(() => {});
+});
+
+test('jar 条目也算打开请求：信号必须挂在提前返回之前', async () => {
+  resetStore();
+  const before = useEditorStore.getState().openRequestSeq;
+
+  const p = loadAndOpenFile('jar://D:/p/app.jar!/a/B.class', 'B.class');
+  assert.equal(useEditorStore.getState().openRequestSeq, before + 1);
+  await p.catch(() => {});
 });

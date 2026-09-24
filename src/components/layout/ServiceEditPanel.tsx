@@ -280,7 +280,15 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           }
         }
       } else {
-        await serviceApi.update(payload);
+        const res = await serviceApi.update(payload);
+        // 配置已落库，但文件监听没跟上必须说出来（CQ-35）：不说的话界面提示"已保存"，
+        // 而用户改文件毫无反应——这正是 file_watcher.rs 把同类结论从 Ok(()) 改成 Err 的原因
+        if (!res.watch_refreshed) {
+          reportError('配置已保存，但文件监听未生效', res.watch_error, {
+            variant: 'warning',
+            description: `改文件可能不会触发重启：${res.watch_error}`,
+          });
+        }
       }
       // 已持久化：草稿使命完成（否则重新打开面板会把旧编辑又"复活"回来）
       useServiceDraftStore.getState().setDraft(draftKey, null);
@@ -410,6 +418,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 <input className={`${INPUT_CLS} pr-8`} value={cwd}
                   onChange={e => applyCwd(e.target.value)} placeholder="/path/to/service" />
                 <button
+                  aria-label="选择工作目录"
                   className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
                   onClick={handleSelectCwd}
                 >
@@ -586,7 +595,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
                     {/* 操作按钮 */}
                     {editingToolCmd?.id !== cmd.id && (
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                         {/* 排序：列表顺序 = 右键菜单顺序。首/尾那侧禁用（点了也是原地不动） */}
                         <button
                           className="p-1.5 text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 rounded-md transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"

@@ -81,7 +81,7 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
 
           {/* Hover 操作：添加到项目（删除在右键菜单；拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽） */}
           <div
-            className={`flex items-center gap-1 opacity-0 flex-shrink-0 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 focus-within:opacity-100 ${isDragging ? '' : 'group-hover:opacity-100'}`}
             onPointerDown={(e) => e.stopPropagation()}
           >
             <button

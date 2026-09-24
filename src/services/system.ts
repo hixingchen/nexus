@@ -32,6 +32,41 @@ export function pickDirectory(opts?: { purpose?: PickPurpose; defaultPath?: stri
   });
 }
 
+/** 保存对话框的用途键（标题由后端决定，同 `PickPurpose`） */
+export type SavePurpose = 'exportTemplates';
+
+/**
+ * 原生文件保存对话框（由 Rust 侧弹框）。
+ *
+ * 为什么必须走后端（SEC-19）：导出要把文件写到"用户挑的位置"，而这个结论不能由一个
+ * IPC 参数说了算——前端 `plugin-dialog` 的 `save()` 拿到的路径经 IPC 回传，服务端分辨不出
+ * 它是不是用户刚选的。Rust 侧弹框会把选中的**所在目录**当场记为"已确认"，于是导出到
+ * 桌面/文档照常可用，而凭空指定 `C:/Windows/...` 会被白名单拒掉。
+ *
+ * `defaultName` 只是对话框里的默认文件名，不是写入路径。
+ */
+export function pickSaveFile(opts?: { purpose?: SavePurpose; defaultName?: string }): Promise<string | null> {
+  return invoke<string | null>('pick_save_file', {
+    purpose: opts?.purpose ?? null,
+    defaultName: opts?.defaultName ?? null,
+  });
+}
+
+/**
+ * 当前应用版本号（"关于"与「检查更新」共用）。
+ *
+ * 为什么由后端答而不是前端读 `package.json`：那是 npm 侧的版本号，与打包出来的安装包
+ * 未必同步；后端返回的是 `CARGO_PKG_VERSION`——**这个二进制自己的**版本（见
+ * `commands/app.rs::get_app_version`）。
+ *
+ * 收进本模块是为了守住"IPC 面收敛在 `services/*`"这条可机械审计的规则（SEC-30）：
+ * `TitleBar` 原先直接 `invoke('get_app_version')`，那是个只读、无参数、无风险的调用，
+ * 但它是全仓仅剩的两处例外之一——新命令照抄这种写法就会绕过服务层。
+ */
+export function getAppVersion(): Promise<string> {
+  return invoke<string>('get_app_version');
+}
+
 /** 在系统资源管理器中打开（失败带原因提示） */
 export async function openInExplorer(path: string): Promise<void> {
   try {

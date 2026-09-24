@@ -1,10 +1,10 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { invoke } from '@tauri-apps/api/core';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { reportError } from '../../utils/error';
 import { notify } from '../../utils/notify';
 import { compareVersions } from '../../utils/version';
 import { nodeApi } from '../../services/service';
+import { getAppVersion } from '../../services/system';
 import { NodeVersionModal } from './NodeVersionModal';
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useClickOutside } from '../../hooks/useClickOutside';
@@ -137,7 +137,7 @@ function AppMenu() {
 
   useEffect(() => {
     let alive = true;
-    invoke<string>('get_app_version')
+    getAppVersion()
       .then(v => { if (alive) setAppVersion(v); })
       .catch(() => { if (alive) setAppVersion(''); });   // 读不到就只显示 Nexus，不报错
     return () => { alive = false; };
@@ -157,7 +157,7 @@ function AppMenu() {
     setOpen(false);
     setChecking(true);
     try {
-      const current = await invoke<string>('get_app_version');
+      const current = await getAppVersion();
       const res = await fetch(LATEST_RELEASE_API, { headers: { Accept: 'application/vnd.github+json' } });
       if (!res.ok) throw new Error(`GitHub 返回 ${res.status}`);
       const data = (await res.json()) as { tag_name?: string; html_url?: string };

@@ -64,7 +64,13 @@ interface Props {
 /** 底部搜索结果面板（浮层）：覆盖在编辑器之上，不改变其高度布局；
  *  右键服务/目录树节点触发 */
 export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
-  const { open, root, title, closeSearch } = useSearchModalStore();
+  // 全仓唯一一处**不带 selector** 的 store 订阅（PERF-39）：当前这个 store 只有 3 个
+  // 用户动作改写的字段，性能上无可测后果；风险是"以后加个每帧都变的字段就在这里静默变慢"。
+  // 逐字段取，与其余 46 处订阅同口径。
+  const open = useSearchModalStore(s => s.open);
+  const root = useSearchModalStore(s => s.root);
+  const title = useSearchModalStore(s => s.title);
+  const closeSearch = useSearchModalStore(s => s.closeSearch);
   const [query, setQuery] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [extensions, setExtensions] = useState('');

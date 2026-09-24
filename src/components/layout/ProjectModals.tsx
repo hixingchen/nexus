@@ -72,6 +72,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
               onKeyDown={e => { if (isSubmitEnter(e)) handleCreate(); }}
             />
             <button
+              aria-label="选择目录"
               className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
               onClick={handleSelectPath}
             >
@@ -166,6 +167,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
               onKeyDown={e => { if (isSubmitEnter(e)) handleSave(); }}
             />
             <button
+              aria-label="选择目录"
               className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
               onClick={handleSelectPath}
             >

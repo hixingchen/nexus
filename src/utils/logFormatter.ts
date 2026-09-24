@@ -194,6 +194,8 @@ function colorizeSyntax(text: string, addPh: PlaceholderFn): string {
 /* eslint-disable no-control-regex -- 占位符哨兵用控制字符是设计，见上 */
 const COLOR_PLACEHOLDER_RE = /\x00(\d+)\x00/g;
 const MARK_PLACEHOLDER_RE = /\x01(\d+)\x01/g;
+/** 哨兵字符本身（renderLine 入口要把日志文本里的它们剥掉，见该函数内的说明） */
+const SENTINEL_CHARS_RE = /[\x00\x01]/g;
 /* eslint-enable no-control-regex */
 
 /**
@@ -246,13 +248,21 @@ function escapeRegExp(text: string): string {
  * <span style="..."> 标签内部（单字符/短词搜索会污染渲染）。
  */
 export function renderLine(line: string, searchTerm: string): string {
+  // **先把哨兵字符从原始文本里剥掉**（SEC-28）。上面那段"它们不可能出现在日志文本里"
+  // 的推理**不成立**：后端唯一的行解码函数 `decode_lossy` 没有任何 NUL 过滤
+  // （NUL 只出现在**文件**读取路径的二进制判据里，服务日志管道没有），服务往 stdout 打一个
+  // `\x000\x00` 就会被当成占位符还原掉——显示内容被静默改写；索引越界时 NUL 还会落进 DOM。
+  // 剥掉之后哨兵才真正是"只由本模块产生"的，那段注释描述的正是这个不变式。
+  const safeLine = line.includes('\x00') || line.includes('\x01')
+    ? line.replace(SENTINEL_CHARS_RE, '')
+    : line;
   if (!searchTerm?.trim()) {
-    return line.includes('\x1b[') ? ansiToHtml(line) : smartColorize(line);
+    return safeLine.includes('\x1b[') ? ansiToHtml(safeLine) : smartColorize(safeLine);
   }
   // 文本层高亮 → 占位符 → 着色 → 恢复 mark
   const marks: string[] = [];
   const re = new RegExp(escapeRegExp(searchTerm), 'gi');
-  const marked = line.replace(re, (m) => {
+  const marked = safeLine.replace(re, (m) => {
     const id = `\x01${marks.length}\x01`;
     marks.push(`${SEARCH_MARK_HTML}${escapeHtml(m)}</mark>`);
     return id;
