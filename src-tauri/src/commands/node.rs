@@ -562,10 +562,7 @@ fn verify_before_run(path: &Path) -> Result<(), String> {
 /// 先按 UTF-8 试，失败回退 GB18030——与编辑器读文件同一套口径：中文 Windows 上
 /// nvm 的提示语可能是 GBK 编码，直接 `from_utf8_lossy` 会得到一串问号。
 fn decode_output(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
-    }
+    crate::core::textenc::decode_to_string(bytes)
 }
 
 /// 跑一条 nvm 命令（绝对路径调用，收口它自己的输出）。

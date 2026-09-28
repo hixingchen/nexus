@@ -78,6 +78,8 @@ export function JarViewer({ path }: { path: string }) {
       {/* 过滤框（fat jar 数万条目，靠过滤定位） */}
       <div className="px-3 py-1.5 border-b border-nexus-border/40 flex-shrink-0">
         <input
+          // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+          aria-label="过滤条目"
           className="w-full px-2 py-1 text-[12px] bg-nexus-bg border border-nexus-border rounded text-nexus-text placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent/50"
           placeholder="过滤条目（如 ApiLog、BOOT-INF/lib）"
           value={filter}

@@ -176,17 +176,8 @@ pub struct ReadFileResponse {
 /// 于是"打开老文件 → 一个字符都没改 → Ctrl+S"就会静默损坏文件。故单独标记，
 /// 由 `write_file` 拒绝写入（编辑仍可查看、可复制，只是不落盘）。
 fn decode_text(bytes: &[u8]) -> (String, &'static str) {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => (s.to_string(), "utf8"),
-        Err(_) => {
-            let (text, _enc, had_errors) = encoding_rs::GB18030.decode(bytes);
-            if had_errors {
-                (text.into_owned(), "lossy")
-            } else {
-                (text.into_owned(), "gb18030")
-            }
-        }
-    }
+    let (text, enc) = crate::core::textenc::decode(bytes);
+    (text, enc.id())
 }
 
 /// 检测文件原始换行风格：'lf' | 'crlf' | 'cr'（混合取占比最大的）
@@ -359,6 +350,55 @@ fn file_modified_millis(t: std::time::SystemTime) -> u64 {
 ///
 /// 只接受 `AppState`（而不是"调用方先 check_path_allowed 再传路径"）：那样校验与读取
 /// 之间仍有窗口（SEC-4），这里把校验与打开合并成一次句柄操作（见 `open_verified_file`）。
+/// jar 字节的**小缓存**（PERF-26）：同一份 jar 会被反复读——在文件树里依次点开 5 个条目
+/// 就是 5 次整包读（Spring Boot fat jar 20–60MB，每次都要读盘 + 建 ZIP 索引）。
+///
+/// 键含 `(真实路径, 长度, mtime)`：**路径来自句柄复核**（每次仍照常校验，SEC-4 不放水），
+/// 只有"读+解析"这一步被省掉；文件一变（构建产物重写）戳记就不匹配，自然回落到重新读。
+///
+/// 上限刻意保守：只缓存 ≤32MB 且只留 1 份——大包留在内存里的代价（几十 MB RSS）比
+/// 省下的几百毫秒更贵。
+/// 缓存项：(句柄复核得到的真实路径, 长度, mtime 毫秒, 字节)。
+/// 起别名是为了压住 `clippy::type_complexity`——顺带让上面那句"键是什么"一眼可读
+type JarCacheEntry = (String, u64, i64, std::sync::Arc<Vec<u8>>);
+static JAR_CACHE: std::sync::Mutex<Option<JarCacheEntry>> = std::sync::Mutex::new(None);
+const JAR_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+async fn read_file_cached(
+    state: &AppState,
+    path: &str,
+    what: &str,
+) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    let (file, real) = state.paths.open_verified_file(&state.db, path)?;
+    let meta = file.metadata().map_err(|e| format!("无法读取文件: {}", e))?;
+    let key = real.to_string_lossy().to_string();
+    let stamp = (meta.len(), mtime_millis(&meta));
+    if let Ok(g) = JAR_CACHE.lock() {
+        if let Some((k, len, mtime, bytes)) = g.as_ref() {
+            if *k == key && *len == stamp.0 && *mtime == stamp.1 {
+                return Ok(std::sync::Arc::clone(bytes));
+            }
+        }
+    }
+    let bytes = read_file_limited(state, path, crate::core::jarfile::MAX_JAR_SIZE, what).await?;
+    let arc = std::sync::Arc::new(bytes);
+    if stamp.0 <= JAR_CACHE_MAX_BYTES {
+        if let Ok(mut g) = JAR_CACHE.lock() {
+            *g = Some((key, stamp.0, stamp.1, std::sync::Arc::clone(&arc)));
+        }
+    }
+    Ok(arc)
+}
+
+/// 文件 mtime 的毫秒表示（拿不到就用 0：那会让戳记与缓存的键永远不匹配，退化成每次重读）
+fn mtime_millis(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 async fn read_file_limited(
     state: &AppState,
     path: &str,
@@ -433,7 +473,11 @@ pub async fn read_hex_page(state: State<'_, AppState>, path: String, offset: u64
 #[tauri::command]
 pub async fn read_class_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let bytes = read_file_limited(&state, &path, MAX_READ_SIZE, "文件").await?;
-    crate::core::classfile::disassemble_class(&bytes)
+    // 1812 行的字节码解析器是纯 CPU 工作（大 class 上几十 ms），不该占 tokio worker
+    // ——worker 数 = CPU 数，占用期间其它 async 命令只能排队（PERF-30）
+    tokio::task::spawn_blocking(move || crate::core::classfile::disassemble_class(&bytes))
+        .await
+        .map_err(|e| format!("解析 class 文件任务失败: {}", e))?
 }
 
 /// 反编译 .class 文件为 Java 源码（捆绑 CFR，失败由前端回退字节码视图）
@@ -450,13 +494,18 @@ pub async fn list_jar(
     path: String,
     nested: Vec<String>,
 ) -> Result<Vec<crate::core::jarfile::JarEntryInfo>, String> {
-    let bytes = read_file_limited(&state, &path, crate::core::jarfile::MAX_JAR_SIZE, "jar").await?;
+    let bytes = read_file_cached(&state, &path, "jar").await?;
     // 解析 ZIP 中央目录是纯 CPU 工作（fat jar 上是几十 MB 的活），放 spawn_blocking：
-    // 与 search_files 等已改造的命令同口径，不占用 tokio worker 线程跑同步解析
-    let inner = crate::core::jarfile::innermost_archive(bytes, &nested)?;
-    tokio::task::spawn_blocking(move || crate::core::jarfile::list_entries(&inner))
-        .await
-        .map_err(|e| format!("列 jar 条目任务失败: {}", e))?
+    // 与 search_files 等已改造的命令同口径，不占用 tokio worker 线程跑同步解析。
+    // `innermost_archive`（逐层解压嵌套 jar，单层上限 50MB×4 层）**也必须进来**——它原先
+    // 留在 await 之后、spawn_blocking 之前，正是这段注释说"放 spawn_blocking"却没放进去的
+    // 那一半（PERF-30）
+    tokio::task::spawn_blocking(move || {
+        let inner = crate::core::jarfile::innermost_archive(&bytes, &nested)?;
+        crate::core::jarfile::list_entries(inner.as_ref())
+    })
+    .await
+    .map_err(|e| format!("列 jar 条目任务失败: {}", e))?
 }
 
 /// jar 条目读取响应：kind = text（已解码）/ class（已反编译）/ binary（base64）
@@ -475,13 +524,13 @@ pub async fn read_jar_entry(
     nested: Vec<String>,
     name: String,
 ) -> Result<JarEntryContent, String> {
-    let bytes = read_file_limited(&state, &path, crate::core::jarfile::MAX_JAR_SIZE, "jar").await?;
+    let bytes = read_file_cached(&state, &path, "jar").await?;
     // 先判类型：`name` 下面要 move 进闭包
     let is_class = name.to_ascii_lowercase().ends_with(".class");
     // 解压指定条目是同步 CPU 工作（fat jar 上可达数十 ms），放进 spawn_blocking 不占 tokio worker。
     // 与 list_jar 同一口径——那里已改，这里原先漏了。
     let (entry, size) = tokio::task::spawn_blocking(move || {
-        let entry = crate::core::jarfile::read_entry(bytes, &nested, &name)?;
+        let entry = crate::core::jarfile::read_entry(&bytes, &nested, &name)?;
         let size = entry.len() as u64;
         Ok::<_, String>((entry, size))
     })
@@ -495,7 +544,10 @@ pub async fn read_jar_entry(
             Ok(src) => src,
             Err(e) => {
                 log::warn!("[nexus] jar 内 class 反编译失败，回退字节码视图: {}", e);
-                crate::core::classfile::disassemble_class(&entry)?
+                // 回退路径同样是那 1812 行解析器：一并挪出 tokio worker（PERF-30）
+                tokio::task::spawn_blocking(move || crate::core::classfile::disassemble_class(&entry))
+                    .await
+                    .map_err(|e| format!("解析 class 字节码任务失败: {}", e))??
             }
         };
         Ok(JarEntryContent { content, kind: "class".into(), size })

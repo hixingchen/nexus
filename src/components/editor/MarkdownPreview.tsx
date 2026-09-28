@@ -3,7 +3,7 @@ import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { marked } from 'marked';
 import DOMPurify, { type Config as PurifyConfig } from 'dompurify';
 import { readImageData } from '../../services/editor';
-import { useEditorStore, loadAndOpenFile, saveActiveFile, settlePendingEdit } from '../../stores/editor';
+import { useEditorStore, loadAndOpenFile, saveActiveFile, flushPendingEdits } from '../../stores/editor';
 import { reportError } from '../../utils/error';
 import { imageMimeOf } from '../../utils/path';
 import { markdownImageSrc, resolveMdLink, headingSlug } from '../../utils/markdown';
@@ -51,7 +51,7 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
   const content = useEditorStore(s => s.fileContent) ?? '';
 
   // 挂载时先结算未合帧的编辑（PERF-13）：否则首帧渲染的是 store 里的旧内容
-  useEffect(() => { settlePendingEdit(); }, []);
+  useEffect(() => { flushPendingEdits(); }, []);
 
   // marked 默认不过滤（它也明确不做净化，见其文档）→ 必须紧跟一层 DOMPurify
   const html = useMemo(

@@ -21,9 +21,10 @@ use crate::commands::node::{
     NodeRuntimeStatus, NodeVersionIndex, NodeVersionInfo, NvmCommandResult, NvmInstallResult,
 };
 use crate::commands::service::{
-    AddServiceParams, CreateServiceTemplateParams, ImportTemplatesResult,
+    AddServiceParams, CreateServiceTemplateParams,
     UpdateServiceParams, UpdateServiceTemplateParams, UpdateServiceResult,
 };
+use crate::commands::template_io::ImportTemplatesResult;
 use crate::commands::tools::{OpenToolUsage, SaveOpenToolParams};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
@@ -38,6 +39,34 @@ fn keys_of<T: serde::Serialize>(value: &T) -> Vec<String> {
     let mut keys: Vec<String> = v.as_object().expect("DTO 应序列化为对象").keys().cloned().collect();
     keys.sort();
     keys
+}
+
+/// 取序列化后的 **字段 → 类型标签**（`null` / `bool` / `number` / `string` / `array` / `object`）。
+///
+/// 为什么光有 `keys_of` 不够（ARCH-27）：它只比对**字段名集合**，钉不住类型与可选性。
+/// 实例：`RunningService.followed_log` 在 Rust 侧是 `Option<String>`，前端用
+/// `?.followed_log ?? null` 把 undefined/null/字符串三种可能兜成同一种表现——若哪天它改成
+/// 总是存在的 `String`（空串表示没跟随），字段名契约照样绿、TS 也绿，而右键菜单会拿空文件名渲染。
+fn types_of<T: serde::Serialize>(value: &T) -> Vec<(String, &'static str)> {
+    let v = serde_json::to_value(value).expect("序列化失败");
+    let obj = v.as_object().expect("DTO 应序列化为对象");
+    let mut out: Vec<(String, &'static str)> = obj
+        .iter()
+        .map(|(k, v)| (k.clone(), type_tag(v)))
+        .collect();
+    out.sort();
+    out
+}
+
+fn type_tag(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn sorted(items: &[&str]) -> Vec<String> {
@@ -620,4 +649,42 @@ fn test_every_deserializable_struct_is_covered() {
          若它不是 IPC 请求载荷（例如库里的 JSON 列格式），把它加进 COVERED_REQUEST_ONLY 并写明理由",
         missing
     );
+}
+
+/// ARCH-27：**可空字段必须仍然是可空的**，而且"有值时是什么类型"也要对得上。
+///
+/// 这几个字段前端都按"可能为空"写的（`?? null` / `?.` / 三段条件渲染），把 Rust 侧从
+/// `Option<T>` 改成 `T` 不会触发任何编译或字段名错误，却会静默改变界面行为：
+/// 例如 `followed_log` 变成空串时，右键菜单会拿空文件名渲染（它只判 `!= null`）。
+#[test]
+fn test_nullable_fields_stay_nullable_and_typed() {
+    // 运行中服务：没在跟随日志文件时必须是 null（前端 `?? null` 后判断）
+    let running = RunningService {
+        service_id: "s1".into(), project_id: "p1".into(), followed_log: None,
+    };
+    assert_eq!(types_of(&running), vec![
+        ("followed_log".to_string(), "null"),
+        ("project_id".to_string(), "string"),
+        ("service_id".to_string(), "string"),
+    ], "followed_log 为 None 时必须序列化成 null");
+    let running2 = RunningService {
+        service_id: "s1".into(), project_id: "p1".into(), followed_log: Some("C:/x.log".into()),
+    };
+    assert_eq!(types_of(&running2).iter().find(|(k, _)| k == "followed_log").unwrap().1, "string",
+        "有跟随文件时是字符串——前端据它显示文件名");
+
+    // 失败服务：spawn 失败（进程没起来）时 exit_code 为 null
+    let failed = FailedService { service_id: "s1".into(), exit_code: None, timestamp: "t".into() };
+    assert_eq!(types_of(&failed).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");
+
+    // 工具命令结果：超时/被停止时没有退出码
+    let result = ToolCommandResult { success: false, output: String::new(), exit_code: None };
+    assert_eq!(types_of(&result).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");
+
+    // 读文件响应：拿不到 mtime 时为 null（前端据此跳过"外部修改"检测）
+    let read = ReadFileResponse {
+        content: String::new(), is_binary: false, size: 0,
+        line_ending: "lf".into(), encoding: "utf8".into(), modified: None,
+    };
+    assert_eq!(types_of(&read).iter().find(|(k, _)| k == "modified").unwrap().1, "null");
 }

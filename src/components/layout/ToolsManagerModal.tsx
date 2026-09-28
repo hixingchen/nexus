@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { Modal } from '../ui/Modal';
 import { openToolsApi, type OpenTool } from '../../services/service';
 import { useToolStore } from '../../stores/toolStore';
 import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
+import {
+  MODAL_DRAFT_KEYS, readModalDraft, useModalDraftStore, type ToolFormDraft,
+} from '../../stores/modalDraftStore';
 
 interface Props {
   open: boolean;
@@ -33,17 +36,44 @@ export function ToolsManagerModal({ open, onClose }: Props) {
   /** 它的引用清单（null = 还没查到/查不到） */
   const [deleteUsage, setDeleteUsage] = useState<{ services: string[]; templates: string[] } | null>(null);
   const [deletingBusy, setDeletingBusy] = useState(false);
+  /** 表单字段 id 前缀（UX-11）：label 的 htmlFor 得指向真实存在的 id，用 useId 避免撞车 */
+  const uid = useId();
 
+  /**
+   * 打开时：优先恢复草稿（UX-14）——本弹窗挂在 ServiceEditPanel 里，那个面板一关
+   * 整块就卸载了，光靠 useState 撑不过一次开关。
+   *
+   * 这里不依赖 `openTools`：列表刷新会让 effect 重跑，那就把用户正在填的内容冲掉了。
+   * 需要工具对象时现读一次 store（`editing` 存的是编辑目标，不是列表快照）。
+   */
   useEffect(() => {
     if (!open) return;
-    setEditing(null);
-    setFormName('');
-    setFormExecutable('');
-    setFormArgs('');
+    const draft = readModalDraft<ToolFormDraft>(MODAL_DRAFT_KEYS.tools);
+    if (draft) {
+      // 草稿指向的工具可能已被删掉：找不到就退回「新增」模式（内容仍留着，不无声消失）
+      setEditing(useToolStore.getState().openTools.find(t => t.id === draft.editingId) ?? null);
+      setFormName(draft.name);
+      setFormExecutable(draft.executable);
+      setFormArgs(draft.args);
+    } else {
+      setEditing(null);
+      setFormName('');
+      setFormExecutable('');
+      setFormArgs('');
+    }
     // 关掉再打开不该残留上一次的确认框
     setDeleting(null);
     setDeleteUsage(null);
   }, [open]);
+
+  // 表单里有内容就留草稿；清空（保存成功 / 取消编辑）即自动清掉草稿。
+  // 空表单不留草稿——没有内容就没有"丢失"可言
+  const hasContent = !!(editing || formName || formExecutable || formArgs);
+  useEffect(() => {
+    useModalDraftStore.getState().setDraft(MODAL_DRAFT_KEYS.tools, hasContent ? {
+      editingId: editing?.id ?? null, name: formName, executable: formExecutable, args: formArgs,
+    } : null);
+  }, [hasContent, editing, formName, formExecutable, formArgs]);
 
   const beginEdit = (t: OpenTool) => {
     setEditing(t);
@@ -133,19 +163,20 @@ export function ToolsManagerModal({ open, onClose }: Props) {
         <div className="space-y-2 p-3 bg-nexus-bg/30 border border-nexus-border/50 rounded-lg">
           <div className="flex items-center gap-3">
             <div className="flex-1">
-              <label className="text-[11px] text-nexus-muted block mb-1">名称</label>
-              <input className={inputCls} value={formName} onChange={e => setFormName(e.target.value)}
+              <label htmlFor={`${uid}-name`} className="text-[11px] text-nexus-muted block mb-1">名称</label>
+              <input id={`${uid}-name`} className={inputCls} value={formName} onChange={e => setFormName(e.target.value)}
                 placeholder="IntelliJ IDEA" />
             </div>
             <div className="flex-[1.4]">
-              <label className="text-[11px] text-nexus-muted block mb-1">可执行文件</label>
+              <label htmlFor={`${uid}-executable`} className="text-[11px] text-nexus-muted block mb-1">可执行文件</label>
               <div className="relative">
-                <input className={`${inputCls} font-mono pr-8`} value={formExecutable}
+                <input id={`${uid}-executable`} className={`${inputCls} font-mono pr-8`} value={formExecutable}
                   onChange={e => setFormExecutable(e.target.value)}
                   placeholder="C:\Program Files\JetBrains\...\idea64.exe" />
                 <button
                   className="absolute right-1 top-1/2 -translate-y-1/2 p-1 text-nexus-muted hover:text-nexus-text rounded"
                   title="浏览选择"
+                  aria-label="浏览选择"
                   onClick={handleSelectExecutable}
                 >
                   {/* 与添加服务/工作目录选择同款图标 */}
@@ -155,8 +186,8 @@ export function ToolsManagerModal({ open, onClose }: Props) {
             </div>
           </div>
           <div>
-            <label className="text-[11px] text-nexus-muted block mb-1">参数（可选）</label>
-            <input className={`${inputCls} font-mono`} value={formArgs} onChange={e => setFormArgs(e.target.value)}
+            <label htmlFor={`${uid}-args`} className="text-[11px] text-nexus-muted block mb-1">参数（可选）</label>
+            <input id={`${uid}-args`} className={`${inputCls} font-mono`} value={formArgs} onChange={e => setFormArgs(e.target.value)}
               placeholder="--reuse-window {path}" />
           </div>
           <div className="flex items-center justify-between">

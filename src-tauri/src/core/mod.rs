@@ -1,10 +1,16 @@
 pub mod ai;
 pub mod classfile;
 pub mod decompiler;
+pub mod envparse;
 pub mod file_watcher;
 pub mod jarfile;
 pub mod logfile;
+pub mod logfollow;
+pub mod logpipe;
+pub mod logtext;
 pub mod process;
+pub mod redact;
+pub mod textenc;
 pub mod winenv;
 #[cfg(windows)]
 pub mod job_object;

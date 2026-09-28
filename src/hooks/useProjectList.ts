@@ -112,7 +112,10 @@ export function useProjectList() {
     }
   }, [expanded]);
 
-  const toggleExpand = useCallback(async (e: React.MouseEvent, projectId: string) => {
+  // 参数类型与上面的 toggleSvcExpand 同一口径（只用到 stopPropagation）：展开入口
+  // 既有鼠标（双击卡片）也有键盘（卡片上的 ArrowRight/ArrowLeft，UX-7），
+  // 键盘那条路没有真实鼠标事件——不写成 React.MouseEvent 就不必伪造一个假事件传进来
+  const toggleExpand = useCallback(async (e: { stopPropagation(): void }, projectId: string) => {
     e.stopPropagation();
     if (expanded.has(projectId)) {
       // 折叠时清除缓存释放内存（缓存正确性由详情页 load 每次写入保证）

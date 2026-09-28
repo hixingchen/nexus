@@ -9,5 +9,6 @@ pub mod process;
 pub mod project;
 pub mod search;
 pub mod service;
+pub mod template_io;
 pub mod tools;
 pub mod watcher;

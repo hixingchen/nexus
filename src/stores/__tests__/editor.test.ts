@@ -6,7 +6,7 @@ import {
   loadAndOpenFile,
   saveActiveFile,
   commitReloadedContent,
-  settlePendingEdit,
+  flushPendingEdits,
   setPendingEditSource,
   clearPendingEditSource,
   unsavedDraftCount,
@@ -145,7 +145,7 @@ test('结算按登记的 tabId 落库，不认当时的活动标签（切走后�
   const tabB = openTab('/p/two.ts', 'two');
   assert.equal(useEditorStore.getState().activeTabId, tabB.id);
 
-  settlePendingEdit();
+  flushPendingEdits();
 
   const st = useEditorStore.getState();
   assert.deepEqual(st.dirtyIds, [tabA.id], `改动必须记在 tabA 名下，实际：${JSON.stringify(st.dirtyIds)}`);
@@ -157,7 +157,7 @@ test('没有待结算内容时结算与计数都是 no-op（登记槽为空）',
   openTab('/p/e.ts', 'e');
   clearPendingEditSource();
   const before = useEditorStore.getState().dirtyIds.length;
-  settlePendingEdit();
+  flushPendingEdits();
   assert.equal(useEditorStore.getState().dirtyIds.length, before);
   assert.equal(unsavedDraftCount(), before);
 });
@@ -168,8 +168,8 @@ test('取过一次就不再重复结算（避免同一份内容被反复记为�
   let calls = 0;
   setPendingEditSource(tab.id, () => { calls += 1; return 'f-edited'; });
 
-  settlePendingEdit();
-  settlePendingEdit();
+  flushPendingEdits();
+  flushPendingEdits();
   assert.equal(calls, 1, '同一份待结算内容只应被取一次');
 
   // 再改回基线内容：未保存标记按基线比较自动清掉
@@ -182,7 +182,7 @@ test('取到的内容是空串也照常落库（清空文件的编辑不能被�
   resetStore();
   const tab = openTab('/p/g.ts', 'g');
   setPendingEditSource(tab.id, () => '');
-  settlePendingEdit();
+  flushPendingEdits();
   const st = useEditorStore.getState();
   assert.equal(st.fileContent, '');
   assert.deepEqual(st.dirtyIds, [tab.id], '清空文件同样是未保存改动');
@@ -193,7 +193,7 @@ test('取到的内容是空串也照常落库（清空文件的编辑不能被�
  * P0-6：**空结算不得销毁端口**。
  *
  * 症状是静默丢内容，且三个出口同时失效。编辑器挂载那一拍 `pendingStateRef` 必然是 null，
- * 紧随其后的同步 effect 就会调一次 `settlePendingEdit()`（切 Markdown 预览同理）——
+ * 紧随其后的同步 effect 就会调一次 `flushPendingEdits()`（切 Markdown 预览同理）——
  * 那次空结算若把端口吃掉，之后**再没有任何代码重新登记**：大文档（>256KB，走合帧路径）
  * 的编辑从此拿不回来，`dirtyIds` 恒不含该标签 ⇒ Ctrl+S 静默无效且提示"成功"、
  * 标签不显示未保存圆点、关窗不弹确认直接丢弃。

@@ -15,6 +15,17 @@ const CFR_JAR: &[u8] = include_bytes!("../../resources/cfr-0.152.jar");
 /// 临时 jar 路径（应用生命周期内只写一次）
 static CFR_JAR_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+/// 上一次**完整比对通过**的那份磁盘文件身份：(长度, mtime 毫秒)（PERF-27）。
+///
+/// 为什么需要：每次反编译都要 `tokio::fs::read` 2MB 再与内嵌常量逐字节比一遍，而
+/// `.class` 是"在文件树里挨个点开"的用法——同一份 jar 会被反复读。
+///
+/// **代价写清楚**：mtime + 长度不是内容哈希，一个**刻意**的攻击者可以用 `SetFileTime`
+/// 伪造出同样的戳记；但同用户的攻击者本来就能直接替换 PATH 上的 java，这道校验真正防的是
+/// "被截断/被换成别的版本/被顺手覆盖"这类**非刻意**的损坏——那些一定会改变长度或 mtime，
+/// 所以戳记一变就重新完整比对，语义没有放松到"只验一次"（审计建议的 OnceLock 就是那样）。
+static CFR_JAR_STAMP: std::sync::Mutex<Option<(u64, i64)>> = std::sync::Mutex::new(None);
+
 /// 反编译超时（CFR 正常 <1s，超时基本是极端类）
 const DECOMPILE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -52,11 +63,22 @@ async fn ensure_cfr_jar() -> Result<&'static PathBuf, String> {
             .await
             .map_err(|e| format!("创建 CFR 目录失败 {}", e))?;
     }
-    if let Ok(on_disk) = tokio::fs::read(path).await {
-        if on_disk.as_slice() == CFR_JAR {
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        let stamp = (meta.len(), mtime_millis(&meta));
+        // 先看戳记：与"上次完整比对通过"的那份一致就免掉这次 2MB 读 + 逐字节比对（PERF-27）
+        let known = CFR_JAR_STAMP.lock().map(|g| *g).unwrap_or(None);
+        if known == Some(stamp) {
             return Ok(path);
         }
-        log::warn!("[nexus] CFR jar 与内嵌版本不一致，重新部署: {}", path.display());
+        if let Ok(on_disk) = tokio::fs::read(path).await {
+            if on_disk.as_slice() == CFR_JAR {
+                if let Ok(mut g) = CFR_JAR_STAMP.lock() {
+                    *g = Some(stamp);
+                }
+                return Ok(path);
+            }
+            log::warn!("[nexus] CFR jar 与内嵌版本不一致，重新部署: {}", path.display());
+        }
     }
     // 随机临时名：固定名会被并发部署互相覆盖，也可被预置同名符号链接
     let tmp = dir.join(format!("cfr-0.152.jar.{}.tmp", uuid::Uuid::new_v4()));
@@ -65,11 +87,33 @@ async fn ensure_cfr_jar() -> Result<&'static PathBuf, String> {
         let _ = tokio::fs::remove_file(&tmp).await;
         // 并发部署：另一个任务已抢先完成 rename → 目标存在且内容正确即视为成功
         return match tokio::fs::read(path).await {
-            Ok(b) if b.as_slice() == CFR_JAR => Ok(path),
+            Ok(b) if b.as_slice() == CFR_JAR => {
+                remember_stamp(path).await;
+                Ok(path)
+            }
             _ => Err(format!("部署 CFR jar 失败: {}", e)),
         };
     }
+    remember_stamp(path).await;
     Ok(path)
+}
+
+/// 刚部署好：把这份文件的戳记记为"已完整比对通过"（内容就是我们写下去的 CFR_JAR）
+async fn remember_stamp(path: &PathBuf) {
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if let Ok(mut g) = CFR_JAR_STAMP.lock() {
+            *g = Some((meta.len(), mtime_millis(&meta)));
+        }
+    }
+}
+
+/// 文件 mtime 的毫秒表示（拿不到就用 0：那会让戳记每次都不同，退化成"每次都完整比对"）
+fn mtime_millis(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 反编译 class 文件字节码为 Java 源码

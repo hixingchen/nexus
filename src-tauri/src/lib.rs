@@ -29,6 +29,12 @@ pub struct AppState {
     /// 为什么收成一个字段：这三项此前是三个独立字段，而 39 个命令都能拿到 `AppState`——
     /// "哪些代码能改白名单"在类型上给不出答案，只能 grep 字段名。见 `commands::paths`。
     pub paths: crate::commands::paths::PathAllowlist,
+    /// 工具命令运行表（run_id → pid/启动时间）。
+    ///
+    /// 为什么由 `AppState` 持有而不是进程全局 static（ARCH-25）：静态表让命令体只能从
+    /// "全进程唯一的那张表"取数——同一测试二进制里的用例互相干扰，而"stop 按 run_id 终止
+    /// 进程树"这条路径每一段都有失败史却没有一段测试。见 `commands::process::ToolCmdTable`。
+    pub tool_cmds: crate::commands::process::ToolCmdTable,
     /// 搜索代数：每次发起内容搜索递增，正在跑的旧搜索据此尽早退出
     /// （Arc 是为了能把它克隆进 spawn_blocking 的闭包）
     pub search_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -249,6 +255,7 @@ pub fn run() {
             process_mgr,
             file_watcher: FileWatcher::new(),
             paths: crate::commands::paths::PathAllowlist::new(),
+            tool_cmds: crate::commands::process::ToolCmdTable::new(),
             ai: std::sync::Mutex::new(None),
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
             search_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -281,8 +288,8 @@ pub fn run() {
             commands::service::create_service_template,
             commands::service::delete_service_template,
             commands::service::reorder_service_templates,
-            commands::service::export_service_templates,
-            commands::service::import_service_templates,
+            commands::template_io::export_service_templates,
+            commands::template_io::import_service_templates,
             commands::project::get_projects,
             commands::project::get_project_detail,
             commands::project::add_project,
@@ -320,6 +327,9 @@ pub fn run() {
             commands::ai::create_ai_panel_webview,
             commands::ai::ai_panel_focus,
             commands::app::prepare_exit,
+            // 前端日志回传（NEW-28）：打包版没有控制台/devtools，前端错误只能这样落进
+            // 与 Rust 侧同一条日志流水（截断 / 换行过滤 / 限流都在 logger 里做）
+            commands::app::log_frontend,
             commands::app::pick_directory,
             commands::app::pick_save_file,
             commands::app::get_app_version,
@@ -349,6 +359,27 @@ pub fn run() {
         Ok(app) => app,
         Err(e) => fatal_startup_error(format!("构建 Nexus 应用失败: {}", e)),
     };
+
+    // 生命周期心跳（ARCH-22）：崩溃判定 / 游离进程认领 / 日志文件自动发现原本**只**由前端的
+    // 3 秒轮询驱动——而 WebView2/Chromium 对隐藏窗口的 `setInterval` 有节流（后台可降到
+    // ≥1 分钟一次），于是窗口最小化期间这三件事一起停摆，症状还是"时好时坏"
+    // （任何一次 start/stop 又会顺手纠正）。这里起一个后端线程，把"界面多久问一次"
+    // 从**功能正确性**的参数降级为**显示新鲜度**的参数。
+    //
+    // 2 秒 < 前端的 3 秒轮询：心跳负责推进状态，前端只负责显示。
+    {
+        let handle = app.handle().clone();
+        std::thread::Builder::new()
+            .name("nexus-lifecycle-tick".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                // 取不到 state 说明应用正在退出（状态已销毁）→ 安静收摊，不刷日志
+                let Some(state) = handle.try_state::<AppState>() else { break };
+                state.process_mgr.tick();
+            })
+            .map_err(|e| log::warn!("[nexus] 生命周期心跳线程启动失败（失败态/认领将只靠前端轮询）: {}", e))
+            .ok();
+    }
 
     // Exit 是最后的安全网：确保所有资源被释放，子进程被终止
     // cleanup_resources 是幂等的（对空集合 no-op），多次调用安全

@@ -381,6 +381,8 @@ export function NodeVersionModal({ open, onClose, onChanged }: Props) {
               type="text"
               value={query}
               onChange={e => setQuery(e.target.value)}
+              // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+              aria-label="搜索 Node 版本"
               // 索引还没到也能打字：到了就自动筛（本地筛，不阻塞输入）
               placeholder="搜版本：22 / 22.23 / 20.11.1，也可搜 LTS 代号（jod）"
               spellCheck={false}

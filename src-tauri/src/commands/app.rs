@@ -22,6 +22,24 @@ pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// 前端日志回传（NEW-28）：把 webview 里的错误写进**同一条**日志流水（行首带 `[frontend]`）。
+///
+/// 为什么需要：打包版既没有控制台也没有 devtools（`tauri` 的 features 里不含 `devtools`），
+/// 而最近几轮的真实故障（日志跟随静默停止、失败态渲染、右键菜单）全发生在前端——
+/// 它们不产生任何 Rust 日志，README 承诺的诊断通道覆盖不到故障发生的那一层。
+///
+/// 为什么参数是 `String` 而不是枚举：这条命令的输入完全来自 webview（**不可信**），
+/// 校验只能发生在这一侧。长度上限、换行过滤、去重限流都在
+/// `crate::logger::log_frontend_message` 里，**一条都不依赖前端自觉**（铁律 10）。
+///
+/// 不返回 `Result`：写日志失败没有可行动作，报错还会在前端形成
+/// `reportError → log_frontend → reportError` 的递归。日志本身的失败由 logger 自己
+/// eprintln（见 `FileSink::open`）。
+#[tauri::command]
+pub fn log_frontend(level: String, message: String) {
+    crate::logger::log_frontend_message(&level, &message);
+}
+
 /// 发起退出：在**独立线程**里做资源清理，完成后再退出进程。
 ///
 /// 为什么异步：`cleanup_resources` → `stop_all()` 会对每个服务串行执行

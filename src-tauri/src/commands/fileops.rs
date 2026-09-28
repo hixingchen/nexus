@@ -534,13 +534,54 @@ fn unique_dest_path(target: &Path, name: &str) -> Option<PathBuf> {
 ///
 /// 两条检查的**顺序不能反**：范围在前。反过来先查存在性的话，调用方（被攻陷的 webview）
 /// 就能拿它当"这个路径存不存在"的探针。
-fn ensure_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<(), String> {
-    paths.check_write_path_allowed(db, path)?;
+fn ensure_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<PathBuf, String> {
+    let target = resolve_deletable(paths, db, path)?;
     // symlink_metadata：不跟随链接（与 copy_recursive 同口径）。删除动作删的是链接本身、
     // 不是它的目标（`trash` 只 canonicalize 父目录），所以判存在也该按链接判
-    std::fs::symlink_metadata(path)
+    std::fs::symlink_metadata(&target)
         .map(|_| ())
-        .map_err(|e| format!("无法访问（可能已被外部删除）: {}（{}）", path, e))
+        .map_err(|e| format!("无法访问（可能已被外部删除）: {}（{}）", path, e))?;
+    Ok(target)
+}
+
+/// 校验删除目标，并返回**交给 `trash` 的那条真实路径**（SEC-22 / SEC-31）。
+///
+/// 口径必须与 `trash` 的实际行为逐字对齐：它只 canonicalize **父目录**、再拼回末段名
+/// ——删的是链接本身，不跟随最后一段。原先这里用整条路径的 `check_write_path_allowed`
+/// （会跟随最后一段），两个方向的代价都真实存在：
+///
+/// - **误拦**：项目里指向白名单外的联接点/软链删不掉，报「访问被拒绝」——用户会去查权限，
+///   而这次删除其实只是摘掉那个链接本身；
+/// - **少拦**：校验在异步线程、删除在阻塞线程，窗口期把**父目录**换成指向白名单外的联接点时，
+///   "校验的对象"与"`trash` 跟随的落点"不是同一个。
+///
+/// 修法两条一起收窄：① 父目录用**句柄复核**（SEC-4 的 `open_verified_dir`，拿内核真实路径
+/// 比根），末段只做纯名字检查（非空、不含分隔符、非 `.`/`..`）；② 把复核得到的**真实父目录**
+/// 拼回末段交给 `trash`——删除落在我们刚验过的那条路径上，而不是原始字符串。
+fn resolve_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<PathBuf, String> {
+    let p = Path::new(path);
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 末段名必须是**单段**：`.`/`..`/含分隔符的一律拒绝（路径穿越的最后一道闸）
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("访问被拒绝".into());
+    }
+    let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Err("访问被拒绝".into());
+    };
+    // 句柄级复核父目录：拿到的 real 是内核视角的真实路径（联接点/`..`/8.3 短名都已解析）
+    match paths.open_verified_dir(db, &parent.to_string_lossy()) {
+        Ok((_handle, real_parent)) => Ok(real_parent.join(&name)),
+        Err(e) => {
+            // 父目录不在白名单里，但**目标自己**可能就是白名单的一个根（删整个项目根是
+            // 允许的既有行为）。这一支退回整条路径校验：它跟随最后一段，对"根本身"
+            // 恰好是对的，而上面那条已把"联接点"的语义管住
+            paths.check_write_path_allowed(db, path).map_err(|_| e)?;
+            Ok(p.to_path_buf())
+        }
+    }
 }
 
 /// `trash` 的错误 `Display` 打的是 Debug 形态（`Os { code: -2147024891, description: "…" }`），
@@ -577,10 +618,11 @@ fn describe_trash_error(e: &trash::Error) -> String {
 /// **391 字符的深层文件照常进回收站**（2026-09-22）——那是读源码推出来的结论，实测推翻了它。）
 #[tauri::command]
 pub async fn delete_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    ensure_deletable(&state.paths, &state.db, &path)?;
+    // 删除用的是**校验过的真实路径**（见 resolve_deletable），不是原始字符串
+    let target = ensure_deletable(&state.paths, &state.db, &path)?;
     // 同步阻塞调用（COM 操作），放阻塞线程池；校验已在上一步返回，闭包里不持任何锁
     tokio::task::spawn_blocking(move || {
-        trash::delete(&path).map_err(|e| format!("删除失败: {}", describe_trash_error(&e)))
+        trash::delete(&target).map_err(|e| format!("删除失败: {}", describe_trash_error(&e)))
     })
     .await
     .map_err(|e| format!("删除任务执行失败: {}", e))?
@@ -679,6 +721,76 @@ mod tests {
     #[cfg(not(windows))]
     fn make_junction(link: &Path, real: &Path) -> bool {
         std::os::unix::fs::symlink(real, link).is_ok()
+    }
+
+    /// SEC-22 / SEC-31：删除的范围校验必须与 `trash` 的口径一致（只 canonicalize 父目录、
+    /// 不跟随最后一段）。这里钉的就是那两个方向**同时**收窄后的行为。
+    #[test]
+    fn test_resolve_deletable_accepts_normal_file_inside_root() {
+        let (db, paths, root) = scoped_allowlist("del_ok");
+        let f = root.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        let got = resolve_deletable(&paths, &db, &f.to_string_lossy()).expect("白名单内的文件可删");
+        // 返回的是句柄复核得到的真实路径（Windows 上带 \?\ 前缀，与 fs::canonicalize 同形）
+        assert_eq!(got, std::fs::canonicalize(&f).unwrap(), "应是同一份真实路径");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **误拦那一半**：项目里指向白名单外的联接点**本身**必须能删——那次删除只摘链接，
+    /// 不会碰到白名单外的任何东西。原先按整条路径 canonicalize 会把它拒掉，
+    /// 用户看到「访问被拒绝」，只会去查权限，查不出所以然。
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_deletable_allows_junction_itself() {
+        let (db, paths, root) = scoped_allowlist("del_junc_self");
+        let outside = tmp_dir("del_outside_self");
+        let link = root.join("link-to-outside");
+        if !make_junction(&link, &outside) {
+            eprintln!("跳过：本机建不了目录联接");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let got = resolve_deletable(&paths, &db, &link.to_string_lossy());
+        assert!(got.is_ok(), "删链接本身不该被拦（报错={:?}）", got.err());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// **少拦那一半**：穿过联接点去删白名单**外**的文件必须仍然被拒——校验的是父目录的
+    /// 真实路径（句柄级），联接点指向哪里都跟着走。
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_deletable_rejects_path_through_junction_to_outside() {
+        let (db, paths, root) = scoped_allowlist("del_junc_through");
+        let outside = tmp_dir("del_outside_through");
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, "别删我").unwrap();
+        let link = root.join("link");
+        if !make_junction(&link, &outside) {
+            eprintln!("跳过：本机建不了目录联接");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        let err = resolve_deletable(&paths, &db, &link.join("victim.txt").to_string_lossy())
+            .expect_err("穿过联接点删白名单外的文件必须被拒");
+        assert!(err.contains("拒绝"), "错误文案要说清是范围问题: {}", err);
+        assert!(victim.exists(), "校验阶段一个字节都不该动");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn test_delete_target_rejects_traversal_and_missing() {
+        let (db, paths, root) = scoped_allowlist("del_reject");
+        // 末段是 `..`：路径穿越的最后一道闸
+        assert!(ensure_deletable(&paths, &db, &format!("{}/..", root.display())).is_err());
+        // 目标不存在：文案必须说"可能已被外部删除"（树是快照，磁盘可能已经变了），
+        // 而不是笼统的「访问被拒绝」——那会把用户指向权限问题
+        let missing = root.join("gone.txt");
+        let err = ensure_deletable(&paths, &db, &missing.to_string_lossy()).expect_err("不存在的目标");
+        assert!(err.contains("已被外部删除"), "文案要说清是「它不在了」而不是笼统拒绝: {}", err);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 探测只报"目标里已有的同名项"，且同名只报一次

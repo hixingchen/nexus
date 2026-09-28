@@ -185,3 +185,60 @@ pub fn shared() -> Option<&'static std::sync::Arc<JobObject>> {
 
 // JobObject 包含的 HANDLE 是 isize，自动满足 Send + Sync。
 // 通过 Arc<JobObject> 在 ProcessManager 间共享。
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// NEW-24②：**唯一能证明手写结构体偏移写对的方式**——真起一个进程、赋入 Job、drop 掉
+    /// Job，断言进程随之消失（`KILL_ON_JOB_CLOSE` 生效）。
+    ///
+    /// 为什么必须真跑而不是读代码：`SetInformationJobObject` 对"LimitFlags 写错偏移"
+    /// **返回成功**——偏移错了就是"这个限制从未生效"，表现为 Nexus 崩溃/被杀之后子进程
+    /// 全部残留，而界面上没有任何征兆（本文件顶部那段偏移注释正是为此写的）。
+    #[test]
+    fn test_drop_job_kills_assigned_process() {
+        let job = JobObject::new().expect("创建 Job Object");
+        // ping 6 次 ≈ 5 秒：Job 真生效的话，进程远早于此就被结束
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 6 127.0.0.1 > NUL"])
+            // 跳过"当前目录优先"的可执行搜索（SEC-14 同口径，spawn_guard 会扫这条）
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("起测试进程");
+        let pid = child.id();
+        if let Err(e) = job.assign_child(&child) {
+            // 当前测试进程本身若受某个作业限制，把子进程赋入另一个 Job 会失败（访问被拒绝）。
+            // 这种情况跳过并说明，不让它变成一条假的失败
+            eprintln!("跳过：本机无法把子进程赋入 Job（{}）", e);
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        // 前置：赋入 Job 之后它**必须还活着**——否则"drop 后它不在了"可能只是因为这条命令
+        // 本来就秒退（假通过）。ping 6 次要 5 秒左右，200ms 时必然还在
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            crate::core::winproc::OwnedProcess::open(pid).map(|p| p.is_alive()).unwrap_or(false),
+            "测试进程在赋入 Job 后 200ms 就没了——这条断言的前提不成立（命令选错了？）"
+        );
+
+        drop(job); // 最后一个句柄关闭 → 作业内所有进程应被系统杀掉
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = crate::core::winproc::OwnedProcess::open(pid)
+                .map(|p| p.is_alive())
+                .unwrap_or(false);
+            if !alive { break; }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("drop 掉 Job 之后进程 {} 仍然活着 —— KILL_ON_JOB_CLOSE 没生效（结构体偏移或限制没写对？）", pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.wait();
+    }
+}

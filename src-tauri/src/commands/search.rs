@@ -294,12 +294,10 @@ fn search_bytes(
     case_sensitive: bool,
     limit: usize,
 ) -> Option<Vec<SearchResultItem>> {
-    // UTF-8 严格解码失败 → 回退 GB18030（GBK 超集）：与编辑器读取（decode_text）对齐，
-    // 否则 Windows 中文老项目的 GBK 文件在搜索中静默缺失
-    let content = match std::str::from_utf8(bytes) {
-        Ok(c) => c.to_string(),
-        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
-    };
+    // 解码走全仓唯一口径（core::textenc）：否则 Windows 中文老项目的 GBK 文件
+    // 在搜索里静默缺失，而编辑器里看得见（CQ-36）。
+    // 走 Cow 版（PERF-29）：合法 UTF-8（绝大多数文件）零拷贝，不再为每个候选文件整份复制
+    let (content, _enc) = crate::core::textenc::decode_cow(bytes);
     let mut hits = Vec::new();
     let q_char_count = q.chars().count();
     for (idx, line) in content.lines().enumerate() {

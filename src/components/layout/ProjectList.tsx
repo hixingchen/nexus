@@ -194,7 +194,9 @@ function SearchBar({ search, setSearch, onNew, onCollapse }: {
       {/* min-w-0：flex 子项默认 min-width:auto，input 的固有宽度会让面板缩窄时溢出 */}
       <div className="flex-1 min-w-0 relative">
         <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-nexus-muted" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="5" cy="5" r="3.5"/><line x1="8.5" y1="8.5" x2="11" y2="11"/></svg>
-        <input className="w-full pl-7 pr-2 py-1 text-[12px] bg-nexus-bg border border-nexus-border rounded text-nexus-text placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent"
+        {/* UX-11：placeholder 一输入就没了，不能当唯一的名字来源——补一个常驻的无障碍名 */}
+        <input aria-label="搜索项目"
+          className="w-full pl-7 pr-2 py-1 text-[12px] bg-nexus-bg border border-nexus-border rounded text-nexus-text placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent"
           placeholder="搜索项目..." value={search} onChange={e => setSearch(e.target.value)} />
       </div>
       <button

@@ -31,6 +31,24 @@ const mountedTrees: RevealTarget[] = [];
 const INDENT_STEP = 14;
 const BASE_PADDING = 18;
 
+/**
+ * 焦点在本棵树的**可见行**之间移动（UX-7），返回是否真的移动了。
+ *
+ * 为什么直接查 DOM 而不是自己维护一张"可见行"表：行的 DOM 顺序就是视觉顺序（展开的子级
+ * 紧跟在本行之后），`[role="treeitem"]` 又只落在行上——`querySelectorAll` 拿到的就是
+ * 键盘该走的那一串，不必让每个节点都订阅整棵树的展开状态（那正是 PERF-18 要避免的）。
+ * 用 `closest('[role="tree"]')` 限定在本棵树内：页面上同时挂着项目树与多棵服务树。
+ */
+function focusRowStep(row: HTMLElement, step: 1 | -1): boolean {
+  const tree = row.closest('[role="tree"]');
+  if (!tree) return false;
+  const rows = Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]'));
+  const next = rows[rows.indexOf(row) + step];
+  if (!next) return false;
+  next.focus();
+  return true;
+}
+
 /** 粘贴图标：目录行「粘贴到此处」与文件行「粘贴到同级」是同一个动作的两个落点，共用一枚 */
 const PASTE_ICON = (
   <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -143,6 +161,13 @@ interface EntryProps {
   /** 子级缩进像素值（indentPx + INDENT_STEP） */
   childIndentPx: number;
   /**
+   * 本行在树里的层级（根行 = 1），只用于 `aria-level`。
+   *
+   * 为什么必须显式传：行的 DOM 结构是「父行的兄弟节点里放子级」，层级**不由 DOM 嵌套
+   * 表达**——不传的话读屏软件只能报出一串没有深浅的条目（树形结构最有用的那部分信息）。
+   */
+  level: number;
+  /**
    * 重新列出**本节点所在的目录**（删除成功后调用）。
    *
    * 为什么由父级下发：被删掉的这一行消失与否，只有父级的 `kids` 说了算——本节点自己
@@ -151,7 +176,7 @@ interface EntryProps {
   reloadParent: () => void;
 }
 
-const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect, childIndentPx, reloadParent }: EntryProps) {
+const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect, childIndentPx, level, reloadParent }: EntryProps) {
   const [open, setOpen] = useState(false);
   const [kids, setKids] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -254,6 +279,40 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
   const go = () => {
     onSelect(e.path);
     if (expandable) { toggle(); } else { loadAndOpenFile(e.path, e.name); }
+  };
+
+  /**
+   * 行上的键盘操作（UX-7）。
+   *
+   * 此前整棵树是鼠标专属的：行是 `div` + `onClick`，键盘**完全无法选中或打开文件**——
+   * 而文件树正是打开文件的主入口（没有它，键盘用户一个文件也打不开）。
+   * 键位照 ARIA tree 的通行约定：上下移动、左右收起/展开、Enter 激活。
+   */
+  const handleKeyDown = (ev: React.KeyboardEvent<HTMLDivElement>) => {
+    switch (ev.key) {
+      case 'Enter':
+        // 与单击同一件事（`go`）：目录收起/展开，文件打开
+        ev.preventDefault();
+        go();
+        break;
+      case 'ArrowDown':
+      case 'ArrowUp':
+        if (focusRowStep(ev.currentTarget, ev.key === 'ArrowDown' ? 1 : -1)) ev.preventDefault();
+        break;
+      case 'ArrowRight':
+        if (expandable && !open) { ev.preventDefault(); void toggle(); }
+        break;
+      case 'ArrowLeft': {
+        if (expandable && open) { ev.preventDefault(); setOpen(false); break; }
+        // 收起状态的目录行与文件行：回到父行。否则键盘一旦走进行下面的子树，
+        // 就只能靠 Tab 一寸寸退出去（那里每一行都是 Tab 停靠点）
+        const parent = ev.currentTarget.parentElement?.closest<HTMLElement>('[role="treeitem"]');
+        if (parent) { ev.preventDefault(); parent.focus(); }
+        break;
+      }
+      default:
+        break;
+    }
   };
 
   // 定位请求（点击标签栏定位图标）：revealPath 在此目录下 → 自动加载并展开。
@@ -389,13 +448,23 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
     <div>
       <div
         ref={entryRef}
-        className={`relative z-10 flex items-center h-[28px] cursor-pointer gap-1 ${
+        // 行本身可聚焦（UX-7）：Tab 能进树，进入后用方向键走位。
+        // `focus-visible` 而不是 `focus`：鼠标点击不该留下焦点环（同 ContextMenu 的口径）
+        className={`relative z-10 flex items-center h-[28px] cursor-pointer gap-1 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-nexus-accent ${
           selected || reveal
             ? 'bg-nexus-selected text-nexus-text'
             : 'text-nexus-text-muted hover:bg-nexus-hover'
         }`}
         style={{ paddingLeft: `${indentPx}px`, paddingRight: 10 }}
+        role="treeitem"
+        aria-level={level}
+        // 叶子节点不写 aria-expanded：它表达的是"可展开且**当前**展开/收起"，
+        // 给文件行写上等于告诉读屏软件"这个文件可以展开"
+        aria-expanded={expandable ? open : undefined}
+        aria-selected={selected || reveal}
+        tabIndex={0}
         onClick={go}
+        onKeyDown={handleKeyDown}
         onContextMenu={handleContextMenu}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
@@ -581,7 +650,7 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             <div className="text-[11px] text-nexus-muted py-0.5 relative z-10" style={{ paddingLeft: `${childIndentPx + 20}px` }}>…</div>
           )}
           {!loading && (showAll ? kids : kids.slice(0, INITIAL_RENDER_LIMIT)).map(k => (
-            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} reloadParent={reloadDir} />
+            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} level={level + 1} reloadParent={reloadDir} />
           ))}
           {!loading && !showAll && kids.length > INITIAL_RENDER_LIMIT && (
             <div
@@ -697,6 +766,10 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
       )}
 
       <div
+        // 行的键盘走位靠 `closest('[role="tree"]')` 限定作用域（页面上同时存在项目树与
+        // 多棵服务树），所以这个角色不是装饰，是 `focusRowStep` 的锚点
+        role="tree"
+        aria-label={rootPath ? `文件树：${rootPath.split(/[/\\]/).filter(Boolean).pop() ?? ''}` : '文件树'}
         className={`overflow-y-auto overflow-x-hidden py-0.5 ${embedded ? '' : 'flex-1'}`}
         onContextMenu={(ev) => {
           // 空白区域右键 → 粘贴到项目根（节点自身的 contextmenu 已 stopPropagation，不会冲突）
@@ -721,7 +794,7 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">空目录</div>
         )}
         {!err && entries.map(ent => (
-          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} reloadParent={loadRoot} />
+          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} level={1} reloadParent={loadRoot} />
         ))}
 
         {/* 空白区域右键菜单：搜索整个树根 / 粘贴到项目根目录 */}

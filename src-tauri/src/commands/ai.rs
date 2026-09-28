@@ -32,7 +32,7 @@ pub struct AiStatus {
 }
 
 /// 组装状态快照（不持锁调用 dsh 检测）
-fn snapshot(state: &AppState, app: &AppHandle) -> AiStatus {
+fn snapshot(state: &AppState) -> AiStatus {
     let (running, url, pid, cwd) = match state.ai.lock() {
         Ok(mut h) => match h.as_mut() {
             Some(s) => {
@@ -51,7 +51,12 @@ fn snapshot(state: &AppState, app: &AppHandle) -> AiStatus {
             (false, None, None, None)
         }
     };
-    let dsh_found = if running { true } else { crate::core::ai::dsh_available(app) };
+    // Job Object 句柄在这里取一次传给 `core::ai`（ARCH-19）：`core` 不再认识 AppState
+    let dsh_found = if running {
+        true
+    } else {
+        crate::core::ai::dsh_available(state.process_mgr.job_arc().as_deref())
+    };
     AiStatus { running, url, pid, cwd, dsh_found }
 }
 
@@ -60,7 +65,7 @@ fn snapshot(state: &AppState, app: &AppHandle) -> AiStatus {
 pub async fn ai_status(app: AppHandle) -> Result<AiStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        Ok(snapshot(&state, &app))
+        Ok(snapshot(&state))
     }).await.map_err(|e| format!("查询 AI 会话状态任务失败: {}", e))?
 }
 
@@ -84,8 +89,11 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             state.paths.ensure_project_dir_allowed(&state.db, dir, "AI 会话工作目录")?;
         }
 
+        // Job Object 句柄取一次，供本函数里所有 `core::ai` 调用共用（ARCH-19）
+        let job = state.process_mgr.job_arc();
+
         // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
-        if !crate::core::ai::dsh_available(&app) {
+        if !crate::core::ai::dsh_available(job.as_deref()) {
             return Err("未检测到 dsh（DeepSeek Harness CLI），请先安装：npm i -g @deepseek-ai/dsh，然后重试".into());
         }
 
@@ -124,7 +132,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         // 代数递增：使任何进行中的旧启动自动放弃
         let gen = state.ai_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let session = match crate::core::ai::spawn_dsh_web(&app, cwd_norm.as_deref(), START_TIMEOUT) {
+        let session = match crate::core::ai::spawn_dsh_web(job.as_deref(), cwd_norm.as_deref(), START_TIMEOUT) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("[ai] 启动 dsh web 失败: {}", e);
@@ -159,7 +167,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             return Err("已取消：会话被更新的请求取代".into());
         }
 
-        let status = snapshot(&state, &app);
+        let status = snapshot(&state);
         log::info!("[ai] dsh web 就绪 (pid={})", status.pid.unwrap_or(0));
         Ok(status)
     }).await.map_err(|e| format!("启动 AI 会话任务失败: {}", e))?
@@ -206,12 +214,13 @@ pub struct DshVersionInfo {
 #[tauri::command]
 pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if !crate::core::ai::dsh_available(&app) {
+        let job = app.state::<AppState>().process_mgr.job_arc();
+        if !crate::core::ai::dsh_available(job.as_deref()) {
             // 未安装：无需联网查，UI 直接给「安装」入口
             return Ok(DshVersionInfo { dsh_found: false, current: None, latest: None, outdated: false });
         }
-        let current = crate::core::ai::query_dsh_version(&app);
-        let latest = crate::core::ai::query_dsh_latest(&app)?;
+        let current = crate::core::ai::query_dsh_version(job.as_deref());
+        let latest = crate::core::ai::query_dsh_latest(job.as_deref())?;
         let outdated = current.as_ref()
             .map(|c| crate::core::ai::version_cmp(c, &latest) == Some(std::cmp::Ordering::Less))
             .unwrap_or(false);
@@ -227,8 +236,9 @@ pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
 pub async fn ai_upgrade_dsh(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         stop_current_session(&app)?;
-        crate::core::ai::upgrade_dsh(&app)?;
-        Ok(crate::core::ai::query_dsh_version(&app).unwrap_or_default())
+        let job = app.state::<AppState>().process_mgr.job_arc();
+        crate::core::ai::upgrade_dsh(job.as_deref())?;
+        Ok(crate::core::ai::query_dsh_version(job.as_deref()).unwrap_or_default())
     })
     .await
     .map_err(|e| format!("升级 dsh 任务失败: {}", e))?

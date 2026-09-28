@@ -358,6 +358,8 @@ export function SearchResultPanel({ rightOffset = 0, blocked = false }: Props) {
         </span>
         <input
           ref={inputRef}
+          // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+          aria-label="搜索内容"
           className="flex-1 min-w-[120px] px-2.5 py-1.5 text-[12px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text font-mono placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors"
           placeholder="输入内容，回车搜索（↑↓ 选结果，Esc 关闭）"
           value={query}

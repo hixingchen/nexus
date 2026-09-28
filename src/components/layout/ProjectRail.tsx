@@ -6,6 +6,7 @@ import { openInExplorer, openTerminal } from '../../services/system';
 import { ProjectContextMenu } from './ProjectContextMenu';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 import { reportError } from '../../utils/error';
+import { focusProjectStep } from '../../utils/keyboard';
 import { needsFavoriteDivider } from '../../utils/projectList';
 
 /**
@@ -90,6 +91,17 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
                 // 双击 = 展开面板 + 展开该项目：与列表里双击项目（展开/收起）同一心智，
                 // 只是窄轨上看不见展开状态，所以这里只做"展开"、不做"再双击收起"
                 onDoubleClick={() => onExpandProject(p)}
+                // 键盘（UX-7）：Enter/空格由 button 原生负责（= onClick = 选中），
+                // 这里补上"上下换项目"与双击的等价键——窄轨是收起态下**唯一可见**的项目入口，
+                // 而双击此前只有鼠标能做
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowRight') {
+                    e.preventDefault();
+                    onExpandProject(p);
+                  } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                    if (focusProjectStep(e.currentTarget, e.key === 'ArrowDown' ? 1 : -1)) e.preventDefault();
+                  }
+                }}
                 // 右键菜单与完整列表同一份（ProjectContextMenu 的前四项）：窄轨上够不着卡片按钮，
                 // 收起状态下"启动一下 / 收藏一下"必须先展开面板才能做，是这里最反直觉的一件事
                 onContextMenu={e => {
@@ -97,13 +109,13 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
                   e.stopPropagation();
                   setMenu({ id: p.id, x: e.clientX, y: e.clientY });
                 }}
-                className={`relative w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 text-[11px] font-medium transition-colors ${
+                className={`relative w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-nexus-accent ${
                   selected
                     ? 'bg-nexus-accent/15 text-nexus-accent'
                     : 'text-nexus-muted/80 hover:bg-nexus-hover/50 hover:text-nexus-text'
                 }`}
                 title={`${p.name}${p.path ? ` · ${p.path}` : ''}${active ? '（运行中）' : ''}
-双击：展开项目列表并展开该项目
+Enter：选中该项目；→ 或双击：展开项目列表并展开该项目；↑↓：切换项目
 右键：启动/停止、收藏、打开位置`}
               >
                 {Array.from(p.name.trim())[0]?.toUpperCase() ?? '?'}

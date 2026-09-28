@@ -15,8 +15,7 @@ use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
-
+use crate::core::job_object::JobObject;
 use crate::core::process::build_internal_command;
 
 // ─── dsh workspace 注册（GUI 工作区跟随项目目录的尽力机制） ─────────
@@ -414,8 +413,8 @@ impl AiTimeouts {
 /// 走 `run_captured` 而不是手写 `spawn + wait`：后者**没有超时**（CLI 挂起会
 /// 永久占用一个阻塞线程，AI 面板再也拿不到状态），也**没有把子进程加入 Job Object**
 /// （应用异常退出后该进程可残留）。`run_captured` 两者都具备。
-pub fn dsh_available(app: &tauri::AppHandle) -> bool {
-    run_captured(app, "dsh --version", AiTimeouts::VERSION_PROBE).is_ok()
+pub fn dsh_available(job: Option<&JobObject>) -> bool {
+    run_captured(job, "dsh --version", AiTimeouts::VERSION_PROBE).is_ok()
 }
 
 // ─── dsh 版本检查 / 升级（面板「检查更新」） ─────────────────────
@@ -425,13 +424,18 @@ pub fn dsh_available(app: &tauri::AppHandle) -> bool {
 /// 超时未退出 → 杀进程树并报错：npm 在 registry 不可达/网络异常时可能长期挂起，
 /// 「检查/升级」按钮不能无限等待。子进程加入共享 Job Object（应用退出兜底清理）。
 /// 进程退出与 reader 线程刷盘有微小竞态，退出后短睡再读（诊断文本，无需精确）
-fn run_captured(app: &tauri::AppHandle, command: &str, timeout: Duration) -> Result<String, String> {
+///
+/// 为什么收 `job` 而不是 `AppHandle`（ARCH-19）：`core` 反向依赖 `commands::AppState`
+/// 会让这组"真的 spawn 子进程、真的超时杀树"的函数在**结构上**不可测——`AppState` 只有
+/// IPC 框架能造出来。改成显式依赖后，测试传 `None`（无 Job）就能直接驱动完整路径，
+/// 与 `core/process.rs` 的 `LogSink`、`core/file_watcher.rs` 的 `on_change` 同一手法。
+/// 句柄由命令层取一次传进来（`ProcessManager::job_arc`）。
+fn run_captured(job: Option<&JobObject>, command: &str, timeout: Duration) -> Result<String, String> {
     log::info!("[ai] 执行命令: {}", crate::core::process::mask_command(command));
     let mut cmd = build_internal_command(command);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
-    #[cfg(windows)]
-    if let Some(job) = app.state::<crate::AppState>().process_mgr.job_arc() {
+    if let Some(job) = job {
         // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
         if let Err(e) = job.assign_child(&child) {
             log::warn!("[nexus] dsh 进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
@@ -623,27 +627,27 @@ fn extract_version(text: &str) -> Option<String> {
 }
 
 /// dsh 本地安装版本（`dsh --version` 输出首个版本号；未安装/解析失败 → None）
-pub fn query_dsh_version(app: &tauri::AppHandle) -> Option<String> {
-    run_captured(app, "dsh --version", AiTimeouts::VERSION_PROBE)
+pub fn query_dsh_version(job: Option<&JobObject>) -> Option<String> {
+    run_captured(job, "dsh --version", AiTimeouts::VERSION_PROBE)
         .ok()
         .and_then(|out| extract_version(&out))
 }
 
 /// npm registry 上 @deepseek-ai/dsh 的最新稳定版（联网，上限 30 秒）
-pub fn query_dsh_latest(app: &tauri::AppHandle) -> Result<String, String> {
-    let out = run_captured(app, "npm view @deepseek-ai/dsh version", AiTimeouts::NPM_QUERY)?;
+pub fn query_dsh_latest(job: Option<&JobObject>) -> Result<String, String> {
+    let out = run_captured(job, "npm view @deepseek-ai/dsh version", AiTimeouts::NPM_QUERY)?;
     extract_version(&out).ok_or_else(|| format!("无法从 npm 响应解析版本号：{}", tail_text(&out)))
 }
 
 /// 升级/安装 dsh 到最新版（npm 全局；--no-fund/--no-audit 免噪音与审计网络请求）。
 /// 调用方须先停掉运行中的 dsh 会话（Windows 文件锁，见 commands::ai）。返回安装后的版本
-pub fn upgrade_dsh(app: &tauri::AppHandle) -> Result<String, String> {
+pub fn upgrade_dsh(job: Option<&JobObject>) -> Result<String, String> {
     run_captured(
-        app,
+        job,
         "npm install -g @deepseek-ai/dsh@latest --no-fund --no-audit",
         AiTimeouts::NPM_INSTALL,
     )?;
-    Ok(query_dsh_version(app).unwrap_or_default())
+    Ok(query_dsh_version(job).unwrap_or_default())
 }
 
 /// 会话 URL host 规范为 localhost（无功能依赖，仅统一展示/导航目标，见模块注释）
@@ -667,16 +671,30 @@ fn parse_web_url(line: &str) -> Option<String> {
 ///
 /// cwd：会话工作目录（dsh web UI 的项目根）。失败路径均先杀进程树再返回，
 /// 不残留孤儿；错误携带 stderr 尾部便于诊断。
-/// app：用于把子进程加入共享 Job Object（应用异常退出时兜底清理）
+/// job：共享 Job Object（应用异常退出时兜底清理），由命令层传入；测试传 None
 pub fn spawn_dsh_web(
-    app: &tauri::AppHandle,
+    job: Option<&JobObject>,
+    cwd: Option<&str>,
+    timeout: Duration,
+) -> Result<AiSession, String> {
+    spawn_web_command(job, "dsh web --no-open --port 0", cwd, timeout)
+}
+
+/// `spawn_dsh_web` 的实体。
+///
+/// 命令为何是参数（ARCH-19）：这条函数里有 spawn + 双流读取 + URL 解析 + 三条 kill 清理
+/// 路径，却长期零覆盖——它们此前只能靠"机器上真的装了 dsh"才能走到。把命令串变成参数后，
+/// 测试用一条 `cmd` 就能驱动全部路径（生产只有一个入口，即上面的 `spawn_dsh_web`）。
+fn spawn_web_command(
+    job: Option<&JobObject>,
+    command: &str,
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<AiSession, String> {
     log::info!("[ai] 启动 dsh web (cwd={:?})", cwd);
 
     // 内部命令（dsh/npm）：禁用"当前目录优先解析"，否则项目内的 dsh.cmd 会被优先执行（SEC-12）
-    let mut cmd = build_internal_command("dsh web --no-open --port 0");
+    let mut cmd = build_internal_command(command);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -688,8 +706,7 @@ pub fn spawn_dsh_web(
         .map_err(|e| format!("启动 dsh web 失败: {}", e))?;
 
     // 加入共享 Job Object：应用异常退出时兜底清理（正常退出走显式 stop）
-    #[cfg(windows)]
-    if let Some(job) = app.state::<crate::AppState>().process_mgr.job_arc() {
+    if let Some(job) = job {
         // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
         if let Err(e) = job.assign_child(&child) {
             log::warn!("[nexus] dsh 进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
@@ -714,6 +731,11 @@ pub fn spawn_dsh_web(
                         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
                         Err(_) => break,
                     };
+                    // 凭据红线（SEC-23）：这一行既进日志（落盘 ~/.nexus/logs/nexus.log）
+                    // 也进 stderr 尾部摘要（启动失败时原样回给界面），而 dsh 的启动横幅
+                    // 里可能带 `?token=…` 的会话 URL——两处都先过一遍脱敏（与命令脱敏同一
+                    // 套口径，SENSITIVE_NAME_HINTS 覆盖 token/secret/password…）
+                    let line = crate::core::process::mask_command(&line);
                     log::debug!("[ai#{}] stderr: {}", pid, line);
                     if let Ok(mut t) = tail.lock() {
                         t.push_str(&line);
@@ -1258,5 +1280,243 @@ mod tests {
         // 缺端口 / 缺 token
         assert_eq!(parse_port("http://localhost/?token=a"), None);
         assert_eq!(parse_token("http://localhost:51234/"), None);
+    }
+
+    /// URL 解析的边界形状：解析结果直接进子 WebView 的导航目标与就绪探测，
+    /// 解析错就是"面板打开一个不存在的页面"，而解析不出只是退化成"启动失败"——宁可后者。
+    #[test]
+    fn test_parse_web_url_edge_shapes() {
+        // 只改写 127.0.0.1；其它主机（含 https）原样保留
+        assert_eq!(
+            parse_web_url("https://dsh.example.com:8443/?token=t"),
+            Some("https://dsh.example.com:8443/?token=t".to_string())
+        );
+        // 前后空白（dsh 的启动行可能带缩进）
+        assert_eq!(
+            parse_web_url("  http://127.0.0.1:8080/?token=t  "),
+            Some("http://localhost:8080/?token=t".to_string())
+        );
+        // scheme 大小写敏感：大写不是 dsh 的输出形状，不去猜
+        assert_eq!(parse_web_url("HTTP://127.0.0.1:8080/"), None);
+        // 只有 host:port 没有 scheme：不猜（猜错会导航到相对地址）
+        assert_eq!(parse_web_url("127.0.0.1:8080/?token=t"), None);
+        assert_eq!(parse_web_url("   "), None);
+    }
+
+    /// 端口/token 提取的边界：拿不到就是 None（调用方据此跳过就绪探测，
+    /// 而不是拿一个猜出来的端口去连本机别的服务）
+    #[test]
+    fn test_parse_port_and_token_edge_shapes() {
+        assert_eq!(parse_port("http://localhost:65535/?token=t"), Some(65535));
+        assert_eq!(parse_port("http://localhost:8080/x?token=t"), Some(8080));
+        // 非数字端口 / 缺端口 / 缺 scheme
+        assert_eq!(parse_port("http://localhost:not-a-port/"), None);
+        assert_eq!(parse_port("http://localhost/?token=a"), None);
+        assert_eq!(parse_port("localhost:80/"), None);
+
+        // token 可以不是第一个查询参数
+        assert_eq!(parse_token("http://localhost:1/?a=1&token=xyz&b=2"), Some("xyz".to_string()));
+        // 空值也是"取到了"（调用方按非空判断要不要探测）
+        assert_eq!(parse_token("http://localhost:1/?token="), Some(String::new()));
+        assert_eq!(parse_token("http://localhost:1/?a=1"), None);
+        assert_eq!(parse_token("http://localhost:1/"), None);
+    }
+
+    /// 输出累积必须有上限（②）：命令狂刷输出（npm install、base64/JSON dump）时，
+    /// 把每个字节都留在内存里等于把"诊断"变成内存泄漏；保留尾部是因为排障看的是最后几行。
+    #[test]
+    fn test_capture_reader_keeps_bounded_tail() {
+        let mut payload = String::new();
+        for i in 0..3000 {
+            payload.push_str(&format!("line-{:05}-{}\n", i, "x".repeat(120)));
+        }
+        payload.push_str("SENTINEL-LAST-LINE\n");
+        let total = payload.len();
+        assert!(total > 300_000, "测试输入要足够大才能顶到上限（{} 字节）", total);
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_capture_reader(std::io::Cursor::new(payload.into_bytes()), Arc::clone(&captured), Arc::clone(&stop));
+
+        // 读取线程不返回 join 句柄（生产路径也不回收）：轮询等它把内存输入读完
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !captured.lock().map(|g| g.contains("SENTINEL-LAST-LINE")).unwrap_or(false) {
+            assert!(Instant::now() < deadline, "读取线程 20 秒内没读完 {} 字节的内存输入", total);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = captured.lock().unwrap().clone();
+        assert!(text.len() <= 6000, "缓冲必须有上限，实际 {} 字节", text.len());
+        assert!(text.contains("SENTINEL-LAST-LINE"), "最后一行必须在（诊断靠尾部）");
+        assert!(!text.contains("line-00000-"), "最旧的行应已被丢弃");
+    }
+
+    /// 失败信息里的输出只取尾部 8 行：界面上不能因一条命令失败就贴一屏；
+    /// 一条输出都没有时给固定占位（而不是空白，否则像是"错误信息丢了"）
+    #[test]
+    fn test_tail_text_keeps_last_lines_only() {
+        assert_eq!(tail_text("  \n\t "), "（无输出）");
+        assert_eq!(tail_text("a\nb"), "a\nb", "8 行以内原样返回");
+
+        let text = (1..=12).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let out = tail_text(&text);
+        assert!(out.starts_with('…'), "截断要留痕（否则读的人以为命令只输出这几行）: {}", out);
+        assert_eq!(out.lines().count(), 8, "省略号贴在第一个保留行上 + 尾部 8 行: {}", out);
+        assert!(out.ends_with("12"), "保留的是最后一行: {}", out);
+        assert!(out.contains("…5"), "省略号标在被丢掉的边界上: {}", out);
+    }
+
+    // ── 超时 / 杀进程树（ARCH-19：这三条路径此前零覆盖）──────────────
+    //
+    // 起进程一律走 `run_captured` / `spawn_web_command`：它们内部用
+    // `build_internal_command`（自带 `NoDefaultCurrentDirectoryInExePath=1`，见 spawn_guard.rs）。
+
+    /// 探针跑的时长（秒）。8 ≈ 7 秒：比任何等待窗口都长，才分得清"超时后立刻返回"与
+    /// "等命令自己跑完"（并行跑整套测试时 taskkill 本身可能耗到 ~2 秒）
+    #[cfg(windows)]
+    const PROBE_PINGS: &str = "8";
+
+    /// 探针进程：把 `ping.exe` 复制成一个**唯一映像名**再跑。
+    ///
+    /// 为什么要唯一名：`run_captured` 只回错误文本、拿不到 pid，"进程有没有被杀掉"只能从
+    /// 进程表读；按 `ping.exe` 查会与本机其它 ping（含 `job_object.rs` 的测试）混在一起，
+    /// 唯一名才能把结论钉死。
+    ///
+    /// 为什么用相对路径 `target\...`：命令串里不能出现引号——`Command` 会给含空格的参数
+    /// 整体加引号，而 cmd `/C` 的引号消解规则（两个引号 + 特殊字符 → 剥首尾）会把路径弄坏。
+    /// 相对路径不含空格，也就永远不需要引号（CWD 由 cargo 固定为 crate 根）。
+    #[cfg(windows)]
+    fn spawn_probe() -> (String, String, std::path::PathBuf) {
+        let name = format!("nexus-ut-ai-probe-{}.exe", uuid::Uuid::new_v4());
+        // 相对 CWD（cargo 把测试进程的 CWD 设成 crate 根）的命令行形式与磁盘位置
+        let rel = format!("target\\{}", name);
+        let abs = std::path::PathBuf::from(&rel);
+        let sys32 = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        std::fs::copy(std::path::Path::new(&sys32).join("System32").join("PING.EXE"), &abs)
+            .expect("复制探针可执行文件失败");
+        (rel, name, abs)
+    }
+
+    /// 进程表里是否还有这个映像名（探针名唯一，命中即是我们自己起的那个）
+    #[cfg(windows)]
+    fn probe_running(name: &str) -> bool {
+        crate::core::winproc::snapshot_processes()
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(name))
+    }
+
+    /// 等探针从进程表消失（杀进程树是异步生效的：taskkill 之后系统回收需要一点时间）
+    #[cfg(windows)]
+    fn wait_probe_gone(name: &str, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe_running(name) {
+            assert!(Instant::now() < deadline, "{}：探针进程仍在运行", why);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 超时路径（③）：进程迟迟不退出 → 杀进程树 + 返回**可读**错误。
+    ///
+    /// 探针跑约 7 秒（`ping -n 8`）、超时 300ms：若实现退回"等进程自然结束"，
+    /// 耗时断言与"进程已消失"断言都会红。错误文本三件套（是哪条命令 / 为什么失败 /
+    /// 已终止）缺一不可——用户看到的只有这一行。
+    /// 耗时上限给到 4 秒：杀进程树是 `taskkill` 子进程 + 最多 2 秒的收尸宽限，
+    /// 并行跑整套测试时实测能到 2.2 秒（不是"等命令跑完"——那是 7 秒级）。
+    #[cfg(windows)]
+    #[test]
+    fn test_run_captured_timeout_kills_process_tree() {
+        let (rel, name, abs) = spawn_probe();
+        let cmd = format!("{} -n {} 127.0.0.1", rel, PROBE_PINGS);
+        let started = Instant::now();
+        let err = run_captured(None, &cmd, Duration::from_millis(300)).expect_err("超时必须返回错误");
+        let elapsed = started.elapsed();
+
+        assert!(err.contains("命令超时"), "错误要说清是超时: {}", err);
+        assert!(err.contains(&cmd), "错误要带原命令（否则排障不知道卡在哪条）: {}", err);
+        assert!(err.contains("已终止"), "错误要说清进程已被终止: {}", err);
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "超时后应立刻返回，不该等命令自然跑完（{:?}）",
+            elapsed
+        );
+        wait_probe_gone(&name, "超时路径没有把进程树杀干净");
+        let _ = std::fs::remove_file(&abs);
+    }
+
+    /// 成功路径：stdout 里的启动 URL 被解析出来（127.0.0.1 → localhost），会话字段齐备。
+    ///
+    /// 用 `cmd` 假冒 dsh：生产命令是写死的 `dsh web --no-open --port 0`，只有测试能替换
+    /// （见 `spawn_web_command` 的说明）。cwd 传 `target`、探针用 `.\` 开头的相对路径——
+    /// 顺便证明 `current_dir` 确实传给了子进程（裸文件名不行：收口用的
+    /// `NoDefaultCurrentDirectoryInExePath=1` 会让 cmd 跳过当前目录，见 spawn_guard.rs）。
+    #[cfg(windows)]
+    #[test]
+    fn test_spawn_web_command_parses_url_and_reports_session() {
+        let (_, name, abs) = spawn_probe();
+        // 绑定再释放拿到一个"没人监听"的端口：就绪探测会立刻连接失败并放弃（不会白等 8 秒）
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("取空闲端口")
+            .local_addr()
+            .expect("读端口")
+            .port();
+        // 先打印 URL（stdout 解析），再用探针拖住进程（约 7 秒）验证 alive/stop
+        let cmd = format!(
+            "echo http://127.0.0.1:{}/?token=ut-token & .\\{} -n {} 127.0.0.1 > NUL",
+            port, name, PROBE_PINGS
+        );
+        let mut session = spawn_web_command(None, &cmd, Some("target"), Duration::from_secs(10))
+            .expect("应解析到启动 URL");
+
+        assert_eq!(session.url, format!("http://localhost:{}/?token=ut-token", port));
+        assert!(session.pid > 0, "会话必须带 pid（状态面板要显示）");
+        assert_eq!(session.cwd.as_deref(), Some("target"), "cwd 应原样带回（前端据此判断归属项目）");
+        assert!(session.alive(), "URL 打印后进程仍在跑（探针 ~7 秒），不该被误判为已退出");
+
+        session.stop();
+        assert!(!session.alive(), "stop 之后进程应已退出");
+        let _ = std::fs::remove_file(&abs);
+    }
+
+    /// 失败路径（进程提前退出）：不能只说"启动失败"——stderr 的原话必须带回来，
+    /// 否则用户和我们都只能猜（"dsh 没装"与"端口被占"在界面上长得一样）。
+    #[cfg(windows)]
+    #[test]
+    fn test_spawn_web_command_reports_stderr_when_exited_without_url() {
+        let (rel, _, abs) = spawn_probe();
+        // 先写 stderr，再用探针拖 1 秒才退出：stderr 尾部是异步线程写的，
+        // 进程立刻退出会让"读到没有"变成掷骰子（生产里同样存在这个窗口）
+        let cmd = format!("echo dsh-not-installed 1>&2 & {} -n 2 127.0.0.1 > NUL", rel);
+        let err = match spawn_web_command(None, &cmd, None, Duration::from_secs(10)) {
+            Err(e) => e,
+            Ok(s) => panic!("没打印 URL 就必须失败（实际拿到 url={} pid={}）", s.url, s.pid),
+        };
+        assert!(err.contains("进程提前退出"), "错误要说清是哪种失败: {}", err);
+        assert!(
+            err.contains("dsh-not-installed"),
+            "stderr 的原话要带回来（否则用户只能猜）: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&abs);
+    }
+
+    /// 超时路径（URL 一直不出现）：同样要杀进程树——否则每次"打开面板"卡住都会留一个
+    /// 跑着的假 dsh，端口与内存都收不回来。
+    #[cfg(windows)]
+    #[test]
+    fn test_spawn_web_command_timeout_kills_process_tree() {
+        let (rel, name, abs) = spawn_probe();
+        let cmd = format!("{} -n {} 127.0.0.1 > NUL", rel, PROBE_PINGS);
+        let started = Instant::now();
+        let err = match spawn_web_command(None, &cmd, None, Duration::from_millis(300)) {
+            Err(e) => e,
+            Ok(s) => panic!("超时必须失败（实际拿到 url={} pid={}）", s.url, s.pid),
+        };
+        assert!(err.contains("等待 dsh web 启动超时"), "错误要说清是启动超时: {}", err);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "超时应立刻返回，而不是等 60 秒的启动窗口（{:?}）",
+            started.elapsed()
+        );
+        wait_probe_gone(&name, "启动超时路径没有把进程树杀干净");
+        let _ = std::fs::remove_file(&abs);
     }
 }

@@ -1,5 +1,6 @@
 import { notify } from './notify';
 import { toMessage } from './message';
+import { logToBackend, type FrontendLogLevel } from './logSink';
 
 // 归一化函数本体在 utils/message.ts（无依赖，便于纯逻辑测试）；
 // 这里再导出一次，保持"错误相关工具都从 utils/error 取"的既有调用点不变。
@@ -27,15 +28,28 @@ interface ReportOptions {
   action?: { label: string; run: () => void };
 }
 
+/** 通知级别 → 日志级别（`reportError` 的三个 variant 与后端白名单的对应关系） */
+const LOG_LEVEL: Record<NonNullable<ReportOptions['variant']>, FrontendLogLevel> = {
+  error: 'error',
+  warning: 'warn',
+  info: 'info',
+};
+
 /**
  * 统一错误上报出口：控制台留详细（含操作名与原因），界面给可读文案。
  *
  * 为什么要有单一出口：此前"`console.error('X失败:', e)` + `showNotification(...)`"成对写了
  * 39 处，改一次错误呈现（统一文案、统一时长、去重）要动 39 个地方；两种归一化写法
  * （`String(e)` 与 `typeof e === 'string' ? ...`）还会让同一种后端错误在不同入口显示不同文案。
+ *
+ * NEW-28：这里同时把错误送回后端（`[frontend]` 前缀，落进 `~/.nexus/logs/nexus.log`）——
+ * 打包版没有控制台也没有 devtools，控制台那一行用户永远看不到。
+ * **只在这一处接**：它是全仓错误上报的唯一出口，接在这里等于覆盖所有调用点；
+ * 别处再接一遍只会得到重复的日志行（后端虽然有限流，但那道闸是防刷屏的，不是用来掩盖重复接线的）。
  */
 export function reportError(op: string, e: unknown, opts?: ReportOptions): void {
   console.error(`${op}:`, e);
+  logToBackend(opts?.variant ? LOG_LEVEL[opts.variant] : 'error', `${op}: ${toMessage(e)}`);
   if (opts?.silent) return;
   notify({
     variant: opts?.variant ?? 'error',

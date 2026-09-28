@@ -70,7 +70,7 @@ interface Props {
 
 export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServicePanel }: Props) {
   const {
-    detail, loadError, services, loading, editingService, setEditingService,
+    detail, loadError, services, servicesLoading, loading, editingService, setEditingService,
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
@@ -122,6 +122,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
 
   // 防抖保存上半区高度：与其余布局键共用 layoutStore 的防抖窗口（原实现各自一份定时器）
   const persistTopPanelHeight = useCallback((h: number) => {
+    // 本地状态也要跟上：面板收起时整条展开列会被卸载（PERF-37），重新展开时
+    // ResizablePanel 拿 `topPanelHeight` 当初始高度——不跟进就会退回应用启动时的旧值
+    setTopPanelHeight(h);
     saveLayout({ [LAYOUT_KEYS.rightPanelTopHeight]: String(h) });
   }, []);
 
@@ -281,31 +284,29 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     setEditingTemplate(prev => prev?.id === tpl.id ? null : tpl);
   }, [setEditingService, setEditingTemplate]);
 
-  if (!detail) {
-    // 失败态必须与"加载中"分开（UX-17）：原实现把 detail 为 null 一律当成加载中，
-    // 加载失败后主区域就**永远**停在"加载中…"（原因只在 8 秒后消失的 toast 里出现过一次）。
-    // 这里给出持久的原因 + 重试入口，用户不必猜也不必重开应用
-    if (loadError) {
-      return (
-        <div className="flex flex-col items-center justify-center h-full gap-3 text-[12px]">
-          <p className="text-nexus-error">项目详情加载失败</p>
-          <p className="text-nexus-muted max-w-[420px] text-center break-all">{loadError}</p>
-          <button
-            className="px-3 py-1.5 text-[12px] bg-nexus-accent/15 text-nexus-accent rounded-md hover:bg-nexus-accent/25 font-medium"
-            onClick={() => void load()}
-          >重试</button>
-        </div>
-      );
-    }
+  // 失败态必须与"加载中"分开（UX-17）：原实现把 detail 为 null 一律当成加载中，
+  // 加载失败后主区域就**永远**停在"加载中…"（原因只在 8 秒后消失的 toast 里出现过一次）。
+  // 这里给出持久的原因 + 重试入口，用户不必猜也不必重开应用
+  if (!detail && loadError) {
     return (
-      <div className="flex items-center justify-center h-full text-[12px] text-nexus-muted">
-        加载中…
+      <div className="flex flex-col items-center justify-center h-full gap-3 text-[12px]">
+        <p className="text-nexus-error">项目详情加载失败</p>
+        <p className="text-nexus-muted max-w-[420px] text-center break-all">{loadError}</p>
+        <button
+          className="px-3 py-1.5 text-[12px] bg-nexus-accent/15 text-nexus-accent rounded-md hover:bg-nexus-accent/25 font-medium"
+          onClick={() => void load()}
+        >重试</button>
       </div>
     );
   }
 
-  const { project } = detail;
-  // 服务列表来自 hook 的单一来源（svcCacheStore），不再从 detail 里取（ARCH-7 ③）
+  const project = detail?.project ?? null;
+  // 服务列表来自 hook 的单一来源（svcCacheStore），不再从 detail 里取（ARCH-7 ③）。
+  //
+  // 这里**不再**在 detail 为 null 时整片 return「加载中…」（UX-18）：那样会把服务列、
+  // 模板库连同主区一起卸载再挂载，切一次项目界面就闪一下（实测三帧：旧项目的服务 →
+  // 「暂无服务」→「加载中…」）。这两块跟"哪个项目"无关，不该跟着消失；
+  // `detail` 为 null 只影响真正依赖它的地方：主区空状态位、服务列表、启动/停止按钮。
 
   return (
     <div className="h-full bg-nexus-editor flex relative overflow-hidden">
@@ -358,8 +359,13 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                 )}
               </div>
             </>
-          ) : (
+          ) : project ? (
             <EmptyState name={project.name} path={project.path} />
+          ) : (
+            // 详情在途：只让主区显示加载态（原先是整片 "加载中…"，见上方 UX-18 的说明）
+            <div className="flex-1 flex items-center justify-center text-[12px] text-nexus-muted">
+              加载中…
+            </div>
           )}
         </ErrorBoundary>
 
@@ -393,7 +399,12 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
 
         {/* 底部搜索结果面板（浮层覆盖编辑器，不挤压其高度）；右侧让位服务列宽度；
             日志视图打开时让位（日志优先完整显示，搜索面板等同被挡住，关日志后恢复） */}
+        {/* key = 项目 id：搜索面板的查询词与结果是**本项目内**的东西（它的根目录是
+            本项目某个服务的工作目录），切项目即作废。原先靠"整个主区域随 detail 卸载"
+            顺带重置，现在主区域不再卸载了（UX-18），就把它显式写出来，免得切项目后
+            面板还挂着上一个项目的命中结果（点开会被文件白名单拒绝） */}
         <SearchResultPanel
+          key={projectId}
           rightOffset={servicePanelCollapsed ? 32 : 360}
           blocked={!!viewingLog}
         />
@@ -402,6 +413,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       {/* 右侧面板：服务列表（上）+ 模板库（下），可收缩 */}
       <ServicePanel
         services={services}
+        servicesLoading={servicesLoading}
         collapsed={servicePanelCollapsed}
         onToggle={() => { onToggleServicePanel(); setEditingService(null); setEditingTemplate(null); }}
         splitPanel={{
@@ -517,6 +529,8 @@ function EmptyState({ name, path }: { name: string; path: string }) {
 
 interface ServicePanelProps {
   services: Service[];
+  /** 服务列表还没到：空列表显示加载态而不是「暂无服务」（UX-18） */
+  servicesLoading: boolean;
   collapsed: boolean;
   onToggle: () => void;
   /** 右侧面板上下分栏配置 */
@@ -542,7 +556,7 @@ interface ServicePanelProps {
 }
 
 function ServicePanel({
-  services, collapsed, onToggle, splitPanel, editingService, onEditService,
+  services, servicesLoading, collapsed, onToggle, splitPanel, editingService, onEditService,
   isServiceRunning, failedInfoOf, followedLogOf, setDeleteSvcTarget,
   onCreateService, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
@@ -564,31 +578,44 @@ function ServicePanel({
           load={load}
         />
       </div>
-      {/* 展开内容：折叠时用 transform 向右滑出（GPU 合成，不触发布局 reflow，
-          避免日志视图在动画期间每帧重排导致卡顿） */}
-      <div className={`absolute left-0 top-0 bottom-0 w-[360px] transition-transform duration-200 ${
-        collapsed ? 'translate-x-full' : 'translate-x-0'
-      }`}>
-        <ExpandedView
-          services={services}
-          splitPanel={splitPanel}
-          editingService={editingService}
-          onEditService={onEditService}
-          isServiceRunning={isServiceRunning}
-          failedInfoOf={failedInfoOf}
-          followedLogOf={followedLogOf}
-          setDeleteSvcTarget={setDeleteSvcTarget}
-          onCreateService={onCreateService}
-          handleStartAll={handleStartAll}
-          handleStopAll={handleStopAll}
-          handleViewLog={handleViewLog}
-          handleRunToolCommand={handleRunToolCommand}
-          handleReorderServices={handleReorderServices}
-          loading={loading}
-          load={load}
-          onToggle={onToggle}
-        />
-      </div>
+      {/* 展开内容：**收起时整块不挂载**（PERF-37）。
+          原先两个视图都常驻、只靠 CSS 藏一个：面板收起后整份服务卡片列表（每张卡一个
+          `useSortable`、外加模板库）仍完整渲染，并跟着每次服务状态/日志轮询重渲——
+          用户看不见它们，CPU 却照付。
+
+          两处有意付出的代价，写在这里免得后来者当成 bug：
+          ① 展开动画没了：原先收起时用 `translate-x-full` 向右滑出（GPU 合成，不触发
+             reflow），条件渲染下没有"滑出"可言——这是取舍：省掉一整棵子树的渲染与
+             dnd-kit 注册，比一段 200ms 的动画值。收起态的 32px 窄条仍走它自己的
+             opacity 过渡，不受影响。
+          ② dnd-kit 的注册时机变了：收起→展开会重新注册排序节点（`useSortable` 随卡片
+             一起挂载）。拖拽排序因此只在展开态可用——收起态本来也没有可拖的卡片。
+          ③ 上下分栏的高度不丢：它由 ResizablePanel 的 `defaultLeftWidth` 提供，而那个值
+             来自 ProjectDetail 的 topPanelHeight（见 persistTopPanelHeight 的说明）。 */}
+      {!collapsed && (
+        <div className="absolute left-0 top-0 bottom-0 w-[360px]">
+          <ExpandedView
+            services={services}
+            servicesLoading={servicesLoading}
+            splitPanel={splitPanel}
+            editingService={editingService}
+            onEditService={onEditService}
+            isServiceRunning={isServiceRunning}
+            failedInfoOf={failedInfoOf}
+            followedLogOf={followedLogOf}
+            setDeleteSvcTarget={setDeleteSvcTarget}
+            onCreateService={onCreateService}
+            handleStartAll={handleStartAll}
+            handleStopAll={handleStopAll}
+            handleViewLog={handleViewLog}
+            handleRunToolCommand={handleRunToolCommand}
+            handleReorderServices={handleReorderServices}
+            loading={loading}
+            load={load}
+            onToggle={onToggle}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -729,6 +756,8 @@ interface SplitPanel {
 
 interface ExpandedViewProps {
   services: Service[];
+  /** 服务列表还没到（见 servicesLoading 的说明） */
+  servicesLoading: boolean;
   splitPanel: SplitPanel;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
@@ -752,7 +781,7 @@ interface ExpandedViewProps {
 }
 
 function ExpandedView({
-  services, splitPanel, editingService, onEditService, isServiceRunning, failedInfoOf,
+  services, servicesLoading, splitPanel, editingService, onEditService, isServiceRunning, failedInfoOf,
   followedLogOf, setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
@@ -764,6 +793,7 @@ function ExpandedView({
       left={
         <ServiceSection
           services={services}
+          servicesLoading={servicesLoading}
           editingService={editingService}
           onEditService={onEditService}
           isServiceRunning={isServiceRunning}
@@ -792,6 +822,8 @@ function ExpandedView({
 
 interface ServiceSectionProps {
   services: Service[];
+  /** 详情未到：空列表显示加载态而不是「暂无服务」，启动/停止按钮也不可用（见 UX-18） */
+  servicesLoading: boolean;
   editingService: Service | null;
   /** 点击服务卡片（父组件处理互斥，关闭模板编辑面板） */
   onEditService: (svc: Service) => void;
@@ -814,7 +846,7 @@ interface ServiceSectionProps {
 }
 
 function ServiceSection({
-  services, editingService, onEditService,
+  services, servicesLoading, editingService, onEditService,
   isServiceRunning, failedInfoOf, followedLogOf,
   setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
@@ -883,14 +915,23 @@ function ServiceSection({
       {/* 服务列表（dnd-kit 拖拽排序：拖手柄排序，整卡点击编辑） */}
       <div className="flex-1 overflow-auto py-1">
         {services.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
-            <span className="text-[24px] opacity-[0.08] select-none font-extralight mb-2">S</span>
-            <span className="text-[12px] text-nexus-muted mb-3">暂无服务</span>
-            <button
-              className="px-4 py-1.5 text-[12px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover"
-              onClick={onCreateService}
-            >添加服务</button>
-          </div>
+          servicesLoading ? (
+            // 列表空 ≠ 没有服务：缓存未命中（首次进入该项目）时列表本来就是空的，
+            // 直接显示「暂无服务」是在说一件没根据的话（UX-18）
+            <div className="flex flex-col items-center justify-center py-16 px-4 text-center gap-2">
+              <span className="w-[16px] h-[16px] border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
+              <span className="text-[12px] text-nexus-muted">加载中…</span>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
+              <span className="text-[24px] opacity-[0.08] select-none font-extralight mb-2">S</span>
+              <span className="text-[12px] text-nexus-muted mb-3">暂无服务</span>
+              <button
+                className="px-4 py-1.5 text-[12px] bg-nexus-accent text-white rounded-md hover:bg-nexus-accent-hover"
+                onClick={onCreateService}
+              >添加服务</button>
+            </div>
+          )
         )}
         <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
           <SortableContext items={services.map(s => s.id)} strategy={verticalListSortingStrategy}>
@@ -917,14 +958,16 @@ function ServiceSection({
       <div className="flex items-center gap-2 px-4 py-2.5 border-t border-nexus-border flex-shrink-0">
         <button
           className="flex-1 px-3 py-1.5 text-[12px] bg-nexus-success/15 text-nexus-success rounded-md hover:bg-nexus-success/25 disabled:opacity-40 font-medium"
-          disabled={loading.__all__ || services.length === 0}
+          // 详情未落地时也必须禁用：此时动作取不到 `detail.project.id`，点了是**空操作**——
+          // 按钮看着能点却没反应，比禁用更让人困惑
+          disabled={loading.__all__ || servicesLoading || services.length === 0}
           onClick={handleStartAll}
         >▶ 全部启动</button>
         {/* 与「全部启动」共用 `loading.__all__`（UX-15）：停止是串行收尸，可能数秒，
             期间必须禁用并显示进行中——否则用户会连点，而每次连点都排一轮停止 */}
         <button
           className="flex-1 px-3 py-1.5 text-[12px] bg-nexus-error/15 text-nexus-error rounded-md hover:bg-nexus-error/25 disabled:opacity-40 font-medium"
-          disabled={loading.__all__ || services.length === 0}
+          disabled={loading.__all__ || servicesLoading || services.length === 0}
           onClick={handleStopAll}
         >{loading.__all__ ? '处理中…' : '■ 全部停止'}</button>
       </div>

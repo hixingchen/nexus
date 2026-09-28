@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { reportError } from '../utils/error';
+import { setFrontendLogSink, type FrontendLogLevel } from '../utils/logSink';
 import type { ConflictPolicy, PasteResponse } from '../utils/pasteResult';
 import type { FileEntry } from '../types/file';
 
@@ -127,6 +128,35 @@ export function copyFilesToClipboard(paths: string[]) {
 export function deletePath(path: string) {
   return invoke<void>('delete_path', { path });
 }
+
+/** 回传失败只警告一次：它必然是"整条通道不通"，每次上报都再喊一遍只会把控制台刷满 */
+let warnedLogFailure = false;
+
+/**
+ * 把一条前端日志送回后端（NEW-28），落进与 Rust 侧**同一条**流水
+ * （`~/.nexus/logs/nexus.log`，行首带 `[frontend]` 来源标记）。
+ *
+ * 为什么需要：打包版既没有控制台也没有 devtools（`tauri` 的 features 里不含 `devtools`），
+ * 而 README 承诺的诊断通道此前只覆盖 Rust 侧——最近几轮的真实故障（日志跟随静默停止、
+ * 失败态渲染、右键菜单）全发生在前端，一条日志都没留下。
+ *
+ * 为什么失败只 `console.warn`：这条通道本身不通时没有可行动作，而回传失败再走一遍
+ * `reportError` 就是无限递归。去重 / 限流 / 截断 / 换行过滤都在后端
+ * （IPC 边界不信任客户端，见 `commands/app.rs::log_frontend`）。
+ *
+ * 不导出：入口只保留 `utils/error.ts` 的 `reportError` 一处，见下面的注册。
+ */
+function logFrontend(level: FrontendLogLevel, message: string): void {
+  void invoke('log_frontend', { level, message }).catch((e: unknown) => {
+    if (warnedLogFailure) return;
+    warnedLogFailure = true;
+    console.warn('前端日志回传失败（只影响日志，不影响功能）:', e);
+  });
+}
+
+// 注册进端口（NEW-28）：`utils/error.ts` 是前端错误的**单一出口**，但它不能 import 本模块
+// ——本模块 import 了 `reportError`，反向再 import 就成环（理由见 `utils/logSink.ts`）
+setFrontendLogSink(logFrontend);
 
 /**
  * 请求退出应用：后端先做非阻塞清理（停服务、关 AI 会话、落库），完成后再真正退出。

@@ -258,7 +258,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   closeTab: (id) => {
     // 先结算未合帧的编辑：下面会删掉该标签的草稿，结算晚了会留下孤儿草稿
-    settlePendingEdit();
+    flushPendingEdits();
     const { tabs, activeTabId, dirtyIds } = get();
     const closedTab = tabs.find(t => t.id === id);
     const newTabs = tabs.filter(t => t.id !== id);
@@ -316,7 +316,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   toggleMdPreview: () => {
     // 大文档的编辑可能还在合帧窗口里（PERF-13）：不先结算，预览渲染的是 store 里的旧内容
-    settlePendingEdit();
+    flushPendingEdits();
     set(s => ({ mdPreview: !s.mdPreview }));
   },
 
@@ -554,10 +554,7 @@ let savingInFlight = false;
  * 关窗时的"保存全部"依赖这条路径——因此不能再假设"要保存的只有活动标签"。
  */
 async function saveTabCore(id: string, withToast: boolean): Promise<boolean> {
-  // **必须在读内容之前**：大文档的编辑可能还没写回 store（PERF-13 合帧），
-  // 直接读 fileContent/drafts 会拿到最多 200ms 前的内容并把它写进磁盘
-  settlePendingEdit();
-  const { tabs, activeTabId, fileContent } = useEditorStore.getState();
+  const { tabs } = useEditorStore.getState();
   const tab = tabs.find(t => t.id === id);
   if (!tab) return true; // 标签已被关闭：无需保存
   if (tab.readonly) {
@@ -569,7 +566,9 @@ async function saveTabCore(id: string, withToast: boolean): Promise<boolean> {
     }
     return false;
   }
-  const content = id === activeTabId ? fileContent : (drafts.get(id) ?? null);
+  // 读内容走唯一入口（ARCH-30）：它内部先结算未合帧的编辑——大文档的编辑可能还没写回
+  // store（PERF-13 合帧），直接读 fileContent/drafts 会拿到最多 200ms 前的内容写进磁盘
+  const content = readContent(id);
   // 内容从未成功加载（读取失败/仍在加载中）：写盘会把磁盘上的原文件覆盖成空内容
   if (content === null) {
     if (withToast) notify({ variant: 'error', title: '文件内容未加载，已取消保存' });
@@ -645,7 +644,13 @@ export function clearPendingEditSource(): void {
 }
 
 /**
- * 物化并落库未合帧的编辑（无待处理内容时是 no-op）。**所有读取内容的路径都必须先经这里。**
+ * 把未合帧的编辑物化落库（无待处理内容时是 no-op）——**这是 flush，不是读入口**（ARCH-30）。
+ *
+ * 只有两处该直接调它：编辑器的合帧定时器到点、编辑器销毁前抢救。**读内容一律走
+ * `readContent`**——它内部先 flush 再读，"读内容"与"先结算"是同一个动作，漏不掉。
+ * 原先只有一个 `settlePendingEdit` 同时充当两者，靠 8 个调用点自觉；漏一处的后果是
+ * **静默丢用户输入**（P0-6 正是这个结构失效的实例：不是漏了调用，而是"调用了但端口已被
+ * 空结算吃掉"）。源码扫描守卫 `src/utils/__tests__/editorContentEntry.test.ts` 盯着这条约定。
  *
  * 先取出再物化：`take()` 可能触发 store 写入（进而重入本函数），清空槽位可避免重复落库。
  *
@@ -656,7 +661,7 @@ export function clearPendingEditSource(): void {
  * 编辑都拿不回来：`dirtyIds` 恒不含该标签 ⇒ Ctrl+S 静默无效、标签不显示未保存圆点、
  * 关窗不弹确认直接丢弃。空结算就把端口放回去，端口只在**取到了内容**之后才作废。
  */
-export function settlePendingEdit(): void {
+export function flushPendingEdits(): void {
   const p = pendingEdit;
   if (!p) return;
   // 先清槽再物化：`take()` 期间的任何重入都只看得到空槽，不会重复落库
@@ -671,12 +676,26 @@ export function settlePendingEdit(): void {
 }
 
 /**
+ * 读取某个标签**当前的内容**（ARCH-30 的唯一读入口）：
+ * 先结算未合帧的编辑，再按"活动标签取 `fileContent`、其余取留下的草稿"取值。
+ *
+ * 为什么要有它：内容的真相有两份存放处（活动标签在 store state、切走后进模块级草稿表），
+ * 而合帧窗口里的最新编辑**两份都不在**——必须先把待物化内容结算掉。原先把这一步交给每个
+ * 调用点自己记得，收进这里之后读内容只有一条路。
+ */
+export function readContent(tabId: string): string | null {
+  flushPendingEdits();
+  const { activeTabId, fileContent } = useEditorStore.getState();
+  return tabId === activeTabId ? fileContent : (drafts.get(tabId) ?? null);
+}
+
+/**
  * 未保存草稿数（关窗守卫判定用）。**统计前先结算未合帧的编辑**：
  * 大文档的首次改动可能还在合帧窗口里（`dirtyIds` 尚未更新），直接读计数会漏掉它——
  * 用户以为"没有未保存内容"直接关窗，那次编辑就跟着进程一起消失。
  */
 export function unsavedDraftCount(): number {
-  settlePendingEdit();
+  flushPendingEdits();
   return useEditorStore.getState().dirtyIds.length;
 }
 
@@ -753,7 +772,7 @@ export async function reloadTab(id: string): Promise<boolean> {
     notify({ variant: 'info', title: '该标签不支持从磁盘重新加载' });
     return false;
   }
-  settlePendingEdit();
+  flushPendingEdits();
   drafts.delete(id);
 
   // ── 顺序是关键：**先把内容读回来，再一次性写进 store** ──────────────
@@ -831,7 +850,7 @@ export async function saveAllDirtyTabs(): Promise<{ saved: number; failed: numbe
  */
 async function loadContentInto(id: string, knownPath?: string): Promise<void> {
   // 先把上一个文件未合帧的编辑结算掉：它按 tabId 落库，所以即便此刻切换也不串标签
-  settlePendingEdit();
+  flushPendingEdits();
   const { tabs, setActiveTabId, setFileContent } = useEditorStore.getState();
   const tab = tabs.find(t => t.id === id);
   const path = knownPath ?? tab?.path;

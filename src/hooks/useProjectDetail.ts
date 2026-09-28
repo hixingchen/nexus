@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { projectApi, serviceApi, type FailedService, type ProjectDetail as PD, type Service } from '../services/service';
+import { projectApi, serviceApi, type FailedService, type ProjectDetailView, type Service } from '../services/service';
 import { useLogStore } from '../stores/logStore';
 import { useEditorStore } from '../stores/editor';
 import { useRunningStore } from '../stores/runningStore';
@@ -10,16 +10,41 @@ import { startProjectServices, stopProjectServices } from '../stores/serviceActi
 import { showNotification } from '../components/ui/Toast';
 import { reportError } from '../utils/error';
 import { pruneServiceDrafts } from '../stores/serviceDraftStore';
+import { selectProjectDetail, servicesPending, type DetailSlot } from '../utils/projectDetail';
 
 /** 空列表常量：缓存未命中时复用它，避免每次渲染产生新数组（会让订阅方无谓重渲染） */
 const EMPTY_SERVICES: Service[] = [];
+
+/**
+ * 已加载过的项目详情，按项目 id 归档（UX-18）。
+ *
+ * 为什么需要：切项目时 `detail` 必须立刻失效——load 在途（或失败）期间留着上一份，
+ * "启动全部/停止全部"取的是 `detail.project.id`，会作用到上一个项目。但"失效"到
+ * "新数据回来"之间，界面只能拿 null 顶着，于是整个右侧面板（服务列 + 模板库 + 主区）
+ * 跟着卸载又挂载；实测切一次项目会连闪三帧：**上一个项目的服务 →「暂无服务」→
+ * 「加载中…」→ 新项目的服务**，本地 SQLite 再快也躲不掉（前两帧与后端耗时无关）。
+ *
+ * 缓存的作用只是"首帧就有正确内容"：按 id 取，绝不混项目；命中后 `load()` 照常执行，
+ * 数据仍以库里的为准（它是显示来源，不是事实来源）。
+ */
+const detailCache = new Map<string, ProjectDetailView>();
 
 /**
  * ProjectDetail 组件的业务逻辑 hook
  * 管理项目详情、运行状态、服务 CRUD、日志查看等状态
  */
 export function useProjectDetail(projectId: string) {
-  const [detail, setDetail] = useState<PD | null>(null);
+  /**
+   * 详情与**它所属的项目 id** 一起存：读的时候不同源一律当作"还没有"。
+   *
+   * 为什么不直接 `useState<PD>`：那样在"项目 id 已切、效果还没跑"的那一帧里，
+   * `detail` 仍是上一个项目的对象，界面会把它的名称与服务当成新项目的渲染出去
+   * （实测就是切项目时的第一帧"上一个项目的服务"）。绑定 id 后这一帧自然落到
+   * 加载态，不需要靠 effect 里补一次 `setDetail(null)` 去追。
+   */
+  const [detailState, setDetailState] = useState<DetailSlot<ProjectDetailView> | null>(null);
+  /** 当前项目的详情：同源 state → 缓存那一份 → null。规则与用例见 utils/projectDetail */
+  const detail = selectProjectDetail(detailState, projectId, detailCache);
   // 运行状态来自全局共享 store（MainLayout 统一 3 秒轮询）
   const running = useRunningStore(s => s.running);
   /** 意外退出的服务（崩溃/秒退/spawn 失败） */
@@ -63,7 +88,10 @@ export function useProjectDetail(projectId: string) {
       useSvcCacheStore.getState().setCache(projectId, d.services);
       // 服务已被删除时其编辑草稿没有意义（还会让关窗确认多算一项）；模板草稿由模板库加载时清理
       pruneServiceDrafts('service', d.services.map(s => s.id));
-      setDetail(d);
+      // 交给组件的只有 project：services 已写进共享缓存，再留一份就是第二份真相（ARCH-29）
+      const view: ProjectDetailView = { project: d.project };
+      setDetailState({ projectId, detail: view });
+      detailCache.set(projectId, view); // 供下次切回本项目时首帧直接命中（见 detailCache 说明）
       setLoadError(null);
       // 运行状态**不在这里单独拉**（ARCH-28）：`runningStore` 自己每 3 秒轮询，而
       // `get_running` 是全项目最重的命令（逐服务 try_wait + 一次全系统进程快照 +
@@ -75,8 +103,11 @@ export function useProjectDetail(projectId: string) {
       if (useRunningStore.getState().loaded) runningLoadedRef.current = true;
     } catch (e) {
       if (seq !== loadSeqRef.current) return;
-      // 失败也要保持"无详情"：否则 load 失败后界面继续显示上一个项目并可对其操作
-      setDetail(null);
+      // 失败也要保持"无详情"：否则 load 失败后界面继续显示上一个项目并可对其操作。
+      // 缓存里那一份也一并丢弃——读失败说明这份数据不可信，留着它就会把 UX-17 的
+      // 失败态（持久的失败原因 + 重试）盖成"看起来一切正常"
+      setDetailState(null);
+      detailCache.delete(projectId);
       // 同时记下原因：主区域据此显示**持久的**失败态与「重试」，而不是永远"加载中…"（UX-17）
       setLoadError(toMessage(e));
       reportError('加载项目详情失败', e);
@@ -84,13 +115,15 @@ export function useProjectDetail(projectId: string) {
   }, [projectId]);
 
   useEffect(() => {
-    // 先清空上一份 detail：load 在途（或失败）期间界面上仍是上一个项目的数据，
-    // 而"启动全部/停止全部"等操作取的是 detail.project.id —— 会作用到上一个项目
-    setDetail(null);
+    // 切项目：把 state 收敛到**本项目**（命中缓存则首帧就是完整界面，未命中则是加载态；
+    // 两种情况下都不会把上一个项目的详情留在界面上——同源判定在读取处，见 detailState）。
+    // 上一个项目的加载失败态也要一并清掉，否则它会盖在新项目头上。
+    setLoadError(null);
+    setDetailState(prev => (prev?.projectId === projectId ? prev : null));
     load();
     setEditingService(null);
     setViewingLog(null);
-  }, [load]);
+  }, [load, projectId]);
 
   // 运行状态由全局 runningStore 轮询；首次加载成功后置位 runningLoadedRef
   const runningLoaded = useRunningStore(s => s.loaded);
@@ -124,6 +157,18 @@ export function useProjectDetail(projectId: string) {
   // 的问题（ARCH-7 ③）。retain/release 让"详情页开着"这件事对缓存的清理可见——
   // 左侧折叠项目行会请求删除缓存，此时只推迟到详情页卸载后再删。
   const cachedServices = useSvcCacheStore(s => s.cache[projectId] ?? EMPTY_SERVICES);
+  /**
+   * 服务列表是否"还没到"（UX-18）。
+   *
+   * 判据刻意不是"列表为空"：本项目详情尚未落地 **且** 共享缓存里也没有服务，才是
+   * "不知道有没有服务"。用空列表直接当结论会说出「暂无服务」这句没有根据的话——
+   * 切项目那一帧正是如此（旧项目的服务已被排除，新项目的数据还没到）。
+   *
+   * 缓存里那份详情命中时（detail 非 null）不算"还没到"：它的 services 与即将 load
+   * 回来的是同一份；但**服务列表读的是共享缓存**，若那份被左侧折叠清掉了，这里仍要
+   * 如实显示加载态。
+   */
+  const servicesLoading = servicesPending(detailState, projectId, cachedServices);
   useEffect(() => {
     const store = useSvcCacheStore.getState();
     store.retain(projectId);
@@ -258,6 +303,8 @@ export function useProjectDetail(projectId: string) {
     loadError,
     /** 服务列表（单一来源：svcCacheStore）——组件一律用这个，不要再从 detail 里取 */
     services: cachedServices,
+    /** 服务列表还没到：空列表要显示加载态，不能显示成「暂无服务」（UX-18） */
+    servicesLoading,
     running,
     loading,
     editingService,

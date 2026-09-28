@@ -338,6 +338,8 @@ function LogHeader({
   onClear: () => void;
   newSincePause: number;
 }) {
+  /** 「清空」的两步确认（UX-19）：第一次点只是把按钮换成确认条，可取消 */
+  const [confirmClear, setConfirmClear] = useState(false);
   return (
     <div className="flex-shrink-0 flex items-center h-12 px-4 border-b border-[#30363d] bg-[#161b22] gap-3 select-none">
       {onClose && (
@@ -374,15 +376,19 @@ function LogHeader({
 
       <div className="flex items-center gap-1.5 bg-[#0d1117] rounded-lg px-2.5 h-[30px] border border-[#30363d] focus-within:border-[#58a6ff] transition-colors">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#8b949e" strokeWidth="1.5"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4 4"/></svg>
-        <input ref={searchRef as React.Ref<HTMLInputElement>} className="w-[130px] bg-transparent text-[12px] text-[#c9d1d9] outline-none placeholder:text-[#484f58] font-mono"
+        <input ref={searchRef as React.Ref<HTMLInputElement>}
+          // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+          aria-label="查找日志"
+          className="w-[130px] bg-transparent text-[12px] text-[#c9d1d9] outline-none placeholder:text-[#484f58] font-mono"
           placeholder="查找…" value={searchTerm}
           onChange={e => { setSearchTerm(e.target.value); setSearchIdx(() => 0); }}
           onKeyDown={e => { if (isSubmitEnter(e)) { e.preventDefault(); onGoMatch(e.shiftKey ? -1 : 1); } }}/>
         {searchActive && (
           <>
             <span className="text-[11px] text-[#8b949e] font-mono tabular-nums w-[32px] text-right">{searchMatches > 0 ? `${Math.min(searchIdx + 1, searchMatches)}/${searchMatches}` : '0/0'}</span>
-            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" onClick={() => onGoMatch(-1)}>▲</button>
-            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" onClick={() => onGoMatch(1)}>▼</button>
+            {/* UX-11：按钮里只有一个三角符号，读屏念不出它是干什么的 */}
+            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="上一个匹配（Shift+Enter）" onClick={() => onGoMatch(-1)}>▲</button>
+            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="下一个匹配（Enter）" onClick={() => onGoMatch(1)}>▼</button>
           </>
         )}
       </div>
@@ -395,10 +401,28 @@ function LogHeader({
         {paused ? `跟随${newSincePause > 0 ? ` (${newSincePause})` : ''}` : '暂停'}
       </button>
 
-      <button className="h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
-        onClick={onClear}>
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M2 4h12M5.3 4V2.7c0-.4.3-.7.7-.7h4c.4 0 .7.3.7.7V4M6.7 7v5M9.3 7v5M3.3 4l.7 9.3c0 .4.3.7.7.7h6.6c.4 0 .7-.3.7-.7L12.7 4"/></svg>清空
-      </button>
+      {/* 清空是**不可撤销**的破坏性动作，而失败服务的日志正是排查崩溃的唯一证据（UX-19）：
+          改成两步确认，并把"要清掉几行"写出来。就地两步而不是弹窗——这里是常驻工具栏，
+          弹窗打断更重，而两步同样可取消 */}
+      {confirmClear ? (
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <span className="text-[11px] text-nexus-error">清空这 {lineCount} 行？</span>
+          <button
+            className="h-[30px] px-2.5 rounded-lg text-[11px] border border-nexus-error/40 text-nexus-error bg-nexus-error/10 hover:bg-nexus-error/20 transition-colors"
+            onClick={() => { setConfirmClear(false); onClear(); }}
+          >确认清空</button>
+          <button
+            className="h-[30px] px-2.5 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors"
+            onClick={() => setConfirmClear(false)}
+          >取消</button>
+        </div>
+      ) : (
+        <button className="h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
+          title="清空日志缓冲（不可撤销；失败服务的日志是排查崩溃的唯一证据）"
+          onClick={() => setConfirmClear(true)}>
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M2 4h12M5.3 4V2.7c0-.4.3-.7.7-.7h4c.4 0 .7.3.7.7V4M6.7 7v5M9.3 7v5M3.3 4l.7 9.3c0 .4.3.7.7.7h6.6c.4 0 .7-.3.7-.7L12.7 4"/></svg>清空
+        </button>
+      )}
     </div>
   );
 }

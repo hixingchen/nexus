@@ -6,7 +6,7 @@ import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatchi
 import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
-import { useEditorStore, saveActiveFile, setPendingEditSource, clearPendingEditSource, settlePendingEdit } from '../../stores/editor';
+import { useEditorStore, saveActiveFile, setPendingEditSource, clearPendingEditSource, flushPendingEdits } from '../../stores/editor';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { getExtension } from '../../utils/path';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
@@ -26,7 +26,7 @@ interface CodeViewerProps {
    *
    * 大文档（>256KB）走合帧路径时**不经过这里**：那条路要按"编辑发生时的 tabId"落库，
    * 而 `onChange` 的语义是"写当前活动标签"——切走后再回调会记到别的标签头上。
-   * 合帧的落库统一由 `stores/editor.ts` 的 `settlePendingEdit()` 完成
+   * 合帧的落库统一由 `stores/editor.ts` 的 `flushPendingEdits()` 完成
    * （见 PERF-13 与 `setPendingEditSource` 的说明）。
    */
   onChange?: (content: string) => void;
@@ -130,6 +130,27 @@ function trackScroll(filePath: string, view: EditorView): () => void {
  * 仅本文件使用（模块级单例，供全局 Ctrl+Z 转发定位活动编辑器），故不导出。
  */
 let activeEditorView: EditorView | null = null;
+
+/**
+ * 打开文件内查找面板，并把焦点放进输入框（含全选：面板已开着时再按 Ctrl+F 也全选，
+ * 直接输入即替换，与 VS Code 一致）。
+ *
+ * 两处调用：编辑器聚焦时由 keymap 的 Mod-f 走；焦点在编辑器**外**（文件树 / 标签栏 /
+ * 服务面板）时由全局 Ctrl+F 转发到这里——那条路径原先是 `preventDefault` 之后什么都不
+ * 接，README 承诺的"Ctrl+F 查找"按下毫无反应（UX-18）。
+ */
+function openFindPanel(view: EditorView): void {
+  openSearchPanel(view);
+  // rAF 等 React 渲染出输入框（createRoot 渲染是异步调度）
+  requestAnimationFrame(() => {
+    // instanceof 运行时检查：querySelector 结果不保证是 input（占位符可能被改）
+    const el = view.dom.querySelector('input[placeholder="查找"]');
+    if (el instanceof HTMLInputElement) {
+      el.focus();
+      el.select();
+    }
+  });
+}
 
 // ── 双击选中代码块（IDEA 风格，全语言通用） ────────────────
 
@@ -440,6 +461,8 @@ function SearchPanelView({ view }: { view: EditorView }) {
       </svg>
       <input
         ref={inputRef}
+        // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+        aria-label="查找"
         className={`w-[240px] px-2 py-1 text-[12px] bg-[#1e222a] border rounded text-[#abb2bf] font-mono focus:outline-none transition-colors ${
           invalid ? 'border-[#e06c75]' : 'border-[#3a3f4b] focus:border-[#4f8cff]'
         }`}
@@ -688,7 +711,7 @@ const INSTANT_EMIT_MAX_LENGTH = 256 * 1024;
 
 /**
  * 大文档合帧窗口（ms）。取 200ms：比人手速（约 10 键/秒）长，连打时只在停顿处物化一次；
- * 又比"用户察觉卡顿"短——真正决定不丢内容的是 `settlePendingEdit` 的读取点（保存/切标签/
+ * 又比"用户察觉卡顿"短——真正决定不丢内容的是 `readContent`/`flushPendingEdits`（见 stores/editor 的 ARCH-30 说明）的调用点（保存/切标签/
  * 关标签/卸载都会先结算），这个定时器只是让 store 里的内容不至于长时间落后。
  */
 const EDIT_COALESCE_MS = 200;
@@ -783,21 +806,8 @@ function createEditorState(
       // historyKeymap 的 redo 只在 linux 绑了 Ctrl-Shift-z（避免与系统/浏览器冲突），
       // Windows 上需显式补绑定（Mod=Ctrl）
       { key: 'Mod-Shift-z', run: redo, preventDefault: true },
-      // 文件内搜索：显式绑定保证生效（search() 自带绑定带 scope 且优先级靠后）。
-      // Ctrl+F 打开/聚焦搜索框并全选其内容（VS Code 行为：面板已打开时再按也全选，直接输入即替换）。
-      // rAF 等 React 渲染出输入框（createRoot 渲染是异步调度）
-      { key: 'Mod-f', run: (view) => {
-        openSearchPanel(view);
-        requestAnimationFrame(() => {
-          // instanceof 运行时检查：querySelector 结果不保证是 input（占位符可能被改）
-          const el = view.dom.querySelector('input[placeholder="查找"]');
-          if (el instanceof HTMLInputElement) {
-            el.focus();
-            el.select();
-          }
-        });
-        return true;
-      }, preventDefault: true },
+      // 文件内搜索：显式绑定保证生效（search() 自带绑定带 scope 且优先级靠后）
+      { key: 'Mod-f', run: (view) => { openFindPanel(view); return true; }, preventDefault: true },
       { key: 'F3', run: findNext, shift: findPrevious, preventDefault: true },
       { key: 'Mod-g', run: findNext, shift: findPrevious, preventDefault: true },
       // Vue 模板注释修复（lang-vue 缺陷）：需先于语言包 keymap 注册才优先匹配；
@@ -1025,7 +1035,7 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
           if (settleTimerRef.current === null) {
             settleTimerRef.current = window.setTimeout(() => {
               settleTimerRef.current = null;
-              settlePendingEdit();
+              flushPendingEdits();
             }, EDIT_COALESCE_MS);
           }
         },
@@ -1083,7 +1093,7 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
         clearTimeout(settleTimerRef.current);
         settleTimerRef.current = null;
       }
-      settlePendingEdit();
+      flushPendingEdits();
       clearPendingEditSource();
       // 这里**不**再抢救滚动位置：被动清理跑在 React 摘 DOM 之后，那时读到的永远是 0，
       // 存进去只会把 trackScroll 记下的真实位置覆盖掉（见 trackScroll 的说明）
@@ -1107,7 +1117,7 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     if (!view) return;
     // 先把未合帧的编辑结算掉（PERF-13）：否则下面会把"用户刚敲的内容"当成"外部变化"
     // 覆盖掉（大文档合帧窗口内，store 里的 content 比编辑器旧）
-    settlePendingEdit();
+    flushPendingEdits();
     // 自己刚输入的回声先判：store 回写的就是编辑器内容，此时 `content` 与文档必然相等，
     // 无需再 `doc.toString()`（全文档序列化）。原实现把这个便宜的判断放在了**昂贵操作之后**，
     // 于是每次按键都要白白物化一次整篇文档。
@@ -1131,8 +1141,14 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
         e.stopPropagation();
         el.select();
       } else if (el && !(el instanceof Element && el.closest('.cm-editor'))) {
+        // 焦点在编辑器外（文件树 / 标签栏 / 服务面板…）：**转发给当前编辑器**打开查找面板。
+        // 原实现只 preventDefault + stopPropagation 就结束了——拦住浏览器查找框之后自己
+        // 不接，用户按下去毫无反应（UX-18）。没有打开的编辑器时不拦（拦下来也无事可做）
+        const view = activeEditorView;
+        if (!view) return;
         e.preventDefault();
         e.stopPropagation();
+        openFindPanel(view);
       }
     };
     document.addEventListener('keydown', handler, true);

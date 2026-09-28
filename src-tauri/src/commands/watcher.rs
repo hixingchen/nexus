@@ -75,12 +75,12 @@ fn load_service_watch_config(db: &crate::database::Database, project_id: &str, s
                 };
                 if paths.is_empty() { return Ok(None); }
                 warn_invalid_paths(&name, &paths);
-                Ok(Some(ServiceWatchConfig {
+                Ok(Some(ServiceWatchConfig::new(
                     id, name, paths,
-                    include: include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    exclude: exclude_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    exclude_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                     restart_mode,
-                }))
+                )))
             }
             None => Ok(None),
         }
@@ -117,12 +117,12 @@ fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) 
             };
             if !paths.is_empty() {
                 warn_invalid_paths(&name, &paths);
-                svcs.push(ServiceWatchConfig {
+                svcs.push(ServiceWatchConfig::new(
                     id, name, paths,
-                    include: include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    exclude: exclude_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    include_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    exclude_str.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                     restart_mode,
-                });
+                ));
             }
         }
         Ok(svcs)
@@ -268,4 +268,91 @@ pub async fn stop_watching(app: AppHandle, project_id: String, service_id: Optio
             Some(sid) => remove_service_watch(app.clone(), &state, &project_id, &sid),
         }
     }).await.map_err(|e| format!("停止文件监听任务失败: {}", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{init_schema, Database};
+
+    /// 内存库 + 两个项目（ARCH-32：`load_service_watch_config` 的 4 条业务规则此前零覆盖）
+    fn test_db() -> Database {
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库");
+        init_schema(&conn).expect("建表");
+        conn.execute(
+            "INSERT INTO projects (id, name, path, sort_index, created_at) VALUES ('p1','甲项目','C:/p1',0,'t')",
+            [],
+        ).expect("插入 p1");
+        conn.execute(
+            "INSERT INTO projects (id, name, path, sort_index, created_at) VALUES ('p2','乙项目','C:/p2',1,'t')",
+            [],
+        ).expect("插入 p2");
+        Database::from_connection(conn)
+    }
+
+    fn insert_service(db: &Database, id: &str, project: &str, name: &str, watch_paths: &str, restart_mode: i32) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO services (id, project_id, name, command, cwd, watch_paths, restart_mode)                  VALUES (?1, ?2, ?3, 'npm run dev', 'C:/s', ?4, ?5)",
+                rusqlite::params![id, project, name, watch_paths, restart_mode],
+            ).map_err(|e| e.to_string())
+        }).expect("插入服务");
+    }
+
+    #[test]
+    fn test_watch_config_skips_restart_mode_zero() {
+        let db = test_db();
+        // restart_mode=0 = 关闭监听：任何入口都不得让它实际监听文件
+        insert_service(&db, "s-off", "p1", "关监听", r#"["./src"]"#, 0);
+        let got = load_service_watch_config(&db, "p1", "s-off").expect("查询应成功");
+        assert!(got.is_none(), "restart_mode=0 的服务不该返回监听配置");
+    }
+
+    #[test]
+    fn test_watch_config_is_scoped_to_project() {
+        let db = test_db();
+        insert_service(&db, "s1", "p1", "甲服务", r#"["./src"]"#, 2);
+        let ok = load_service_watch_config(&db, "p1", "s1").expect("查询应成功");
+        assert!(ok.is_some(), "本项目内应能读到");
+        let crossed = load_service_watch_config(&db, "p2", "s1").expect("查询应成功");
+        assert!(crossed.is_none(), "跨项目绑定必须落空（id 全局唯一，但监听是项目维度资源）");
+    }
+
+    #[test]
+    fn test_watch_config_reports_malformed_paths_json() {
+        let db = test_db();
+        insert_service(&db, "s-bad", "p1", "坏配置", "{不是数组}", 1);
+        let err = load_service_watch_config(&db, "p1", "s-bad").expect_err("JSON 非法必须报错");
+        assert!(err.contains("坏配置"), "错误里要点出是哪个服务的配置有问题: {}", err);
+        assert!(err.contains("监听路径"), "要说清坏在哪一项: {}", err);
+    }
+
+    #[test]
+    fn test_watch_config_empty_paths_means_no_watching() {
+        let db = test_db();
+        insert_service(&db, "s-empty", "p1", "空路径", "[]", 2);
+        assert!(load_service_watch_config(&db, "p1", "s-empty").expect("查询应成功").is_none(),
+            "没配监听路径 = 不监听（而不是监听整个工作目录）");
+        insert_service(&db, "s-blank", "p1", "空串", "   ", 2);
+        assert!(load_service_watch_config(&db, "p1", "s-blank").expect("查询应成功").is_none(),
+            "空白串按没配处理");
+    }
+
+    #[test]
+    fn test_watch_config_parses_paths_and_rules() {
+        let db = test_db();
+        insert_service(&db, "s1", "p1", "甲服务", r#"["C:/s/src", "C:/s/web"]"#, 2);
+        let got = load_service_watch_config(&db, "p1", "s1").expect("查询应成功").expect("应有配置");
+        assert_eq!(got.paths, vec!["C:/s/src".to_string(), "C:/s/web".to_string()]);
+        assert_eq!(got.restart_mode, 2);
+        assert!(!got.include.is_empty(), "include 未配时应回落到建表默认值 '*'");
+    }
+
+    #[test]
+    fn test_project_name_reports_missing_project() {
+        let db = test_db();
+        assert_eq!(project_name(&db, "p1").expect("应能读到"), "甲项目");
+        let err = project_name(&db, "nope").expect_err("项目不存在必须报错");
+        assert!(err.contains("项目不存在"), "错误文案要说清原因: {}", err);
+    }
 }

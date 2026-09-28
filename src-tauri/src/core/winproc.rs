@@ -103,15 +103,23 @@ pub(crate) fn snapshot_processes() -> Vec<ProcEntry> {
 /// 广度优先、带 visited 集合：快照里 pid 唯一，但父链可能因 pid 复用出现自环，
 /// 不去重的话循环不会终止。
 pub(crate) fn descendants(root: u32, snapshot: &[ProcEntry]) -> Vec<u32> {
+    // 先建 `ppid → 子进程` 索引（PERF-21）：原实现对**每个** frontier 节点都线性扫一遍
+    // 整张快照，前台进程越多越慢（O(后代数 × 进程数)）。建索引是一次 O(进程数) 的
+    // HashMap 插入，遍历本身不变——行为与顺序完全一致，只是不再重复扫描
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for e in snapshot {
+        children.entry(e.ppid).or_default().push(e.pid);
+    }
     let mut found: Vec<u32> = Vec::new();
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     visited.insert(root);
     let mut frontier = vec![root];
     while let Some(pid) = frontier.pop() {
-        for e in snapshot.iter().filter(|e| e.ppid == pid) {
-            if visited.insert(e.pid) {
-                found.push(e.pid);
-                frontier.push(e.pid);
+        let Some(kids) = children.get(&pid) else { continue };
+        for &kid in kids {
+            if visited.insert(kid) {
+                found.push(kid);
+                frontier.push(kid);
             }
         }
     }

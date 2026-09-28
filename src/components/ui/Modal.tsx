@@ -91,6 +91,10 @@ export function Modal({ open, title, onClose, children, width = '420px' }: Modal
       onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
       onMouseUp={(e) => {
         // 仅在遮罩自身上下都按下+抬起时才关闭：拖拽选中文字后在遮罩上松手不算点击遮罩
+        //
+        // 关闭＝"先离开"而不是"放弃"（UX-14）：带表单的弹窗把未提交内容写进
+        // stores/modalDraftStore（点遮罩 / Esc / ✕ 关闭后重新打开还在），
+        // 清草稿只发生在提交成功或用户显式点「取消」时。新加表单弹窗请沿用这套分工
         if (mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) {
           onClose();
         }

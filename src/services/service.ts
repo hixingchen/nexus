@@ -77,6 +77,18 @@ export interface Project {
   sort_index: number;
 }
 
+/**
+ * 组件侧看到的项目详情：**只有 project**（ARCH-29）。
+ *
+ * `ProjectDetail.services` 是 IPC 的传输通道（后端一次调用把服务列表捎回来，省一次
+ * 往返），收到后立刻写进 `useSvcCacheStore`，之后全仓只从那里读。原先"组件别读它"
+ * 只靠一句 `@deprecated` 注释约束——把它从组件侧的类型里去掉之后，读它变成编译错误，
+ * 而 `svcCacheStore` 的引用计数正建立在"服务的读点只有一个"这个前提上。
+ */
+export interface ProjectDetailView {
+  project: Project;
+}
+
 export interface ProjectDetail {
   project: Project;
   /**

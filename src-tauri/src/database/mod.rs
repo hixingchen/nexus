@@ -141,7 +141,11 @@ const SCHEMA_VERSION: i32 = 9;
 
 /// 建表 + 迁移（`pub(crate)`：命令层的 SQL 路径测试要自己搭一个内存库，见 commands/service.rs 的 tests）
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
+    // `synchronous=NORMAL`（PERF-32）：WAL 下默认是 FULL——每次提交都 fsync。本项目是配置库，
+    // 写路径全是用户交互触发（不是热路径），而 WAL + NORMAL 是 SQLite 官方推荐的组合：
+    // 崩溃最多丢最后若干**已提交事务**（不会损坏库），代价是偶发几十 ms 的提交延迟消失。
+    // 该 PRAGMA 是 per-connection 的，必须在这里对真正使用的这条连接设置
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
         .map_err(|e| format!("初始化数据库 PRAGMA 失败: {}", e))?;
 
     // 读取旧版本号（仅日志用；老库由 CREATE IF NOT EXISTS + 增量加列原地升级）
@@ -358,6 +362,19 @@ mod tests {
 
     fn in_memory() -> Connection {
         Connection::open_in_memory().expect("打开内存数据库失败")
+    }
+
+    /// PERF-32：`synchronous=NORMAL` 必须**真的落在这条连接上**（铁律 21：配置写了 ≠ 生效了）。
+    /// WAL + NORMAL 是本项目的取舍（配置库，崩溃最多丢最后若干事务），改回去会让每次提交都 fsync。
+    #[test]
+    fn test_init_schema_sets_wal_and_normal_synchronous() {
+        let conn = in_memory();
+        init_schema(&conn).expect("建表");
+        // 内存库的 journal_mode 恒为 memory/persisted 之外的值，故只断言 synchronous（1 = NORMAL）
+        let sync_mode: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).expect("读 synchronous");
+        assert_eq!(sync_mode, 1, "synchronous 应为 NORMAL(1)，实际 {}", sync_mode);
+        let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).expect("读 foreign_keys");
+        assert_eq!(fk, 1, "外键约束必须开着");
     }
 
     fn db_wrapper() -> Database {

@@ -43,7 +43,7 @@
 
 ### 界面
 - 深色主题、自定义标题栏、可拖拽面板布局、布局状态持久化
-- 全局搜索弹窗、文件/目录二次定位、快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z 撤销）
+- 全局搜索弹窗、文件/目录二次定位、快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板；Ctrl+R / F5 / Ctrl+Shift+R 在**有未保存改动**时会被拦下并走关窗确认，不做静默刷新）
 
 ## 第三方组件
 
@@ -133,6 +133,9 @@ cd src-tauri && cargo clippy --all-targets   # 后端静态分析（0 警告）
 | 启动致命错误 | `~/.nexus/logs/startup-error.log` |
 
 > 打包版没有控制台，**排查问题请看 `~/.nexus/logs/nexus.log`**；开发期 `RUST_LOG=debug` 可提高日志级别。
+> **前端错误也写进同一个文件**（行首带 `[frontend]` 来源标记，出口是 `utils/error.ts` 的 `reportError`）——
+> 打包版既没有控制台也没有 devtools，不这样记，故障发生的那一层就一点痕迹都不留。
+> 同一个错误 60 秒内超过 5 条会被限流（`[frontend]` 那一行会写明"不再写日志"），限流不是没发生。
 
 ## 项目结构
 

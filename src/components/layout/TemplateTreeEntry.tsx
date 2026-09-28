@@ -1,6 +1,7 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { openInExplorer, openTerminal } from '../../services/system';
+import { useDndMonitor } from '@dnd-kit/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { ServiceTemplate } from '../../services/service';
@@ -33,16 +34,48 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
     transition: isDragging ? 'none' : transition,
     zIndex: isDragging ? 50 : 'auto' as const,
   };
-  /** 本次点击前发生过拖拽（长按松手会触发 click，需跳过编辑打开） */
+  /** 本次点击前发生过**指针**拖拽（长按松手会触发 click，需跳过编辑打开） */
   const draggedRef = useRef(false);
-  useEffect(() => {
-    if (isDragging) draggedRef.current = true;
-  }, [isDragging]);
+  // 只有指针拖拽才需要"松手后吞掉那次补发的 click"（UX-8）：键盘拖拽（Space 起步）
+  // 不会补发 click，若也置脏，拖拽排序后第一次点击/Enter 会被白白吞掉一次。
+  // 判据取拖拽的激活事件类型——它由 dnd-kit 在 document 级按键监听里处理，
+  // 不受这里对 Enter 的接管影响（见 handleKeyDown）。
+  // 拖拽一结束就安排清掉：那次补发的 click 与拖拽结束在**同一个事件循环回合**里，
+  // 而"松手落在卡片之外"时它根本不会来——标记若一直留着，下次真实点击/Enter 就被吞了
+  const clearDragFlagSoon = () => { setTimeout(() => { draggedRef.current = false; }, 0); };
+  useDndMonitor({
+    onDragStart: (e) => {
+      if (e.active.id === tpl.id && !(e.activatorEvent instanceof KeyboardEvent)) draggedRef.current = true;
+    },
+    onDragEnd: (e) => { if (e.active.id === tpl.id) clearDragFlagSoon(); },
+    onDragCancel: (e) => { if (e.active.id === tpl.id) clearDragFlagSoon(); },
+  });
   const handleClick = () => {
     if (draggedRef.current) { draggedRef.current = false; return; }
     onEdit(tpl);
   };
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+  /**
+   * 键盘分工（UX-8）：卡片经 dnd-kit 的 attributes 拿到 `role="button"` + `tabIndex=0`
+   * ——辅助技术把它朗读成按钮，所以 **Enter 必须是"卡片动作"（等价点击，即打开编辑面板）**；
+   * **Space 留给 dnd-kit 的键盘排序**（它的屏幕阅读器说明正是"按空格拾起"，方向键移动、
+   * 再按空格/Enter 落下、Esc 取消），`KeyboardSensor` 照旧挂着，键盘排序能力不变。
+   *
+   * 为什么不能把 Enter 也转发给 dnd：它的激活器默认把 Enter 也算作"开始拖拽"
+   * （`defaultKeyboardCodes.start = [Space, Enter]`），转发过去 Enter 就又变回了拖拽。
+   */
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // 焦点在内层按钮（添加到项目）上时按键归那个按钮：转发给 dnd 会让 Enter 与 Space
+    // 都被激活器 preventDefault 掉，这个按钮用键盘根本按不动
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter') {
+      // 拖拽进行中：Enter 是"落下"（dnd 挂在 document 上的监听会处理），不该顺手开一次面板
+      if (!isDragging) { e.preventDefault(); handleClick(); }
+      return;
+    }
+    listeners?.onKeyDown?.(e);
+  };
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -71,6 +104,7 @@ export function TemplateTreeEntry({ tpl, busy, isEditing, onEdit, onAdd, onReque
             : 'bg-nexus-bg/30 border border-nexus-border hover:border-nexus-muted/70'
         } ${busy ? 'opacity-60 pointer-events-none' : ''} ${isDragging ? 'shadow-[0_16px_48px_rgba(0,0,0,0.5)] ring-2 ring-nexus-accent/30 border-nexus-accent/50 bg-nexus-bg cursor-grabbing' : ''}`}
         onClick={handleClick}
+        onKeyDown={handleKeyDown}
         onContextMenu={handleContextMenu}
         title={isDragging ? '拖拽排序' : `${tpl.command}${tpl.cwd ? ` (${tpl.cwd})` : ''}`}
       >

@@ -5,6 +5,7 @@ import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
 import { useSearchModalStore } from '../../stores/searchModal';
 import { copyText } from '../../utils/clipboard';
+import { focusProjectStep } from '../../utils/keyboard';
 import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 
 interface Props {
@@ -18,13 +19,38 @@ interface Props {
   actingId: string | null;
   expandedSvc: Set<string>;
   onSelect: () => void;
-  /** 展开/收起服务目录树（双击卡片；卡片上不再有箭头按钮） */
-  onToggleExpand: (e: React.MouseEvent) => void;
+  /**
+   * 展开/收起服务目录树（鼠标：双击卡片；键盘：卡片上的 → / ←，UX-7）。
+   *
+   * 参数类型与 `useProjectList.toggleSvcExpand` 同一口径（只用到 `stopPropagation`）：
+   * 键盘那条路没有真实鼠标事件，不这么写就得伪造一个假事件。
+   */
+  onToggleExpand: (e: { stopPropagation(): void }) => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onStart: (e: React.MouseEvent) => void;
   onStop: (e: React.MouseEvent) => void;
   onTogglePin: (e: React.MouseEvent) => void;
   onToggleSvcExpand: (serviceId: string) => void;
+}
+
+/**
+ * 键盘触发的展开/收起没有真实鼠标事件：`toggleExpand` 只用到 `stopPropagation`。
+ * 与 `ProjectList` 里那个同名的 no-op 是同一手法（CQ-21：不伪造 `as React.MouseEvent`）。
+ */
+const NO_DOM_EVENT = { stopPropagation: () => {} };
+
+/**
+ * `Enter` 等价于单击（UX-7）：给那些"只绑了 onClick 的 div 行"用。
+ *
+ * 为什么需要：项目目录/服务目录这两行是打开对应文件树的**唯一入口**，而它们此前是纯鼠标的
+ * ——卡片能展开项目了，键盘用户却在这一步断掉，树里那些刚做好的键盘操作一行也够不着。
+ */
+function activateOnEnter(run: () => void) {
+  return (ev: React.KeyboardEvent) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    run();
+  };
 }
 
 export function ProjectListItem({
@@ -56,18 +82,54 @@ export function ProjectListItem({
    */
   const [projectTreeOpen, setProjectTreeOpen] = useState(false);
 
+  /**
+   * 卡片上的键盘操作（UX-7）。
+   *
+   * 此前卡片是纯 `div`：键盘既选不中项目，也展不开它的服务目录树（展开只绑在双击上），
+   * 而"进项目的文件树"整个应用只有这一条路。键位：Enter 选中、→ / ← 展开/收起、↑↓ 换项目。
+   */
+  const handleCardKeyDown = (ev: React.KeyboardEvent<HTMLDivElement>) => {
+    // 焦点在卡片里的启动/收藏按钮上时，按键归按钮（否则 Enter 会被卡片抢走）
+    if (ev.target !== ev.currentTarget) return;
+    switch (ev.key) {
+      case 'Enter':
+        ev.preventDefault();
+        onSelect();
+        break;
+      case 'ArrowRight':
+        if (!isExpanded) { ev.preventDefault(); onToggleExpand(NO_DOM_EVENT); }
+        break;
+      case 'ArrowLeft':
+        if (isExpanded) { ev.preventDefault(); onToggleExpand(NO_DOM_EVENT); }
+        break;
+      case 'ArrowUp':
+      case 'ArrowDown':
+        // 已在首/末项时不拦默认行为（让页面自己滚动，而不是"按了没反应"）
+        if (focusProjectStep(ev.currentTarget, ev.key === 'ArrowDown' ? 1 : -1)) ev.preventDefault();
+        break;
+      default:
+        break;
+    }
+  };
+
   return (
     <>
     {/* data-project-id：ProjectList 用它把"选中项滚进视野"（见那边的 effect） */}
     <div className="mb-1.5" data-project-id={project.id}>
       <div
-        className={`mx-2 rounded-md px-3 py-2.5 cursor-pointer group ${
+        className={`mx-2 rounded-md px-3 py-2.5 cursor-pointer group focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-nexus-accent ${
           selected
             ? 'bg-nexus-accent/10 border border-nexus-accent/30'
             : 'bg-nexus-bg/30 border border-nexus-border hover:bg-nexus-hover hover:border-nexus-muted'
         }`}
+        // 可聚焦 + Enter 选中（UX-7）；title 里写明键盘等价操作——
+        // "双击展开"此前没有任何可见提示，键盘用户更无从得知
+        tabIndex={0}
+        aria-current={selected ? 'true' : undefined}
+        title="Enter 选中；→ 展开 / ← 收起服务目录树；↑↓ 切换项目；右键更多操作"
         onClick={onSelect}
         onDoubleClick={onToggleExpand}
+        onKeyDown={handleCardKeyDown}
         onContextMenu={onContextMenu}
       >
         <div className="flex items-start gap-2">
@@ -148,18 +210,22 @@ export function ProjectListItem({
               定位优先级低于服务树（见 FileTree 的 kind / utils/fileTree.ts）。 */}
           <div>
             <div
-              className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors ${
+              className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-nexus-accent ${
                 projectTreeOpen
                   ? 'text-nexus-text bg-nexus-bg/40'
                   : 'text-nexus-text-muted hover:bg-nexus-hover/30 hover:text-nexus-text'
               }`}
+              // 这一行是走到项目文件树的**唯一入口**（树在它下面），此前只有鼠标能开（UX-7）
+              tabIndex={0}
+              aria-expanded={projectTreeOpen}
               onClick={() => setProjectTreeOpen(v => !v)}
+              onKeyDown={activateOnEnter(() => setProjectTreeOpen(v => !v))}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 setProjectMenu({ x: e.clientX, y: e.clientY });
               }}
-              title="项目根目录（不属于任何服务的文件在这里）· 右键可搜索整个项目"
+              title="项目根目录（不属于任何服务的文件在这里）· 右键可搜索整个项目 · Enter 展开"
             >
               <svg
                 className={`flex-shrink-0 text-nexus-muted/60 transition-transform ${projectTreeOpen ? 'rotate-90' : ''}`}
@@ -190,18 +256,22 @@ export function ProjectListItem({
               return (
                 <div key={s.id}>
                   <div
-                    className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors ${
+                    className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-nexus-accent ${
                       svcExpanded
                         ? 'text-nexus-text bg-nexus-bg/40'
                         : 'text-nexus-text-muted hover:bg-nexus-hover/30 hover:text-nexus-text'
                     }`}
+                    // 同「项目目录」那一行：它是这棵服务文件树的唯一入口（UX-7）
+                    tabIndex={0}
+                    aria-expanded={svcExpanded}
                     onClick={() => onToggleSvcExpand(s.id)}
+                    onKeyDown={activateOnEnter(() => onToggleSvcExpand(s.id))}
                     onContextMenu={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
                       setSvcMenu({ x: e.clientX, y: e.clientY, svc: s });
                     }}
-                    title="右键可搜索文件内容"
+                    title="右键可搜索文件内容 · Enter 展开"
                   >
                     <svg
                       className={`flex-shrink-0 text-nexus-muted/60 transition-transform ${svcExpanded ? 'rotate-90' : ''}`}

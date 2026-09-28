@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { arrayMove } from '@dnd-kit/sortable';
 import { serviceApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
@@ -89,7 +89,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [showFileTree, setShowFileTree] = useState(initialDraft?.showFileTree ?? service.show_file_tree);
   const [saving, setSaving] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
+  /** 「放弃修改」的两步确认（UX-19）：它同时会清掉草稿，一次点击不够 */
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  /** 表单字段 id 前缀（UX-11）：label 的 htmlFor 要指向真实存在的 id，用 useId 避免多处手写撞车 */
+  const uid = useId();
 
   // 工具命令状态（DB 里的 TEXT 列属不受信数据，用带校验的解析器而不是裸 JSON.parse）。
   // 原值快照只算一次：dirty 判定每键都要比较，不能每次渲染重新 parse
@@ -392,11 +396,27 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
         <div className="flex items-center gap-2 px-4 h-[28px] flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
           <span className="w-1.5 h-1.5 rounded-full bg-nexus-warning flex-shrink-0" />
           <span className="flex-1 text-[11.5px] text-nexus-warning">有未保存的修改（切换服务/面板不会丢失）</span>
-          <button
-            className="text-[11.5px] text-nexus-warning hover:underline"
-            title="回到已保存的配置"
-            onClick={handleDiscard}
-          >放弃修改</button>
+          {/* 放弃修改会**永久清掉草稿**（不只是把表单还原），所以走两步确认（UX-19）：
+              紧挨着提示条的小号文字按钮，一点就没，用户以为只是"撤销这一下" */}
+          {confirmDiscard ? (
+            <span className="flex items-center gap-2">
+              <span className="text-[11.5px] text-nexus-error">丢弃这些修改并清掉草稿？</span>
+              <button
+                className="text-[11.5px] text-nexus-error font-medium hover:underline"
+                onClick={() => { setConfirmDiscard(false); handleDiscard(); }}
+              >确认放弃</button>
+              <button
+                className="text-[11.5px] text-nexus-text-muted hover:text-nexus-text hover:underline"
+                onClick={() => setConfirmDiscard(false)}
+              >取消</button>
+            </span>
+          ) : (
+            <button
+              className="text-[11.5px] text-nexus-warning hover:underline"
+              title="回到已保存的配置（会丢弃本面板里未保存的改动与草稿，不可撤销）"
+              onClick={() => setConfirmDiscard(true)}
+            >放弃修改</button>
+          )}
         </div>
       )}
       <div className="flex-1 overflow-auto p-3 space-y-3">
@@ -404,18 +424,18 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
         <div className={cardCls}>
           <div className="space-y-3">
             <div>
-              <label className={labelCls}>名称</label>
-              <input className={INPUT_CLS} value={name} onChange={e => setName(e.target.value)} />
+              <label htmlFor={`${uid}-name`} className={labelCls}>名称</label>
+              <input id={`${uid}-name`} className={INPUT_CLS} value={name} onChange={e => setName(e.target.value)} />
             </div>
             <div>
-              <label className={labelCls}>启动命令</label>
-              <textarea className={`${INPUT_CLS} font-mono resize-none`} rows={2} value={command}
+              <label htmlFor={`${uid}-command`} className={labelCls}>启动命令</label>
+              <textarea id={`${uid}-command`} className={`${INPUT_CLS} font-mono resize-none`} rows={2} value={command}
                 onChange={e => setCommand(e.target.value)} placeholder="npm run dev" />
             </div>
             <div>
-              <label className={labelCls}>工作目录</label>
+              <label htmlFor={`${uid}-cwd`} className={labelCls}>工作目录</label>
               <div className="relative mt-1">
-                <input className={`${INPUT_CLS} pr-8`} value={cwd}
+                <input id={`${uid}-cwd`} className={`${INPUT_CLS} pr-8`} value={cwd}
                   onChange={e => applyCwd(e.target.value)} placeholder="/path/to/service" />
                 <button
                   aria-label="选择工作目录"
@@ -452,19 +472,19 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           {restartMode > WATCH_MODE_OFF && (
             <div className="space-y-3">
               <div>
-                <label className={labelCls}>监听路径</label>
-                <input className={`${INPUT_CLS} font-mono mt-1`} value={watchPaths}
+                <label htmlFor={`${uid}-watch-paths`} className={labelCls}>监听路径</label>
+                <input id={`${uid}-watch-paths`} className={`${INPUT_CLS} font-mono mt-1`} value={watchPaths}
                   onChange={e => setWatchPaths(e.target.value)} placeholder='["./server", "./shared"]' />
               </div>
               <div>
-                <label className={labelCls}>包含文件</label>
-                <textarea className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={3} value={watchInclude}
+                <label htmlFor={`${uid}-watch-include`} className={labelCls}>包含文件</label>
+                <textarea id={`${uid}-watch-include`} className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={3} value={watchInclude}
                   onChange={e => setWatchInclude(e.target.value)}
                   placeholder={'*\n*.ts\n*.tsx\n*.rs\n*.py'} />
               </div>
               <div>
-                <label className={labelCls}>排除</label>
-                <textarea className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={4} value={watchExclude}
+                <label htmlFor={`${uid}-watch-exclude`} className={labelCls}>排除</label>
+                <textarea id={`${uid}-watch-exclude`} className={`${INPUT_CLS} font-mono resize-none mt-1`} rows={4} value={watchExclude}
                   onChange={e => setWatchExclude(e.target.value)}
                   placeholder={'node_modules\n.git\ndist\ntarget'} />
               </div>
@@ -489,6 +509,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 {/* 开关：选中时 accent 蓝轨道 + 滑块右移 */}
                 <span
                   role="switch"
+                  // UX-11：可见文字在兄弟 span 上，开关自己没有可访问名——读屏会只念"开关"
+                  aria-label={item.label}
                   aria-checked={item.checked}
                   tabIndex={0}
                   onKeyDown={(e) => {
@@ -670,7 +692,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           {showAdvanced && (
             <div className="mt-3">
               <div className="flex items-center justify-between">
-                <label className={labelCls}>环境变量</label>
+                <label htmlFor={`${uid}-env`} className={labelCls}>环境变量</label>
                 {/* SEC-6：变量值默认遮蔽。服务配置里常放 token/密码（命令日志已掩码，
                     这里此前是明文直接摊在屏幕上——截图/录屏/共享屏幕即泄露）*/}
                 <button
@@ -681,6 +703,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 >{showEnvValues ? '遮蔽值' : '显示值'}</button>
               </div>
               <textarea
+                id={`${uid}-env`}
                 className={`${INPUT_CLS} font-mono resize-none mt-1`}
                 rows={4}
                 value={showEnvValues ? envVars : maskEnvValues(envVars)}
@@ -794,6 +817,8 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
   const [timeoutSecs, setTimeoutInput] = useState(
     initial?.timeout_secs != null ? String(initial.timeout_secs) : ''
   );
+  /** 表单字段 id 前缀（UX-11），同上：label 必须指向一个真实存在的 id */
+  const uid = useId();
 
   /** 空 → undefined（默认）；非负整数 → 数值；非法输入 → undefined（按默认处理） */
   const parseTimeout = (): number | undefined => {
@@ -818,8 +843,9 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
   return (
     <form onSubmit={handleSubmit} className="mt-3 space-y-2 p-2.5 bg-nexus-bg/50 rounded-md border border-nexus-border/50">
       <div>
-        <label className="text-[11px] text-nexus-muted">名称</label>
+        <label htmlFor={`${uid}-cmd-name`} className="text-[11px] text-nexus-muted">名称</label>
         <input
+          id={`${uid}-cmd-name`}
           className={INPUT_CLS}
           value={name}
           onChange={e => setName(e.target.value)}
@@ -828,8 +854,9 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
         />
       </div>
       <div>
-        <label className="text-[11px] text-nexus-muted">命令</label>
+        <label htmlFor={`${uid}-cmd-command`} className="text-[11px] text-nexus-muted">命令</label>
         <input
+          id={`${uid}-cmd-command`}
           className={`${INPUT_CLS} font-mono`}
           value={cmd}
           onChange={e => setCmd(e.target.value)}
@@ -837,8 +864,9 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
         />
       </div>
       <div>
-        <label className="text-[11px] text-nexus-muted">超时（秒）</label>
+        <label htmlFor={`${uid}-cmd-timeout`} className="text-[11px] text-nexus-muted">超时（秒）</label>
         <input
+          id={`${uid}-cmd-timeout`}
           className={INPUT_CLS}
           value={timeoutSecs}
           onChange={e => setTimeoutInput(e.target.value)}

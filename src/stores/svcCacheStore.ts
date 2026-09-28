@@ -18,7 +18,11 @@ interface SvcCacheState {
   refs: Record<string, number>;
   /** 折叠时被请求过删除、但因仍被持有而推迟的项目（持有者释放后真正删除） */
   pendingEvict: Record<string, true>;
-  /** 详情 load 成功后写入（覆盖旧缓存） */
+  /**
+   * 详情 load 成功后写入（覆盖旧缓存）。
+   *
+   * 写入即撤销本项目此前"待删除"的请求——见实现处的说明（UX-19）。
+   */
   setCache: (projectId: string, services: Service[]) => void;
   /** 声明"我正在用这个项目的服务列表"（在 effect 里成对调用 retain/release） */
   retain: (projectId: string) => void;
@@ -32,8 +36,24 @@ export const useSvcCacheStore = create<SvcCacheState>((set, get) => ({
   refs: {},
   pendingEvict: {},
 
+  /**
+   * 为什么写入时要清掉 `pendingEvict`（UX-19）：那个标记是**折叠项目行**时留下的
+   * "待删请求"，而列表重新展开同一个项目（或详情页 load）会再写一次缓存——数据既然
+   * 刚回来，旧的删除请求就已经过期了。
+   *
+   * 不清它会出现这个 bug（实测复现）：折叠 → 标记待删（详情页还持有，删不了）→ 双击
+   * 重新展开（缓存写入，标记却留着）→ 切到别的项目（详情页释放引用）→ `release` 按
+   * 那条陈旧请求把**刚装回来**的服务列表删掉。表现是"展开着的项目卡片显示『暂无服务
+   * 目录树』"，而折叠它的动作根本没发生过。
+   */
   setCache: (projectId, services) =>
-    set(st => ({ cache: { ...st.cache, [projectId]: services } })),
+    set(st => {
+      const cache = { ...st.cache, [projectId]: services };
+      if (!st.pendingEvict[projectId]) return { cache };
+      const pendingEvict = { ...st.pendingEvict };
+      delete pendingEvict[projectId];
+      return { cache, pendingEvict };
+    }),
 
   retain: (projectId) =>
     set(st => ({ refs: { ...st.refs, [projectId]: (st.refs[projectId] ?? 0) + 1 } })),

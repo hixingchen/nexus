@@ -29,10 +29,31 @@ pub struct ServiceWatchConfig {
     pub id: String,
     pub name: String,
     pub paths: Vec<String>,
+    /// `paths` 的**规范化前缀**（统一 `/`、确保以 `/` 结尾），构造时算一次（PERF-28）。
+    ///
+    /// 热路径上每个 (路径 × 服务 × 监听路径) 都要拿它做前缀匹配，而原实现每次比较都重新
+    /// 拼一遍字符串——18 服务 × 2 监听路径 ≈ 36 次小分配/事件，洪泛时每 500ms 十几万次。
+    /// **不要直接构造本结构体**，走 `ServiceWatchConfig::new`，否则这个字段会是空的。
+    pub paths_norm: Vec<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     /// 0=关闭监听, 1=确认重启, 2=自动重启（随事件透传给前端）
     pub restart_mode: i32,
+}
+
+impl ServiceWatchConfig {
+    /// 唯一构造入口：顺带把 `paths_norm` 算出来（见字段说明）
+    pub fn new(
+        id: String,
+        name: String,
+        paths: Vec<String>,
+        include: Vec<String>,
+        exclude: Vec<String>,
+        restart_mode: i32,
+    ) -> Self {
+        let paths_norm = paths.iter().map(|p| normalize_prefix(p)).collect();
+        Self { id, name, paths, paths_norm, include, exclude, restart_mode }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -374,7 +395,7 @@ fn path_needed_by_any(path: &Path, services: &[ServiceWatchConfig]) -> bool {
     // 提取路径各组件用于目录名匹配
     let components: Vec<&str> = path_str.split('/').collect();
     services.iter().any(|svc| {
-        let in_watch = svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp)));
+        let in_watch = svc.paths_norm.iter().any(|wp| path_str.starts_with(wp));
         in_watch && service_accepts(svc, &path_str, &components)
     })
 }
@@ -392,7 +413,7 @@ fn match_changes(
         let components: Vec<&str> = path_str.split('/').collect();
         let mut matched = false;
         for svc in services {
-            let in_watch = svc.paths.iter().any(|wp| path_str.starts_with(&normalize_prefix(wp)));
+            let in_watch = svc.paths_norm.iter().any(|wp| path_str.starts_with(wp));
             if !in_watch { continue; }
             if !service_accepts(svc, path_str, &components) { continue; }
             // 不 break：同一路径可能被多个服务同时监听，每个服务都应收到事件
@@ -501,14 +522,15 @@ mod tests {
     // ── path_needed_by_any / service_accepts ────────────────
 
     fn make_svc(id: &str, paths: Vec<&str>, exclude: Vec<&str>, include: Vec<&str>) -> ServiceWatchConfig {
-        ServiceWatchConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            paths: paths.into_iter().map(String::from).collect(),
-            include: include.into_iter().map(String::from).collect(),
-            exclude: exclude.into_iter().map(String::from).collect(),
-            restart_mode: 0,
-        }
+        // 走唯一构造入口（它顺带算 paths_norm，PERF-28）——直接构造会让前缀匹配拿不到规范化值
+        ServiceWatchConfig::new(
+            id.to_string(),
+            id.to_string(),
+            paths.into_iter().map(String::from).collect(),
+            include.into_iter().map(String::from).collect(),
+            exclude.into_iter().map(String::from).collect(),
+            0,
+        )
     }
 
     #[test]

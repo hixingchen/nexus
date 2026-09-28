@@ -391,7 +391,10 @@ pub(crate) fn final_path_of_handle(file: &std::fs::File) -> Result<PathBuf, Stri
     }
 
     let handle = file.as_raw_handle() as WinHandle;
-    let mut buf = vec![0u16; 4096];
+    // 先在**栈**上试（PERF-29）：这个函数是每个文件访问的句柄复核入口，搜索时会按候选文件
+    // 逐个调用（2 万文件 = 2 万次 8KB 堆分配）。4096 个 u16 对真实路径绰绰有余，
+    // 超长路径再走下面的堆扩容重试
+    let mut buf = [0u16; 4096];
     let len = unsafe {
         GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0)
     };
@@ -400,18 +403,17 @@ pub(crate) fn final_path_of_handle(file: &std::fs::File) -> Result<PathBuf, Stri
     }
     if len as usize >= buf.len() {
         // 超长路径：扩容重试一次（上限 32k，足够任何真实路径）
-        buf = vec![0u16; len as usize + 1];
+        let mut heap = vec![0u16; len as usize + 1];
         let len2 = unsafe {
-            GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0)
+            GetFinalPathNameByHandleW(handle, heap.as_mut_ptr(), heap.len() as u32, 0)
         };
-        if len2 == 0 || len2 as usize >= buf.len() {
+        if len2 == 0 || len2 as usize >= heap.len() {
             return Err("无法解析文件真实路径（路径过长）".into());
         }
-        buf.truncate(len2 as usize);
-    } else {
-        buf.truncate(len as usize);
+        heap.truncate(len2 as usize);
+        return Ok(PathBuf::from(String::from_utf16_lossy(&heap)));
     }
-    Ok(PathBuf::from(String::from_utf16_lossy(&buf)))
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
 }
 
 #[cfg(not(windows))]
