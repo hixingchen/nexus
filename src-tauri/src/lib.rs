@@ -318,6 +318,8 @@ pub fn run() {
             commands::tools::open_service_with_tool,
             commands::layout::save_layout,
             commands::layout::load_layout,
+            // 恢复默认布局：清掉除「当前选中的项目」以外的布局键（见 commands/layout.rs）
+            commands::layout::reset_layout,
             commands::editor::set_project_root,
             commands::ai::ai_status,
             commands::ai::ai_start,
@@ -333,6 +335,10 @@ pub fn run() {
             commands::app::pick_directory,
             commands::app::pick_save_file,
             commands::app::get_app_version,
+            // Nexus 自己的数据/日志目录（设置 > 通用 > 数据与日志）：
+            // 读取用 get_app_paths，打开用 open_app_dir（用途键，不收路径）
+            commands::app::get_app_paths,
+            commands::app::open_app_dir,
             // Node 运行时（独立工具，不参与服务配置）
             commands::node::get_node_runtime,
             commands::node::download_nvm_installer,

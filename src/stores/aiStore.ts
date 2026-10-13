@@ -7,6 +7,14 @@ import { LAYOUT_KEYS, saveLayout, useLayoutStore, type LayoutKey } from './layou
 export const AI_PANEL_MIN_W = 320;
 export const AI_PANEL_MAX_W = 900;
 
+/**
+ * 面板默认宽度。
+ *
+ * 抽成常量是为了「恢复默认布局」能复用同一个数——重置路径若另写一个字面量，
+ * 两处早晚不一致（表现是"恢复默认布局恢复出另一个宽度"）。
+ */
+const DEFAULT_AI_PANEL_WIDTH = 560;
+
 /** AI 启用记忆在布局库的键前缀（历史遗留：新版本不再写入，仅启动时清残留行） */
 const AI_ON_KEY_PREFIX = 'ai_on_';
 
@@ -126,7 +134,7 @@ export function selectAiPanelVisible(s: AiState): boolean {
 
 export const useAiStore = create<AiState>((set, get) => ({
   panelOpen: false,
-  panelWidth: 560,
+  panelWidth: DEFAULT_AI_PANEL_WIDTH,
   running: false,
   url: null,
   sessionCwd: null,
@@ -287,3 +295,19 @@ export const useAiStore = create<AiState>((set, get) => ({
 
   setInstalling: (v) => set({ installing: v }),
 }));
+
+/**
+ * 「恢复默认布局」（设置 > 通用）：把面板宽度贴回默认值。
+ *
+ * 为什么在这里**订阅**而不是由设置面板去逐个通知各消费方：那样每加一个布局项，
+ * 都要记得回去改那个按钮——漏一个的表现是"恢复默认布局对某一项无效"，
+ * 而没人会想到问题出在"少写了一行通知"。让每个消费方自己认领自己那一项，
+ * 加项时改的就是它自己所在的文件（同 `layoutStore` 的 `LAYOUT_KEYS` 集中登记口径）。
+ *
+ * 订阅写在 store 定义**之后**：`useAiStore` 是 const，定义前引用会抛 TDZ 错误。
+ */
+useLayoutStore.subscribe((state, prev) => {
+  if (state.resetSeq !== prev.resetSeq) {
+    useAiStore.setState({ panelWidth: DEFAULT_AI_PANEL_WIDTH });
+  }
+});

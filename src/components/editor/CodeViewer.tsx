@@ -7,6 +7,8 @@ import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile, setPendingEditSource, clearPendingEditSource, flushPendingEdits } from '../../stores/editor';
+import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { CODE_FONT_STACK, parseEditorFontSize } from '../../utils/editorFont';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { getExtension } from '../../utils/path';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
@@ -719,6 +721,35 @@ const EDIT_COALESCE_MS = 200;
 /** 语言槽：语言包按需加载（见 langLoaders），加载完成后用它把语言装进已有编辑器 */
 const languageCompartment = new Compartment();
 
+/**
+ * 字号槽：编辑器字号是**用户设置**（设置 > 编辑器），改它不该重建编辑器。
+ *
+ * 为什么用 Compartment 而不是改一个 CSS 变量：CodeMirror 会缓存字符宽度与行高，用来算
+ * 光标位置、滚动高度与选区换算。字体大小变了却不重新测量，症状是"光标整体偏移、点哪都差
+ * 半个字"——这类问题不会报错，只会让人觉得编辑器坏了。`reconfigure` 自带一次完整重测量，
+ * 这是官方给这条路径的入口（见组件里那个 effect）。
+ */
+const fontSizeCompartment = new Compartment();
+
+/**
+ * 字号主题（只负责字号，其余样式在 `createEditorState` 的基础主题里）。
+ *
+ * 为什么根与内容区都设同一个值：只设 `.cm-content` 的话，行号栏（`.cm-gutters` 的
+ * font-size 从编辑器根继承）不跟着变——选大字号后行号明显偏小，看着像坏了。
+ * 两处同源同值，不存在"改一处忘一处"。
+ */
+function editorFontTheme(px: number) {
+  return EditorView.theme({
+    '&': { fontSize: `${px}px` },
+    '.cm-content': { fontSize: `${px}px` },
+  });
+}
+
+/** 建编辑器时用的当前字号（同步读 store：避免"先按默认建好、再 reconfigure"那一下闪动） */
+function currentEditorFontSize(): number {
+  return parseEditorFontSize(useLayoutStore.getState().values?.[LAYOUT_KEYS.editorFontSize]);
+}
+
 /** 创建 CodeMirror 编辑器状态（含语言支持和主题） */
 function createEditorState(
   content: string,
@@ -816,6 +847,8 @@ function createEditorState(
     ]),
     // 语言槽：JS 系列同步装（最常用且体量小），其余先留空、由 loadLanguage 异步 reconfigure
     languageCompartment.of(getLanguageExtension(filePath)),
+    // 字号槽：用户设置（设置 > 编辑器），改它只 reconfigure 这一小段，不重建编辑器
+    fontSizeCompartment.of(editorFontTheme(currentEditorFontSize())),
     // 颜色值色块（VS Code 风格）：CSS 类文件全文；Vue/HTML 仅 <style> 块内
     ...(() => {
       const ext = getExtension(filePath, { lower: true });
@@ -846,8 +879,10 @@ function createEditorState(
       },
       '.cm-scroller::-webkit-scrollbar-corner': { background: '#21252b' },
       '.cm-content': {
-        fontFamily: "'JetBrains Mono', 'Fira Code', Consolas, monospace",
-        fontSize: '14px',
+        // 字体栈与设置面板里的预览共用一份（`utils/editorFont.ts` 的 CODE_FONT_STACK）：
+        // 预览说这样好看、回到编辑器却是另一种字，那个预览就没有意义了
+        fontFamily: CODE_FONT_STACK,
+        // 字号**不在这里**：它是用户设置，由 fontSizeCompartment 提供（见那里的说明）
       },
       '.cm-gutters': {
         backgroundColor: '#282c34',
@@ -1102,6 +1137,30 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       viewRef.current?.destroy();
     };
   }, [filePath, editable, openSeq]);
+
+  /**
+   * 字号变化 → 只重配字号槽（设置 > 编辑器里拖动滑块时走的就是这里）。
+   *
+   * 为什么不能只改样式就算完：CodeMirror 缓存字符宽度与行高（光标定位、滚动高度、
+   * 选区换算全靠它），字体大小变了却不让它重新测量，结果是"点哪都差半个字"。
+   * `reconfigure` 会带一次完整重测量。
+   *
+   * 为什么不是重建编辑器：那会丢撤销栈与光标位置，而这个设置是**边拖边看**的。
+   *
+   * 挂载时也会跑一次（值相同、结果幂等）：建编辑器时已经按当前值装过字号槽，
+   * 这一次只是让"挂载"与"改值"共用同一条路径，少一条只在某一种时序下才走的分支。
+   */
+  const editorFontSize = useLayoutStore((s) => parseEditorFontSize(s.values?.[LAYOUT_KEYS.editorFontSize]));
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    try {
+      view.dispatch({ effects: fontSizeCompartment.reconfigure(editorFontTheme(editorFontSize)) });
+    } catch (e) {
+      // 降级路径：字号没变（用户可见的结果是"拖了滑块但字没动"），所以必须留痕
+      console.error('应用编辑器字号失败（已保持原字号）:', e);
+    }
+  }, [editorFontSize]);
 
   /**
    * 外部内容晚到 → 覆盖式同步文档。

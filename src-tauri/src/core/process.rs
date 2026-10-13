@@ -449,6 +449,22 @@ impl ProcessManager {
     }
 
     fn stop_locked(&self, key: &str, snapshot: Option<&[super::winproc::ProcEntry]>) -> Result<(), String> {
+        let outcome = self.stop_locked_outcome(key, snapshot);
+        // **收尸没干净就如实上报**（CQ-25）：表项此时已经被摘掉，`get_running()` 会报它
+        // "未运行"，界面显示已停止，而进程仍在跑并占着端口。上层（stop_project_services /
+        // delete_service）本来就是按"可能失败"写的，这条 Err 才是那些分支的第一个真实来源
+        if !outcome.is_clean() {
+            return Err(format!("停止未完成：{}", outcome.describe()));
+        }
+        Ok(())
+    }
+
+    /// 停止的**实现**：把收尸结果原样交出来，不压成错误文案。
+    ///
+    /// 为什么拆成两个（ARCH-31）：`restart` 需要在"旧进程没退干净"时再等一会儿，而那需要
+    /// **pid**（`CleanupOutcome.survivors`）——`stop_locked` 把它拍成了一句错误字符串，pid 就
+    /// 没了。两条路径共用这一段实现，停止语义因此只有一处。
+    fn stop_locked_outcome(&self, key: &str, snapshot: Option<&[super::winproc::ProcEntry]>) -> CleanupOutcome {
         log::info!("[nexus] 停止服务: {}", key);
 
         // Phase 1: 从 map 中移除 entry，释放锁
@@ -476,13 +492,7 @@ impl ProcessManager {
             let log_key: LogKey = Arc::from(key);
             buffers.remove(&*log_key);
         }
-        // **收尸没干净就如实上报**（CQ-25）：表项此时已经被摘掉，`get_running()` 会报它
-        // "未运行"，界面显示已停止，而进程仍在跑并占着端口。上层（stop_project_services /
-        // delete_service）本来就是按"可能失败"写的，这条 Err 才是那些分支的第一个真实来源
-        if !outcome.is_clean() {
-            return Err(format!("停止未完成：{}", outcome.describe()));
-        }
-        Ok(())
+        outcome
     }
 
     /// 重启单个服务。
@@ -495,11 +505,47 @@ impl ProcessManager {
         let _guard = lock_lifecycle(&lock, spec.service_id);
         // 旧进程没确认退出**不阻塞重启**（CQ-25）：用户的诉求是"把它跑起来"，而新进程
         // 起不来时后端会如实报端口/启动错误——那比"重启被拒绝"更接近用户意图。
-        // 但要留痕：这说明旧进程可能还占着端口
-        if let Err(e) = self.stop_locked(spec.service_id, None) {
-            log::warn!("[nexus] 重启前停止旧进程未完全成功，继续尝试启动: {}", e);
-        }
+        //
+        // 但**先给它一段宽限**（ARCH-31）：见 `settle_survivors` 的说明。原来的写法是
+        // 只 `log::warn` 一句就继续启动，于是新进程与"正在退出的旧进程"抢端口——
+        // dev server 的子进程持有监听套接字，taskkill 之后内核回收还要几十到几百毫秒，
+        // 抢输的那一方表现为"启动即退出"。**自动重启比手动点更容易踩上这个窗口**：
+        // 它每 2 秒就可能来一次，而用户手动点的时候这些资源通常已经释放了。
+        let outcome = self.stop_locked_outcome(spec.service_id, None);
+        self.settle_survivors(spec.service_id, outcome);
         self.start_locked(spec)
+    }
+
+    /// 重启前等"没退干净的旧进程"真的消失（最长 [`RESTART_SETTLE_TIMEOUT`]）。
+    ///
+    /// 等到了就什么都不说（正常路径，不打扰用户）；等不到就照旧启动，但把这件事
+    /// **写进该服务的日志缓冲**——只写 `log::warn` 的话，这条唯一的原因只落在
+    /// `~/.nexus/logs/nexus.log` 里，而用户的现场在日志面板上：他看到的只有卡片上
+    /// "失败"两个字，没有任何线索指向"旧进程还占着端口"。
+    fn settle_survivors(&self, service_id: &str, outcome: CleanupOutcome) {
+        if outcome.survivors.is_empty() {
+            return;
+        }
+        log::info!(
+            "[nexus] 重启前等待旧进程退出：{} 个，最长 {:?}",
+            outcome.survivors.len(),
+            RESTART_SETTLE_TIMEOUT
+        );
+        let left = wait_until_gone(
+            outcome.survivors,
+            RESTART_SETTLE_TIMEOUT,
+            RESTART_SETTLE_POLL,
+            survivors_of,
+        );
+        if !left.is_empty() {
+            self.append_system_line(service_id, format!(
+                "上一次停止未完成：仍有 {} 个进程未退出（{:?}），本次启动可能与它们抢端口\
+                 ——若随后启动失败，请稍后手动重启一次",
+                left.len(),
+                left
+            ));
+            log::warn!("[nexus] 重启前旧进程仍未退出: {:?}（已继续启动）", left);
+        }
     }
 
     /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）
@@ -983,6 +1029,36 @@ impl CleanupOutcome {
         parts.extend(self.errors.iter().cloned());
         parts.join("；")
     }
+}
+
+/// 重启前等待旧进程退出的上限（ARCH-31）。
+///
+/// 3 秒是折中：端口/句柄回收实测在几十到几百毫秒量级，3 秒足够覆盖；再长就等于"点了重启
+/// 半天没反应"，而这条路径的用户诉求恰恰是"赶紧把它跑起来"——所以宁可超时后照旧启动
+/// （并如实写出原因），也不无限等。
+const RESTART_SETTLE_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// 等待期间的轮询间隔：100ms 足够细（句柄失效不会更快），也不会空转烧 CPU
+const RESTART_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// 轮询到给定 pid 全部消失为止，返回**仍未消失**的那些（超时也原样返回）。
+///
+/// 为什么抽成自由函数并接收 `alive` 闭包：真正判断存活要操作系统句柄（`survivors_of`），
+/// 而"轮询—超时—返回剩余"这段决策逻辑本身值得被钉住——超时算错的两个方向都不报错：
+/// 要么白等（用户以为卡住），要么在旧进程还在时就抢端口（就是这次要修的症状）。
+/// 时间参数同样注入，测试因此是毫秒级的，不用真的等 3 秒。
+fn wait_until_gone(
+    mut survivors: Vec<u32>,
+    timeout: Duration,
+    poll: Duration,
+    mut alive: impl FnMut(&[u32]) -> Vec<u32>,
+) -> Vec<u32> {
+    let deadline = Instant::now() + timeout;
+    while !survivors.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(poll);
+        survivors = alive(&survivors);
+    }
+    survivors
 }
 
 /// 收尸后复核一批 pid 是否真的没了。
@@ -1722,6 +1798,65 @@ mod tests {
         let _ = parent.wait();
     }
 
+    /// `wait_until_gone`：复查到"全没了"就提前返回，不把超时耗满。
+    ///
+    /// 这条钉的是"白等"那一侧：实现若写成"先睡满超时再查一次"，用户点重启会白卡 3 秒。
+    #[test]
+    fn test_wait_until_gone_returns_early_when_all_dead() {
+        let mut calls = 0;
+        let started = Instant::now();
+        let left = wait_until_gone(
+            vec![11, 22],
+            // 超时给得远大于实际需要：实现若睡满超时，耗时会明显偏离
+            Duration::from_millis(1000),
+            Duration::from_millis(1),
+            |pids| {
+                calls += 1;
+                if calls >= 2 { Vec::new() } else { pids.to_vec() }
+            },
+        );
+        assert!(left.is_empty(), "全部退出后应当返回空，实际 {:?}", left);
+        assert_eq!(calls, 2, "应当在复查到空的那一刻就停，而不是继续轮询");
+        assert!(started.elapsed() < Duration::from_millis(500), "不该把超时耗满");
+    }
+
+    /// 超时：仍活着的 pid 原样交回去（调用方据此写出"可能与它们抢端口"）。
+    ///
+    /// 这条钉的是另一侧：不返回 survivors 的话，上层就写不出原因，用户只看到"失败"。
+    #[test]
+    fn test_wait_until_gone_returns_survivors_on_timeout() {
+        let started = Instant::now();
+        let mut calls = 0;
+        let left = wait_until_gone(
+            vec![7],
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            |pids| {
+                calls += 1;   // 永远不死
+                pids.to_vec()
+            },
+        );
+        assert_eq!(left, vec![7], "超时后应当把仍存活的 pid 交回去");
+        assert!(calls > 1, "超时前应当轮询过多次，实际 {}", calls);
+        assert!(started.elapsed() < Duration::from_secs(5), "等待时间失控（疑似死循环）");
+    }
+
+    /// 空输入：一次存活查询都不该发生（列表为空时立刻返回，也不该白睡一拍）。
+    #[test]
+    fn test_wait_until_gone_empty_input_does_not_poll() {
+        let mut calls = 0;
+        let left = wait_until_gone(
+            Vec::new(),
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |pids| {
+                calls += 1;
+                pids.to_vec()
+            },
+        );
+        assert!(left.is_empty());
+        assert_eq!(calls, 0, "空列表不该触发任何一次存活查询");
+    }
 }
 
 

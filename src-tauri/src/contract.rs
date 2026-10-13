@@ -10,6 +10,7 @@
 //! 这类故障在界面上表现为"某个字段莫名其妙是空的"，很难定位。这里把字段名钉住。
 
 use crate::commands::ai::{AiStatus, DshVersionInfo};
+use crate::commands::app::AppPaths;
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
 use crate::commands::process::{
@@ -95,6 +96,15 @@ fn test_response_dtos_are_snake_case() {
         outdated: false,
     };
     assert_eq!(keys_of(&info), sorted(&["dsh_found", "current", "latest", "outdated"]));
+
+    // 应用自己的数据/日志目录（设置 > 通用 > 数据与日志）：三个路径原样显示给用户，
+    // 用户照着它去翻日志——字段名错了就是界面上那行路径空白
+    let paths = AppPaths {
+        data_dir: "d".into(),
+        log_dir: "d/logs".into(),
+        log_file: "d/logs/nexus.log".into(),
+    };
+    assert_eq!(keys_of(&paths), sorted(&["data_dir", "log_dir", "log_file"]));
 
     // jar 条目（JarViewer）
     let entry = JarEntryInfo {
@@ -559,7 +569,7 @@ fn scan_ipc_structs() -> IpcStructs {
 /// 提到模块级是为了让**请求侧**那条守卫也能看见它（ARCH-21）：同一批结构体（`Service`/
 /// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
 const COVERED_RESPONSE: &[&str] = &[
-        "AiStatus", "DshVersionInfo",
+        "AiStatus", "DshVersionInfo", "AppPaths",
         "FileEntry", "ReadFileResponse", "HexPage", "JarEntryContent",
         "PasteFilesResult", "PasteConflict",
         "ToolCommandResult", "ToolCommandLogLine", "ToolCommandLogBatchPayload",

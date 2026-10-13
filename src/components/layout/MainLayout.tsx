@@ -12,6 +12,7 @@ import { CloseGuard } from './CloseGuard';
 import { ProjectRail } from './ProjectRail';
 import { securityApi, projectApi } from '../../services/service';
 import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../stores/layoutStore';
+import { parseEditorFontSize } from '../../utils/editorFont';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import type { LogStream, ServiceLogBatchEvent } from '../../services/logService';
@@ -26,11 +27,20 @@ function isMissingProject(msg: string): boolean {
   return msg.includes('项目不存在');
 }
 
+/**
+ * 左列（项目列表）的默认宽度。
+ *
+ * 抽成常量是为了「恢复默认布局」能复用同一个数：重置路径若另写一个字面量，
+ * 两处早晚不一致——表现是"恢复默认布局恢复出另一个宽度"，而且很难被发现
+ * （用户只会觉得"好像没完全恢复"）。
+ */
+const DEFAULT_LEFT_PANEL_WIDTH = 260;
+
 export function MainLayout() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
-  const [leftPanelWidth, setLeftPanelWidth] = useState(260);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(DEFAULT_LEFT_PANEL_WIDTH);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
   const [ready, setReady] = useState(false);
@@ -146,6 +156,42 @@ export function MainLayout() {
       setReady(true);
     });
   }, [saveLayout]);
+
+  /**
+   * 「恢复默认布局」（设置 > 通用）：清库之后由**各消费方自己**把默认值贴回来。
+   *
+   * 为什么清了库还要这一步：默认值是本组件的字面量（见 `DEFAULT_LEFT_PANEL_WIDTH`），
+   * 而后端只知道"库里有什么"，不知道默认值该是多少；更关键的是**组件只在挂载时读一次
+   * 布局**，库里那些行没了并不会让已经渲染出来的面板改尺寸。`ResizablePanel` 也只在
+   * `defaultLeftWidth` 这个 prop 变化时才同步内部尺寸（见它的注释），所以这里必须
+   * 显式 set 一遍。
+   *
+   * 这也是这条路优于"清库 + 刷新窗口"的原因：刷新会关掉所有已打开的标签页、
+   * 并拆掉 AI 会话（`AiPanel` 卸载时会 `destroyWv`），而用户要的只是面板回到初始尺寸。
+   */
+  const resetSeq = useLayoutStore(s => s.resetSeq);
+  useEffect(() => {
+    if (resetSeq === 0) return;   // 0 = 从未重置（首次挂载不走这里）
+    setLeftPanelWidth(DEFAULT_LEFT_PANEL_WIDTH);
+    setLeftPanelCollapsed(false);
+    setServicePanelCollapsed(false);
+  }, [resetSeq]);
+
+  /**
+   * 把「文本字号」写到 `:root` 的 `--nexus-text-size` 上——纯 CSS 的文本面靠它跟着变
+   * （Markdown 预览的 `.md-preview` 一族：编辑器里的预览与「帮助 > 使用文档」）。
+   *
+   * 为什么代码视图不读这个变量：CodeMirror 缓存字符宽度与行高做光标定位，只改 CSS 会让它
+   * 算错位置，必须走 `reconfigure` 重新测量（见 CodeViewer 的 fontSizeCompartment）。
+   * 两条路径同源于同一个设置值，所以不会出现两处不一致。
+   *
+   * 为什么挂在 MainLayout：它是应用根，任何时候都挂载着（设置面板与标签页都可能关着），
+   * 而字号必须在**启动时**就生效——不能等用户打开设置面板才写这个变量。
+   */
+  const textSize = useLayoutStore(s => parseEditorFontSize(s.values?.[LAYOUT_KEYS.editorFontSize]));
+  useEffect(() => {
+    document.documentElement.style.setProperty('--nexus-text-size', `${textSize}px`);
+  }, [textSize]);
 
   // 选中项目变化时保存
   useEffect(() => {

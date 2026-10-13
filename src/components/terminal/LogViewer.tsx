@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, mem
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
+import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { parseEditorFontSize } from '../../utils/editorFont';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
 import { includesIgnoreCase } from '../../utils/search';
@@ -15,8 +17,30 @@ interface LogViewerProps { serviceKey: string; serviceName?: string; fill?: bool
 
 /** 空数组常量（避免选择器每次返回新引用导致无谓重渲染） */
 const EMPTY_LINES: ServiceLogLine[] = [];
-/** 行高估算值（13px × leading-relaxed 1.625 ≈ 21px）；真实行高由 ResizeObserver 实测回填（长行换行更高） */
-const ESTIMATED_ROW_H = 21;
+
+/**
+ * 日志正文相对「文本字号」的偏移（px）：正文比代码视图小 1px。
+ *
+ * 这个 13/14 的关系是**改动前就有的观感**（容器上写的是 `text-[13px]`），保留它，
+ * 没动过设置的用户看到的日志和以前一模一样。
+ */
+const LOG_TEXT_SIZE_OFFSET = 1;
+
+/** leading-relaxed 的比值（行高 = 字号 × 1.625） */
+const LINE_HEIGHT_RATIO = 1.625;
+
+/**
+ * 行高估算值：只用于**尚未被测量过**的行，真实行高由 ResizeObserver 实测回填
+ * （长行换行会更高）。
+ *
+ * 为什么从写死的 21 改成按字号算：这个值决定滚动条长度与「跳到某一行」的落点，
+ * 字号一变它就不准了（21 是 13px × 1.625 的旧值）。字号改变时还必须清掉实测缓存，
+ * 见下面那个 `virtualizer.measure()` 的 effect。
+ */
+function estimateRowHeight(textSize: number): number {
+  return Math.round((textSize - LOG_TEXT_SIZE_OFFSET) * LINE_HEIGHT_RATIO);
+}
+
 /** 视口外预渲染行数：滚动留白兜底，同时限定「拖拽改宽时必须重新断行的行数」 */
 const OVERSCAN = 12;
 /** 日志上下内边距（交给 virtualizer 的 paddingStart/End，贴底计算与真实滚动高度同一口径） */
@@ -123,10 +147,19 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   // ── 虚拟列表 ──────────────────────────────────────────────
 
+  /**
+   * 文本字号（设置 > 编辑器）：日志正文跟着它走（比代码视图小 1px）。
+   *
+   * 这里订阅 store 而不是读一次：改字号时**行高会变**，而虚拟列表按行高算滚动条长度与
+   * "跳到某一行"的落点——所以字号变化必须同时做两件事：换掉估算值（下面 `estimateSize`），
+   * 以及清掉实测缓存（再下面那个 `virtualizer.measure()` 的 effect）。
+   */
+  const textSize = useLayoutStore((s) => parseEditorFontSize(s.values?.[LAYOUT_KEYS.editorFontSize]));
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ESTIMATED_ROW_H,
+    estimateSize: () => estimateRowHeight(textSize),
     overscan: OVERSCAN,
     // 贴底语义：行高实测值变化（长行换行 / 拖拽改宽）时按总高差补偿滚动位置，
     // 保证「始终看着最新一行」不被重排或窗口滑动打断
@@ -155,6 +188,23 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   useEffect(() => () => {
     useLogStore.getState().resumeLogs(serviceKey);
   }, [serviceKey]);
+
+  /**
+   * 字号变化：清掉行高实测缓存，让所有行按新字号重新测量。
+   *
+   * 为什么必须（光换 `estimateSize` 不够）：估算值只管**还没测量过**的行，而这里几乎每一行
+   * 都已经被 ResizeObserver 量过并存进缓存——不清缓存的话，滚动条长度与"跳到第 N 行"的落点
+   * 会继续按旧字号的实测值算，字号越大偏得越多。做法与上面"切换服务"那一处完全一致
+   * （那里清缓存是因为缓存以索引为键，会被新服务的行错误复用）。
+   *
+   * `anchorTo: 'end'` 会在重测后按总高差补偿滚动位置，所以"正在看最新一行"不会被打断。
+   */
+  useLayoutEffect(() => {
+    virtualizer.measure();
+    // 依赖即触发源：只有字号变化需要重测。`virtualizer` 是跨渲染稳定的实例（上面那两处
+    // 刻意不列它），这里列上是因为 lint 的 exhaustive-deps 会为"用了却不列"记一条告警，
+    // 而本仓库的门禁是"≤6 条存量告警"——新增一条就红。列一个稳定引用不会带来多余的重跑。
+  }, [textSize, virtualizer]);
 
   // 跟随模式：每次数据更新后贴底（等价旧实现的 scrollTop = scrollHeight）。
   // 用 layout effect 让新行与目标滚动位置同帧提交，避免先看到旧位置再跳到底部；
@@ -254,9 +304,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
       />
 
       {/* 文本样式（字体/字号/行高/换行）放在滚动容器上由行继承，与旧 <pre> 的表现一致；
-          行高实测值依赖这里的 leading-relaxed，改动需同步 ESTIMATED_ROW_H */}
+          行高由 `estimateRowHeight` 按同一个字号算（ESTIMATED_ROW_H 那个写死的 21 已随字号
+          设置改成派生值），改动这里需同步那里的 LINE_HEIGHT_RATIO */}
       <div ref={scrollRef} onScroll={handleScroll}
-        className={`overflow-auto bg-[#0d1117] font-mono text-[13px] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
+        className={`overflow-auto bg-[#0d1117] font-mono text-[length:calc(var(--nexus-text-size)-1px)] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
         style={fill ? undefined : { maxHeight: '220px' }}>
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualItems.map(vi => {

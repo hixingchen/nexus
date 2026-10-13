@@ -116,6 +116,20 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             }
             h.take()
         };
+        // 本次是不是"同一个项目、上一个进程已死"的重启。
+        //
+        // **只有这一种情况允许跳过"会话文件已经够新鲜"的重写**：上一次 bump 的就是这个
+        // 项目的会话，它必然仍是 dsh 眼里最近活动的 workspace。
+        //
+        // 切换项目**绝不能**用这条跳过——那时判据会比成"我自己够不够新鲜"，而不是
+        // "我是不是所有项目里最新的"，于是 5 分钟内来回切项目时，赢的是**最近一次被 bump 过**
+        // 的那个项目，而不是你最后点的那个（用户报的就是这个：点项目 → 点 AI 图标 →
+        // 面板里的工作区是另一个项目）。「上一个会话都没有」（应用刚启动）同理：必须 bump。
+        let restarting_same_project = match &prev {
+            Some(s) => s.cwd == cwd_norm,
+            None => false,
+        };
+
         if let Some(mut old) = prev {
             log::info!("[ai] 会话目录变化或进程已退出，停止旧会话 (pid={})", old.pid);
             old.stop();
@@ -126,7 +140,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         // 按会话时间选最近 —— 对有/无历史会话的项目都强制选中当前项目）。
         // 尽力而为：失败不阻塞启动
         if let Some(dir) = cwd_norm.as_deref() {
-            crate::core::ai::ensure_workspace_active(dir, name_norm.as_deref());
+            crate::core::ai::ensure_workspace_active(dir, name_norm.as_deref(), restarting_same_project);
         }
 
         // 代数递增：使任何进行中的旧启动自动放弃

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::State;
 use crate::AppState;
 
@@ -50,22 +50,41 @@ pub fn open_terminal(state: State<AppState>, path: String) -> Result<(), String>
     Ok(())
 }
 
-/// 在系统资源管理器中打开路径
+/// Windows：explorer.exe 的「定位到这个文件」参数。
 ///
-/// 与文件读写同口径校验路径：此前该命令不校验，可打开任意路径（含把任意文件路径写进系统剪贴板场景）
-#[tauri::command]
-pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), String> {
-    state.paths.check_path_allowed(&state.db, &path)?;
-    let path_buf = PathBuf::from(&path);
+/// **引号只包路径**（`/select,"<完整路径>"`），不能把整串交给 `Command::arg` —— 那正是原来的
+/// bug：路径里一旦有空格（`第01章 计算机系统概述.md` 这种），Rust 会按标准规则给**整个参数**
+/// 加引号，得到 `"/select,C:\...\第01章 计算机系统概述.md"`；而 explorer 要求开关在引号
+/// **外面**，它认不出这种形式，于是退回去打开默认位置（「文档」）。用户的现场就是这样：
+/// 点「在资源管理器中打开」，弹出来的是 `C:\Users\<用户>\Documents`——
+/// 而路径里没有空格的文件看着一切正常，因为那时根本不会加引号。
+///
+/// 路径含 `"` 时返回 `None`（Windows 文件名不允许它，但路径也可能来自环境变量）：
+/// 调用方据此降级为"打开所在目录"，而不是拼出一条 explorer 会误解的命令行。
+fn explorer_select_arg(win_path: &str) -> Option<String> {
+    if win_path.contains('"') {
+        return None;
+    }
+    Some(format!("/select,\"{}\"", win_path))
+}
 
-    log::info!("[nexus] 打开资源管理器: {}", path);
-
+/// 在系统文件管理器里定位一个路径（文件＝打开所在目录并选中它；目录＝直接打开）。
+///
+/// **调用方负责先确认这个路径该不该打开**（白名单校验 / 目录已建出来），这里只负责拉起
+/// 资源管理器——所以它是 `pub(crate)` 而不是命令，不接受来自前端的路径。
+///
+/// 为什么抽成一个函数（ARCH-30）：白名单**外**的路径也要走同一个动作——`~/.nexus` 的
+/// 数据目录与日志目录（见 `commands/app.rs::open_app_dir`，那里的"打开日志目录"是 README
+/// 承诺的排障入口）。两处各写一份的话，`NoDefaultCurrentDirectoryInExePath` 这个收口口径
+/// 迟早只改一处——SEC-14 就是这么漏掉 `java`/`taskkill` 的，而 GUARD-1 正是为这件事立的。
+pub(crate) fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+
         // Windows: 直接调用 explorer.exe（不经 cmd，避免 %VAR% 展开和 & | ^ 元字符注入）。
         // 注意：文件场景必须传完整文件路径——/select,<目录> 会让 explorer 打开该目录的父级（少一层）
-        let win_path = path.replace('/', "\\");
-        let is_dir = path_buf.is_dir();
+        let win_path = path.to_string_lossy().replace('/', "\\");
         let mut cmd = std::process::Command::new("explorer.exe");
         // 跳过"当前目录优先"的可执行文件搜索（SEC-14 同口径）：explorer 是我们自己拉起的
         // 系统工具、不承载用户 shell。不加这一行，Nexus 的工作目录里放一个 explorer.exe
@@ -73,11 +92,17 @@ pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), Stri
         // 关于"env 会被子进程继承"：Explorer 已在运行时我们拉起的这个只是转发请求后退出，
         // 环境变量随之消失；真由它当 shell 的场合，双击启动用的是完整路径，不受影响。
         cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
-        if is_dir {
+        if path.is_dir() {
+            // 单个路径作为参数时，`arg` 的标准转义正是对的（含空格会被正确包进引号）
             cmd.arg(&win_path);
+        } else if let Some(arg) = explorer_select_arg(&win_path) {
+            // **必须用 `raw_arg`**：这里的引号已经按 explorer 的语法拼好了，
+            // 再经一次 `arg` 的标准转义就会变成 `"/select,..."`（见 `explorer_select_arg`）
+            cmd.raw_arg(arg);
         } else {
-            // 打开所在目录并选中该文件（/select, 必须与路径合并为单参数，否则部分环境只打开目录）
-            cmd.arg(format!("/select,{}", win_path));
+            // 路径里有 explorer 表达不了的字符：降级为打开所在目录（与 mac/linux 分支同行为）
+            let parent = path.parent().unwrap_or(path).to_string_lossy().replace('/', "\\");
+            cmd.arg(parent);
         }
         cmd.spawn()
             .map_err(|e| format!("打开资源管理器失败: {}", e))?;
@@ -85,12 +110,12 @@ pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), Stri
     #[cfg(target_os = "macos")]
     {
         // mac 没有"选中文件"的等价能力，文件退化为打开所在目录
-        let target = if path_buf.is_dir() {
-            path.clone()
+        let target = if path.is_dir() {
+            path.to_path_buf()
         } else {
-            path_buf.parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone())
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.to_path_buf())
         };
         std::process::Command::new("open")
             .arg(&target)
@@ -100,12 +125,12 @@ pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), Stri
     #[cfg(target_os = "linux")]
     {
         // linux 同理，退化为打开所在目录
-        let target = if path_buf.is_dir() {
-            path.clone()
+        let target = if path.is_dir() {
+            path.to_path_buf()
         } else {
-            path_buf.parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone())
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.to_path_buf())
         };
         std::process::Command::new("xdg-open")
             .arg(&target)
@@ -113,6 +138,16 @@ pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), Stri
             .map_err(|e| format!("打开文件管理器失败: {}", e))?;
     }
     Ok(())
+}
+
+/// 在系统资源管理器中打开路径
+///
+/// 与文件读写同口径校验路径：此前该命令不校验，可打开任意路径（含把任意文件路径写进系统剪贴板场景）
+#[tauri::command]
+pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), String> {
+    state.paths.check_path_allowed(&state.db, &path)?;
+    log::info!("[nexus] 打开资源管理器: {}", path);
+    reveal_in_file_manager(&PathBuf::from(&path))
 }
 
 /// 文件信息
@@ -668,5 +703,34 @@ mod tests {
         assert_eq!(detect_line_ending(b"a\rb\r"), "cr");
         // 混合：取占比最大者
         assert_eq!(detect_line_ending(b"a\r\nb\r\nc\n"), "crlf");
+    }
+
+    /// Windows：`/select,` 的引号**只包路径**，开关必须在引号外。
+    ///
+    /// 这条钉的是一个用户报过的症状：文件名里有空格时（`第01章 计算机系统概述.md`），
+    /// `Command::arg` 会把整串（含 `/select,`）一起加引号，explorer 认不出来，
+    /// 于是打开默认位置「文档」——而路径没空格的文件看着完全正常。
+    /// 三条断言分别对应：含空格路径、不含空格路径（同一规则，少一个分支就少一种失败形态）、
+    /// 以及开关的位置本身。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_explorer_select_arg_quotes_only_the_path() {
+        assert_eq!(
+            explorer_select_arg(r"C:\Users\me\Desktop\学习\第01章 计算机系统概述.md").unwrap(),
+            "/select,\"C:\\Users\\me\\Desktop\\学习\\第01章 计算机系统概述.md\""
+        );
+        assert_eq!(
+            explorer_select_arg(r"C:\proj\a.md").unwrap(),
+            "/select,\"C:\\proj\\a.md\"",
+            "不含空格的路径也照样加引号：一种规则比两种少一类失败形态"
+        );
+        let arg = explorer_select_arg(r"C:\a b\c.md").unwrap();
+        assert!(
+            arg.starts_with("/select,\""),
+            "引号必须从 /select, **之后**开始（原来就是把开关也包进去了）：{}",
+            arg
+        );
+        // 无法表达的路径 → None，调用方降级为打开所在目录
+        assert!(explorer_select_arg("C:\\a\"b\\c.md").is_none());
     }
 }

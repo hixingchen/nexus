@@ -12,4 +12,11 @@ export interface FileTab {
   readonlyReason?: string;
   /** 查看器类型（默认 text） */
   viewerType?: FileViewerType;
+  /**
+   * Markdown 视图模式：`true` = 渲染预览、`false` = 源码。
+   *
+   * `undefined`（刚打开的标签）= 用默认值，见 `stores/editor.ts` 的 `MD_PREVIEW_BY_DEFAULT`。
+   * 按标签记而不是全局一份：用户把某个文件切成源码，不该连带改掉其它文件的默认视图。
+   */
+  preview?: boolean;
 }

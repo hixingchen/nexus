@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   useEditorStore,
+  selectMdPreviewOnActiveTab,
   loadAndOpenFile,
   saveActiveFile,
   commitReloadedContent,
@@ -251,4 +252,55 @@ test('jar 条目也算打开请求：信号必须挂在提前返回之前', asyn
   const p = loadAndOpenFile('jar://D:/p/app.jar!/a/B.class', 'B.class');
   assert.equal(useEditorStore.getState().openRequestSeq, before + 1);
   await p.catch(() => {});
+});
+
+/**
+ * Markdown 的默认视图与"按标签各记"。
+ *
+ * 守的是两件事：
+ * 1. **默认是渲染预览**（用户明确要求的默认行为：md 绝大多数是拿来读的）；
+ * 2. 视图模式**不属于别的文件**——原实现是一个全局布尔，用户把某个 md 切成源码后，
+ *    之后打开的每个 md 都跟着变源码，"默认预览"于是只在第一次点开时成立。
+ *    这里第 3、5 两条断言就是钉这个的。
+ */
+test('md 默认走渲染预览，且视图模式按标签各记（不被别的文件带跑）', () => {
+  resetStore();
+
+  const a = openTab('/p/doc-a.md', '# A');
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), true, '刚打开的 md 应当默认预览');
+
+  // 切成源码（用户要改内容）
+  useEditorStore.getState().toggleMdPreview();
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
+
+  // 打开**另一个** md：不受上一个文件影响，仍是默认预览
+  const b = openTab('/p/doc-b.md', '# B');
+  assert.equal(
+    selectMdPreviewOnActiveTab(useEditorStore.getState()),
+    true,
+    '另一个文件被上一个文件的切换带跑了——视图模式必须按标签各记',
+  );
+
+  // 切回 a：它自己那份"源码"记着
+  useEditorStore.getState().setActiveTabId(a.id);
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
+
+  // 再切回 b：它的预览模式也还在
+  useEditorStore.getState().setActiveTabId(b.id);
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), true);
+});
+
+test('非 Markdown 标签的判据恒为 false（预览按钮不显示，切换也不生效）', () => {
+  resetStore();
+  openTab('/p/code.ts', 'const a = 1;');
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
+
+  // 即便切了一次（界面里这个按钮根本不会渲染），判据也不该被带成 true
+  useEditorStore.getState().toggleMdPreview();
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
+});
+
+test('没有活动标签时判据为 false（不抛错）', () => {
+  resetStore();
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
 });

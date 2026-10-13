@@ -4,7 +4,7 @@ import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
 import { SvgIcon } from '../ui/SvgIcon';
 import { getIconSvg } from '../file-tree/FileIcons';
-import { useEditorStore, switchToTab, saveActiveFile, reloadTab } from '../../stores/editor';
+import { useEditorStore, selectMdPreviewOnActiveTab, switchToTab, saveActiveFile, reloadTab } from '../../stores/editor';
 import { isMarkdownFile } from '../../utils/markdown';
 import { useContextMenuPosition } from '../../hooks/useContextMenuPosition';
 import { useClickOutside } from '../../hooks/useClickOutside';
@@ -16,7 +16,7 @@ export function EditorTabs() {
   const tabs = useEditorStore(s => s.tabs);
   const activeTabId = useEditorStore(s => s.activeTabId);
   const dirtyIds = useEditorStore(s => s.dirtyIds);
-  const mdPreview = useEditorStore(s => s.mdPreview);
+  const mdPreview = useEditorStore(selectMdPreviewOnActiveTab);
   const toggleMdPreview = useEditorStore(s => s.toggleMdPreview);
   const closeTab = useEditorStore(s => s.closeTab);
   const closeTabs = useEditorStore(s => s.closeTabs);

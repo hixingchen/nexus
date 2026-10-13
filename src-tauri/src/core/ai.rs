@@ -271,6 +271,21 @@ fn group_name_for(dir: &str) -> String {
     out
 }
 
+/// 会话文件名（dsh 会把格式版本写进名字：`session.jsonl.zstd` / `session.v3.jsonl.zstd` /
+/// `session.v4.jsonl.zstd` …）。
+///
+/// **为什么不能写死一个名字**（用户报过的症状）：写死 `session.jsonl.zstd` 的后果不是
+/// "少 bump 一次"，而是整套"工作区跟随项目"**静默失效**——本机 137 个会话里 74 个是带
+/// 版本号的（v3 68 个 + v4 6 个），一个都认不到，于是 dsh 永远打开上一次真正用过的那个项目，
+/// 而 Nexus 这边看起来一切正常（注册表写进去了、进程也用对的 cwd 起来了）。
+/// 判据放宽到"`session.` 开头、`.jsonl.zstd` 结尾"，下一个版本号出现时不必再改一次。
+///
+/// 安全性由 `bump_session_activity` 的 header 校验兜底：文件名认错了不会写坏数据，
+/// 最多是"这次没 bump"。
+fn is_session_file_name(name: &str) -> bool {
+    name.starts_with("session.") && name.ends_with(".jsonl.zstd")
+}
+
 /// 扫描 dsh 会话目录，返回 cwd 匹配指定目录的会话文件（cwd 归一比较）。
 ///
 /// 性能路径（原实现每次都整读**每个**会话文件）：① 先按 cwd 派生的分组目录名筛选，
@@ -293,25 +308,42 @@ fn find_project_sessions(storage: &Path, dir_norm: &str) -> Vec<PathBuf> {
     for group in scan {
         let Ok(ses) = std::fs::read_dir(group) else { continue };
         for s in ses.flatten() {
-            let file = s.path().join("session.jsonl.zstd");
-            if !file.exists() { continue; }
-            let Some(header) = probe_session_header(&file) else { continue };
-            let cwd_matches = header.get("cwd").and_then(|c| c.as_str()).map(norm_path) == Some(dir_norm.to_string());
-            if cwd_matches { out.push(file); }
+            // 一个会话目录里就是那一个会话文件——但名字带版本号，所以要按规则认（见上）
+            let Ok(files) = std::fs::read_dir(s.path()) else { continue };
+            for f in files.flatten() {
+                let name = f.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !is_session_file_name(name) { continue; }
+                let file = f.path();
+                let Some(header) = probe_session_header(&file) else { continue };
+                let cwd_matches = header.get("cwd").and_then(|c| c.as_str()).map(norm_path) == Some(dir_norm.to_string());
+                if cwd_matches { out.push(file); }
+            }
         }
     }
     out
 }
 
-/// createdAt 距今小于该阈值的会话视为"已经是活跃的"，跳过整文件重写。
+/// createdAt 距今小于该阈值的会话视为"已经够新鲜"，跳过整文件重写。
 ///
 /// 重写一次会话文件 = 整读 + 解压首帧 + 重新压缩 + 写临时文件 + rename（按原大小整体写盘），
-/// 而 dsh GUI 选中工作区看的是"最近活动"，同一分钟内重复打开面板根本不需要再 bump。
+/// 同一个项目反复起停时不必每次都写一遍。
+///
+/// ⚠️ **这条跳过只能用在"同一个项目的重启"上**（见 `ensure_workspace_active` 的
+/// `restarting_same_project`）。它的判据是"**我自己**够不够新鲜"，而 dsh 选工作区比的是
+/// "**谁在所有项目里最新**"——两者不等价。曾经把它用在切换项目上，症状是：
+/// 5 分钟内从 A 切到 B 再切回 A 时，A 因为"够新鲜"被跳过，而 B 的时间戳更新，
+/// 于是 dsh 打开的是 B 而不是你在 Nexus 里点的 A。
 const BUMP_SKIP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// bump 会话文件首帧 createdAt = 现在。
 /// 帧替换语义：只解/改/压第一个帧（header 行），其余帧原样拼接 —— dsh 格式要求
-/// 首帧恰好为 header 一行，结构不可整体重写（整文件重写会导致 host 拒读）
+/// 首帧恰好为 header 一行，结构不可整体重写（整文件重写会导致 host 拒读）。
+///
+/// 已核对的三种文件名（`session.jsonl.zstd` / `.v3.` / `.v4.`）**首帧结构完全一致**：
+/// 一个 zstd 帧、解出恰好一行 header JSON（含 `type:"session"` / `createdAt` / `cwd`），
+/// 后续帧才是事件——所以这里的整帧替换对它们都安全（实测：v3 首帧 227 字节 1 行、
+/// v4 首帧 207 字节 1 行）。
 fn bump_session_activity(file: &Path) -> Result<(), String> {
     let raw = std::fs::read(file).map_err(|e| format!("读会话文件失败: {}", e))?;
     let (s, e) = first_frame_bounds(&raw).ok_or("会话文件帧结构异常")?;
@@ -321,6 +353,12 @@ fn bump_session_activity(file: &Path) -> Result<(), String> {
         .ok_or("首帧无内容")?
         .parse()
         .map_err(|err: serde_json::Error| format!("header 解析失败: {}", err))?;
+    // **只改"确实是会话 header"的首帧**：dsh 的格式还会再变，而这条路径写的是用户数据。
+    // 认不出来时宁可这次不 bump（工作区跟随失效，用户看得见、可恢复），也不能往一个
+    // 不认识的结构里塞字段——那是在写坏用户的会话历史，不可恢复。
+    if head.get("type").and_then(|t| t.as_str()) != Some("session") {
+        return Err("首帧不是会话 header（格式不认识），跳过改写".into());
+    }
     if let Some(obj) = head.as_object_mut() {
         obj.insert("createdAt".into(), serde_json::Value::from(epoch_ms()));
     }
@@ -337,22 +375,46 @@ fn bump_session_activity(file: &Path) -> Result<(), String> {
 
 /// 让 dsh GUI 打开时选中目标项目：注册 workspace（沿用注册逻辑）+
 /// bump 该项目会话活动时间。host 停止后、spawn 前调用。尽力而为，失败不阻塞启动
-pub fn ensure_workspace_active(dir: &str, title: Option<&str>) {
+///
+/// `restarting_same_project`：本次是不是"同一个项目、上一个进程已死"的重启。
+/// **只有这种情况**才能跳过"已经够新鲜"的会话重写——上一次 bump 的就是它，它必然仍是
+/// dsh 眼里最近活动的那个 workspace。切换项目、以及应用刚启动（还没有任何会话）都必须
+/// 老老实实 bump：dsh GUI 选的是"所有项目里最近活动的"，只把自己刷新到"够新鲜"并不够
+/// （详见 `BUMP_SKIP_WINDOW_MS` 的说明）。
+pub fn ensure_workspace_active(dir: &str, title: Option<&str>, restarting_same_project: bool) {
     let Some(storage) = dsh_storage_dir() else { return };
+    ensure_workspace_active_at(&storage, dir, title, restarting_same_project);
+}
+
+/// [`ensure_workspace_active`] 的实现：storage 由调用方给。
+///
+/// 拆出来的唯一理由是**可测**（与 `ensure_workspace_registered_at` 同一套做法）：
+/// `dsh_storage_dir()` 读环境变量，而测试里改环境变量会影响同进程的其它用例——
+/// 偏偏"切换项目必须 bump、同一项目重启才可以跳过"是这个模块里最该被钉住的判据
+/// （它判错的症状就是用户报的：AI 面板打开的工作区和项目卡片对不上）。
+pub(crate) fn ensure_workspace_active_at(
+    storage: &Path,
+    dir: &str,
+    title: Option<&str>,
+    restarting_same_project: bool,
+) {
     // 1. 注册/刷新 workspace 记录（含 path 缺失时重建）
-    if let Err(e) = ensure_workspace_registered_at(&storage, dir, title) {
+    if let Err(e) = ensure_workspace_registered_at(storage, dir, title) {
         log::warn!("[ai] workspace 注册失败（忽略）: {}", e);
     }
     // 2. bump 本项目会话的活动时间 → recentWorkspace 必选中本项目
     let dir_norm = norm_path(dir);
-    for file in find_project_sessions(&storage, &dir_norm) {
-        // 已经足够"新鲜"的会话不必重写：bump 一次 = 整读 + 解压 + 重压 + 整份写盘（见常量的说明）
-        let created_at = probe_session_header(&file)
-            .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()));
-        if let Some(ts) = created_at {
-            if epoch_ms() - ts < BUMP_SKIP_WINDOW_MS {
-                log::debug!("[ai] 会话活动时间已新鲜，跳过重写: {}", file.display());
-                continue;
+    for file in find_project_sessions(storage, &dir_norm) {
+        if restarting_same_project {
+            // 同一个项目的重启：上一次 bump 的就是它，跳过"已经够新鲜"的那些
+            // （bump 一次 = 整读 + 解压 + 重压 + 整份写盘，见常量的说明）
+            let created_at = probe_session_header(&file)
+                .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()));
+            if let Some(ts) = created_at {
+                if epoch_ms() - ts < BUMP_SKIP_WINDOW_MS {
+                    log::debug!("[ai] 会话活动时间已新鲜，跳过重写: {}", file.display());
+                    continue;
+                }
             }
         }
         if let Err(e) = bump_session_activity(&file) {
@@ -1104,11 +1166,18 @@ mod tests {
         assert_eq!(url, "http://localhost:9/?token=token_has_127.0.0.1_substr");
     }
 
-    /// 构造双帧会话文件（首帧 header + 尾随帧），模拟 dsh 真实布局
+    /// 构造双帧会话文件（首帧 header + 尾随帧），模拟 dsh 真实布局。
+    ///
+    /// 默认用**无版本号的旧名字**；带版本号的名字（dsh 现在实际写的）见 `make_session_file_named`。
     fn make_session_file(dir: &std::path::Path, cwd: &str) -> PathBuf {
+        make_session_file_named(dir, cwd, "session.jsonl.zstd")
+    }
+
+    /// 同 `make_session_file`，但文件名可指定（`session.v3.jsonl.zstd` 等）
+    fn make_session_file_named(dir: &std::path::Path, cwd: &str, name: &str) -> PathBuf {
         let sid = "session-test-0001";
         let group = dir.join("sessions").join("--D-work--proj--");
-        let file = group.join(sid).join("session.jsonl.zstd");
+        let file = group.join(sid).join(name);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let header = serde_json::json!({
             "type": "session", "version": 0, "id": sid,
@@ -1123,6 +1192,74 @@ mod tests {
         buf.extend_from_slice(&frame2);
         std::fs::write(&file, buf).unwrap();
         file
+    }
+
+    /// 首帧是**任意一行 JSON** 的会话文件（用来验证"认不出来就拒绝改写"）
+    fn make_session_file_with_first_line(dir: &std::path::Path, first_line: &str) -> PathBuf {
+        let group = dir.join("sessions").join("--D-work--proj--");
+        let file = group.join("session-odd-0001").join("session.v9.jsonl.zstd");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut line = first_line.to_string();
+        line.push('\n');
+        let mut buf = zstd_encode(line.as_bytes()).unwrap();
+        buf.extend_from_slice(&zstd_encode(b"").unwrap());
+        std::fs::write(&file, buf).unwrap();
+        file
+    }
+
+    /// dsh 从 v3 起把格式版本写进**文件名**（`session.v3.jsonl.zstd` / `session.v4.jsonl.zstd`）。
+    ///
+    /// 这条钉的是用户报过的症状：Nexus 曾写死 `session.jsonl.zstd`，于是带版本号的会话
+    /// **一个都扫不到**（本机 137 个里 74 个），`ensure_workspace_active` 没有可 bump 的对象
+    /// ——"工作区跟随项目"整套静默失效，表现为"点了项目，AI 面板打开的还是另一个项目"。
+    #[test]
+    fn test_find_project_sessions_matches_versioned_file_names() {
+        let cwd = r"D:\work\GitProject\proj";
+        for name in ["session.jsonl.zstd", "session.v3.jsonl.zstd", "session.v4.jsonl.zstd"] {
+            let dir = std::env::temp_dir().join(format!("ai-name-test-{}", uuid::Uuid::new_v4()));
+            make_session_file_named(&dir, cwd, name);
+            let found = find_project_sessions(&dir, &norm_path(cwd));
+            assert_eq!(found.len(), 1, "`{}` 必须被认到（否则工作区跟随静默失效）", name);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// 会话目录里的非会话文件不该被当成会话（放宽文件名判据的代价要守住）
+    #[test]
+    fn test_find_project_sessions_ignores_non_session_files() {
+        let cwd = r"D:\work\GitProject\proj";
+        let dir = std::env::temp_dir().join(format!("ai-name-test-{}", uuid::Uuid::new_v4()));
+        let session = make_session_file_named(&dir, cwd, "session.v3.jsonl.zstd");
+        // 同一个会话目录里放几个别的文件
+        let session_dir = session.parent().unwrap();
+        std::fs::write(session_dir.join("session.jsonl"), b"{}").unwrap();
+        std::fs::write(session_dir.join("notes.jsonl.zstd"), b"x").unwrap();
+        let found = find_project_sessions(&dir, &norm_path(cwd));
+        assert_eq!(found.len(), 1, "只该认出那一个会话文件，实际 {:?}", found);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **首帧不是会话 header 时拒绝改写**，且一个字节都不动。
+    ///
+    /// 这是这条路径唯一的安全底线：它写的是用户的会话历史（不可恢复）。dsh 的格式还会再变，
+    /// 认不出来时正确的动作是"这次不 bump"（工作区跟随失效，用户看得见），
+    /// 而不是往一个不认识的结构里塞 `createdAt`。
+    #[test]
+    fn test_bump_refuses_unknown_first_frame_without_touching_file() {
+        let dir = std::env::temp_dir().join(format!("ai-guard-test-{}", uuid::Uuid::new_v4()));
+        // 首帧是合法 JSON，但不是会话 header（type 不是 session）
+        let file = make_session_file_with_first_line(&dir, r#"{"type":"event","payload":"x"}"#);
+        let before = std::fs::read(&file).unwrap();
+        assert!(bump_session_activity(&file).is_err(), "认不出首帧时必须报错而不是改写");
+        assert_eq!(std::fs::read(&file).unwrap(), before, "拒绝改写时必须一个字节都不动");
+
+        // 首帧根本不是 JSON：同样拒绝
+        let file2 = make_session_file_with_first_line(&dir, "not json at all");
+        let before2 = std::fs::read(&file2).unwrap();
+        assert!(bump_session_activity(&file2).is_err());
+        assert_eq!(std::fs::read(&file2).unwrap(), before2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1165,6 +1302,52 @@ mod tests {
         let found3 = find_project_sessions(&dir, &norm_path("D:/other/proj"));
         assert!(found3.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **切换项目必须 bump**，哪怕本项目的会话"刚刚才写过"；只有"同一项目、进程已死"的
+    /// 重启才允许跳过。
+    ///
+    /// 这条钉的是用户报过的症状：5 分钟内从 A 切到 B 再切回 A 时，A 因为"够新鲜"被跳过，
+    /// 而 B 的时间戳更新，于是 dsh GUI 打开的是 **B**——而 Nexus 里选中的是 A。
+    /// 根子在判据问错了问题：跳过窗口问的是"**我自己**够不够新鲜"，而 dsh 选工作区比的是
+    /// "**谁在所有项目里最新**"。这两个问题只在"没有别的项目被 bump 过"时才等价。
+    #[test]
+    fn test_workspace_active_bumps_on_switch_but_skips_on_same_project_restart() {
+        let storage = std::env::temp_dir().join(format!("ai-active-test-{}", uuid::Uuid::new_v4()));
+        let cwd = r"D:\work\GitProject\proj";
+        let file = make_session_file(&storage, cwd);
+        let created_at = |f: &std::path::Path| -> i64 {
+            probe_session_header(f)
+                .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()))
+                .expect("会话 header 里有 createdAt")
+        };
+        // 造出来的会话是 2023 年的时间戳（远早于跳过窗口）
+        assert!(epoch_ms() - created_at(&file) > BUMP_SKIP_WINDOW_MS);
+
+        // 切换项目（restarting_same_project = false）→ 必须 bump 到"现在"
+        ensure_workspace_active_at(&storage, cwd, Some("proj"), false);
+        let after_switch = created_at(&file);
+        assert!(
+            epoch_ms() - after_switch < BUMP_SKIP_WINDOW_MS,
+            "切换项目后会话时间戳必须是新鲜的，实际 {}",
+            after_switch
+        );
+
+        // 同一项目的重启 → 允许跳过（现在它确实已经是最新的了）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ensure_workspace_active_at(&storage, cwd, Some("proj"), true);
+        assert_eq!(created_at(&file), after_switch, "同一项目重启可以跳过重写");
+
+        // 再切一次项目（restarting_same_project = false）→ **即使刚刚才写过也要重写**：
+        // 这正是原实现漏掉的那一步（它看到"够新鲜"就跳过了）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ensure_workspace_active_at(&storage, cwd, Some("proj"), false);
+        assert!(
+            created_at(&file) > after_switch,
+            "切换项目必须重新 bump，否则 dsh 会打开另一个更近活动的项目"
+        );
+
+        std::fs::remove_dir_all(&storage).ok();
     }
 
     // ── 插件就绪探测 ─────────────────────────────────────

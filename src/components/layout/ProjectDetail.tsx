@@ -30,8 +30,7 @@ import {
 } from '@dnd-kit/core';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useProjectDetail } from '../../hooks/useProjectDetail';
-import { useEditorStore } from '../../stores/editor';
-import { isMarkdownFile } from '../../utils/markdown';
+import { useEditorStore, selectMdPreviewOnActiveTab } from '../../stores/editor';
 import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
 import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type Service, type ServiceTemplate } from '../../services/service';
@@ -62,6 +61,16 @@ const EMPTY_TEMPLATE: ServiceTemplate = {
   tool_commands: '[]', open_tool_id: '', created_at: '',
 };
 
+/**
+ * 上半区（项目服务）的默认高度：3/5 窗口高度（扣掉 TitleBar/StatusBar 约 56px）。
+ *
+ * 抽成函数是为了「恢复默认布局」能复用同一份算法——重置路径若另写一遍这个公式，
+ * 两处早晚不一致，而且只在特定窗口尺寸下才看得出来（"恢复默认布局恢复出另一个高度"）。
+ */
+function defaultTopPanelHeight(): number {
+  return Math.round(Math.max(96, Math.min((window.innerHeight - 56) * 0.6, window.innerHeight - 200)));
+}
+
 interface Props {
   projectId: string;
   servicePanelCollapsed: boolean;
@@ -77,9 +86,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     isServiceRunning, failedInfoOf, followedLogOf, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
-  // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）
-  const mdPreview = useEditorStore(s => s.mdPreview);
-  const mdPreviewOnThisTab = mdPreview && !!activeTab && isMarkdownFile(activeTab.path);
+  // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）。
+  // 判据走 store 的选择器（按标签各记 + 默认预览），**不要在这里另算一遍**——见它的说明
+  const mdPreviewOnThisTab = useEditorStore(selectMdPreviewOnActiveTab);
 
   // 工具命令执行（订阅事件流 / 跑命令 / 失败态 / 停止）抽到独立 hook（ARCH-7 ②）
   const {
@@ -96,8 +105,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   const [deleteTplTarget, setDeleteTplTarget] = useState<{ id: string; name: string } | null>(null);
   const [deletingTpl, setDeletingTpl] = useState(false);
   // 上半区（项目服务）初始高度：默认 3/5 窗口高度（扣 TitleBar/StatusBar 约 56px），DB 恢复值到达后覆盖
-  const [topPanelHeight, setTopPanelHeight] = useState(() =>
-    Math.round(Math.max(96, Math.min((window.innerHeight - 56) * 0.6, window.innerHeight - 200))));
+  const [topPanelHeight, setTopPanelHeight] = useState(() => defaultTopPanelHeight());
   const topPanelMaxHeight = Math.round(window.innerHeight - 200);
 
   const loadTemplates = useCallback(() => {
@@ -119,6 +127,19 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       if (h) setTopPanelHeight(Number(h));
     }).catch(() => { /* 读失败用默认高度（ensureLoaded 内部已留痕） */ });
   }, [loadTemplates]);
+
+  /**
+   * 「恢复默认布局」（设置 > 通用）：清库之后由各消费方自己把默认值贴回来。
+   *
+   * 为什么清了库还要这一步：组件只在挂载时读一次布局，库里那些行没了并不会让已经渲染
+   * 出来的分栏改高度；`ResizablePanel` 也只在 `defaultLeftWidth` 这个 prop 变化时才
+   * 同步内部尺寸（见它的注释：拖拽期间父组件不改 prop，所以这里 set 一次是安全的）。
+   */
+  const resetSeq = useLayoutStore(s => s.resetSeq);
+  useEffect(() => {
+    if (resetSeq === 0) return;   // 0 = 从未重置（首次挂载不走这里）
+    setTopPanelHeight(defaultTopPanelHeight());
+  }, [resetSeq]);
 
   // 防抖保存上半区高度：与其余布局键共用 layoutStore 的防抖窗口（原实现各自一份定时器）
   const persistTopPanelHeight = useCallback((h: number) => {

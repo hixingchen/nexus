@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { marked } from 'marked';
 import DOMPurify, { type Config as PurifyConfig } from 'dompurify';
@@ -41,8 +41,38 @@ const SANITIZE_CONFIG: PurifyConfig = {
   FORBID_ATTR: ['style'],
 };
 
+/**
+ * 每个文件「上次看到哪儿」的滚动**比例**（模块级，跨组件实例与跨会话存活）。
+ *
+ * 为什么需要：预览是**随标签切换整体卸载重挂**的（`ProjectDetail` 只渲染活动标签的查看器），
+ * 而滚动位置挂在 DOM 上——重挂之后它就是 0，于是切走再切回会回到第一行。
+ * `CodeViewer` 早就有同一套机制（它那里的 `scrollByPath`），预览当初漏了；
+ * 而 md 现在**默认就是预览**，所以这个缺口从"偶尔"变成了"每次"。
+ *
+ * 为什么是**持续跟踪**而不是"卸载前读一把"：React 卸载时先摘 DOM 再跑清理，
+ * 那时读 `scrollTop` 永远是 0（`CodeViewer` 的 `trackScroll` 注释里记着这个坑的完整推理：
+ * "症状极具误导性——每次都忠实地还原到第一行"）。
+ *
+ * 为什么存**比例**而不是像素：文件可能被改过（内容重排），窗口或面板宽度也可能变过，
+ * 那时像素值指的是另一个位置；比例至少还停在文档的同一个相对位置。
+ * 布局没变时比例是精确还原（同一个 max 乘回去）——也就是最常见的"切走又切回"。
+ */
+const scrollRatioByPath = new Map<string, number>();
+
+/** 最多记多少个文件的比例（与 CodeViewer 的缓存上限同一个量级，防长期使用后无限增长） */
+const MAX_SCROLL_ENTRIES = 64;
+
 export function MarkdownPreview({ filePath }: { filePath: string }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 当前文件路径的 ref：滚动监听只挂一次，事件里读它拿最新值。
+   *
+   * **必须在 render 期间赋值**（而不是放进 effect）：md→md 切换时组件不重新挂载，
+   * 浏览器替换 innerHTML 后夹取 scrollTop 触发的那个 scroll 事件可能早于 effect 重跑，
+   * 只有 render 期的赋值能保证那一刻读到的是新路径（见滚动跟踪 effect 的说明）。
+   */
+  const filePathRef = useRef(filePath);
+  filePathRef.current = filePath;
   /**
    * 内容自己订阅，不由父组件传入（与 CodeViewer 同策略）：`fileContent` 每次按键都变，
    * 让 ProjectDetail 订阅它会把整棵子树拖进重渲染——而预览期间编辑器是卸载的，
@@ -58,6 +88,73 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
     () => DOMPurify.sanitize(marked.parse(content, { async: false }) as string, SANITIZE_CONFIG),
     [content],
   );
+
+  /**
+   * 还原上次看到的位置。
+   *
+   * 用 `useLayoutEffect` 而不是 `useEffect`：后者跑在浏览器绘制之后，用户会看到
+   * "先在第一行闪一下、再跳到上次的位置"——比不还原更刺眼。依赖 `html`：内容变了
+   * （重新读盘/在源码模式改过）也要落回同一个相对位置。
+   *
+   * 已知边界：文档里的**本地图片是异步读盘转 base64 的**（见下面那个 effect），
+   * 图加载完会把内容撑高、max 变大，于是这次还原的位置会比上次略靠前。
+   * 没去纠正它是有意的——纠正要么和用户自己的滚动打架（程序化滚动同样会触发 scroll
+   * 事件，"这次滚动是不是用户干的"在同一个 tick 里分不干净），要么引入一个
+   * 时间窗启发式，两种都比如实说明这个偏差更糟。
+   */
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 0) return;   // 内容不足一屏：无处可滚（也不该把记录覆盖成 0）
+    const ratio = scrollRatioByPath.get(filePath);
+    /**
+     * 没有记录 = 本次会话还没看过这个文件 → **从头开始**。
+     *
+     * 这个显式置 0 不能省：md→md 切换时组件不重新挂载、DOM 元素被复用，
+     * `scrollTop` 会原样留在**上一个文件**的像素值上（只被新内容的长度夹一下），
+     * 于是"打开一个没看过的文件"会停在文档中间——那不叫"记住了位置"，
+     * 而是把上一个文件的位置错当成这个文件的。
+     */
+    el.scrollTop = ratio === undefined ? 0 : ratio * max;
+  }, [html, filePath]);
+
+  /**
+   * 持续记录滚动位置（挂在滚动事件上，**只挂一次**，靠 ref 读当前文件）。
+   *
+   * 为什么不能"卸载前读一把"：React 删除组件时先摘 DOM、再跑清理，那时读到的是 0
+   * ——`CodeViewer` 的 `trackScroll` 注释里为这件事付过一次代价。
+   * 位置要在**用户滚动的那一刻**就记下来，之后谁什么时候销毁组件都不影响它。
+   *
+   * 为什么 `filePath` 走 ref 而不是进依赖：这个组件在 md→md 切换时**不会重新挂载**
+   * （`ProjectDetail` 在同一个位置渲染它，只换 prop），DOM 元素被复用、`innerHTML` 被替换，
+   * 浏览器随之把 `scrollTop` 夹到新内容允许的范围内——**并触发一次 scroll 事件**。
+   * 那次夹取记到"新文件"名下才是对的；若闭包还拿着旧路径，它就会把**旧文件**记下的位置
+   * 覆盖成 0（典型场景：从长文档切到短文档，夹到 0，于是切回长文档还在第一行）。
+   * 而 ref 在 render 期间就已更新（早于 commit 与任何事件），所以无论事件落到哪个监听器上，
+   * 记的都是当时屏幕上真正显示的那个文件。
+   */
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const max = el.scrollHeight - el.clientHeight;
+      // 不足一屏时 max ≤ 0：不记（否则一个恒为 0 的比例会盖掉之前记住的位置）
+      if (max <= 0) return;
+      const path = filePathRef.current;
+      // 先删再设：让它排到 Map 末尾，下面按插入序淘汰最旧的
+      scrollRatioByPath.delete(path);
+      scrollRatioByPath.set(path, el.scrollTop / max);
+      while (scrollRatioByPath.size > MAX_SCROLL_ENTRIES) {
+        const oldest = scrollRatioByPath.keys().next().value;
+        if (oldest === undefined) break;
+        scrollRatioByPath.delete(oldest);
+      }
+    };
+    // passive：滚动是高频事件，我们只是记录，不阻止默认行为
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
 
   /**
    * 给标题补 id，让 `[文字](#小节)` 这类目录链接真的能跳。

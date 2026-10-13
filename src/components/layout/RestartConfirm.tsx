@@ -1,7 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type FileChangeEvent } from '../../services/service';
 import { reportError } from '../../utils/error';
+import { notify } from '../../utils/notify';
+import { createAutoRestarter } from '../../utils/autoRestart';
+import { useRunningStore } from '../../stores/runningStore';
 import { useAiPanelReserve } from '../../hooks/useAiPanelReserve';
 
 type ConfirmItem = {
@@ -12,13 +15,9 @@ type ConfirmItem = {
 };
 
 const MAX_RESTART_ITEMS = 5;
-/** 自动重启的最小间隔（ms）：连续文件变更风暴时避免反复重启 */
-const AUTO_RESTART_DEBOUNCE_MS = 2000;
 
 export function RestartConfirm() {
   const [items, setItems] = useState<ConfirmItem[]>([]);
-  /** 记录 2 秒内已自动重启过的服务，防止事件风暴触发连环重启 */
-  const autoRestartCooldownRef = useRef(new Set<string>());
   /** AI 面板占用右侧：卡片必须让位——原生子 WebView 盖在所有 DOM 之上，
    *  卡片若落在面板区域内会既看不见也点不到（z-index 对原生层无效）。
    *  口径收在 useAiPanelReserve（与通知/右键菜单同一处），随面板宽度变化自动跟随 */
@@ -26,6 +25,41 @@ export function RestartConfirm() {
   const cardRight = aiPanelReserve + 24;
 
   useEffect(() => {
+    /**
+     * 自动重启的决策逻辑在 `utils/autoRestart.ts`（可单测，见它的说明）；这里只把它接到
+     * 真实的重启命令、运行状态与提示上。
+     *
+     * 两处不能省：
+     * - `probe` 必须先 `refresh()` 拿**权威状态**再判定。`unknown`（还在启动）与
+     *   `failed`（秒退）的处理完全相反，拿 3 秒前的轮询缓存下结论会把两者判反；
+     * - `onGiveUp` 是唯一会打扰用户的时刻（中间的重试是静默的，否则改代码时会刷屏）。
+     *
+     * 这个状态机的定时器活到组件卸载之后（`RestartConfirm` 挂在 `MainLayout` 上，
+     * 与应用同寿命；卸载即退出，剩下的定时器打到的是模块级函数，不会碰已卸载的 DOM）。
+     */
+    const restarter = createAutoRestarter({
+      restart: (sid) => processApi.restart(sid),
+      probe: async (sid) => {
+        await useRunningStore.getState().refresh();
+        const st = useRunningStore.getState();
+        if (st.failed.some(f => f.service_id === sid)) return 'failed';
+        if (st.running.some(r => r.service_id === sid)) return 'running';
+        return 'unknown';
+      },
+      sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+      onGiveUp: ({ serviceName, attempts }) => {
+        notify({
+          variant: 'error',
+          title: `服务「${serviceName}」自动重启未成功`,
+          description:
+            `已连续尝试 ${attempts} 次。失败那次的输出保留在日志面板里（点服务卡片上的「失败」），`
+            + `多半是端口没释放或代码当时还没写完——稍后手动重启一次通常就好了。`,
+          duration: 12000,
+        });
+      },
+      onError: (sid, e) => reportError(`自动重启服务失败（服务 ${sid}）`, e),
+    });
+
     let disposed = false;
     let unlisten: (() => void) | null = null;
     listen<FileChangeEvent>('file-changed', (event) => {
@@ -38,14 +72,11 @@ export function RestartConfirm() {
         const name = c.service_name;
         const sid = c.service_id;
 
-        // 自动重启模式：不弹确认框，直接重启（带 2 秒冷却去抖）
+        // 自动重启模式：不弹确认框，交给状态机（节流 + 尾沿去抖 + 失败重试）。
+        // **不能在这里判断"跳过"**——状态机自己会合并同一服务的连续变更，
+        // 外面再丢一次就等于把"最后一次改动"丢了（原实现就是这么丢的）
         if (c.restart_mode === 2) {
-          if (autoRestartCooldownRef.current.has(sid)) continue;
-          autoRestartCooldownRef.current.add(sid);
-          setTimeout(() => { autoRestartCooldownRef.current.delete(sid); }, AUTO_RESTART_DEBOUNCE_MS);
-          processApi.restart(sid).catch((e) => {
-            reportError('自动重启失败', e);
-          });
+          restarter.change(sid, name);
           continue;
         }
 

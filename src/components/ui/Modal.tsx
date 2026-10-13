@@ -7,12 +7,33 @@ interface ModalProps {
   onClose: () => void;
   children: React.ReactNode;
   width?: string;
+  /**
+   * 左侧分类栏（设置面板用）。给了它就切到「左分类 + 右内容」的面板布局：
+   * 标题栏不变，内容区左侧多出一列，两列**各自滚动**。
+   *
+   * 为什么做成 `Modal` 的一个变体、而不是另写一个 `SettingsModal` 壳：焦点陷阱（UX-6）、
+   * Esc 只关栈顶（`uiStore.modalStack`）、`pushModal` 让 AiPanel 把**原生子 WebView**
+   * 移出屏幕——这三件事都在这里。复制一份壳就等于把它们复制一遍，而它们各自都有失败史。
+   */
+  sidebar?: React.ReactNode;
+  /**
+   * 面板形态的**固定高度**（只在给了 `sidebar` 时生效）。
+   *
+   * 为什么需要"固定"：面板内容随分类切换长短不一（「通用」三节、Node 版本一屏列表），
+   * 让高度跟着内容走的话，点一下分类整个弹窗就跳一次——连同标题栏和关闭按钮一起挪位，
+   * 用户的鼠标刚对准的按钮就跑了。固定高度之后内容区自己滚动，外框不动。
+   *
+   * 不传则退回"内容撑开、max-height 封顶"（适合内容长度稳定的面板）。
+   * 建议值形如 `clamp(440px, calc(100vh - 120px), 700px)`：对内容固定，但对窗口自适应
+   * ——写死像素会让它在小窗口（本项目 minHeight 600）里顶出屏幕。
+   */
+  height?: string;
 }
 
 /** 可聚焦元素（焦点陷阱与"打开时先聚焦谁"共用一份选择器） */
 const FOCUSABLE = 'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-export function Modal({ open, title, onClose, children, width = '420px' }: ModalProps) {
+export function Modal({ open, title, onClose, children, width = '420px', sidebar, height }: ModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const mouseDownTarget = useRef<EventTarget | null>(null);
@@ -79,6 +100,8 @@ export function Modal({ open, title, onClose, children, width = '420px' }: Modal
 
   if (!open) return null;
 
+  const isPanel = sidebar != null;
+
   // 遮罩层级 z-[65]：必须高于编辑面板 z-[60]（否则抽屉浮在遮罩上仍可点击），低于右键菜单 z-[70]
   return (
     <div
@@ -106,10 +129,17 @@ export function Modal({ open, title, onClose, children, width = '420px' }: Modal
         // tabIndex=-1：没有可聚焦控件时（纯提示弹窗）焦点仍有落点，
         // 否则 `:focus` 留在 body 上、Tab 会从页面开头重新开始
         tabIndex={-1}
-        className="bg-nexus-surface border border-nexus-border rounded-lg shadow-2xl overflow-hidden focus:outline-none"
-        style={{ width, maxWidth: 'calc(100vw - 40px)' }}
+        className={`bg-nexus-surface border border-nexus-border rounded-lg shadow-2xl overflow-hidden focus:outline-none ${isPanel ? 'flex flex-col' : ''}`}
+        style={{
+          width,
+          maxWidth: 'calc(100vw - 40px)',
+          // 面板形态要限高：Node 版本那一屏（已装列表 + 搜索 + 输出）会超过一屏高度，
+          // 而 Modal 此前只有 maxWidth——高度顶出去时底部按钮就点不到了。
+          // 给了 `height` 就用它（固定外框，内容自己滚），否则只封顶、高度仍由内容决定。
+          ...(isPanel ? { maxHeight: 'calc(100vh - 80px)', ...(height ? { height } : null) } : null),
+        }}
       >
-        <div className="flex items-center justify-between px-4 h-[36px] border-b border-nexus-border bg-nexus-bg/30">
+        <div className="flex items-center justify-between px-4 h-[36px] border-b border-nexus-border bg-nexus-bg/30 flex-shrink-0">
           <span className="text-[13px] text-nexus-text font-medium">{title}</span>
           <button
             className="text-nexus-muted hover:text-nexus-text p-1 rounded hover:bg-nexus-hover/50"
@@ -122,9 +152,24 @@ export function Modal({ open, title, onClose, children, width = '420px' }: Modal
             </svg>
           </button>
         </div>
-        <div className="p-4">
-          {children}
-        </div>
+        {isPanel ? (
+          /* flex-auto（`flex: 1 1 auto`）而不是 flex-1（`flex: 1 1 0%`）：这个对话框的高度是
+             "内容撑开、max-height 封顶"，**不是**确定高度——列向 flex 容器里 basis=0 的子项
+             假设高度为 0，容器又按假设高度算自己的高度，于是整个内容区会**塌成 0 高**。
+             basis=auto 让"内容多高就多高"，被封顶时靠 flex-shrink + min-h-0 收缩并自己滚动。 */
+          <div className="flex-auto min-h-0 flex">
+            <div className="w-[140px] flex-shrink-0 overflow-y-auto border-r border-nexus-border bg-nexus-bg/20 py-2">
+              {sidebar}
+            </div>
+            <div className="flex-1 min-w-0 overflow-y-auto p-4">
+              {children}
+            </div>
+          </div>
+        ) : (
+          <div className="p-4">
+            {children}
+          </div>
+        )}
       </div>
     </div>
   );

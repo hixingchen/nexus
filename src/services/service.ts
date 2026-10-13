@@ -438,6 +438,15 @@ export const layoutApi = {
     invoke<void>('save_layout', { items }),
 
   load: () => invoke<Record<string, string>>('load_layout'),
+
+  /**
+   * 恢复默认布局：删掉布局表里除「当前选中的项目」以外的全部键，返回删除的行数。
+   *
+   * 为什么是"删行"而不是"写一份默认值回去"：默认值是各组件的字面量
+   * （`MainLayout` 的 `useState(260)` 等），后端并不知道它们——见
+   * `commands/layout.rs::reset_layout` 的说明。
+   */
+  reset: () => invoke<number>('reset_layout'),
 };
 
 // ─── Security API ──────────────────────────────────────────

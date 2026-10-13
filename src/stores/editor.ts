@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { notify } from '../utils/notify';
 import { reportError } from '../utils/error';
 import { getExtension } from '../utils/path';
+import { isMarkdownFile } from '../utils/markdown';
 import type { FileTab } from '../types/editor';
 import * as editorService from '../services/editor';
 
@@ -12,13 +13,15 @@ interface EditorStore {
   /** 有未保存更改的标签 id */
   dirtyIds: string[];
   /**
-   * Markdown 预览模式（只对当前活动标签的 .md 文件生效）。
+   * ── Markdown 视图模式 ──
    *
-   * 为什么放在 store 而不是组件本地 state：切换按钮在 EditorTabs、渲染在 ProjectDetail，
-   * 两处都要读它。**刻意不在切标签时重置**——浏览一组 md 时模式保持一致更顺手；
-   * 非 md 标签只是忽略它。
+   * **不再是 store 里的一个布尔**：模式按标签各记（`FileTab.preview`，见
+   * `types/editor.ts`），读的时候一律走下面的 `selectMdPreviewOnActiveTab`。
+   *
+   * 为什么改：原实现是一个全局布尔，用户把某个 md 切成源码后，**其余 md 也跟着变**——
+   * "默认预览"于是只在第一次点开时成立。原注释的理由是"浏览一组 md 时模式保持一致更顺手"，
+   * 按标签记之后这个好处仍在（切换标签不会重置），而且每个文件各记各的。
    */
-  mdPreview: boolean;
   /** 定位请求：打开文件后滚动到指定行并高亮命中词（CodeViewer 消费后清除） */
   locate: { path: string; line: number; query: string } | null;
   /** 高亮清除信号：每次 +1，CodeViewer 监听后清空命中装饰 */
@@ -53,7 +56,11 @@ interface EditorStore {
   closeTabs: (ids: string[]) => void;
   setActiveTabId: (id: string) => void;
   setFileContent: (content: string | null) => void;
-  /** 切换 Markdown 预览（切到预览前先把未合帧的编辑结算掉，避免预览到旧内容） */
+  /**
+   * 切换**当前标签**的 Markdown 预览（只对 .md 有效）。
+   *
+   * 切之前先把未合帧的编辑结算掉（PERF-13）：否则预览渲染的是 store 里的旧内容。
+   */
   toggleMdPreview: () => void;
   /** 编辑器内容变更：写入草稿并标记当前标签未保存 */
   updateDraft: (content: string) => void;
@@ -228,12 +235,36 @@ function removeCacheForPath(path: string): void {
   }
 }
 
+/**
+ * 打开一个 Markdown 文件时**默认显示渲染效果**，而不是源码。
+ *
+ * 为什么默认预览：这里的 .md 绝大多数是给人**读**的（README、说明文档、笔记），"读"比"改"
+ * 常见得多；要看/改源码时，标签栏那个眼睛图标一点即切（模式按标签记住，不会被别的文件带跑）。
+ *
+ * 想改回默认源码编辑：把这里改成 `false` 即可——判据只有这一处。
+ */
+const MD_PREVIEW_BY_DEFAULT = true;
+
+/**
+ * 当前标签是否处于「Markdown 预览」。
+ *
+ * **切换按钮（EditorTabs）与渲染分支（ProjectDetail）必须都用这个选择器**：各算一遍迟早
+ * 会出现"按钮显示在预览、画面却是源码"——两个判据只要有一处漏掉"按标签各记"或默认值，
+ * 就会分叉。
+ *
+ * 读的是标签自己的 `preview` 字段，`undefined`（刚打开的标签）才落回默认值。
+ */
+export function selectMdPreviewOnActiveTab(s: Pick<EditorStore, 'tabs' | 'activeTabId'>): boolean {
+  const tab = s.tabs.find(t => t.id === s.activeTabId);
+  if (!tab || !isMarkdownFile(tab.path)) return false;
+  return tab.preview ?? MD_PREVIEW_BY_DEFAULT;
+}
+
 export const useEditorStore = create<EditorStore>((set, get) => ({
   tabs: [],
   activeTabId: null,
   fileContent: null,
   dirtyIds: [],
-  mdPreview: false,
   fileOpenSeq: {},
   openRequestSeq: 0,
   locate: null,
@@ -317,7 +348,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   toggleMdPreview: () => {
     // 大文档的编辑可能还在合帧窗口里（PERF-13）：不先结算，预览渲染的是 store 里的旧内容
     flushPendingEdits();
-    set(s => ({ mdPreview: !s.mdPreview }));
+    const { activeTabId } = get();
+    if (!activeTabId) return;
+    const next = !selectMdPreviewOnActiveTab(get());
+    set(s => ({
+      tabs: s.tabs.map(t => (t.id === activeTabId ? { ...t, preview: next } : t)),
+    }));
   },
 
   updateDraft: (content) => {

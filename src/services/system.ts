@@ -77,6 +77,49 @@ export async function openInExplorer(path: string): Promise<void> {
   }
 }
 
+/**
+ * Nexus 自己的目录（数据库 + 日志）：设置 > 通用 > 数据与日志 显示与打开用。
+ *
+ * 字段名与后端 `commands/app.rs::AppPaths` 一一对应（响应侧一律 snake_case，
+ * 由 `contract.rs` 钉住）。
+ */
+export interface AppPaths {
+  /** 数据目录（`nexus.db` 所在） */
+  data_dir: string;
+  /** 日志目录 */
+  log_dir: string;
+  /** 应用日志文件；超过 5MB 轮转为同目录的 `nexus.log.1` */
+  log_file: string;
+}
+
+/**
+ * 读应用自己的数据/日志目录。
+ *
+ * 为什么问后端要：路径的唯一来源是 `lib.rs::data_dir()`（它认 `NEXUS_DATA_DIR` 覆盖）。
+ * 前端自己拼 `~/.nexus`，会让被隔离的实例（端到端验证专用）把用户指向真实数据目录。
+ */
+export function getAppPaths(): Promise<AppPaths> {
+  return invoke<AppPaths>('get_app_paths');
+}
+
+/** 「打开数据/日志目录」的用途键（对应后端 `app.rs::app_dir`，**不是路径**） */
+export type AppDirKind = 'data' | 'log';
+
+/**
+ * 在系统资源管理器中打开应用自己的数据/日志目录。
+ *
+ * 参数是用途键而不是路径：`~/.nexus` 不在文件访问白名单里，而白名单的模型是
+ * "前端不能指定任意路径"——这里收一个路径参数，就等于补上"打开任意目录"的入口
+ * （理由与 `pickDirectory` 走后端同一套，见 `commands/app.rs::app_dir`）。
+ */
+export async function openAppDir(kind: AppDirKind): Promise<void> {
+  try {
+    await invoke('open_app_dir', { kind });
+  } catch (e) {
+    reportError('打开目录失败', e);
+  }
+}
+
 /** 在系统终端中打开（失败带原因提示） */
 export async function openTerminal(path: string): Promise<void> {
   try {

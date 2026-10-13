@@ -22,6 +22,64 @@ pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Nexus 自己的目录（数据库 + 日志）：给「设置 > 通用 > 数据与日志」显示与打开用。
+///
+/// 为什么由后端答而不是前端拼 `~/.nexus`：路径的**唯一来源**是 `crate::data_dir()`
+/// （它认 `NEXUS_DATA_DIR` 覆盖，见那里的说明）。前端自己拼一个 `~/.nexus`，
+/// 会让被隔离的实例（端到端验证专用）把用户指向真实数据目录——那正是隔离要避免的事。
+#[derive(serde::Serialize)]
+pub struct AppPaths {
+    /// 数据目录（`nexus.db` 所在）
+    pub data_dir: String,
+    /// 日志目录（`nexus.log` 所在）
+    pub log_dir: String,
+    /// 应用日志文件；超过 5MB 轮转为同目录下的 `nexus.log.1`
+    pub log_file: String,
+}
+
+#[tauri::command]
+pub fn get_app_paths() -> AppPaths {
+    let data = crate::data_dir();
+    let logs = data.join("logs");
+    AppPaths {
+        data_dir: data.to_string_lossy().to_string(),
+        log_dir: logs.to_string_lossy().to_string(),
+        log_file: logs.join("nexus.log").to_string_lossy().to_string(),
+    }
+}
+
+/// 「打开数据/日志目录」的**用途键** → 目录。
+///
+/// 为什么不让前端传路径（那样 `open_in_explorer` 直接就能用）：`~/.nexus` 不在文件访问
+/// 白名单里，而白名单的模型是"**前端不能指定任意路径**"（见 `commands/paths.rs`）。
+/// 开一个 `open_app_dir(path: String)` 等于给被攻陷的 webview 补上一个"打开任意目录"的
+/// 入口——枚举参数把这个缺口关掉，与 `picker_title`（SEC-17）是同一套口径。
+///
+/// 未知用途**不回落**成某个目录、也不把前端传进来的字符串写回错误里：回落会让"打错一个
+/// 字"变成"打开了别处"，而回显前端字符串正是 SEC-17 收掉的那种写法。
+fn app_dir(kind: &str) -> Result<std::path::PathBuf, String> {
+    match kind {
+        "data" => Ok(crate::data_dir()),
+        "log" => Ok(crate::data_dir().join("logs")),
+        _ => Err("未知的目录用途".to_string()),
+    }
+}
+
+/// 在系统资源管理器中打开 Nexus 自己的数据/日志目录（`kind` 见 `app_dir`）。
+///
+/// 这是 README「数据与日志位置」那一节承诺的排障入口：打包版没有控制台，出问题时用户
+/// 要看的就是 `~/.nexus/logs/nexus.log`，而在此之前的唯一办法是照着文档手敲路径。
+#[tauri::command]
+pub fn open_app_dir(kind: String) -> Result<(), String> {
+    let dir = app_dir(&kind)?;
+    // 目录不存在时 explorer 会默默打开"文档"或干脆什么都不做——先建出来，
+    // 让"打开日志目录"在任何时刻（包括还没写过日志的新装机器）都有确定的落点
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建目录 {} 失败: {}", dir.display(), e))?;
+    log::info!("[nexus] 打开应用目录({}): {}", kind, dir.display());
+    crate::commands::editor::reveal_in_file_manager(&dir)
+}
+
 /// 前端日志回传（NEW-28）：把 webview 里的错误写进**同一条**日志流水（行首带 `[frontend]`）。
 ///
 /// 为什么需要：打包版既没有控制台也没有 devtools（`tauri` 的 features 里不含 `devtools`），
@@ -202,5 +260,37 @@ mod tests {
         // 保存对话框同一套口径（SEC-19）
         assert_eq!(save_picker_title(Some("exportTemplates")), "导出模板文件");
         assert_eq!(save_picker_title(Some("whatever")), "保存文件");
+    }
+
+    /// SEC-17 同口径：应用目录**只认用途键**，未知用途一律拒绝（且不回落成某个目录）。
+    ///
+    /// 这条守的是"前端不能借这个命令打开任意目录"：`app_dir` 一旦把输入当路径用，
+    /// 白名单就白做了——`~/.nexus` 本来就在白名单外，能打开它就等于能打开任何目录。
+    #[test]
+    fn test_app_dir_accepts_purpose_keys_only() {
+        let data = app_dir("data").expect("data 用途");
+        let log = app_dir("log").expect("log 用途");
+        // 日志目录必须在数据目录**之下**：两者不共享前缀时，「数据与日志」那一块会把
+        // 用户引到两个不相干的位置（而日志本来就是数据目录的一部分）
+        assert!(log.starts_with(&data), "日志目录应在数据目录之下: {:?}", log);
+        assert!(log.ends_with("logs"));
+
+        // 路径、上级目录、空串、大小写变体：都不是用途键
+        for bad in ["", "..", "C:/Windows", "data/../..", "DATA", "logs"] {
+            assert!(app_dir(bad).is_err(), "`{}` 不该被当作用途键接受", bad);
+        }
+    }
+
+    /// `get_app_paths` 报出来的三个路径必须自洽（数据目录 → logs → nexus.log）。
+    ///
+    /// 它们会**原样显示在界面上**（用户照着它去翻日志），拼错一层就是"按界面给的路径
+    /// 找不到文件"——而那时用户只会怀疑日志没写。
+    #[test]
+    fn test_get_app_paths_are_consistent() {
+        let p = get_app_paths();
+        assert!(p.log_dir.starts_with(&p.data_dir));
+        assert!(p.log_dir.ends_with("logs"));
+        assert!(p.log_file.starts_with(&p.log_dir));
+        assert!(p.log_file.ends_with("nexus.log"));
     }
 }
