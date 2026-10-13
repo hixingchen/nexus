@@ -78,8 +78,9 @@
 | 构建 | Vite + pnpm + cargo |
 
 **依赖版本锁定**：`.npmrc` 的 `save-exact=true` 让直接依赖精确落盘，`pnpm-lock.yaml` 入库，
-CI 与发布流程一律 `pnpm install --frozen-lockfile`。`package.json` 的 `pnpm.overrides` 是四条
-**传递依赖的版本地板**（`package.json` 不支持注释，理由记在这里；四条由提交 `455a603` 的审计收口引入）：
+CI 与发布流程一律 `pnpm install --frozen-lockfile`。`package.json` 的 `pnpm.overrides` 是五条
+**传递依赖的版本地板**（`package.json` 不支持注释，理由记在这里；前四条由提交 `455a603` 的审计收口引入，
+第五条为 `GHSA-68fv-2mgg-jv7q` 引入）：
 
 | 被钉的包 | 区间 | 由谁传递引入 | 区间为什么这样写 |
 |---|---|---|---|
@@ -87,11 +88,13 @@ CI 与发布流程一律 `pnpm install --frozen-lockfile`。`package.json` 的 `
 | `postcss` | `>=8.5.23 <9` | tailwindcss / vite / postcss-import / postcss-js / postcss-load-config / postcss-nested，同时也是本仓直接 devDependency | 同上；上界取当前 8.5.28 的下一个主版本 |
 | `browserslist` | `>=4.28.7 <5` | autoprefixer、`@babel/helper-compilation-targets`（经 `@vitejs/plugin-react`） | 同上；上界取当前 4.29.0 的下一个主版本 |
 | `baseline-browser-mapping` | `>=2.11.0 <3` | 仅 browserslist | 同上；上界取当前 2.11.25 的下一个主版本 |
+| `source-map-js` | `>=1.2.2 <2` | postcss（经 vite / autoprefixer）与 tailwindcss 链 | 下界是 `GHSA-68fv-2mgg-jv7q`（source-map-js 的拒绝服务）的修复版本；上界取 1.x 的下一个主版本。它只在构建期解析 source map，不进安装包 |
 
 > 区间只写在 `package.json` 一处（本表是它的说明，不是第二份可执行配置）。改动区间后
 > `pnpm install --frozen-lockfile` 会先报 `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`——`pnpm-lock.yaml`
-> 的 `overrides:` 段记录的是区间原文，需要 `pnpm install --no-frozen-lockfile` 同步一次
-> （本次同步只改了区间字符串，解析版本与 integrity 未变）。
+> 的 `overrides:` 段记录的是区间原文，需要 `pnpm install --no-frozen-lockfile` 同步一次。
+> 同步会按新区间解析依赖：`455a603` 那次只改了区间字符串（解析版本与 integrity 未变），
+> `source-map-js` 这次是真的换了版本（1.2.1 → 1.2.2）。
 
 ## 开发环境
 

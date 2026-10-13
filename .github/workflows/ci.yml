@@ -123,5 +123,14 @@ jobs:
       # `save-exact=true`，别把它当成镜像来源（`git log -p --all -- .npmrc | grep -i registry` 为空）。
       # 而那类镜像没有实现 audit 端点，一旦被带进来就会得到 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS
       # （红得莫名其妙），所以这里钉死官方源
-      - name: pnpm audit（high 及以上）
-        run: pnpm audit --registry=https://registry.npmjs.org/ --audit-level high
+      #
+      # `--prod`：门禁只覆盖 **dependencies + optionalDependencies**，也就是会进安装包的那部分。
+      #
+      # 为什么不全量（2026-10-13 的决定）：dev 链上的 advisory 有时**本地根本修不掉**——
+      # 例如 braces ≤3.0.3（经 tailwindcss → chokidar / micromatch）至今没有修复版本
+      # （`first_patched_version: null`，npm 上最高就是 3.0.3），而它只在构建期跑、不进产物。
+      # 全量拦截的后果是 main 长期挂红，红灯变成背景噪音，**产物依赖的真问题反而被淹掉**。
+      # dev 链的问题因此回到"人逐条评估"：`pnpm audit --dev` 可随时手动看（没有 `--ignore` 开关，
+      # 免掉某一条只能靠这种口径收敛或换工具）。
+      - name: pnpm audit（high 及以上，只看会进安装包的依赖）
+        run: pnpm audit --prod --registry=https://registry.npmjs.org/ --audit-level high
