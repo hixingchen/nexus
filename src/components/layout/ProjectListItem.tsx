@@ -155,10 +155,18 @@ export function ProjectListItem({
               </span>
             )}
           </div>
-          {/* 启动/停止按钮 */}
+          {/* 启动/停止按钮。
+              两个状态共用一个**固定 22×22 的按钮盒**（图标居中，不再靠 p-1 + 图标自身撑开）：
+              三角形 14px、spinner 13px，靠内边距撑的话启动中会差 1px（按钮跟着缩一下），
+              而 ▶→■ 的切换又是同一瞬间发生的——"按下时按钮动了一下"就是这么来的。
+              盒子定死之后，两个状态、三种图标都占同一块地方（同 CodeViewer 的图标按钮）。
+
+              运行态给底色、图标用满色（与 ServiceTreeEntry 的「■ 停止」同一套语义色）：
+              此前运行态是 70% 透明度的**裸图标**、没有任何按钮底色，压在卡片上就是一个暗红方块
+              ——看着像按下去没弹起来的坑，而不是"点一下能停"的控件。 */}
           {isRunning ? (
             <button
-              className="flex-shrink-0 p-1 rounded text-nexus-error/70 hover:text-nexus-error hover:bg-nexus-error/10 disabled:opacity-30"
+              className="flex-shrink-0 w-[22px] h-[22px] flex items-center justify-center rounded bg-nexus-error/15 text-nexus-error hover:bg-nexus-error/25 active:bg-nexus-error/30 disabled:opacity-30 transition-colors"
               disabled={actingId === project.id}
               onClick={onStop}
               title="停止"
@@ -168,7 +176,7 @@ export function ProjectListItem({
           ) : (
             <button
               /* 不带 disabled:opacity-30：启动中要显示 spinner，压暗会让它看不清 */
-              className="flex-shrink-0 p-1 rounded text-nexus-success/70 hover:text-nexus-success hover:bg-nexus-success/10"
+              className="flex-shrink-0 w-[22px] h-[22px] flex items-center justify-center rounded text-nexus-success/70 hover:text-nexus-success hover:bg-nexus-success/10 active:bg-nexus-success/20 transition-colors"
               disabled={actingId === project.id}
               onClick={onStart}
               title="启动"
