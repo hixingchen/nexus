@@ -1,7 +1,8 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
-import { projectApi, type Project } from '../../services/service';
+import type { Project } from '../../services/service';
 import { useRunningStore } from '../../stores/runningStore';
 import { useProjectActions } from '../../hooks/useProjectActions';
+import { cachedProjects, fetchProjects } from '../../hooks/useProjectList';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { ProjectContextMenu } from './ProjectContextMenu';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
@@ -31,7 +32,9 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
   /** 双击项目：展开项目列表**并**展开这个项目（与列表里双击项目的语义一致） */
   onExpandProject: (project: Project) => void;
 }) {
-  const [projects, setProjects] = useState<Project[]>([]);
+  // 首帧用共享缓存：窄轨是**收起时新挂载**的，直接空列表会让窄轨先空一拍再冒出方块。
+  // 缓存由 useProjectList 的 load 写入，两者看的是同一份 `get_projects`
+  const [projects, setProjects] = useState<Project[]>(cachedProjects);
   // 运行状态来自全局 store（MainLayout 已在轮询），无需自己拉
   const running = useRunningStore(s => s.running);
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
@@ -49,7 +52,8 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
 
   useEffect(() => {
     let alive = true;
-    projectApi.getAll()
+    // 与列表共用 fetchProjects：它写共享缓存，本窄轨（以及下次展开的列表）的首帧才有数据
+    fetchProjects()
       .then(list => { if (alive) setProjects(list); })
       .catch(e => reportError('加载项目列表失败', e));
     return () => { alive = false; };

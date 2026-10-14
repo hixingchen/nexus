@@ -264,6 +264,31 @@ export function MainLayout() {
     </div>
   );
 
+  /**
+   * 主内容：项目列 + 编辑器/服务列。
+   *
+   * **收起与展开必须是同一棵树**（只是左槽换成窄轨、分隔条消失）：原先写成
+   * `cond ? <div>…</div> : <ResizablePanel/>`，根元素类型一变，React 就把整块右区
+   * （详情页 / 模板库 / 文件树 / 编辑器）卸载重建——点一次收缩，这些模块全部重挂载并
+   * 各自重拉数据，界面上闪「暂无模板」「暂无项目」和一片空白（实测连闪两帧 ~130ms）。
+   * 现在根一直是 `ResizablePanel`，右区原地保留，收缩只剩左槽换视图这一件事。
+   */
+  const mainContent = (
+    <ResizablePanel
+      left={leftPanelCollapsed ? leftRail : leftPanel}
+      right={detailPanel}
+      collapsed={leftPanelCollapsed}
+      // 收起态不复用 `leftPanelWidth`：分隔条已消失，拖出来的宽度无处可去，
+      // 松手后窄轨不动、只有持久化值被改写。展开时宽度仍是收起前那个值
+      collapsedWidth={32}
+      defaultLeftWidth={leftPanelWidth}
+      minWidth={150}
+      maxWidth={500}
+      direction="horizontal"
+      onResize={(w) => { setLeftPanelWidth(w); saveLayout({ left_panel_width: String(w) }); }}
+    />
+  );
+
   // 首次加载中
   if (!ready) {
     return (
@@ -275,25 +300,6 @@ export function MainLayout() {
       </div>
     );
   }
-
-  // 收起态不复用 ResizablePanel：否则分隔条仍可拖动，会与"固定 32px 窄轨"的语义打架
-  // （拖出来的宽度无处可去，松手后窄轨不动、只有持久化值被改写）。展开时宽度保持不变。
-  const mainContent = leftPanelCollapsed ? (
-    <div className="flex h-full w-full overflow-hidden">
-      <div className="w-[32px] flex-shrink-0">{leftRail}</div>
-      <div className="flex-1 min-w-0 overflow-hidden">{detailPanel}</div>
-    </div>
-  ) : (
-    <ResizablePanel
-      left={leftPanel}
-      right={detailPanel}
-      defaultLeftWidth={leftPanelWidth}
-      minWidth={150}
-      maxWidth={500}
-      direction="horizontal"
-      onResize={(w) => { setLeftPanelWidth(w); saveLayout({ left_panel_width: String(w) }); }}
-    />
-  );
 
   return (
     <div className="h-screen flex flex-col relative bg-nexus-editor text-nexus-text">

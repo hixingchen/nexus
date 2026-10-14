@@ -64,10 +64,23 @@ interface Props {
   onChanged?: () => void;
 }
 
+/**
+ * 本进程内最近一次**成功**拉到的版本索引。
+ *
+ * 为什么需要（本组件是"挂载即拉"的）：`SettingsModal` 只挂载当前分类，用户「通用 → Node 版本
+ * → 通用 → Node 版本」来回切一次就会重下一次索引（`<node_mirror>index.json`，几百 KB、要联网），
+ * 而这份索引在一次会话里几乎不会变（它只在 Node 发新版时变）。
+ * 命中缓存时首帧就有列表、不发请求；要主动重拉有面板上的「刷新」（它调的就是 `loadIndex`）。
+ *
+ * 只在**成功**时写：失败留 null，下次进入照常重试（否则一次网络抖动会把这个分类
+ * 钉死在"拿不到列表"上，而用户没有任何手动重试的机会）。
+ */
+let cachedIndex: NodeVersionIndex | null = null;
+
 export function NodeVersionSection({ onChanged }: Props) {
   const [runtime, setRuntime] = useState<NodeRuntimeStatus | null>(null);
-  /** 可安装版本索引：联网拉，失败保持 null（不影响已装列表的使用） */
-  const [index, setIndex] = useState<NodeVersionIndex | null>(null);
+  /** 可安装版本索引：联网拉，失败保持 null（不影响已装列表的使用）；首帧用会话缓存 */
+  const [index, setIndex] = useState<NodeVersionIndex | null>(cachedIndex);
   const [loadingIndex, setLoadingIndex] = useState(false);
   /** 搜索词——筛选是本地做的，敲字不触发请求 */
   const [query, setQuery] = useState('');
@@ -109,7 +122,9 @@ export function NodeVersionSection({ onChanged }: Props) {
     setLoadingIndex(true);
     setIndexError('');
     try {
-      setIndex(await nodeApi.listVersions());
+      const list = await nodeApi.listVersions();
+      cachedIndex = list;          // 供本次会话内再进这个分类时首帧直接用（见 cachedIndex 说明）
+      setIndex(list);
     } catch (e: unknown) {
       setIndex(null);
       setIndexError(toMessage(e));
@@ -122,8 +137,9 @@ export function NodeVersionSection({ onChanged }: Props) {
     // 本组件只在设置面板的「Node 版本」分类被选中时挂载，因此"挂载"就等于原来的"打开面板"，
     // 不再需要 open 判断（面板关掉再打开会重新挂载，行为与原来一致）
     void refresh();
-    // 版本索引要联网（几百 KB），进入这个分类时才拉
-    void loadIndex();
+    // 版本索引要联网（几百 KB）：本次会话已经拉到过就不重拉（见 cachedIndex），
+    // 要强制刷新有面板上的「刷新」
+    if (!cachedIndex) void loadIndex();
   }, [refresh, loadIndex]);
 
   /**

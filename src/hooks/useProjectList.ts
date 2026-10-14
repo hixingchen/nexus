@@ -6,11 +6,39 @@ import { useProjectActions } from './useProjectActions';
 import { reportError } from '../utils/error';
 
 /**
+ * 最近一次成功拉到的项目列表（模块级，跨卸载保留）。
+ *
+ * 列表（ProjectList）与窄轨（ProjectRail）是**两个组件、各持一份 state**，且不会同时挂载，
+ * 所以每次收缩/展开切换，接手的那一方都是首次挂载：没有这份缓存，它的首帧必然是空列表——
+ * 展开时闪「暂无项目」+「创建第一个项目」，收起时窄轨空一拍（实测各 ~1~2 帧，把 IPC
+ * 延迟算进去更久）。数据仍以 `load()` 为事实来源，这里只是让首帧别说"没有项目"这句
+ * 没根据的话（同 `detailCache` / `svcCacheStore` 的口径）。
+ */
+let lastProjects: Project[] = [];
+
+/** 首帧用的项目列表（只读快照语义：拿到后仍会照常 `load()` 刷新） */
+export function cachedProjects(): Project[] {
+  return lastProjects;
+}
+
+/**
+ * 拉一份项目列表并写进共享缓存。
+ *
+ * 两个消费方（`useProjectList.load` 与 `ProjectRail` 的加载 effect）都走这里，
+ * 而不是各自 `projectApi.getAll()`：缓存若只有一个写入口，"谁写的是新数据"就不需要再判。
+ */
+export async function fetchProjects(): Promise<Project[]> {
+  const list = await projectApi.getAll();
+  lastProjects = list;
+  return list;
+}
+
+/**
  * ProjectList 组件的业务逻辑 hook
  * 管理项目列表、运行状态、搜索、CRUD 操作等
  */
 export function useProjectList() {
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [projects, setProjects] = useState<Project[]>(cachedProjects);
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [expandedSvc, setExpandedSvc] = useState<Set<string>>(new Set());
@@ -34,7 +62,7 @@ export function useProjectList() {
 
   const load = useCallback(async () => {
     try {
-      setProjects(await projectApi.getAll());
+      setProjects(await fetchProjects());   // 顺带刷新共享缓存（见 cachedProjects）
     } catch (e) {
       reportError('加载项目列表失败', e);
     }

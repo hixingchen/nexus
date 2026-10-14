@@ -61,6 +61,11 @@ pub fn open_terminal(state: State<AppState>, path: String) -> Result<(), String>
 ///
 /// 路径含 `"` 时返回 `None`（Windows 文件名不允许它，但路径也可能来自环境变量）：
 /// 调用方据此降级为"打开所在目录"，而不是拼出一条 explorer 会误解的命令行。
+///
+/// `cfg` 与它唯一的调用点一致：调用点在 `reveal_in_file_manager` 的 Windows 分支里，
+/// 不门控的话非 Windows 上它是死代码（`dead_code` 警告），而本文件开头那条约定
+/// （ARCH-10）保留 mac/linux 分支的目的正是让非 Windows 上 `cargo check` 干净通过。
+#[cfg(target_os = "windows")]
 fn explorer_select_arg(win_path: &str) -> Option<String> {
     if win_path.contains('"') {
         return None;

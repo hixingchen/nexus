@@ -586,8 +586,12 @@ function ServicePanel({
     <div className={`absolute right-0 top-0 bottom-0 z-10 flex flex-col flex-shrink-0 overflow-hidden bg-nexus-surface border-l border-nexus-border ${
       collapsed ? 'w-[32px]' : 'w-[360px]'
     }`}>
-      {/* 折叠条（32px）：折叠时可见 */}
-      <div className={`h-full transition-opacity duration-200 ${collapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+      {/* 折叠条（32px）：**只在收起时挂载**。
+          原先两个视图都常驻、靠 `opacity` 过渡切换，代价是展开时它会在 200ms 里淡出——
+          而它是个纵向 flex 容器的子项（stretch），宽度被拉到 360px，于是那一排居中的
+          图标（展开箭头 / AI / 服务圆点）正好闪在展开内容的**正中间**，看起来像一层鬼影。
+          收起侧本来就没有动画可言（面板宽度直接跳到 32px），删掉过渡不损失什么。 */}
+      {collapsed && (
         <CollapsedView
           services={services}
           isServiceRunning={isServiceRunning}
@@ -598,7 +602,7 @@ function ServicePanel({
           onRunToolCommand={handleRunToolCommand}
           load={load}
         />
-      </div>
+      )}
       {/* 展开内容：**收起时整块不挂载**（PERF-37）。
           原先两个视图都常驻、只靠 CSS 藏一个：面板收起后整份服务卡片列表（每张卡一个
           `useSortable`、外加模板库）仍完整渲染，并跟着每次服务状态/日志轮询重渲——
@@ -607,8 +611,7 @@ function ServicePanel({
           两处有意付出的代价，写在这里免得后来者当成 bug：
           ① 展开动画没了：原先收起时用 `translate-x-full` 向右滑出（GPU 合成，不触发
              reflow），条件渲染下没有"滑出"可言——这是取舍：省掉一整棵子树的渲染与
-             dnd-kit 注册，比一段 200ms 的动画值。收起态的 32px 窄条仍走它自己的
-             opacity 过渡，不受影响。
+             dnd-kit 注册，比一段 200ms 的动画值。两个视图至此都是"直接切"，不再有过渡。
           ② dnd-kit 的注册时机变了：收起→展开会重新注册排序节点（`useSortable` 随卡片
              一起挂载）。拖拽排序因此只在展开态可用——收起态本来也没有可拖的卡片。
           ③ 上下分栏的高度不丢：它由 ResizablePanel 的 `defaultLeftWidth` 提供，而那个值

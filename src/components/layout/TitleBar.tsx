@@ -9,7 +9,7 @@ import { LATEST_RELEASE_API, NEW_ISSUE_URL, REPO_URL } from '../../utils/links';
 import { SettingsModal, type SettingsSection } from '../settings/SettingsModal';
 import { AboutModal } from '../help/AboutModal';
 import { UsageDocsModal } from '../help/UsageDocsModal';
-import { useCallback, useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useClickOutside } from '../../hooks/useClickOutside';
 
 /**
@@ -30,7 +30,14 @@ interface TitleBarProps {
 }
 
 export function TitleBar({ projectName }: TitleBarProps) {
-  const appWindow = getCurrentWindow();
+  /**
+   * 窗口句柄只取一次：`getCurrentWindow()` 每次调用都 `new Window(...)`（见
+   * @tauri-apps/api 的 window 模块），放进依赖就是"每次渲染都换一个身份"——
+   * 下面那个 effect 会跟着重跑，于是每渲染一次就多一次 `isMaximized()` IPC
+   * 和一次 `onResized` 退订/重订（标题栏的重渲染并不罕见：开合菜单、开关设置面板、
+   * 切项目都会）。
+   */
+  const appWindow = useMemo(() => getCurrentWindow(), []);
   const [isMaximized, setIsMaximized] = useState(false);
   /**
    * 当前展开的顶级菜单（null = 都关着）。
@@ -59,6 +66,17 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
   /** 两个菜单共同的容器：点它以外的地方（含点另一个菜单之外的窗口区域）一律收起 */
   const menusRef = useRef<HTMLDivElement>(null);
+  /**
+   * 两个顶级菜单的**按钮**：菜单条目被点中时，焦点要先交还给它们。
+   *
+   * 为什么必须（实测）：条目被点中后菜单立刻卸载，浏览器随之把焦点丢给 `body`；
+   * 而 `Modal` 是在自己挂载后的 effect 里读 `document.activeElement` 当作"关闭时要还回去
+   * 的位置"——那一刻读到的是 body，于是关闭面板后焦点落在 body 上，`body.focus()`
+   * 什么也做不了，键盘用户得从页面开头重新 Tab 一遍（`Modal` 的焦点还原承诺
+   * 在这条路径上形同虚设）。菜单按钮是常驻的，先把它聚焦，Modal 记下的就是它。
+   */
+  const settingsMenuRef = useRef<HTMLButtonElement>(null);
+  const helpMenuRef = useRef<HTMLButtonElement>(null);
   // escape：菜单是键盘可达的（Tab 到按钮 + 回车展开），那就得能用 Esc 退出——
   // 只给鼠标用户留出口等于键盘用户展开后关不掉
   useClickOutside(menusRef, () => setOpenMenu(null), { escape: true });
@@ -93,14 +111,22 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
   /** 打开设置面板并落在指定分类（两个入口都走这里） */
   const openSettings = useCallback((section: SettingsSection) => {
+    settingsMenuRef.current?.focus();   // 见 menusRef 下方关于焦点的那段说明
     setOpenMenu(null);
     setSettings({ open: true, section });
   }, []);
 
   /** 打开帮助菜单里的某个弹窗 */
   const openHelpDialog = useCallback((which: HelpDialog) => {
+    helpMenuRef.current?.focus();
     setOpenMenu(null);
     setHelpDialog(which);
+  }, []);
+
+  /** 收起帮助菜单（「检查更新」这一行用它：检查在后台继续，焦点不该留在 body 上） */
+  const closeHelpMenu = useCallback(() => {
+    helpMenuRef.current?.focus();
+    setOpenMenu(null);
   }, []);
 
   /**
@@ -110,6 +136,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
    * （使用文档 / 关于）。不走 webview 内导航：应用有导航守卫，会被拦成"点了没反应"。
    */
   const openExternal = useCallback((url: string) => {
+    helpMenuRef.current?.focus();
     setOpenMenu(null);
     void openUrl(url).catch((err) => reportError('打开网页失败', err));
   }, []);
@@ -125,6 +152,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
       <div className="relative h-full flex" ref={menusRef} data-menu>
         <TitleMenu
           label="设置"
+          triggerRef={settingsMenuRef}
           open={openMenu === 'settings'}
           onToggle={() => setOpenMenu(openMenu === 'settings' ? null : 'settings')}
         >
@@ -134,6 +162,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
         <TitleMenu
           label="帮助"
+          triggerRef={helpMenuRef}
           open={openMenu === 'help'}
           onToggle={() => setOpenMenu(openMenu === 'help' ? null : 'help')}
         >
@@ -143,7 +172,7 @@ export function TitleBar({ projectName }: TitleBarProps) {
           {/* 分隔线：上面是文档类入口，下面是"这是哪个应用"——两类东西 */}
           <MenuSeparator />
           <MenuItem onClick={() => openHelpDialog('about')}>关于 Nexus</MenuItem>
-          <CheckUpdateItem onDone={() => setOpenMenu(null)} />
+          <CheckUpdateItem onDone={closeHelpMenu} />
         </TitleMenu>
       </div>
 
@@ -202,15 +231,18 @@ export function TitleBar({ projectName }: TitleBarProps) {
  * **把整个窗口拖走**（这个坑踩过一次：当初 Node 版本面板挂在拖拽区里面，
  * 点它的背景就把窗口拖走了，见 `TitleBar` 里 handleMouseDown 的说明）。
  */
-function TitleMenu({ label, open, onToggle, children }: {
+function TitleMenu({ label, open, onToggle, children, triggerRef }: {
   label: string;
   open: boolean;
   onToggle: () => void;
   children: React.ReactNode;
+  /** 菜单按钮本体：条目被点中时调用方要把焦点交还给它（见 TitleBar 里的说明） */
+  triggerRef?: React.Ref<HTMLButtonElement>;
 }) {
   return (
     <div className="relative h-full" data-menu>
       <button
+        ref={triggerRef}
         className={`h-full px-2.5 text-[12.5px] transition-colors ${
           open ? 'bg-nexus-hover text-nexus-text' : 'text-nexus-text-muted hover:text-nexus-text hover:bg-nexus-hover/40'
         }`}

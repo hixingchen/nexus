@@ -47,7 +47,8 @@ interface LayoutStore {
   values: Record<string, string> | null;
   /** 读取在途的 Promise（并发调用共享同一次查库） */
   loading: Promise<Record<string, string>> | null;
-  ensureLoaded: () => Promise<Record<string, string>>;
+  /** @param force 跳过"已加载"快捷路径，强制重新查库（值全程不清空，见实现处说明） */
+  ensureLoaded: (force?: boolean) => Promise<Record<string, string>>;
   /**
    * 「恢复默认布局」代数：每执行一次 +1（0 = 从未重置）。
    *
@@ -141,9 +142,13 @@ export async function resetLayoutToDefaults(): Promise<number> {
    * 库里并不是空的：`reset_layout` 保留了当前选中的项目与编辑器字号（见 `commands/layout.rs`
    * 的 `KEEP_ON_RESET`）。只置 null 的话，这些被保留的键在内存里会一直缺到下次启动——
    * 表现是"恢复默认布局之后编辑器字号莫名其妙变小了"，而数据库里其实还好好存着。
+   *
+   * 重查走 `ensureLoaded(true)`（`force`）而**不是"置 null 再 ensureLoaded"**：置 null 到
+   * 新值回来的这几毫秒里，订阅方读到的是"没有布局"——字号回落到默认 14px，
+   * 于是 Markdown 预览与日志面板的字跳一下、CodeMirror 白重测量一次（`values` 全程有效
+   * 就不会有这一帧）。`force` 只跳过"已加载就不查"的快捷路径，其余合并逻辑完全一致。
    */
-  useLayoutStore.setState({ values: null, loading: null });
-  await useLayoutStore.getState().ensureLoaded();
+  await useLayoutStore.getState().ensureLoaded(true);
   useLayoutStore.getState().markReset();
   return removed;
 }
@@ -155,10 +160,17 @@ export const useLayoutStore = create<LayoutStore>((set, get) => ({
 
   markReset: () => set((s) => ({ resetSeq: s.resetSeq + 1 })),
 
-  ensureLoaded: () => {
+  /**
+   * 读一次布局库（进程内只查一次，之后返回缓存）。
+   *
+   * `force = true` 用于「恢复默认布局」：库里的行刚被删过，内存这份必须重新查——
+   * 但它**不清 `values`**，新值一次落地，中途订阅方读到的始终是有效值（原因见
+   * `resetLayoutToDefaults`）。
+   */
+  ensureLoaded: (force = false) => {
     const { values, loading } = get();
-    if (values) return Promise.resolve(values);
-    if (loading) return loading;
+    if (values && !force) return Promise.resolve(values);
+    if (loading && !force) return loading;
     const p = layoutApi
       .load()
       .then((v) => {

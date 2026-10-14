@@ -511,32 +511,20 @@ impl ProcessManager {
         // dev server 的子进程持有监听套接字，taskkill 之后内核回收还要几十到几百毫秒，
         // 抢输的那一方表现为"启动即退出"。**自动重启比手动点更容易踩上这个窗口**：
         // 它每 2 秒就可能来一次，而用户手动点的时候这些资源通常已经释放了。
-        let outcome = self.stop_locked_outcome(spec.service_id, None);
-        self.settle_survivors(spec.service_id, outcome);
-        self.start_locked(spec)
-    }
-
-    /// 重启前等"没退干净的旧进程"真的消失（最长 [`RESTART_SETTLE_TIMEOUT`]）。
-    ///
-    /// 等到了就什么都不说（正常路径，不打扰用户）；等不到就照旧启动，但把这件事
-    /// **写进该服务的日志缓冲**——只写 `log::warn` 的话，这条唯一的原因只落在
-    /// `~/.nexus/logs/nexus.log` 里，而用户的现场在日志面板上：他看到的只有卡片上
-    /// "失败"两个字，没有任何线索指向"旧进程还占着端口"。
-    fn settle_survivors(&self, service_id: &str, outcome: CleanupOutcome) {
-        if outcome.survivors.is_empty() {
-            return;
-        }
-        log::info!(
-            "[nexus] 重启前等待旧进程退出：{} 个，最长 {:?}",
-            outcome.survivors.len(),
-            RESTART_SETTLE_TIMEOUT
-        );
-        let left = wait_until_gone(
-            outcome.survivors,
-            RESTART_SETTLE_TIMEOUT,
-            RESTART_SETTLE_POLL,
-            survivors_of,
-        );
+        // 先取出来：`start_locked` 会消费 `spec`，而提示要写在它**之后**（见下）
+        let service_id = spec.service_id;
+        let outcome = self.stop_locked_outcome(service_id, None);
+        let left = settle_survivors(outcome);
+        let started = self.start_locked(spec);
+        // 这条提示必须写在 `start_locked` **之后**。
+        //
+        // `start_locked` 的第一步就是清空该服务的日志缓冲（新生命周期的起点，见那里的
+        // `buffers.remove(key)`）——写在它前面的话，刚写完的这条会被那一句整条删掉：
+        // 消息"写进去了"、日志面板里永远看不到，而这条提示恰恰是"为什么重启后起不来"
+        // 的唯一线索（ARCH-31 的改动就是这么等于没写的）。
+        //
+        // 放在启动之后还有个好处：启动失败时系统行的顺序是"失败原因 → 本次的嫌疑"，
+        // 读起来是"失败了，因为……"。
         if !left.is_empty() {
             self.append_system_line(service_id, format!(
                 "上一次停止未完成：仍有 {} 个进程未退出（{:?}），本次启动可能与它们抢端口\
@@ -544,8 +532,8 @@ impl ProcessManager {
                 left.len(),
                 left
             ));
-            log::warn!("[nexus] 重启前旧进程仍未退出: {:?}（已继续启动）", left);
         }
+        started
     }
 
     /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）
@@ -1040,6 +1028,32 @@ const RESTART_SETTLE_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// 等待期间的轮询间隔：100ms 足够细（句柄失效不会更快），也不会空转烧 CPU
 const RESTART_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// 重启前等"没退干净的旧进程"真的消失（最长 [`RESTART_SETTLE_TIMEOUT`]），
+/// 返回**仍未退出**的那些 pid（正常路径返回空）。
+///
+/// 为什么只等、不写原因：原因要写进该服务的日志缓冲，而那个缓冲在 `start_locked`
+/// 开头会被清空——写入必须由**启动之后**的调用方做（见 `restart` 的说明）。
+fn settle_survivors(outcome: CleanupOutcome) -> Vec<u32> {
+    if outcome.survivors.is_empty() {
+        return Vec::new();
+    }
+    log::info!(
+        "[nexus] 重启前等待旧进程退出：{} 个，最长 {:?}",
+        outcome.survivors.len(),
+        RESTART_SETTLE_TIMEOUT
+    );
+    let left = wait_until_gone(
+        outcome.survivors,
+        RESTART_SETTLE_TIMEOUT,
+        RESTART_SETTLE_POLL,
+        survivors_of,
+    );
+    if !left.is_empty() {
+        log::warn!("[nexus] 重启前旧进程仍未退出: {:?}（已继续启动）", left);
+    }
+    left
+}
 
 /// 轮询到给定 pid 全部消失为止，返回**仍未消失**的那些（超时也原样返回）。
 ///
@@ -1839,6 +1853,46 @@ mod tests {
         assert_eq!(left, vec![7], "超时后应当把仍存活的 pid 交回去");
         assert!(calls > 1, "超时前应当轮询过多次，实际 {}", calls);
         assert!(started.elapsed() < Duration::from_secs(5), "等待时间失控（疑似死循环）");
+    }
+
+    /// `start_locked` 开头会**清空**该服务的日志缓冲——这就是"重启前那条提示必须写在
+    /// 启动之后"的原因。
+    ///
+    /// 为什么单独钉这个前提：写错顺序不会报错、也不会让任何断言失败，只是让那条提示
+    /// 永远不显示（ARCH-31 的改动曾经就是这样等于没写的：写在 `settle_survivors` 里，
+    /// 紧接着被 `start_locked` 的 `buffers.remove(key)` 整条删掉，而用户和测试都看不出）。
+    /// 这条用例钉住前半截（启动会清空），`restart` 里的顺序由注释与这半截共同约束：
+    /// 谁哪天改了"启动不再清缓冲"，那段注释与顺序就该重新判断一次。
+    ///
+    /// 端到端那条路（真出现"杀不掉的旧进程" → 提示出现在日志面板）没有自动化用例：
+    /// 它要求一个 taskkill /F 之后仍活着的进程，只有在真机偶发场景里才有。
+    #[cfg(windows)]
+    #[test]
+    fn test_start_clears_log_buffer_so_restart_note_must_come_after() {
+        let mgr = ProcessManager::new();
+        let key = "restart-note-1";
+        mgr.append_system_line(key, "重启前写下的提示".into());
+        assert_eq!(mgr.get_logs(key).len(), 1, "前提没成立：先写的那条不在缓冲里");
+
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: key, name: "n",
+            command: "exit /b 0", cwd: ".", env_vars: &[], log_sink: Arc::new(|_| {}),
+        }).expect("启动应当成功");
+
+        let texts: Vec<String> = mgr.get_logs(key).iter().map(|l| l.text.clone()).collect();
+        assert!(
+            texts.iter().all(|t| !t.contains("重启前写下的提示")),
+            "启动应当清空上一个生命周期的日志（写在前面的提示会被整条删掉），实际 {:?}",
+            texts,
+        );
+
+        // 反过来：启动之后再写就留得住——`restart` 的顺序正是这两步
+        mgr.append_system_line(key, "启动之后写下的提示".into());
+        assert!(
+            mgr.get_logs(key).iter().any(|l| l.text.contains("启动之后写下的提示")),
+            "写在启动之后的提示应当留在缓冲里",
+        );
+        let _ = mgr.stop(key);
     }
 
     /// 空输入：一次存活查询都不该发生（列表为空时立刻返回，也不该白睡一拍）。
