@@ -11,13 +11,21 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
 use crate::core::ai::{AiSession, AiTimeouts};
 
 /// 等待 dsh web 输出启动 URL 的超时（集中定义见 core/ai.rs 的 AiTimeouts）
 const START_TIMEOUT: Duration = AiTimeouts::WEB_START;
+
+/// `ai_start` 失败时的**错误码前缀**（`<码>::<人话>`）。
+///
+/// 为什么用前缀而不是结构化错误：Tauri 命令的 `Result<T, E>` 里 E 的形态受前端 `catch`
+/// 的既有写法约束，改动要动全部调用点的错误处理；而面板真正需要区分的只有"该给哪个按钮"
+/// 这一件事——运行时没准备（给「准备运行时」）还是装了跑不起来（给「重新安装」）。
+pub const ERR_RUNTIME_MISSING: &str = "ai_runtime_missing";
+pub const ERR_RUNTIME_BROKEN: &str = "ai_runtime_broken";
 
 /// 会话状态快照
 #[derive(Clone, Serialize)]
@@ -27,8 +35,8 @@ pub struct AiStatus {
     pub url: Option<String>,
     pub pid: Option<u32>,
     pub cwd: Option<String>,
-    /// dsh CLI 是否可用（未运行时现场检测）
-    pub dsh_found: bool,
+    /// 私有运行时的状态（未运行时现场探测；把"没装"与"装了跑不动"分开）
+    pub runtime: crate::core::ai::DshProbe,
 }
 
 /// 组装状态快照（不持锁调用 dsh 检测）
@@ -52,12 +60,25 @@ fn snapshot(state: &AppState) -> AiStatus {
         }
     };
     // Job Object 句柄在这里取一次传给 `core::ai`（ARCH-19）：`core` 不再认识 AppState
-    let dsh_found = if running {
-        true
+    let runtime = if running {
+        running_runtime()
     } else {
-        crate::core::ai::dsh_available(state.process_mgr.job_arc().as_deref())
+        crate::core::ai::probe_dsh(state.process_mgr.job_arc().as_deref())
     };
-    AiStatus { running, url, pid, cwd, dsh_found }
+    AiStatus { running, url, pid, cwd, runtime }
+}
+
+/// 会话在跑时的运行时状态：**必然就绪**（否则压根起不来），且不去实跑探测——
+/// 那是一整次进程启动，而 `snapshot` 会被前端的状态轮询反复调到。
+fn running_runtime() -> crate::core::ai::DshProbe {
+    let rt = crate::core::runtime::resolve();
+    crate::core::ai::DshProbe {
+        ready: true,
+        source: rt.as_ref().map(|r| r.source),
+        node_version: rt.and_then(|r| (!r.node_version.is_empty()).then_some(r.node_version)),
+        version: None,
+        problem: None,
+    }
 }
 
 /// 查询会话状态
@@ -92,9 +113,19 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         // Job Object 句柄取一次，供本函数里所有 `core::ai` 调用共用（ARCH-19）
         let job = state.process_mgr.job_arc();
 
-        // dsh 缺失：快速失败并提示安装（避免等满 60 秒超时才报错）
-        if !crate::core::ai::dsh_available(job.as_deref()) {
-            return Err("未检测到 dsh（DeepSeek Harness CLI），请先安装：npm i -g @deepseek-ai/dsh，然后重试".into());
+        // 运行时没准备好 / 装好了但跑不起来：**快速失败并说清是哪一种**。
+        //
+        // 原实现是 `if !dsh_available() { "未检测到 dsh，请先安装 npm i -g …" }`，两个洞：
+        // ① 判据只看退出码，"什么都不干但 exit 0"被认成可用，于是放行到 spawn 才失败；
+        // ② "没装"和"装了跑不动"给同一句文案，用户照着重装一遍仍然不行（事故里就是这样）。
+        let Some(runtime) = crate::core::runtime::resolve() else {
+            // 只给一句话的摘要："要下载什么、为什么、之后会怎样"由界面的错误卡负责展开
+            // （它在自己的位置上画按钮与说明，后端重复一遍只会让卡片里同一句话说三遍）
+            return Err(format!("{}::还没准备过，点下面的按钮下载一次即可。", ERR_RUNTIME_MISSING));
+        };
+        if let Err(e) = runtime.probe(job.as_deref()) {
+            log::error!("[ai] 运行时实测不通过: {}", e);
+            return Err(format!("{}::{}", ERR_RUNTIME_BROKEN, e));
         }
 
         // 幂等：运行中且目录一致且进程存活 → 复用；进程已死则重启（崩溃自愈）
@@ -108,7 +139,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
                             url: Some(s.url.clone()),
                             pid: Some(s.pid),
                             cwd: s.cwd.clone(),
-                            dsh_found: true,
+                            runtime: running_runtime(),
                         });
                     }
                     log::info!("[ai] 会话进程已退出 (pid={})，重启", s.pid);
@@ -146,7 +177,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         // 代数递增：使任何进行中的旧启动自动放弃
         let gen = state.ai_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let session = match crate::core::ai::spawn_dsh_web(job.as_deref(), cwd_norm.as_deref(), START_TIMEOUT) {
+        let session = match crate::core::ai::spawn_dsh_web(&runtime, job.as_deref(), cwd_norm.as_deref(), START_TIMEOUT) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("[ai] 启动 dsh web 失败: {}", e);
@@ -229,12 +260,12 @@ pub struct DshVersionInfo {
 pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let job = app.state::<AppState>().process_mgr.job_arc();
-        if !crate::core::ai::dsh_available(job.as_deref()) {
-            // 未安装：无需联网查，UI 直接给「安装」入口
+        let Some(rt) = crate::core::runtime::resolve() else {
+            // 运行时都没准备：无需联网查，UI 直接给「准备运行时」入口
             return Ok(DshVersionInfo { dsh_found: false, current: None, latest: None, outdated: false });
-        }
-        let current = crate::core::ai::query_dsh_version(job.as_deref());
-        let latest = crate::core::ai::query_dsh_latest(job.as_deref())?;
+        };
+        let current = crate::core::ai::query_dsh_version(&rt, job.as_deref());
+        let latest = crate::core::ai::query_dsh_latest(&rt, job.as_deref())?;
         let outdated = current.as_ref()
             .map(|c| crate::core::ai::version_cmp(c, &latest) == Some(std::cmp::Ordering::Less))
             .unwrap_or(false);
@@ -245,17 +276,166 @@ pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
 }
 
 /// 升级/安装 dsh 到最新版。先停当前会话（Windows 文件锁，npm 无法覆盖运行中文件）。
-/// 返回安装后的 dsh 版本（读取失败返回空串，前端降级文案）
+///
+/// 走**私有运行时自己的 npm**、装进**私有目录**，并**装完实跑一次确认**
+/// （原因见 `core::runtime::install_or_upgrade_dsh`）。
 #[tauri::command]
 pub async fn ai_upgrade_dsh(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        stop_current_session(&app)?;
         let job = app.state::<AppState>().process_mgr.job_arc();
-        crate::core::ai::upgrade_dsh(job.as_deref())?;
-        Ok(crate::core::ai::query_dsh_version(job.as_deref()).unwrap_or_default())
+        let Some(rt) = crate::core::runtime::resolve() else {
+            return Err(format!(
+                "{}::AI 运行时还没准备好，请先在「设置 > AI 运行时」里准备",
+                ERR_RUNTIME_MISSING
+            ));
+        };
+        // 先停会话再动 dsh 的文件（Windows 文件锁）
+        stop_current_session(&app)?;
+        crate::core::runtime::install_or_upgrade_dsh(&rt, job.as_deref())
+            .map_err(|f| format!("{}::{}", ERR_RUNTIME_BROKEN, f.to_message()))
     })
     .await
     .map_err(|e| format!("升级 dsh 任务失败: {}", e))?
+}
+
+// ─── 私有运行时（设置面板 + 错误卡的入口） ─────────────────────
+
+/// 运行时状态（设置面板展示 + 错误卡判断该给哪个按钮）
+#[derive(Clone, Serialize)]
+pub struct AiRuntimeStatus {
+    /// 目录与指针齐全
+    pub ready: bool,
+    /// 这一对路径来自哪里（`manual` = 用户手动指定）
+    pub source: Option<crate::core::runtime::RuntimeSource>,
+    /// 自带 Node 的版本（如 `v24.21.0`；手动指定时为空）
+    pub node_version: Option<String>,
+    /// 实测到的 dsh 版本（跑得起来时才有）
+    pub dsh_version: Option<String>,
+    /// 装了但跑不起来时的原因（人话 + 原话）
+    pub problem: Option<String>,
+    /// 占用磁盘字节数（"卸载能腾出多少"）
+    pub size_bytes: u64,
+    /// 当前生效的那对路径（出问题时能告诉用户它在哪）
+    pub path: String,
+    /// 自动装的那份的安装目录（与 `path` 不同：手动指定时 path 指向别处，而
+    /// "卸载"删的始终是这一个）
+    pub install_dir: String,
+    /// 是否设了手动指定（界面据此显示「清除」入口）
+    pub has_manual: bool,
+    /// 安装步骤名（界面据此画步骤条，不必自己维护一份字符串）
+    pub steps: Vec<String>,
+}
+
+fn runtime_status(job: Option<&crate::core::job_object::JobObject>) -> AiRuntimeStatus {
+    let probe = crate::core::ai::probe_dsh(job);
+    // 展示用的路径：手动指定时给用户看他指定的那对，否则给自动装的那份
+    let path = crate::core::runtime::resolve()
+        .map(|r| format!("{} + {}", r.node_exe, r.dsh_js))
+        .unwrap_or_else(|| crate::core::runtime::runtime_root().display().to_string());
+    AiRuntimeStatus {
+        ready: probe.ready,
+        source: probe.source,
+        node_version: probe.node_version,
+        dsh_version: probe.version,
+        problem: probe.problem,
+        size_bytes: crate::core::runtime::size_on_disk(),
+        path,
+        install_dir: crate::core::runtime::runtime_root().display().to_string(),
+        has_manual: crate::core::runtime::has_manual(),
+        steps: crate::core::runtime::STEPS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// 查询运行时状态（**不实跑**以外的开销很小；设置面板进入时调一次）
+#[tauri::command]
+pub async fn ai_runtime_status(app: AppHandle) -> Result<AiRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let job = app.state::<AppState>().process_mgr.job_arc();
+        Ok(runtime_status(job.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("查询 AI 运行时状态失败: {}", e))?
+}
+
+/// 安装 / 重新安装 AI 运行时（下载 Node + 装 dsh，首次约 300MB）。
+///
+/// **先停 AI 会话**：正在跑的 dsh 就是私有 `node.exe`，不先停就删不掉/覆盖不了旧目录
+/// （Windows 文件锁）。进度经 `ai-runtime-progress` 事件推送。
+#[tauri::command]
+pub async fn ai_runtime_install(
+    app: AppHandle,
+) -> Result<AiRuntimeStatus, crate::core::runtime::RuntimeFailure> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(_slot) = crate::core::runtime::try_acquire_install() else {
+            return Err(crate::core::runtime::RuntimeFailure::busy());
+        };
+        stop_current_session(&app)
+            .map_err(|e| crate::core::runtime::RuntimeFailure::internal(format!("先停会话失败: {}", e)))?;
+        let job = app.state::<AppState>().process_mgr.job_arc();
+
+        let emitter = app.clone();
+        let result = crate::core::runtime::install(job.as_deref(), &|p| {
+            // 进度推送失败不影响安装本身（前端没监听就没人收），但必须留痕
+            if let Err(e) = emitter.emit("ai-runtime-progress", p) {
+                log::warn!("[ai] 推运行时进度失败: {}", e);
+            }
+        });
+        let rt = result?;
+        log::info!("[ai] 私有运行时就绪: node={} dsh={}", rt.node_version, rt.dsh_js);
+        Ok(runtime_status(job.as_deref()))
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::core::runtime::RuntimeFailure::internal(e.to_string())))
+}
+
+/// 卸载 AI 运行时（删掉 `~/.nexus/runtime`，腾出约 300MB）。
+///
+/// **只删运行时自己的目录**——`~/.dsh` 一个字节都不碰（那里是登录凭据、会话历史、
+/// 浏览器 profile，删了等于让用户重新登录并丢掉全部会话）。
+#[tauri::command]
+pub async fn ai_runtime_uninstall(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // 正在跑的 dsh 就是私有 node.exe：不先停就是 EBUSY（删不掉）
+        stop_current_session(&app)?;
+        crate::core::runtime::uninstall()
+    })
+    .await
+    .map_err(|e| format!("卸载 AI 运行时任务失败: {}", e))?
+}
+
+/// **手动指定**运行时（A 方案）：填 `node.exe` 与 dsh 的路径，绕开下载。
+///
+/// 给两类机器用：① 内网/下载不通，拿不到那 300MB；② 机器上本来就有可用的 Node + dsh。
+/// 保存前会**当场实测一次**（`dsh --version` 要吐出真版本号）——设一个跑不起来的路径
+/// 等于把 AI 设死，而"保存成功了却不能用"是最难查的那种失败。
+#[tauri::command]
+pub async fn ai_runtime_set_manual(
+    app: AppHandle,
+    node_exe: String,
+    dsh_path: String,
+) -> Result<AiRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let job = app.state::<AppState>().process_mgr.job_arc();
+        // 换解释器要先停会话：旧会话的 node.exe 还占着，而且留着它会让"换没换成功"看不出来
+        stop_current_session(&app)?;
+        crate::core::runtime::set_manual(&node_exe, &dsh_path, job.as_deref())?;
+        Ok(runtime_status(job.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("保存手动指定的运行时失败: {}", e))?
+}
+
+/// 清除手动指定，回到用 Nexus 自带的那份
+#[tauri::command]
+pub async fn ai_runtime_clear_manual(app: AppHandle) -> Result<AiRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let job = app.state::<AppState>().process_mgr.job_arc();
+        stop_current_session(&app)?;
+        crate::core::runtime::clear_manual()?;
+        Ok(runtime_status(job.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("清除手动指定的运行时失败: {}", e))?
 }
 
 /// 创建 AI 面板的内嵌子 WebView（带文档创建时注入的焦点记忆/恢复脚本）。

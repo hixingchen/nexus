@@ -3,14 +3,21 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Webview, getAllWebviews } from '@tauri-apps/api/webview';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
-import type { UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAiStore, selectAiRunningHere, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
 import { useUiStore } from '../../stores/uiStore';
-import { aiService } from '../../services/aiService';
+import {
+  aiService,
+  toAiError,
+  AI_RUNTIME_PROGRESS_EVENT,
+  type AiRuntimeStatus,
+  type RuntimeProgress,
+} from '../../services/aiService';
 import { reportError } from '../../utils/error';
 import { showNotification } from '../ui/Toast';
 import { RobotIcon } from './RobotIcon';
 import { UpdateControl } from './UpdateControl';
+import { AiErrorCard } from './AiErrorCard';
 
 interface AiPanelProps {
   /** 当前项目的工作目录（dsh web 会话根）；null = 未选项目 */
@@ -161,6 +168,16 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const runningHere = useAiStore(selectAiRunningHere);
   /** 是否有全局弹窗打开（添加服务/工具库/更新等）——打开时子 WebView 移出屏幕 */
   const anyModalOpen = useUiStore((s) => s.modalCount > 0);
+
+  /**
+   * 运行时状态：只在**出错时**拉一次。它要扫目录算占用空间，不该进状态轮询。
+   * 错误卡用它拼「复制诊断信息」。
+   */
+  const [runtimeStatus, setRuntimeStatus] = useState<AiRuntimeStatus | null>(null);
+  /** 运行时安装/重装的实时进度（后端按字节推 `ai-runtime-progress`） */
+  const [progress, setProgress] = useState<RuntimeProgress | null>(null);
+  /** 运行时安装/重装进行中：按钮禁用防重复点，面板主体让位给进度 */
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
 
   const dockRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<{ x: number; w: number } | null>(null);
@@ -489,9 +506,6 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     st.setPanelOpen(false);
   };
 
-  /** 未检测到 dsh（AI 引擎未安装）：错误卡换成「安装」引导而非终端命令提示 */
-  const dshMissing = lastError != null && lastError.includes('未检测到 dsh');
-
   /**
    * 本次安装期间**用户自己**按过 ✕ 吗（`handleHide` 置位，`handleInstallDsh` 开头重置）。
    *
@@ -556,9 +570,79 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     }
   };
 
+  /** 出错时拉一次运行时状态（拼「复制诊断信息」用；成功路径不拉，免得白扫一遍目录） */
+  useEffect(() => {
+    if (!lastError) return;
+    let alive = true;
+    aiService
+      .runtimeStatus()
+      .then((s) => { if (alive) setRuntimeStatus(s); })
+      .catch(() => { /* 诊断信息是锦上添花，拿不到就不带那一段 */ });
+    return () => { alive = false; };
+  }, [lastError]);
+
+  /**
+   * 安装进度：后端按字节推（curl 正在下多少 + 走到哪一步）。
+   *
+   * 为什么非要有进度：首次要下约 300MB，而**没有进度的转圈和"卡死"是分不出来的**——
+   * 用户这一整轮的困惑，底色就是"不知道它在干嘛"。
+   */
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let alive = true;
+    void listen<RuntimeProgress>(AI_RUNTIME_PROGRESS_EVENT, (ev) => setProgress(ev.payload))
+      .then((fn) => { if (alive) unlisten = fn; else fn(); })
+      .catch((e) => reportError('订阅 AI 运行时进度失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, []);
+
+  /**
+   * 准备 / 重新安装 AI 运行时（错误卡上的主操作）。
+   *
+   * 装完自动接着启会话：用户的意图是"我要用 AI"，不是"我要装个东西"——
+   * 让他装完再自己点一次，等于把一次操作拆成两次。
+   */
+  const handleInstallRuntime = async () => {
+    if (runtimeBusy) return;
+    setRuntimeBusy(true);
+    setProgress(null);
+    try {
+      await aiService.runtimeInstall();
+      const s = useAiStore.getState();
+      showNotification({ variant: 'success', title: 'AI 运行时就绪', duration: 3000 });
+      if (s.currentCwd) void s.ensureRunning(s.currentCwd, s.currentName);
+    } catch (e) {
+      useAiStore.getState().setError(toAiError(e));
+    } finally {
+      setRuntimeBusy(false);
+      setProgress(null);
+    }
+  };
+
+  /**
+   * 清除手动指定的运行时，回到自带那份（错误卡上的退路，见 AiErrorCard 的说明）。
+   * 清完接着启会话：用户的意图同样是"我要用 AI"。
+   */
+  const handleClearManual = async () => {
+    if (runtimeBusy) return;
+    setRuntimeBusy(true);
+    try {
+      setRuntimeStatus(await aiService.runtimeClearManual());
+      const s = useAiStore.getState();
+      showNotification({ variant: 'success', title: '已回到自带运行时', duration: 3000 });
+      if (s.currentCwd) void s.ensureRunning(s.currentCwd, s.currentName);
+    } catch (e) {
+      useAiStore.getState().setError(toAiError(e));
+    } finally {
+      setRuntimeBusy(false);
+    }
+  };
+
   // 宽度唯一事实来源：拖拽期 = manualWRef（DOM 已应用，React 渲染读到同一值，
   // 不覆盖不跳变）；静止期 = store（持久化）。关闭/无面板 → 0
-  const widthFact = manualWRef.current ?? (panelOpen || installing ? panelWidth : 0);
+  // runtimeBusy 与 installing 同理：运行时正在装时面板要让位给进度，不能因为
+  // 用户此刻没展开就把它收成 0 宽（那会让"装到哪了"彻底看不见）
+  const widthFact = manualWRef.current ?? (panelOpen || installing || runtimeBusy ? panelWidth : 0);
 
   return (
     <div
@@ -648,22 +732,22 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
              会话内容分支：原生 WebView 铺满整个槽位（slotRef）；未创建成功前
              显示 DOM 覆盖层（WebView 是原生层，一旦创建就盖在 DOM 之上） */}
         <div ref={slotRef} className="relative flex-1 min-h-0 overflow-hidden bg-nexus-editor">
-          {installing ? (
+          {runtimeBusy ? (
+            <RuntimeProgressView progress={progress} steps={runtimeStatus?.steps ?? null} />
+          ) : installing ? (
             <div className="h-full flex flex-col items-center justify-center gap-3 text-nexus-muted">
               <div className="w-5 h-5 border-2 border-nexus-accent/30 border-t-nexus-accent rounded-full animate-spin" />
               <p className="text-[12px] select-none">正在安装 / 更新 dsh…（需联网，约 1~2 分钟）</p>
             </div>
           ) : lastError ? (
-            <PanelMessage
-              title={dshMissing ? '未找到 dsh' : 'AI 会话启动失败'}
-              detail={dshMissing
-                ? '未检测到 dsh（AI 助手引擎）。点下方按钮联网安装最新版，装好后自动启动会话。'
-                : lastError}
-              action={dshMissing ? (
-                <RetryButton onClick={() => void handleInstallDsh()}>安装 dsh</RetryButton>
-              ) : (
-                <RetryButton onClick={handleRefresh}>重试</RetryButton>
-              )}
+            <AiErrorCard
+              error={lastError}
+              status={runtimeStatus}
+              busy={runtimeBusy}
+              onInstallRuntime={() => void handleInstallRuntime()}
+              onReinstallRuntime={() => void handleInstallRuntime()}
+              onClearManual={() => void handleClearManual()}
+              onRetry={handleRefresh}
             />
           ) : showFrame ? (
             <>
@@ -713,6 +797,53 @@ function PanelMessage({
       <p className="text-[13px] text-nexus-text font-medium">{title}</p>
       {detail && <p className="text-[11.5px] text-nexus-muted leading-relaxed break-all">{detail}</p>}
       {action && <div className="mt-1">{action}</div>}
+    </div>
+  );
+}
+
+/**
+ * 运行时安装进度：**分步 + 当前步的实时字节数**。
+ *
+ * 为什么不能只放一个转圈：首次要下约 300MB，一个没有进度的 spinner 和"卡死"是分不出来的。
+ * 步骤名由后端给（`AiRuntimeStatus.steps`，与它真正执行的顺序同源），界面不自己维护一份
+ * ——两份字符串迟早对不上，对不上时用户看到的进度就是假的。拿不到步骤表时退化成
+ * 单行实时文本（照样能看出在动）。
+ */
+function RuntimeProgressView({
+  progress, steps,
+}: {
+  progress: RuntimeProgress | null;
+  steps: string[] | null;
+}) {
+  const current = progress?.step_index ?? 0;
+  return (
+    <div className="h-full flex flex-col items-center justify-center gap-3 px-8">
+      <p className="text-[12.5px] text-nexus-text">正在准备 AI 运行时</p>
+      {steps ? (
+        <ol className="w-full max-w-[300px] space-y-1.5">
+          {steps.map((label, i) => {
+            const done = i < current;
+            const active = i === current;
+            return (
+              <li key={label} className="flex items-start gap-2 text-[11.5px] leading-snug">
+                <span className={`mt-[3px] w-2 h-2 flex-shrink-0 rounded-full ${
+                  done ? 'bg-emerald-500' : active ? 'bg-nexus-accent animate-pulse' : 'bg-nexus-border'
+                }`} />
+                <span className={done ? 'text-nexus-muted' : active ? 'text-nexus-text' : 'text-nexus-muted/60'}>
+                  {label}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+      {/* 实时子状态（"12.3 MB / 35.9 MB"）：这一行才是"它在动"的直接证据 */}
+      <p className="text-[11px] text-nexus-muted tabular-nums select-none">
+        {progress?.detail ?? '正在开始…'}
+      </p>
+      <p className="text-[11px] text-nexus-muted/70 leading-relaxed text-center max-w-[300px]">
+        首次使用需下载约 300MB（装完占磁盘约 600MB），仅此一次。之后 AI 与你机器上的 Node 版本无关。
+      </p>
     </div>
   );
 }

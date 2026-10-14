@@ -1389,23 +1389,159 @@ pub fn build_command(command_str: &str) -> Command {
     }
 }
 
-/// 构建 Nexus **自己**发起的命令（`dsh` / `npm` 等内部 CLI）。
+/// 构建 Nexus **自己**发起的命令（`dsh` / `npm` 等内部 CLI），**不经 PATH 解析的形态**。
 ///
 /// 与 `build_command` 的唯一差别：设置 `NoDefaultCurrentDirectoryInExePath=1`，
 /// 让 Windows 在解析可执行文件名时**跳过当前目录**。
 ///
-/// 攻击面（SEC-12）：`dsh web` 的工作目录是项目目录（AI 会话根），
+/// 攻击面（SEC-12）：内部命令的工作目录是项目目录（AI 会话根），
 /// 而 cmd 默认先搜当前目录——项目里放一个 `dsh.cmd` 就会被优先于 PATH 上的真 dsh 执行，
 /// "克隆一个不受信任的仓库 + 打开 AI 面板"即可触发任意命令执行。
 ///
 /// 为什么不给用户配置的服务命令也加：`gradlew`/`mvnw` 这类**项目内**启动脚本按裸名调用
 /// 是常见且正当的用法，禁掉当前目录搜索会让它们失效（用户得改写成 `.\gradlew`）。
 /// 用户命令本就是用户自己写的 shell 串，那条路径的信任边界见 `build_command`。
+///
+/// **`#[cfg(test)]` 是如实标注，不是权宜**：AI 侧现在一律用 `core::runtime` 产出的
+/// **绝对路径**起进程（`Command::new` + 私有 node.exe 的绝对路径），压根不做名字解析——那是比
+/// "关掉当前目录搜索"更强的一级（SEC-12 的攻击面结构性消失）。生产里已无调用者；
+/// 保留它是因为 `spawn_web_command` 那几条用例要用 `cmd` 内建命令驱动全部路径，
+/// 而它们需要的正是这条命令串形态。**生产里再出现"按名字起内部命令"，就是这次收口被回退了。**
+#[cfg(test)]
 pub fn build_internal_command(command_str: &str) -> Command {
     let mut c = build_command(command_str);
     // 文档化开关（NT 4.0 起支持）：cmd 与 CreateProcess 不再把当前目录当搜索路径
     c.env("NoDefaultCurrentDirectoryInExePath", "1");
     c
+}
+
+/// 超时终止后等进程真正退出的宽限期（与 `core::ai::AiTimeouts::REAP` 同值）。
+/// 单列常量而不是引 `ai`：本函数是**通用**运行器，不该反向依赖某个业务模块的超时表。
+const CAPTURE_REAP: Duration = Duration::from_millis(2000);
+
+/// 起一个**已经拼好的** `Command`，捕获它的输出（stdout+stderr 合并，保留尾部若干行），
+/// 带超时与进程树终止。`label` 只用于日志与错误文案（说清跑的是哪条命令）。
+///
+/// 为什么要有这一支（而不是都用 `core::ai::run_captured`）：后者收的是**命令串**，
+/// 走 `cmd /C` 再查 PATH。AI 私有运行时的全部意义就是**不走 PATH**——它必须
+/// 传进去的就是 node.exe 的绝对路径。两条路径共用本函数，超时、杀树、
+/// 输出捕获、Job Object 纳管的口径才是同一套（此前这些语义只存在于 `run_captured` 里）。
+///
+/// 进程退出与 reader 线程刷盘有微小竞态，退出后等"长度不再增长"再读（诊断文本，无需精确）。
+pub fn run_captured_command(
+    job: Option<&crate::core::job_object::JobObject>,
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    log::info!("[nexus] 执行命令: {}", mask_command(label));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
+    if let Some(job) = job {
+        // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
+        if let Err(e) = job.assign_child(&child) {
+            log::warn!("[nexus] 子进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
+        }
+    }
+    let stdout = child.stdout.take().ok_or_else(|| "无法读取命令输出".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "无法读取命令错误输出".to_string())?;
+    let captured = Arc::new(Mutex::new(String::new()));
+    // 停止标志：超时终止进程树后置位。若孙进程仍持有管道写端，reader 不会等到 EOF，
+    // 两个线程 + 缓冲会永久留在进程里（反复调用会持续堆积线程）
+    let stop_reading = Arc::new(AtomicBool::new(false));
+    spawn_capture_reader(stdout, Arc::clone(&captured), Arc::clone(&stop_reading));
+    spawn_capture_reader(stderr, Arc::clone(&captured), Arc::clone(&stop_reading));
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // 等 reader 把管道里剩下的读完。固定睡一段时间在机器繁忙时会读到空 buffer，
+                // 于是"命令失败（退出码 1）。（无输出）"——把唯一的原因丢了（用户报过）。
+                // 改成"长度连续两次不变"：既等得住慢 reader，也不会白等。
+                let mut last_len = usize::MAX;
+                for _ in 0..12 {
+                    let len = captured.lock().map(|g| g.len()).unwrap_or(0);
+                    if len == last_len {
+                        break;
+                    }
+                    last_len = len;
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                let text = captured.lock().map(|g| g.clone()).unwrap_or_default();
+                if status.success() {
+                    return Ok(text);
+                }
+                // 失败要能远程排障：退出码 + 是哪条命令 + 原话，三样一起进日志和界面
+                log::warn!("[nexus] 命令失败 exit={:?} cmd={} 输出={}", status.code(), label, text.trim());
+                return Err(format!(
+                    "命令失败（退出码 {:?}）：{}\n输出：{}",
+                    status.code(),
+                    label,
+                    tail_of(&text)
+                ));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_and_reap(&mut child, CAPTURE_REAP);
+                    stop_reading.store(true, Ordering::Relaxed);
+                    return Err(format!("命令超时（超过 {} 秒），已终止：{}", timeout.as_secs(), label));
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(e) => {
+                stop_reading.store(true, Ordering::Relaxed);
+                return Err(format!("等待命令退出失败: {}", e));
+            }
+        }
+    }
+}
+
+/// 后台线程逐行累积输出（stdout/stderr 各起一个；非 UTF-8 行跳过；保留尾部）
+///
+/// 用 `read_log_lines`（有界行读取）而不是 `BufRead::lines()`：后者会把整行先读进内存，
+/// 命令输出单行 GB 级（base64/JSON dump）时足以打满内存；同时它允许我们在超时终止后
+/// 通过 `stop` 标志让线程主动退出（不必等管道 EOF）。
+pub(crate) fn spawn_capture_reader<R: std::io::Read + Send + 'static>(
+    stream: R,
+    captured: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+) {
+    let spawn = std::thread::Builder::new()
+        .name("nexus-cmd-capture".into())
+        .spawn(move || {
+            let reader = std::io::BufReader::new(stream);
+            for line in read_log_lines(reader) {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(mut c) = captured.lock() {
+                    c.push_str(line.trim_end());
+                    c.push('\n');
+                    if c.len() > 6000 {
+                        let from = c.floor_char_boundary(c.len() - 3000);
+                        c.drain(..from);
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawn {
+        log::warn!("[nexus] 命令输出读取线程创建失败（输出将不完整）: {}", e);
+    }
+}
+
+/// 输出文本取尾部（最多 8 行；空时给占位说明）
+pub(crate) fn tail_of(text: &str) -> String {
+    let t = text.trim();
+    if t.is_empty() {
+        return "（无输出）".into();
+    }
+    let lines: Vec<&str> = t.lines().collect();
+    if lines.len() > 8 {
+        format!("…{}", lines[lines.len() - 8..].join("\n"))
+    } else {
+        t.to_string()
+    }
 }
 
 /// 跨模块共用的测试夹具（ARCH-23）：`core::process` 与 `core::logfollow` 的测试都要用。
@@ -1893,6 +2029,21 @@ mod tests {
             "写在启动之后的提示应当留在缓冲里",
         );
         let _ = mgr.stop(key);
+    }
+
+    /// 失败信息里的输出只取尾部 8 行：界面上不能因一条命令失败就贴一屏；
+    /// 一条输出都没有时给固定占位（而不是空白，否则像是"错误信息丢了"）
+    #[test]
+    fn test_tail_of_keeps_last_lines_only() {
+        assert_eq!(tail_of("  \n\t "), "（无输出）");
+        assert_eq!(tail_of("a\nb"), "a\nb", "8 行以内原样返回");
+
+        let text = (1..=12).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let out = tail_of(&text);
+        assert!(out.starts_with('…'), "截断要留痕（否则读的人以为命令只输出这几行）: {}", out);
+        assert_eq!(out.lines().count(), 8, "省略号贴在第一个保留行上 + 尾部 8 行: {}", out);
+        assert!(out.ends_with("12"), "保留的是最后一行: {}", out);
+        assert!(out.contains("…5"), "省略号标在被丢掉的边界上: {}", out);
     }
 
     /// 空输入：一次存活查询都不该发生（列表为空时立刻返回，也不该白睡一拍）。

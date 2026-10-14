@@ -68,6 +68,18 @@
 
 - CFR（[MIT License](src-tauri/resources/cfr-LICENSE.txt)）：Java 字节码反编译，jar 随应用内嵌分发
 
+以下三项**不随安装包分发**，而是首次使用 AI 面板时按需下载到用户自己的数据目录
+（`~/.nexus/runtime/`，可在「设置 > AI 运行时」查看与卸载）。列出它们是因为 Nexus 会
+下载并执行这些代码，而不是把它们打进了产物：
+
+- Node.js（MIT）：AI 面板的运行环境。从 nodejs.org / npmmirror 取官方 Windows 压缩包，
+  下载后核对官方 `SHASUMS256.txt` 里的 SHA-256 才解压。许可原文随之落在该 Node 目录的 `LICENSE`
+- npm（Artistic-2.0）：安装 dsh 用的包管理器，随上面的 Node 压缩包自带。
+  许可原文在该 Node 目录的 `node_modules/npm/LICENSE`
+- @deepseek-ai/dsh（MIT，Copyright (c) 2026 DeepSeek）：AI 助手引擎，由上面那份 npm 装进
+  `~/.nexus/runtime/ai/`。它自带的大量依赖由 npm 解析安装，各自遵循自身许可，
+  许可文件在各自的包目录下
+
 ## 技术栈
 
 | 层 | 技术 |

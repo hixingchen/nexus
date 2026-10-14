@@ -47,7 +47,22 @@ const EXEMPT: &[(&str, &str, &str)] = &[
          也不受「先搜当前目录」影响——与 spawn_tool_program 的直启分支同理。\
          用绝对路径是有意的：Nexus 启动时的 PATH 未必与用户终端一致，裸名可能压根找不到 nvm",
     ),
+    ("core/runtime.rs", "command", ABS_PATH_RUNTIME),
+    ("core/runtime.rs", "npm_command", ABS_PATH_RUNTIME),
+    ("core/runtime.rs", "install_dsh", ABS_PATH_RUNTIME),
+    ("core/runtime.rs", "run_direct", ABS_PATH_RUNTIME),
 ];
+
+/// `core/runtime.rs` 那几处豁免共用的理由（同源四处，写一遍免得各说各话）。
+///
+/// 它比设置 `NoDefaultCurrentDirectoryInExePath` **更强一级**：那一级是"名字解析时跳过当前
+/// 目录"，这里是"名字解析压根不发生"——传进去的是私有运行时解析出的 `node.exe` /
+/// `npm-cli.js` 绝对路径（见 `core::runtime` 的 `resolve` 与 `npm_cli`）。
+/// 而这正是整个 `core::runtime` 存在的目的：**让 AI 用哪个 Node 不再由用户的 nvm / PATH 决定**
+/// （事故经过见该模块的文档注释）。
+const ABS_PATH_RUNTIME: &str = "绝对路径调用：传进去的是私有运行时解析出的 node.exe / npm-cli.js 绝对路径\
+     （见 core/runtime 的 resolve 与 npm_cli），不经 PATH 解析、也不受「先搜当前目录」影响。\
+     比设置 NoDefaultCurrentDirectoryInExePath 更强的一级——名字解析压根不发生";
 
 /// 一处 `Command::new(`：所在文件、行号、所属函数、以及该行之后的一小段窗口
 struct Site {
@@ -188,8 +203,8 @@ fn test_internal_commands_are_hardened_or_exempt() {
         "以下位置用裸名拉起了进程，但既没有设 `NoDefaultCurrentDirectoryInExePath`，\
          也不在 EXEMPT 里：\n  {}\n\
          处置二选一：\n\
-         ① 是我们自己拉起的内部命令 → 加 `.env(\"NoDefaultCurrentDirectoryInExePath\", \"1\")`\
-         （或改用 `core::process::build_internal_command`）；\n\
+         ① 是我们自己拉起的内部命令 → **首选绝对路径**（`core::runtime` 就是这么钉住 dsh 解释器的）；\
+         确实只能按名字起（命令串 / cmd 内建），再加 `.env(\"NoDefaultCurrentDirectoryInExePath\", \"1\")`；\n\
          ② 属于用户边界（用户要在这个进程里敲裸名命令）→ 加进 `spawn_guard.rs` 的 EXEMPT 并写明理由。",
         unhandled.join("\n  ")
     );

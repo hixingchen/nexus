@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { aiService } from '../services/aiService';
+import { aiService, toAiError, type AiError } from '../services/aiService';
 import { reportError } from '../utils/error';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore, type LayoutKey } from './layoutStore';
 
@@ -87,10 +87,22 @@ interface AiState {
   starting: boolean;
   /** dsh 安装/升级进行中：面板主体展示进度；期间禁止启动会话（防撞半安装的二进制） */
   installing: boolean;
-  /** 最近一次启动错误（面板展示） */
-  lastError: string | null;
+  /**
+   * 最近一次启动错误（面板展示）。
+   *
+   * 存**结构**而不是字符串：界面要按"卡在哪一步"给不同的按钮与文案（见 `AiError`）。
+   * 原来的 `string` + `msg.includes('未检测到 dsh')` 把文案当协议用——后端改一个字，
+   * 界面就静默走错分支（那正是本轮事故里"照着重装一遍还是不行"的成因之一）。
+   */
+  lastError: AiError | null;
   /** 在途请求期间目标变化：记录最新目标，完成后自动追启 */
   pendingTarget: { cwd: string; name: string | null } | null;
+
+  /**
+   * 直接写入错误（供面板在**非启动路径**上展示失败：准备/重装运行时、升级 dsh）。
+   * 启动路径自己会在 catch 里写，不需要这个。
+   */
+  setError: (e: AiError | null) => void;
 
   /** 挂载引导：载入上次拖拽宽度 + 清理旧版本遗留的 AI 记忆行（记忆本身仅本次运行内） */
   bootstrap: () => Promise<void>;
@@ -279,9 +291,9 @@ export const useAiStore = create<AiState>((set, get) => ({
         // （sessionCwd 还是老项目 → runningHere=false，且没有自愈路径）
       });
     } catch (e) {
-      const msg = String(e);
+      const err = toAiError(e);
       // 「已取消」= 启动被 stop 打断（后端 epoch 自杀）：当正常路径，不展示错误
-      if (!msg.startsWith('已取消')) set({ lastError: msg });
+      if (!err.summary.startsWith('已取消')) set({ lastError: err });
       set({ starting: false, running: false, url: null, sessionCwd: null });
     }
     // 收敛：请求期间目标又变了 → 补一次最新目标的启动。cwd 与项目名都要比：
@@ -294,6 +306,8 @@ export const useAiStore = create<AiState>((set, get) => ({
   },
 
   setInstalling: (v) => set({ installing: v }),
+
+  setError: (e) => set({ lastError: e, starting: false }),
 }));
 
 /**

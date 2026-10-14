@@ -11,12 +11,14 @@
 use std::cmp::Ordering;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::core::job_object::JobObject;
-use crate::core::process::build_internal_command;
+use crate::core::runtime::AiRuntime;
 
 // ─── dsh workspace 注册（GUI 工作区跟随项目目录的尽力机制） ─────────
 
@@ -454,12 +456,16 @@ impl AiSession {
 pub struct AiTimeouts;
 
 impl AiTimeouts {
-    /// `dsh --version`（探活/取版本）：正常 <1s，10s 足够宽裕
+    /// `dsh --version`（探活/取版本）：正常 <1s，10s 足够宽裕。
+    /// 私有运行时的 `probe`（`<node.exe> <bin.js> --version`）也走这个值。
     pub const VERSION_PROBE: Duration = Duration::from_secs(10);
     /// `npm view`（联网查最新版）：registry 慢时常见数秒
     pub const NPM_QUERY: Duration = Duration::from_secs(30);
-    /// `npm install -g`（下载安装/升级 dsh）：唯一允许分钟级的操作
-    pub const NPM_INSTALL: Duration = Duration::from_secs(300);
+    /// `npm install`（下载安装/升级 dsh）：唯一允许分钟级的操作。
+    ///
+    /// 30 分钟而不是 5 分钟：**首次要下 269MB**，300 秒在慢网下不够；而"装到一半超时被杀"
+    /// 会留下一个只能整个重来的半成品目录（比多等一会儿贵得多）。升级通常只下增量，远快于此。
+    pub const NPM_INSTALL: Duration = Duration::from_secs(1800);
     /// `dsh web` 启动并打印 URL：冷启动要起 Node + 加载插件，60s 是保守上限
     pub const WEB_START: Duration = Duration::from_secs(60);
     /// 插件 bundle 就绪轮询窗口（URL 已打印但模块服务尚未注册）
@@ -470,13 +476,41 @@ impl AiTimeouts {
     pub const REAP: Duration = Duration::from_millis(2000);
 }
 
-/// dsh CLI 是否可用（`dsh --version` 能否成功退出）
+/// 私有运行时探活结果（界面据此把"卡在哪"说清楚）
+#[derive(Clone, Serialize)]
+pub struct DshProbe {
+    /// 运行时已就绪（node.exe / dsh 的 bin.js / 指针齐全）
+    pub ready: bool,
+    /// 这一对路径来自哪里（`manual` = 用户手动指定；`None` = 未就绪）。
+    /// 界面据此决定给哪个按钮：重装 or 清除手动指定
+    pub source: Option<crate::core::runtime::RuntimeSource>,
+    /// 自带 Node 的版本（目录名，如 `v24.21.0`；手动指定 / 未就绪时 None）
+    pub node_version: Option<String>,
+    /// 实测到的 dsh 版本号（跑得起来时才有）
+    pub version: Option<String>,
+    /// 跑不起来时的原因（人话摘要 + 原话）
+    pub problem: Option<String>,
+}
+
+/// 私有运行时探活：**就绪**（目录与指针齐全）+ **实测能跑**（输出里真有版本号）。
 ///
-/// 走 `run_captured` 而不是手写 `spawn + wait`：后者**没有超时**（CLI 挂起会
-/// 永久占用一个阻塞线程，AI 面板再也拿不到状态），也**没有把子进程加入 Job Object**
-/// （应用异常退出后该进程可残留）。`run_captured` 两者都具备。
-pub fn dsh_available(job: Option<&JobObject>) -> bool {
-    run_captured(job, "dsh --version", AiTimeouts::VERSION_PROBE).is_ok()
+/// 两点为什么都必要：
+/// - 判据是"输出里有版本号"而不是"退出码为 0"。dsh 的入口是
+///   `if (import.meta.main) await runCli();`，在缺这个字段的 Node（20、24.0、24.1）上
+///   那一行永远不成立，**进程干干净净退出、零输出、退出码 0**——只判退出码会把"什么都
+///   没干"认成"可用"。这就是原实现（`dsh_available` 只看 `is_ok()`）的洞。
+/// - 返回结构体而不是 bool：把"没装"和"装了但跑不动"分开，否则界面只能笼统说
+///   "未检测到 dsh，请先安装"，用户照着重装一遍还是不行。
+pub fn probe_dsh(job: Option<&JobObject>) -> DshProbe {
+    let Some(rt) = crate::core::runtime::resolve() else {
+        return DshProbe { ready: false, source: None, node_version: None, version: None, problem: None };
+    };
+    let source = Some(rt.source);
+    let node_version = (!rt.node_version.is_empty()).then(|| rt.node_version.clone());
+    match rt.probe(job) {
+        Ok(v) => DshProbe { ready: true, source, node_version, version: Some(v), problem: None },
+        Err(e) => DshProbe { ready: true, source, node_version, version: None, problem: Some(e) },
+    }
 }
 
 // ─── dsh 版本检查 / 升级（面板「检查更新」） ─────────────────────
@@ -492,114 +526,22 @@ pub fn dsh_available(job: Option<&JobObject>) -> bool {
 /// IPC 框架能造出来。改成显式依赖后，测试传 `None`（无 Job）就能直接驱动完整路径，
 /// 与 `core/process.rs` 的 `LogSink`、`core/file_watcher.rs` 的 `on_change` 同一手法。
 /// 句柄由命令层取一次传进来（`ProcessManager::job_arc`）。
-fn run_captured(job: Option<&JobObject>, command: &str, timeout: Duration) -> Result<String, String> {
-    log::info!("[ai] 执行命令: {}", crate::core::process::mask_command(command));
-    let mut cmd = build_internal_command(command);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {}", e))?;
-    if let Some(job) = job {
-        // 纳管失败只影响"应用被强杀"这条路径（CQ-27）；assign_child 内部已给出原因，这里留痕
-        if let Err(e) = job.assign_child(&child) {
-            log::warn!("[nexus] dsh 进程未纳入 Job Object（Nexus 异常退出时可能残留）: {}", e);
-        }
-    }
-    let stdout = child.stdout.take().ok_or_else(|| "无法读取命令输出".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "无法读取命令错误输出".to_string())?;
-    let captured = Arc::new(Mutex::new(String::new()));
-    // 停止标志：超时终止进程树后置位。若孙进程仍持有管道写端，reader 不会等到 EOF，
-    // 两个线程 + 缓冲会永久留在进程里（反复点「检查更新」会持续堆积线程）
-    let stop_reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_capture_reader(stdout, Arc::clone(&captured), Arc::clone(&stop_reading));
-    spawn_capture_reader(stderr, Arc::clone(&captured), Arc::clone(&stop_reading));
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // 等 reader 把管道里剩下的读完。固定睡 150ms 在机器繁忙时会读到空 buffer，
-                // 于是"命令失败（退出码 1）。（无输出）"——把唯一的原因丢了（用户报过）。
-                // 改成"长度连续两次不变"：既等得住慢 reader，也不会白等。
-                let mut last_len = usize::MAX;
-                for _ in 0..12 {
-                    let len = captured.lock().map(|g| g.len()).unwrap_or(0);
-                    if len == last_len {
-                        break;
-                    }
-                    last_len = len;
-                    std::thread::sleep(Duration::from_millis(40));
-                }
-                let text = captured.lock().map(|g| g.clone()).unwrap_or_default();
-                if status.success() {
-                    return Ok(text);
-                }
-                // 失败要能远程排障：退出码 + 是哪条命令 + 原话，三样一起进日志和界面
-                log::warn!("[ai] 命令失败 exit={:?} cmd={} 输出={}", status.code(), command, text.trim());
-                return Err(format!(
-                    "命令失败（退出码 {:?}）：{}\n输出：{}",
-                    status.code(), command, tail_text(&text)
-                ));
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    crate::core::process::kill_and_reap(&mut child, AiTimeouts::REAP);
-                    stop_reading.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Err(format!("命令超时（超过 {} 秒），已终止：{}", timeout.as_secs(), command));
-                }
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            Err(e) => {
-                stop_reading.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Err(format!("等待命令退出失败: {}", e));
-            }
-        }
-    }
-}
-
-/// 后台线程逐行累积输出（stdout/stderr 各起一个；非 UTF-8 行跳过；保留尾部）
+/// **仅测试**：跑一条**命令串**（经 `cmd /C`）并收输出。
 ///
-/// 用 `read_log_lines`（有界行读取）而不是 `BufRead::lines()`：后者会把整行先读进内存，
-/// 命令输出单行 GB 级（base64/JSON dump）时足以打满内存；同时它允许我们在超时终止后
-/// 通过 `stop` 标志让线程主动退出（不必等管道 EOF）。
-fn spawn_capture_reader<R: std::io::Read + Send + 'static>(
-    stream: R,
-    captured: Arc<Mutex<String>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let spawn = std::thread::Builder::new()
-        .name("nexus-cmd-capture".into())
-        .spawn(move || {
-            let reader = std::io::BufReader::new(stream);
-            for line in crate::core::process::read_log_lines(reader) {
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                if let Ok(mut c) = captured.lock() {
-                    c.push_str(line.trim_end());
-                    c.push('\n');
-                    if c.len() > 6000 {
-                        let from = c.floor_char_boundary(c.len() - 3000);
-                        c.drain(..from);
-                    }
-                }
-            }
-        });
-    if let Err(e) = spawn {
-        log::warn!("[ai] 命令输出读取线程创建失败（输出将不完整）: {}", e);
-    }
-}
-
-/// 输出文本取尾部（最多 8 行；空时给占位说明）
-fn tail_text(text: &str) -> String {
-    let t = text.trim();
-    if t.is_empty() {
-        return "（无输出）".into();
-    }
-    let lines: Vec<&str> = t.lines().collect();
-    if lines.len() > 8 {
-        format!("…{}", lines[lines.len() - 8..].join("\n"))
-    } else {
-        t.to_string()
-    }
+/// 生产路径已全部改走 [`crate::core::process::run_captured_command`] 的绝对路径形态
+/// （见 `core::runtime`）。保留这一条是因为 `test_run_captured_timeout_kills_process_tree`
+/// 要用 `cmd` 内建命令驱动"超时杀进程树"那条路。`#[cfg(test)]` 如实反映
+/// "生产不再用命令串起内部命令"——这正是本轮要根除的形态。
+#[cfg(test)]
+fn run_captured(job: Option<&JobObject>, command: &str, timeout: Duration) -> Result<String, String> {
+    // 本体在 `core::process`（ARCH-24）：私有运行时那条路要起**绝对路径的程序**、
+    // 不经 cmd 不查 PATH，两条路必须共用同一套超时/杀树/输出捕获语义，否则口径会各自漂移
+    crate::core::process::run_captured_command(
+        job,
+        &mut crate::core::process::build_internal_command(command),
+        command,
+        timeout,
+    )
 }
 
 /// 解析版本号：主段数字逐段比较前统一补足 3 段 + 是否有预发布后缀。
@@ -679,8 +621,11 @@ fn cmp_pre(a: &[PreId], b: &[PreId]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
-/// 从命令输出中提取第一个形如 x.y.z（可带 v 前缀/预发布后缀）的版本号
-fn extract_version(text: &str) -> Option<String> {
+/// 从命令输出中提取第一个形如 x.y.z（可带 v 前缀/预发布后缀）的版本号。
+///
+/// `pub(crate)`：私有运行时的探测判据也用它——"什么叫一个版本号"必须只有一处定义，
+/// 否则两条路的判据迟早漂移，而这次的洞（exit 0 但零输出被判成可用）正出在判据上。
+pub(crate) fn extract_version(text: &str) -> Option<String> {
     text.lines()
         .flat_map(|l| l.split(|c: char| c.is_whitespace() || c == ','))
         .map(|tok| tok.trim_matches(['"', '\'']))
@@ -688,29 +633,26 @@ fn extract_version(text: &str) -> Option<String> {
         .map(|tok| tok.to_string())
 }
 
-/// dsh 本地安装版本（`dsh --version` 输出首个版本号；未安装/解析失败 → None）
-pub fn query_dsh_version(job: Option<&JobObject>) -> Option<String> {
-    run_captured(job, "dsh --version", AiTimeouts::VERSION_PROBE)
-        .ok()
-        .and_then(|out| extract_version(&out))
+/// 私有 dsh 的版本（**实测**；跑不起来 → None）
+pub fn query_dsh_version(rt: &AiRuntime, job: Option<&JobObject>) -> Option<String> {
+    rt.probe(job).ok()
 }
 
 /// npm registry 上 @deepseek-ai/dsh 的最新稳定版（联网，上限 30 秒）
-pub fn query_dsh_latest(job: Option<&JobObject>) -> Result<String, String> {
-    let out = run_captured(job, "npm view @deepseek-ai/dsh version", AiTimeouts::NPM_QUERY)?;
-    extract_version(&out).ok_or_else(|| format!("无法从 npm 响应解析版本号：{}", tail_text(&out)))
+///
+/// 走**私有 npm**：私有化之后目标机器上可能根本没有 Node，PATH 上没有 npm 可用；
+/// 就算有，那也是别的 Node 的 npm。镜像配置（用户的 `~/.npmrc`）依然生效。
+pub fn query_dsh_latest(rt: &AiRuntime, job: Option<&JobObject>) -> Result<String, String> {
+    let mut cmd = rt.npm_command(&["view", crate::core::runtime::DSH_PACKAGE, "version"])?;
+    let label = format!("npm view {} version（私有运行时）", crate::core::runtime::DSH_PACKAGE);
+    let out = crate::core::process::run_captured_command(job, &mut cmd, &label, AiTimeouts::NPM_QUERY)?;
+    extract_version(&out).ok_or_else(|| format!("无法从 npm 响应解析版本号：{}", crate::core::process::tail_of(&out)))
 }
 
-/// 升级/安装 dsh 到最新版（npm 全局；--no-fund/--no-audit 免噪音与审计网络请求）。
-/// 调用方须先停掉运行中的 dsh 会话（Windows 文件锁，见 commands::ai）。返回安装后的版本
-pub fn upgrade_dsh(job: Option<&JobObject>) -> Result<String, String> {
-    run_captured(
-        job,
-        "npm install -g @deepseek-ai/dsh@latest --no-fund --no-audit",
-        AiTimeouts::NPM_INSTALL,
-    )?;
-    Ok(query_dsh_version(job).unwrap_or_default())
-}
+// 升级/安装 dsh 的入口搬到了 `core::runtime::install_or_upgrade_dsh`：
+// 它必须用**私有 node + 私有 npm + `--prefix` 私有目录**（`-g` 会按用户级 `~/.npmrc`
+// 里的 `prefix=` 装进用户那份，于是界面报"升级成功"而实际跑的还是老版本、且不报错），
+// 并且装完要**实跑一次**确认——这两条都属于运行时自己的知识，不该散在 ai.rs 里。
 
 /// 会话 URL host 规范为 localhost（无功能依赖，仅统一展示/导航目标，见模块注释）
 fn to_localhost(url: &str) -> String {
@@ -734,29 +676,41 @@ fn parse_web_url(line: &str) -> Option<String> {
 /// cwd：会话工作目录（dsh web UI 的项目根）。失败路径均先杀进程树再返回，
 /// 不残留孤儿；错误携带 stderr 尾部便于诊断。
 /// job：共享 Job Object（应用异常退出时兜底清理），由命令层传入；测试传 None
+///
+/// `runtime` 提供的是**一对绝对路径**：`<私有node.exe> <私有bin.js> web …`。
+/// 这是整件事的收口——原先 `cmd /C "dsh web …"` 要经两次 PATH 解析（dsh 的 shim →
+/// shim 里的裸 `node`），于是"AI 用哪个 Node"由用户 nvm 当前选中的版本决定。
 pub fn spawn_dsh_web(
+    runtime: &AiRuntime,
     job: Option<&JobObject>,
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<AiSession, String> {
-    spawn_web_command(job, "dsh web --no-open --port 0", cwd, timeout)
+    spawn_web_command(
+        job,
+        runtime.command(&["web", "--no-open", "--port", "0"]),
+        cwd,
+        timeout,
+    )
 }
 
 /// `spawn_dsh_web` 的实体。
 ///
 /// 命令为何是参数（ARCH-19）：这条函数里有 spawn + 双流读取 + URL 解析 + 三条 kill 清理
-/// 路径，却长期零覆盖——它们此前只能靠"机器上真的装了 dsh"才能走到。把命令串变成参数后，
-/// 测试用一条 `cmd` 就能驱动全部路径（生产只有一个入口，即上面的 `spawn_dsh_web`）。
+/// 路径，却长期零覆盖——它们此前只能靠"机器上真的装了 dsh"才能走到。命令变成参数后，
+/// 测试用一条 `cmd /C …` 就能驱动全部路径（生产只有一个入口，即上面的 `spawn_dsh_web`）。
+///
+/// 参数从"命令串"改成 `Command`：生产那条路**必须能指定绝对路径的可执行文件**
+/// （`Command::new` 收的必须是绝对路径），而命令串只能经 `cmd /C` 再查 PATH。
+/// 测试那条路自己用 `build_internal_command` 拼 `cmd /C`，能力一点没减。
 fn spawn_web_command(
     job: Option<&JobObject>,
-    command: &str,
+    mut cmd: Command,
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<AiSession, String> {
     log::info!("[ai] 启动 dsh web (cwd={:?})", cwd);
 
-    // 内部命令（dsh/npm）：禁用"当前目录优先解析"，否则项目内的 dsh.cmd 会被优先执行（SEC-12）
-    let mut cmd = build_internal_command(command);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -1519,7 +1473,7 @@ mod tests {
 
         let captured = Arc::new(Mutex::new(String::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        spawn_capture_reader(std::io::Cursor::new(payload.into_bytes()), Arc::clone(&captured), Arc::clone(&stop));
+        crate::core::process::spawn_capture_reader(std::io::Cursor::new(payload.into_bytes()), Arc::clone(&captured), Arc::clone(&stop));
 
         // 读取线程不返回 join 句柄（生产路径也不回收）：轮询等它把内存输入读完
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1533,20 +1487,7 @@ mod tests {
         assert!(!text.contains("line-00000-"), "最旧的行应已被丢弃");
     }
 
-    /// 失败信息里的输出只取尾部 8 行：界面上不能因一条命令失败就贴一屏；
-    /// 一条输出都没有时给固定占位（而不是空白，否则像是"错误信息丢了"）
-    #[test]
-    fn test_tail_text_keeps_last_lines_only() {
-        assert_eq!(tail_text("  \n\t "), "（无输出）");
-        assert_eq!(tail_text("a\nb"), "a\nb", "8 行以内原样返回");
-
-        let text = (1..=12).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
-        let out = tail_text(&text);
-        assert!(out.starts_with('…'), "截断要留痕（否则读的人以为命令只输出这几行）: {}", out);
-        assert_eq!(out.lines().count(), 8, "省略号贴在第一个保留行上 + 尾部 8 行: {}", out);
-        assert!(out.ends_with("12"), "保留的是最后一行: {}", out);
-        assert!(out.contains("…5"), "省略号标在被丢掉的边界上: {}", out);
-    }
+    // `tail_text` 的用例随函数搬到了 `core::process`（见那里的 test_tail_of_keeps_last_lines_only）
 
     // ── 超时 / 杀进程树（ARCH-19：这三条路径此前零覆盖）──────────────
     //
@@ -1646,7 +1587,7 @@ mod tests {
             "echo http://127.0.0.1:{}/?token=ut-token & .\\{} -n {} 127.0.0.1 > NUL",
             port, name, PROBE_PINGS
         );
-        let mut session = spawn_web_command(None, &cmd, Some("target"), Duration::from_secs(10))
+        let mut session = spawn_web_command(None, crate::core::process::build_internal_command(&cmd), Some("target"), Duration::from_secs(10))
             .expect("应解析到启动 URL");
 
         assert_eq!(session.url, format!("http://localhost:{}/?token=ut-token", port));
@@ -1668,7 +1609,7 @@ mod tests {
         // 先写 stderr，再用探针拖 1 秒才退出：stderr 尾部是异步线程写的，
         // 进程立刻退出会让"读到没有"变成掷骰子（生产里同样存在这个窗口）
         let cmd = format!("echo dsh-not-installed 1>&2 & {} -n 2 127.0.0.1 > NUL", rel);
-        let err = match spawn_web_command(None, &cmd, None, Duration::from_secs(10)) {
+        let err = match spawn_web_command(None, crate::core::process::build_internal_command(&cmd), None, Duration::from_secs(10)) {
             Err(e) => e,
             Ok(s) => panic!("没打印 URL 就必须失败（实际拿到 url={} pid={}）", s.url, s.pid),
         };
@@ -1689,7 +1630,7 @@ mod tests {
         let (rel, name, abs) = spawn_probe();
         let cmd = format!("{} -n {} 127.0.0.1 > NUL", rel, PROBE_PINGS);
         let started = Instant::now();
-        let err = match spawn_web_command(None, &cmd, None, Duration::from_millis(300)) {
+        let err = match spawn_web_command(None, crate::core::process::build_internal_command(&cmd), None, Duration::from_millis(300)) {
             Err(e) => e,
             Ok(s) => panic!("超时必须失败（实际拿到 url={} pid={}）", s.url, s.pid),
         };

@@ -16,6 +16,7 @@ use std::process::Stdio;
 use serde::Serialize;
 use tauri::command;
 
+use crate::core::download::{run_curl, run_curl_stdout};
 use crate::core::winenv::env_or_persistent;
 
 /// 找到的 nvm-windows 安装
@@ -281,14 +282,6 @@ pub struct NvmInstallResult {
     pub path: String,
 }
 
-/// Windows 自带的 curl（Win10 1803 起内置）。
-///
-/// 用绝对路径而不是裸名，与 `run_nvm` 同一个理由：不依赖 PATH，也不受"先搜当前目录"影响。
-fn system_curl() -> PathBuf {
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    Path::new(&sysroot).join("System32").join("curl.exe")
-}
-
 /// 文件像不像个能跑的安装器：够大 + `MZ` 头。
 /// curl 的 `--fail` 挡了 4xx/5xx，但"下到一半断线"仍会留下一个短文件——不验就会把它执行起来。
 /// 官方 nvm-windows 1.2.2 安装器的 SHA-256（SEC-20）。
@@ -342,87 +335,6 @@ fn valid_installer_with(path: &Path, expected_sha256: &str) -> bool {
             false
         }
     }
-}
-
-/// 用系统自带的 curl 把一个 URL 下到本地文件（`max_time` 是整体超时，单位秒）。
-///
-/// 两处下载共用：nvm 安装器（GitHub release 直链）与版本索引（镜像上的 `index.json`）。
-/// 用 curl 而不是引 HTTP 客户端：Rust 侧至今没有 HTTP 依赖，而且**前端也够不着这两个地址**
-/// （CSP 只放开了 api.github.com）——引一个客户端只为下两个文件不划算。
-///
-/// 失败时把 URL 一起写进错误里：这两条地址一个来自常量、一个来自用户的 `settings.txt`，
-/// 出问题时第一件要知道的事就是"到底去哪个地址取的"。
-fn run_curl(url: &str, dest: &Path, max_time: u32) -> Result<(), String> {
-    run_curl_raw(url, Some(dest), max_time).map(|_| ())
-}
-
-/// 同上，但结果**直接从 stdout 取**，不落任何文件（CQ-43）。
-///
-/// 为什么要有这一支：版本索引原先下到固定的 `%TEMP%\nexus\node-index.json` 再读回来，
-/// 而两条并发调用（关掉面板再打开就会触发）会同时写它——curl 截断重写时另一路读到半截，
-/// 报出来是"版本索引不是预期的 JSON"这种假错误。索引本来就只是一次性解析，不必落盘。
-fn run_curl_stdout(url: &str, max_time: u32) -> Result<Vec<u8>, String> {
-    run_curl_raw(url, None, max_time).map(|out| out.stdout)
-}
-
-/// curl 调用的公共部分：拼参数、起进程、把非零退出码翻成带地址的错误。
-/// `dest` 为 `None` = 不指定 `-o`，curl 把正文写到 stdout。
-fn run_curl_raw(
-    url: &str,
-    dest: Option<&Path>,
-    max_time: u32,
-) -> Result<std::process::Output, String> {
-    let curl = system_curl();
-    if !curl.is_file() {
-        return Err(format!(
-            "找不到 {}（Windows 自带的下载组件）——请手动下载：{}",
-            curl.display(), url
-        ));
-    }
-    if let Some(dir) = dest.and_then(Path::parent) {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {} 失败: {}", dir.display(), e))?;
-    }
-
-    let mut cmd = std::process::Command::new(&curl);
-    // 显式设置收口（spawn_guard 的 GUARD-1）：这里是绝对路径调用，本来就不搜当前目录，
-    // 写上是为了让"新增的进程调用"在守卫里是一次明确决定，而不是漏写
-    cmd.env("NoDefaultCurrentDirectoryInExePath", "1")
-        .args([
-            "-L",                 // release 直链会 302 到 objects.githubusercontent.com，镜像也会 302
-            "--fail",             // 4xx/5xx 直接算失败，别把错误页当成正经文件存下来
-            "--retry", "3",       // 国内直连偶尔断流，重试几次比让用户重来便宜
-            "--retry-delay", "2",
-            "--connect-timeout", "20",
-            "--max-time",
-        ])
-        .arg(max_time.to_string())
-        .args(["--silent", "--show-error"]);
-    if let Some(d) = dest {
-        cmd.arg("-o").arg(d);
-    }
-    cmd.arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let out = cmd.output().map_err(|e| format!("启动下载失败: {}", e))?;
-    if !out.status.success() {
-        let detail = decode_output(&out.stderr);
-        return Err(format!(
-            "下载失败（curl 退出码 {:?}）：{}\n地址：{}",
-            out.status.code(),
-            detail.trim(),
-            url
-        ));
-    }
-    Ok(out)
 }
 
 /// 下载官方安装器（本地已有一份合格的就不再下——安装器可重复运行，没必要重下 5.6 MB）

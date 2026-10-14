@@ -3,6 +3,7 @@ import { Modal } from '../ui/Modal';
 import { GeneralSection } from './GeneralSection';
 import { EditorSection } from './EditorSection';
 import { NodeVersionSection } from './NodeVersionSection';
+import { AiRuntimeSection } from './AiRuntimeSection';
 
 /**
  * 设置面板：**全部应用设置的唯一容器**（左分类 + 右内容）。
@@ -19,13 +20,14 @@ import { NodeVersionSection } from './NodeVersionSection';
  * **两个入口共用本组件**（见 `TitleBar`）：标题栏右侧的「Node v22.22.1」按钮与
  * 菜单里的「设置 > Node 版本」打开的是同一个面板、同一个分类——不是两套界面渲染同一份状态。
  */
-export type SettingsSection = 'general' | 'editor' | 'node';
+export type SettingsSection = 'general' | 'editor' | 'node' | 'ai';
 
 /** 左栏分类表（顺序即显示顺序） */
 const SECTIONS: { key: SettingsSection; label: string }[] = [
   { key: 'general', label: '通用' },
   { key: 'editor', label: '编辑器' },
   { key: 'node', label: 'Node 版本' },
+  { key: 'ai', label: 'AI 运行时' },
 ];
 
 interface SettingsModalProps {
@@ -100,6 +102,7 @@ export function SettingsModal({
       {section === 'general' && <GeneralSection />}
       {section === 'editor' && <EditorSection />}
       {section === 'node' && <NodeVersionSection onChanged={onNodeChanged} />}
+      {section === 'ai' && <AiRuntimeSection />}
     </Modal>
   );
 }

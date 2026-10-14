@@ -9,7 +9,9 @@
 //! `rename_all`）不会有任何编译或类型错误，前端只会在运行时拿到 `undefined`——
 //! 这类故障在界面上表现为"某个字段莫名其妙是空的"，很难定位。这里把字段名钉住。
 
-use crate::commands::ai::{AiStatus, DshVersionInfo};
+use crate::commands::ai::{AiRuntimeStatus, AiStatus, DshVersionInfo};
+use crate::core::ai::DshProbe;
+use crate::core::runtime::{RuntimeFailure, RuntimeProgress, RuntimeSource};
 use crate::commands::app::AppPaths;
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
@@ -84,9 +86,20 @@ fn test_response_dtos_are_snake_case() {
         url: None,
         pid: None,
         cwd: None,
-        dsh_found: true,
+        runtime: DshProbe {
+            ready: true,
+            source: None,
+            node_version: None,
+            version: None,
+            problem: None,
+        },
     };
-    assert_eq!(keys_of(&status), sorted(&["running", "url", "pid", "cwd", "dsh_found"]));
+    assert_eq!(keys_of(&status), sorted(&["running", "url", "pid", "cwd", "runtime"]));
+    // 运行时的子字段也是契约的一部分（面板据此决定给哪个按钮）
+    assert_eq!(
+        keys_of(&status.runtime),
+        sorted(&["ready", "source", "node_version", "version", "problem"])
+    );
 
     // dsh 版本信息（面板「检查更新」）
     let info = DshVersionInfo {
@@ -96,6 +109,50 @@ fn test_response_dtos_are_snake_case() {
         outdated: false,
     };
     assert_eq!(keys_of(&info), sorted(&["dsh_found", "current", "latest", "outdated"]));
+
+    // AI 运行时状态（设置 > AI 运行时）
+    let runtime_status = AiRuntimeStatus {
+        ready: true,
+        source: None,
+        node_version: None,
+        dsh_version: None,
+        problem: None,
+        size_bytes: 0,
+        path: "p".into(),
+        install_dir: "d".into(),
+        has_manual: false,
+        steps: Vec::new(),
+    };
+    assert_eq!(
+        keys_of(&runtime_status),
+        sorted(&[
+            "ready", "source", "node_version", "dsh_version", "problem",
+            "size_bytes", "path", "install_dir", "has_manual", "steps",
+        ])
+    );
+    // `source` 的取值也是契约：前端按 `'manual'` 决定给「清除手动指定」还是「重新安装」
+    assert_eq!(
+        serde_json::to_value(RuntimeSource::Manual).unwrap(),
+        serde_json::Value::String("manual".into()),
+    );
+    assert_eq!(
+        serde_json::to_value(RuntimeSource::Private).unwrap(),
+        serde_json::Value::String("private".into()),
+    );
+
+    // 安装进度（`ai-runtime-progress` 事件载荷）：界面按 step_index 高亮步骤条
+    let progress = RuntimeProgress { step_index: 0, detail: "d".into(), downloaded: 0, total: 0 };
+    assert_eq!(keys_of(&progress), sorted(&["step_index", "detail", "downloaded", "total"]));
+
+    // 安装失败（`ai_runtime_install` 的错误体）：四段分开，界面才能"先说卡在哪、再贴原话"
+    let failure = RuntimeFailure::busy();
+    assert_eq!(keys_of(&failure), sorted(&["step_index", "step", "summary", "raw"]));
+    // `busy` 与具体步骤无关 → step_index 必须是 null（界面据此不高亮任何一格）
+    assert_eq!(
+        serde_json::to_value(&failure).unwrap().get("step_index"),
+        Some(&serde_json::Value::Null),
+        "与步骤无关的失败不能假装卡在某一步"
+    );
 
     // 应用自己的数据/日志目录（设置 > 通用 > 数据与日志）：三个路径原样显示给用户，
     // 用户照着它去翻日志——字段名错了就是界面上那行路径空白
@@ -570,6 +627,17 @@ fn scan_ipc_structs() -> IpcStructs {
 /// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
 const COVERED_RESPONSE: &[&str] = &[
         "AiStatus", "DshVersionInfo", "AppPaths",
+        // AI 私有运行时：状态走 invoke，进度走 `ai-runtime-progress` 事件，失败体是
+        // `ai_runtime_install` 的 Err 载荷——三条都出前端，字段名都得钉住
+        "DshProbe", "AiRuntimeStatus", "RuntimeProgress", "RuntimeFailure",
+        // 豁免：`AiRuntime` 是**进程内的句柄**（一对绝对路径 + 版本号），只给 `spawn_dsh_web`
+        // 用，从不经 IPC 出前端——前端看到的是 `AiRuntimeStatus`（它才是那个载荷的 DTO）。
+        // 保留 `Serialize` 只为一件事：安装成功时记一条含它的日志（`log::info!` 的 `{}` 需要）
+        "AiRuntime",
+        // 豁免：`ManualConfig` 是**磁盘上的配置文件格式**（`<data_dir>/ai-runtime.json`），
+        // 只在 core::runtime 内部读写，不过 IPC。它同时 derive 了 Deserialize，
+        // 所以请求侧那条守卫也看得见它——两处都登记（见 COVERED_REQUEST_ONLY）
+        "ManualConfig",
         "FileEntry", "ReadFileResponse", "HexPage", "JarEntryContent",
         "PasteFilesResult", "PasteConflict",
         "ToolCommandResult", "ToolCommandLogLine", "ToolCommandLogBatchPayload",
@@ -622,6 +690,9 @@ fn test_every_serializable_struct_is_covered() {
 fn test_every_deserializable_struct_is_covered() {
     /// 只做**请求方向**的类型：有 `from_value` 断言（且断言到"值与默认不同"）
     const COVERED_REQUEST_ONLY: &[&str] = &[
+        // 磁盘上的配置文件格式（同上）：不经 IPC，也不受"请求参数 camelCase"约束——
+        // 它给人看、可手工编辑，字段名跟着 Rust 侧走
+        "ManualConfig",
         "SearchParams",                    // ARCH-12：三个 default 字段的静默回落
         "AddServiceParams",
         "UpdateServiceParams",
