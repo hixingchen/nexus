@@ -13,6 +13,9 @@
 //!
 //! 扫描是启发式的（与 `contract.rs` 的覆盖守卫同款），**故意宽松**：漏报只是退回今天的行为，
 //! 误报的代价是在豁免表里加一行带理由的条目。它的目的是提醒，不是证明。
+//!
+//! GUARD-2（本文件末尾）守的是另一件同源的事：**起控制台程序时压住它自己的窗口**
+//! （打包版 Nexus 是 GUI 子系统、没有控制台，漏了就会在用户桌面上多一个黑窗）。
 
 /// 允许**不做**收口的调用点（键为「相对 `src/` 的路径」+「所属函数」）。
 ///
@@ -47,13 +50,10 @@ const EXEMPT: &[(&str, &str, &str)] = &[
          也不受「先搜当前目录」影响——与 spawn_tool_program 的直启分支同理。\
          用绝对路径是有意的：Nexus 启动时的 PATH 未必与用户终端一致，裸名可能压根找不到 nvm",
     ),
-    ("core/runtime.rs", "command", ABS_PATH_RUNTIME),
-    ("core/runtime.rs", "npm_command", ABS_PATH_RUNTIME),
-    ("core/runtime.rs", "install_dsh", ABS_PATH_RUNTIME),
-    ("core/runtime.rs", "run_direct", ABS_PATH_RUNTIME),
+    ("core/runtime.rs", "direct_command", ABS_PATH_RUNTIME),
 ];
 
-/// `core/runtime.rs` 那几处豁免共用的理由（同源四处，写一遍免得各说各话）。
+/// `core/runtime.rs` 那处豁免的理由（该模块的四个 spawn 点都收口到这一个构造函数）。
 ///
 /// 它比设置 `NoDefaultCurrentDirectoryInExePath` **更强一级**：那一级是"名字解析时跳过当前
 /// 目录"，这里是"名字解析压根不发生"——传进去的是私有运行时解析出的 `node.exe` /
@@ -226,5 +226,76 @@ fn test_exempt_list_has_no_stale_entries() {
         stale.is_empty(),
         "EXEMPT 里这些条目在源码中已找不到对应调用点（函数改名/删除了？）：{:?}",
         stale
+    );
+}
+
+// ─── GUARD-2：起控制台程序的地方必须对"窗口"表过态 ────────────────
+
+/// GUARD-2 的扫描范围（相对 `src/`）：**故意只守这一个文件**。
+///
+/// 为什么不扫全仓：判定"该不该有窗口"要看调用点的性质——`open_terminal` 有意开一个终端
+/// （`CREATE_NEW_CONSOLE`），`open_in_explorer` / `run_installer` 拉的是 GUI 程序
+/// （explorer.exe、Inno 安装器本就不建控制台）。把它们一起扫进来只会得到一张越写越长的
+/// 豁免表，最后没人看。真正会踩坑的是**我们自己起控制台程序的地方**——今天就是这里
+/// （`node.exe`），而它的 spawn 点已全部收口到 `direct_command`，扫一遍就堵死了。
+const WINDOW_GUARD_FILE: &str = "core/runtime.rs";
+
+/// 把控制台窗口**压掉**的写法（三选一，都是本仓在用的写法）
+const WINDOW_SUPPRESSED: [&str; 3] = ["CREATE_NO_WINDOW", "0x08000000", "SERVICE_CREATE_FLAGS"];
+/// 有意**新开**窗口的写法（用户自己要看的终端）
+const WINDOW_INTENDED: [&str; 2] = ["CREATE_NEW_CONSOLE", "0x00000010"];
+
+/// GUARD-2：`core/runtime.rs` 里每一处 `Command::new(` 都必须对控制台窗口**表过态**。
+///
+/// 为什么需要：打包版 Nexus 是 GUI 子系统、自己没有控制台（`main.rs` 的
+/// `windows_subsystem = "windows"`），而 `node.exe` 是控制台程序——"父进程无控制台 + 没给
+/// `CREATE_NO_WINDOW`"时 `CreateProcess` 会给它**新建一个控制台窗口**。1.9.0 真发生过：
+/// 启动链从 `cmd /C`（标志由 `SERVICE_CREATE_FLAGS` 顺带带上）改成绝对路径直起之后，
+/// 这里的四个 spawn 点一个都没带标志，于是"打开 AI 面板就闪出一个标题为 `node.exe` 全路径的
+/// 黑窗，会话起来后它还一直留着，关掉它连 AI 会话一起关掉"——而**全程不报任何错**。
+///
+/// 判据是"表过态"而不是"必须压掉"：有意开窗口的写法（`CREATE_NEW_CONSOLE`）同样通过。
+/// 这条守卫要的是"作者想过这件事"，不是替他决定该不该有窗口。
+#[test]
+fn test_runtime_spawns_decide_about_console_window() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let text = std::fs::read_to_string(root.join(WINDOW_GUARD_FILE)).unwrap_or_else(|e| {
+        panic!("读不到 {}（改名/移动了？这条守卫要跟着走）：{}", WINDOW_GUARD_FILE, e)
+    });
+    let lines: Vec<&str> = text.lines().collect();
+    let prod_end = test_module_start(&lines).unwrap_or(lines.len());
+
+    let mut spawns = 0;
+    let mut undecided = Vec::new();
+    for (i, line) in lines.iter().enumerate().take(prod_end) {
+        if !line.contains("Command::new(") {
+            continue;
+        }
+        spawns += 1;
+        // 与 GUARD-1 同一个窗口大小：`CREATE_NO_WINDOW` 就在 `creation_flags` 那一行上
+        let window = lines[i..(i + 12).min(lines.len())].join("\n");
+        let decided = WINDOW_SUPPRESSED
+            .iter()
+            .chain(WINDOW_INTENDED.iter())
+            .any(|m| window.contains(m));
+        if !decided {
+            undecided.push(i + 1);
+        }
+    }
+
+    assert!(
+        spawns >= 1,
+        "{} 里一处 `Command::new(` 都没扫到——路径或解析失效，这条守卫正在空转",
+        WINDOW_GUARD_FILE
+    );
+    assert!(
+        undecided.is_empty(),
+        "{} 的第 {:?} 行起进程时没有对**控制台窗口**表态。打包版 Nexus 没有控制台，\
+         控制台子进程会各自新建一个黑窗（标题是 exe 全路径），关掉它还等于关掉那个服务。\n\
+         处置二选一：\n\
+         ① 压住 → `.creation_flags(CREATE_NO_WINDOW)`（0x08000000；本文件的 spawn 点已全部\
+         收口到 `direct_command`，加在那里最省事）；\n\
+         ② 确实要让用户看见窗口 → `CREATE_NEW_CONSOLE`（0x00000010）。",
+        WINDOW_GUARD_FILE, undecided
     );
 }

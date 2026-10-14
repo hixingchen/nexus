@@ -147,13 +147,37 @@ pub struct AiRuntime {
     pub source: RuntimeSource,
 }
 
+/// 起一个**绝对路径**的程序，并压住它可能弹出的控制台窗口。
+///
+/// 为什么必须有这一位（1.9.0 的回归）：打包版 Nexus 是 GUI 子系统、**自己没有控制台**
+/// （见 `main.rs` 的 `windows_subsystem = "windows"`），而 `node.exe` 是控制台程序——
+/// "父进程无控制台 + 没给 `CREATE_NO_WINDOW`"时 `CreateProcess` 会给它**新建一个控制台窗口**。
+/// 现象：打开 AI 面板时闪出一个标题为 `…\runtime\node\<版本>\node.exe` 的黑窗（探活那一次），
+/// 会话起来后那个窗口一直留在桌面上；用户顺手关掉它 = 连 AI 会话一起关掉。
+/// 本机实测（2026-10-14，GUI 子系统父进程 + 这份私有 `node.exe`）：不带标志会新建一个
+/// `CASCADIA_HOSTING_WINDOW_CLASS` 窗口（标题正是 node.exe 全路径），带上之后一个都不建。
+///
+/// 这条链原本是 `cmd /C "dsh web …"`，窗口由 `process::SERVICE_CREATE_FLAGS` 顺带压住；
+/// 改成"绝对路径直起"之后标志丢了——`cmd` 那条路还在带，本模块的四个 spawn 点却一个都没带。
+fn direct_command(exe: &Path) -> Command {
+    let mut c = Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 控制台程序**不带窗口**运行：控制台句柄不设、窗口不建，管道读写不受影响
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
 impl AiRuntime {
     /// 起一个 dsh 命令：`<node.exe> <bin.js> <args…>`
     ///
     /// **不经 cmd、不查 PATH**——这正是整个模块存在的理由。调用方拿到 Command 后
     /// 自己设 cwd / stdio，再交给 `core::process::run_captured_command` 或 `.spawn()`。
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(&self.node_exe);
+        let mut c = direct_command(Path::new(&self.node_exe));
         c.arg(&self.dsh_js).args(args);
         c
     }
@@ -192,7 +216,7 @@ impl AiRuntime {
                 }
             )
         })?;
-        let mut c = Command::new(&self.node_exe);
+        let mut c = direct_command(Path::new(&self.node_exe));
         c.arg(npm).args(args);
         Ok(c)
     }
@@ -736,7 +760,7 @@ fn extract_node_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 fn install_dsh(job: Option<&JobObject>, node_exe: &Path, npm_cli: &Path) -> Result<(), String> {
     let prefix = ai_dir();
     std::fs::create_dir_all(&prefix).map_err(|e| format!("建目录 {} 失败: {}", prefix.display(), e))?;
-    let mut cmd = Command::new(node_exe);
+    let mut cmd = direct_command(node_exe);
     cmd.arg(npm_cli)
         .arg("install")
         .arg("--prefix")
@@ -757,7 +781,7 @@ fn run_direct(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(exe);
+    let mut cmd = direct_command(exe);
     cmd.args(args);
     if let Some(d) = cwd {
         cmd.current_dir(d);
