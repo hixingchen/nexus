@@ -5,6 +5,7 @@ import {
   useEditorStore,
   selectMdPreviewOnActiveTab,
   loadAndOpenFile,
+  locateFile,
   saveActiveFile,
   commitReloadedContent,
   flushPendingEdits,
@@ -39,7 +40,7 @@ function freshTab(path: string): FileTab {
  * tabs/activeTabId/dirtyIds（`updateDraft` 按活动标签判定，残留的活动标签会让断言错位）。
  */
 function resetStore(): void {
-  useEditorStore.setState({ tabs: [], activeTabId: null, fileContent: null, dirtyIds: [] });
+  useEditorStore.setState({ tabs: [], activeTabId: null, fileContent: null, dirtyIds: [], locate: null });
 }
 
 function openTab(path: string, content: string): FileTab {
@@ -288,6 +289,37 @@ test('md 默认走渲染预览，且视图模式按标签各记（不被别的�
   // 再切回 b：它的预览模式也还在
   useEditorStore.getState().setActiveTabId(b.id);
   assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), true);
+});
+
+/**
+ * 搜索结果定位：md 必须切到源码模式，否则 locate 没人消费。
+ *
+ * 守的是一次实测到的缺口：md 默认打开渲染预览，而"滚到第 N 行 + 高亮命中词"只有
+ * CodeViewer 能做；预览没有行锚点 → locate 请求被静默丢弃（点了搜索结果，文件停在
+ * 第一屏）。这组用例走"标签已打开 + 内容已缓存"的路径，不需要 IPC。
+ */
+test('locateFile：md 标签切到源码模式，并写入 locate 请求', async () => {
+  resetStore();
+  const tab = openTab('/p/doc.md', '# A\n\nneedle here');
+  assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), true, '前置：md 默认预览');
+
+  await locateFile(tab.path, tab.name, 3, 'needle');
+
+  const st = useEditorStore.getState();
+  assert.equal(
+    selectMdPreviewOnActiveTab(st),
+    false,
+    '定位后该标签应切到源码（预览不挂 CodeViewer，locate 会被丢掉）',
+  );
+  assert.deepEqual(st.locate, { path: tab.path, line: 3, query: 'needle' });
+});
+
+test('locateFile：非 md 标签不动视图模式，只写 locate', async () => {
+  resetStore();
+  const tab = openTab('/p/x.ts', 'const x = 1;');
+  await locateFile(tab.path, tab.name, 1, 'x');
+  assert.equal(useEditorStore.getState().tabs[0]?.preview, undefined, '非 md 不该被写入 preview');
+  assert.deepEqual(useEditorStore.getState().locate, { path: tab.path, line: 1, query: 'x' });
 });
 
 test('非 Markdown 标签的判据恒为 false（预览按钮不显示，切换也不生效）', () => {

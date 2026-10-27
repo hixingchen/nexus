@@ -144,6 +144,12 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
         .arg("--showversion").arg("false")
         .arg(&class_path)
         .stdin(Stdio::null())
+        // **必须显式 piped**：默认是 inherit——CFR 的源码会直接打印到父进程的控制台，
+        // `wait_with_output()` 只能收 piped 流，拿到的 stdout 是空的。原实现从
+        // `cmd.output()`（默认 piped）改成 `spawn()` + 纳管 Job Object 时漏了这两行，
+        // 于是**所有 class 都反编译成功但内容为空**（打开是空标签），而不是报错回退。
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // kill_on_drop：timeout 丢弃 future 时 Child 被 drop → 自动终止 java 进程，
         // 避免反复打开卡死的 class 堆积僵尸 JVM
         .kill_on_drop(true);
@@ -172,8 +178,14 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
 
     match output {
         Ok(Ok(output)) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            Ok(strip_cfr_banner(&text).to_string())
+            // 成功退出但输出为空 = 没有反编译结果（CFR 对个别类会这样）。
+            // 不能把空串当成功返回：上层会显示一个空标签，而不是回退到字节码视图。
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let text = strip_cfr_banner(&raw);
+            if text.trim().is_empty() {
+                return Err("CFR 未输出反编译结果（结果为空）".into());
+            }
+            Ok(text.to_string())
         }
         Ok(Ok(output)) => Err(format!(
             "CFR 退出码 {}: {}",

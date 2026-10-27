@@ -1,4 +1,5 @@
 import { Component, type ReactNode } from 'react';
+import { logToBackend } from '../../utils/logSink';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -22,8 +23,14 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
   componentDidCatch(error: unknown, errorInfo: unknown) {
     // 详细原因进控制台（兜底 UI 只给用户可读提示）
-    // 只留控制台：这里已经渲染了降级界面（用户看得见），再弹 toast 是重复告知
+    // 不弹 toast：这里已经渲染了降级界面（用户看得见），再弹一次是重复告知
     console.error('[ErrorBoundary] 渲染失败:', error, errorInfo);
+    // 但必须落盘：打包版没有控制台，兜底 UI 那句"原因见控制台"是句空话。
+    // 与 reportError 不重复——边界接住的渲染异常根本走不到 reportError
+    logToBackend(
+      'error',
+      `[ErrorBoundary] 渲染失败: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+    );
   }
 
   render() {

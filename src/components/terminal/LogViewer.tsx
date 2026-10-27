@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { useUiStore } from '../../stores/uiStore';
 import { parseEditorFontSize } from '../../utils/editorFont';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
@@ -261,15 +262,35 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   // ── 快捷键 ────────────────────────────────────────────────
 
+  /**
+   * Esc 关闭用的最新回调。
+   *
+   * 监听只挂一次（挂载/卸载各一次），不能闭包住首次渲染的 `onClose`——它每次渲染都是
+   * 新的箭头函数；即便它内部只是 `setViewingLog(null)`，也该按"用当下这个"来写。
+   */
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault();
         setTimeout(() => searchRef.current?.focus(), 50);
       }
-      if (e.key === 'Escape' && document.activeElement === searchRef.current) {
+      if (e.key !== 'Escape') return;
+      // 搜索框里的 Esc 只退出输入（与改动前一致）；再按一次才是关面板
+      if (document.activeElement === searchRef.current) {
         searchRef.current?.blur();
+        return;
       }
+      // 弹窗/输入表单里的 Esc 不是"关日志"：弹窗优先、输入优先（编辑面板可叠在日志上）
+      if (useUiStore.getState().modalCount > 0) return;
+      const t = e.target;
+      if (t instanceof HTMLElement
+        && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      // Esc 是日志面板除 ✕ 之外的**第二出口**：✕ 被通知/原生层挡住、或头部被滚出视区时，
+      // 键盘仍能把面板关掉（README 也承诺了"Esc 关闭面板"）
+      onCloseRef.current?.();
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
@@ -392,7 +413,11 @@ function LogHeader({
   /** 「清空」的两步确认（UX-19）：第一次点只是把按钮换成确认条，可取消 */
   const [confirmClear, setConfirmClear] = useState(false);
   return (
-    <div className="flex-shrink-0 flex items-center h-12 px-4 border-b border-[#30363d] bg-[#161b22] gap-3 select-none">
+    /* 头部**允许换行**：窗口窄时（AI 面板 + 服务列同时展开，主区只剩几百像素）
+       右侧的查找/暂停/清空原本全是 flex-shrink-0，会被裁到容器外面——截图里
+       「清空这 N 行？确认清空」只露出半截就是这条路径。现在信息区留在第一行，
+       操作组作为一个整体在放不下时换到第二行右对齐，所有按钮都保持可点。 */
+    <div className="flex-shrink-0 flex flex-wrap items-center min-h-12 px-4 py-1.5 border-b border-[#30363d] bg-[#161b22] gap-x-3 gap-y-1.5 select-none">
       {onClose && (
         <button aria-label="关闭日志面板"
           className="h-7 w-7 flex items-center justify-center rounded-lg text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
@@ -405,7 +430,7 @@ function LogHeader({
       <span className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${
         isRunning ? 'bg-nexus-success' : failure ? 'bg-nexus-error' : 'bg-nexus-muted/40'
       }`}/>
-      <span className="text-[13px] text-[#c9d1d9] font-medium truncate">{serviceName}</span>
+      <span className="text-[13px] text-[#c9d1d9] font-medium truncate min-w-0">{serviceName}</span>
       {/* 状态标签：运行中 / 已失败（退出码） / 未运行。
           文案与卡片徽章同源（utils/serviceFailure），两处必须说同一件事 */}
       <span
@@ -423,57 +448,61 @@ function LogHeader({
       <span className="text-[12px] text-[#8b949e] flex-shrink-0" title="当前行数（只保留最新 2000 行）">
         {lineCount.toLocaleString()} 行
       </span>
-      <div className="flex-1"/>
 
-      <div className="flex items-center gap-1.5 bg-[#0d1117] rounded-lg px-2.5 h-[30px] border border-[#30363d] focus-within:border-[#58a6ff] transition-colors">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#8b949e" strokeWidth="1.5"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4 4"/></svg>
-        <input ref={searchRef as React.Ref<HTMLInputElement>}
-          // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
-          aria-label="查找日志"
-          className="w-[130px] bg-transparent text-[12px] text-[#c9d1d9] outline-none placeholder:text-[#484f58] font-mono"
-          placeholder="查找…" value={searchTerm}
-          onChange={e => { setSearchTerm(e.target.value); setSearchIdx(() => 0); }}
-          onKeyDown={e => { if (isSubmitEnter(e)) { e.preventDefault(); onGoMatch(e.shiftKey ? -1 : 1); } }}/>
-        {searchActive && (
-          <>
-            <span className="text-[11px] text-[#8b949e] font-mono tabular-nums w-[32px] text-right">{searchMatches > 0 ? `${Math.min(searchIdx + 1, searchMatches)}/${searchMatches}` : '0/0'}</span>
-            {/* UX-11：按钮里只有一个三角符号，读屏念不出它是干什么的 */}
-            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="上一个匹配（Shift+Enter）" onClick={() => onGoMatch(-1)}>▲</button>
-            <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="下一个匹配（Enter）" onClick={() => onGoMatch(1)}>▼</button>
-          </>
+      {/* 操作组：整体右对齐（ml-auto）；放不下时作为一个整体换到下一行，
+          组内再放不下（查找框 + 匹配数 + 三个按钮）时还可以继续换行 */}
+      <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1.5 min-w-0">
+        <div className="flex items-center gap-1.5 bg-[#0d1117] rounded-lg px-2.5 h-[30px] border border-[#30363d] focus-within:border-[#58a6ff] transition-colors">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#8b949e" strokeWidth="1.5"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4 4"/></svg>
+          <input ref={searchRef as React.Ref<HTMLInputElement>}
+            // UX-11：placeholder 输入后即消失，读屏与"回头再看"都需要一个常驻的无障碍名
+            aria-label="查找日志"
+            className="w-[130px] bg-transparent text-[12px] text-[#c9d1d9] outline-none placeholder:text-[#484f58] font-mono"
+            placeholder="查找…" value={searchTerm}
+            onChange={e => { setSearchTerm(e.target.value); setSearchIdx(() => 0); }}
+            onKeyDown={e => { if (isSubmitEnter(e)) { e.preventDefault(); onGoMatch(e.shiftKey ? -1 : 1); } }}/>
+          {searchActive && (
+            <>
+              <span className="text-[11px] text-[#8b949e] font-mono tabular-nums w-[32px] text-right">{searchMatches > 0 ? `${Math.min(searchIdx + 1, searchMatches)}/${searchMatches}` : '0/0'}</span>
+              {/* UX-11：按钮里只有一个三角符号，读屏念不出它是干什么的 */}
+              <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="上一个匹配（Shift+Enter）" onClick={() => onGoMatch(-1)}>▲</button>
+              <button className="text-[#8b949e] hover:text-[#c9d1d9] text-[10px]" aria-label="下一个匹配（Enter）" onClick={() => onGoMatch(1)}>▼</button>
+            </>
+          )}
+        </div>
+
+        <button onClick={onPause}
+          className={`h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border transition-colors flex-shrink-0 ${
+            paused ? 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5'
+                   : 'border-[#d29922]/30 text-[#d29922] bg-[#d29922]/10 hover:bg-[#d29922]/20'}`}
+          title={paused ? `恢复自动滚动到最新日志${newSincePause > 0 ? `（暂停期间新增 ${newSincePause} 行）` : ''}` : '暂停自动滚动（方便回溯查看）'}>
+          {paused ? `跟随${newSincePause > 0 ? ` (${newSincePause})` : ''}` : '暂停'}
+        </button>
+
+        {/* 清空是**不可撤销**的破坏性动作，而失败服务的日志正是排查崩溃的唯一证据（UX-19）：
+            改成两步确认，并把"要清掉几行"写出来。就地两步而不是弹窗——这里是常驻工具栏，
+            弹窗打断更重，而两步同样可取消 */}
+        {confirmClear ? (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 flex-shrink-0">
+            {/* 问句不拆行：空间不够时让按钮换到下一行，而不是把"清空这 5 行？"断成两截 */}
+            <span className="text-[11px] text-nexus-error whitespace-nowrap">清空这 {lineCount} 行？</span>
+            <button
+              className="h-[30px] px-2.5 rounded-lg text-[11px] border border-nexus-error/40 text-nexus-error bg-nexus-error/10 hover:bg-nexus-error/20 transition-colors flex-shrink-0"
+              onClick={() => { setConfirmClear(false); onClear(); }}
+            >确认清空</button>
+            <button
+              className="h-[30px] px-2.5 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
+              onClick={() => setConfirmClear(false)}
+            >取消</button>
+          </div>
+        ) : (
+          <button className="h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
+            title="清空日志缓冲（不可撤销；失败服务的日志是排查崩溃的唯一证据）"
+            onClick={() => setConfirmClear(true)}>
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M2 4h12M5.3 4V2.7c0-.4.3-.7.7-.7h4c.4 0 .7.3.7.7V4M6.7 7v5M9.3 7v5M3.3 4l.7 9.3c0 .4.3.7.7.7h6.6c.4 0 .7-.3.7-.7L12.7 4"/></svg>清空
+          </button>
         )}
       </div>
-
-      <button onClick={onPause}
-        className={`h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border transition-colors flex-shrink-0 ${
-          paused ? 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5'
-                 : 'border-[#d29922]/30 text-[#d29922] bg-[#d29922]/10 hover:bg-[#d29922]/20'}`}
-        title={paused ? `恢复自动滚动到最新日志${newSincePause > 0 ? `（暂停期间新增 ${newSincePause} 行）` : ''}` : '暂停自动滚动（方便回溯查看）'}>
-        {paused ? `跟随${newSincePause > 0 ? ` (${newSincePause})` : ''}` : '暂停'}
-      </button>
-
-      {/* 清空是**不可撤销**的破坏性动作，而失败服务的日志正是排查崩溃的唯一证据（UX-19）：
-          改成两步确认，并把"要清掉几行"写出来。就地两步而不是弹窗——这里是常驻工具栏，
-          弹窗打断更重，而两步同样可取消 */}
-      {confirmClear ? (
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-          <span className="text-[11px] text-nexus-error">清空这 {lineCount} 行？</span>
-          <button
-            className="h-[30px] px-2.5 rounded-lg text-[11px] border border-nexus-error/40 text-nexus-error bg-nexus-error/10 hover:bg-nexus-error/20 transition-colors"
-            onClick={() => { setConfirmClear(false); onClear(); }}
-          >确认清空</button>
-          <button
-            className="h-[30px] px-2.5 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors"
-            onClick={() => setConfirmClear(false)}
-          >取消</button>
-        </div>
-      ) : (
-        <button className="h-[30px] px-2.5 flex items-center gap-1 rounded-lg text-[11px] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-white/5 transition-colors flex-shrink-0"
-          title="清空日志缓冲（不可撤销；失败服务的日志是排查崩溃的唯一证据）"
-          onClick={() => setConfirmClear(true)}>
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M2 4h12M5.3 4V2.7c0-.4.3-.7.7-.7h4c.4 0 .7.3.7.7V4M6.7 7v5M9.3 7v5M3.3 4l.7 9.3c0 .4.3.7.7.7h6.6c.4 0 .7-.3.7-.7L12.7 4"/></svg>清空
-        </button>
-      )}
     </div>
   );
 }

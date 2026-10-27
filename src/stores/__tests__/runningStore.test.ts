@@ -17,7 +17,12 @@ import { useRunningStore } from '../runningStore.ts';
  */
 
 function reset(): void {
-  useRunningStore.setState({ running: [], failed: [], loaded: true });
+  useRunningStore.setState({
+    running: [],
+    failed: [],
+    loaded: true,
+    stopSignal: { seq: 0, serviceIds: [] },
+  });
 }
 
 test('followed_log 从 null 变成路径：必须落库（否则「取消跟随日志」入口永不出现）', () => {
@@ -60,4 +65,22 @@ test('failed 分支仍是逐字段全比（exit_code / timestamp 变了要落库
   useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 1, timestamp: 't1' }]);
   useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 2, timestamp: 't1' }]);
   assert.equal(useRunningStore.getState().failed[0]?.exit_code, 2, '退出码变化必须被认出来');
+});
+
+/**
+ * 显式停止信号：日志面板的自动关闭只认它，不认"running/failed 里暂时没有"。
+ * 后者在自动重启 stop→start 的空窗里会误触发，把面板当开关拉。
+ */
+test('显式停止信号：seq 单调递增并带上本次停掉的服务；轮询写入不会抹掉它', () => {
+  reset();
+  const before = useRunningStore.getState().stopSignal.seq;
+  useRunningStore.getState().markStopped(['s1']);
+  const sig = useRunningStore.getState().stopSignal;
+  assert.equal(sig.seq, before + 1, '每次显式停止都应递增序号（打开日志时快照它来判断"是不是新停止"）');
+  assert.deepEqual(sig.serviceIds, ['s1']);
+
+  // 轮询/动作后的状态刷新不能清掉这个信号：否则"停止 → 刷新 → 打开日志"之间
+  // 那次停止会被一次轮询抹平，面板关不掉
+  useRunningStore.getState().setRunning([], []);
+  assert.deepEqual(useRunningStore.getState().stopSignal, sig);
 });

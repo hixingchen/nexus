@@ -36,6 +36,11 @@ export async function stopProjectServices(projectId: string, services: Service[]
     useLogStore.getState().clearLogs(s.id);
   }
   await useRunningStore.getState().refresh();
+  // 显式停止信号：日志面板据此关闭。只报"确实已不在运行"的那些——停止失败的服务
+  // 还在跑，面板不该跟着关（与原先按运行态判定的口径对齐，但只在这个显式动作上判定，
+  // 不再对轮询差值做判定，见 runningStore.stopSignal 的说明）
+  const stillRunning = new Set(useRunningStore.getState().running.map(r => r.service_id));
+  useRunningStore.getState().markStopped(services.map(s => s.id).filter(id => !stillRunning.has(id)));
   return errors;
 }
 
@@ -98,4 +103,6 @@ export async function stopSingleService(projectId: string, serviceId: string): P
   await processApi.stop(serviceId);
   watchApi.stop(projectId, serviceId).catch((e) => reportError('停止文件监听失败', e, { silent: true }));
   useLogStore.getState().clearLogs(serviceId);
+  // 显式停止信号：日志面板据此关闭（只认用户动作，不认重启中间的空窗）
+  useRunningStore.getState().markStopped([serviceId]);
 }

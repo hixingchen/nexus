@@ -31,9 +31,17 @@ const SPLIT_W = 6;
 /** Dock 头部高度（DOM） */
 const HEADER_H = 36;
 
-/** 子 WebView 唯一标签源（模块级递增：组件重挂载/旧标签未释放也不会撞名报 already exists） */
+/**
+ * 子 WebView 唯一标签源。
+ *
+ * 模块级递增解决**同一页面内**的重挂载/旧标签未释放；再加一个页面实例随机前缀解决
+ * **跨页面重载**的撞名：睡眠恢复后 WebView2 渲染进程重启 → 页面重新加载 → 模块计数
+ * 从 0 开始，而上一份页面创建的 `ai-panel-1` 仍挂在窗口上（原生控件不随渲染进程消失）。
+ * 没有前缀时创建会报 "already exists"，面板打不开、旧页面却还浮在界面上。
+ */
+const PAGE_TAG = Math.random().toString(36).slice(2, 8);
 let wvSeq = 0;
-const nextWvLabel = () => `ai-panel-${++wvSeq}`;
+const nextWvLabel = () => `ai-panel-${PAGE_TAG}-${++wvSeq}`;
 
 /**
  * 全局弹窗打开期间子 WebView 的暂停标志（模块级：guardedRelayout 等模块函数共用）。
@@ -254,6 +262,31 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   // 同时记录父页面交互时间（焦点保护判定用，见 lastParentFocusAt）
   useEffect(() => {
     void useAiStore.getState().bootstrap();
+
+    /**
+     * 清掉上一份页面遗留的子 WebView。
+     *
+     * 睡眠唤醒后 WebView2 渲染进程会重启，页面随之重新加载；而子 WebView 是**挂在窗口上的
+     * 原生控件**，不会随页面消失。新页面的状态是全新的（`panelOpen=false`），既不认识它、
+     * 也不会回收它——它就以旧矩形浮在界面之上，正好盖住右侧服务面板；再打开 AI 面板时
+     * 还会撞上它的旧标签（见 PAGE_TAG 的说明）。
+     *
+     * 跳过本实例已持有的那个：StrictMode 双挂载时第一次创建可能已经完成，不能误杀。
+     */
+    void getAllWebviews()
+      .then((list) => {
+        const current = wvRef.current?.label;
+        return Promise.all(
+          list
+            .filter((w) => w.label.startsWith('ai-panel-') && w.label !== current)
+            .map((w) => closeQuietly(w)),
+        );
+      })
+      .catch((e) => {
+        // 失败时旧页面可能仍浮在界面上：只留控制台线索（与 parkOffscreen 同一口径）
+        console.warn('清理遗留 AI 面板 WebView 失败（可能仍浮在界面上）:', e);
+      });
+
     const onParentFocusIn = () => { lastParentFocusAt = Date.now(); };
     document.addEventListener('focusin', onParentFocusIn);
     return () => {
@@ -887,7 +920,12 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
   // 每路先等两帧让 DOM 布局跟随窗口变化；守卫版 relayout 无效矩形不写入
   const relayoutNow = () => {
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => void guardedRelayout(sync, slot));
+      requestAnimationFrame(() => {
+        // 收起/弹窗期间窗口恢复（睡眠唤醒、最小化恢复、切回）时，Windows/WebView2 可能
+        // 把原生子 WebView 按旧矩形重新露出来；这里补一次移屏（幂等）。可见态才走正常重贴。
+        if (wvHidden || modalPause) { parkOffscreen(wv); return; }
+        void guardedRelayout(sync, slot);
+      });
     });
   };
   const unlistens: UnlistenFn[] = [];

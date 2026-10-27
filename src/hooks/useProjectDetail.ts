@@ -11,6 +11,7 @@ import { showNotification } from '../components/ui/Toast';
 import { reportError } from '../utils/error';
 import { pruneServiceDrafts } from '../stores/serviceDraftStore';
 import { selectProjectDetail, servicesPending, type DetailSlot } from '../utils/projectDetail';
+import { shouldAutoCloseLog } from '../utils/logPanel';
 
 /** 空列表常量：缓存未命中时复用它，避免每次渲染产生新数组（会让订阅方无谓重渲染） */
 const EMPTY_SERVICES: Service[] = [];
@@ -49,6 +50,8 @@ export function useProjectDetail(projectId: string) {
   const running = useRunningStore(s => s.running);
   /** 意外退出的服务（崩溃/秒退/spawn 失败） */
   const failed = useRunningStore(s => s.failed);
+  /** 用户显式停止的信号：日志面板只在**用户动作**后关闭（见下方的生命周期 effect） */
+  const stopSignal = useRunningStore(s => s.stopSignal);
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [editingService, setEditingService] = useState<Service | null>(null);
   const [deleteSvcTarget, setDeleteSvcTarget] = useState<{ id: string; name: string } | null>(null);
@@ -175,20 +178,37 @@ export function useProjectDetail(projectId: string) {
     return () => store.release(projectId);
   }, [projectId]);
 
-  // 日志面板生命周期：查看的服务既不在运行、也不在失败列表 = 已被主动停止
-  // （项目列表停止 / 单服务停止 / 全部停止）→ 关闭面板 + 清空日志。
-  // 崩溃服务在 failed 列表中，面板保留（报错是诊断关键）；
-  // 服务已从项目配置中删除 → 同样关闭面板并清日志
+  /**
+   * 面板打开时的停止信号序号（-1 = 当前没开面板）。
+   *
+   * 为什么要记这个数：`stopSignal` 会一直留着上一次停过的服务 id。不记序号的话，
+   * "停止服务 → 再启动 → 打开日志"会因为上一次的残留信号**立刻**把刚打开的面板关掉。
+   * 只有打开之后的新停止动作才算数（见 handleViewLog 与下方的 effect）。
+   */
+  const openedStopSeqRef = useRef(-1);
+
+  // 日志面板生命周期：只在两种**确定事实**下自动关闭 + 清日志——
+  // ① 服务已从项目配置中删除；② 用户显式停止了它（`runningStore.stopSignal`）。
+  //
+  // 为什么不再用"running/failed 里暂时没有它"：自动重启与手动重启都是后端
+  // stop → start，中间有一段既不在 running 也不在 failed 的空窗；按运行态差值判断
+  // 会在自动重启循环里把面板当开关拉，高频挂载/卸载时旧 DOM 可能残留成"幽灵"
+  // （日志冻结、✕ 点不动、新日志被挤到最下方）。崩溃服务仍在 failed 中，面板照旧保留。
   useEffect(() => {
-    if (!viewingLog) return;
-    const svcExists = cachedServices.some(s => s.id === viewingLog);
-    const isActive = running.some(r => r.service_id === viewingLog)
-      || failed.some(f => f.service_id === viewingLog);
-    if (!svcExists || !isActive) {
+    if (!viewingLog) {
+      openedStopSeqRef.current = -1;
+      return;
+    }
+    if (shouldAutoCloseLog({
+      serviceId: viewingLog,
+      serviceExists: cachedServices.some(s => s.id === viewingLog),
+      stopSignal,
+      openedStopSeq: openedStopSeqRef.current,
+    })) {
       setViewingLog(null);
       useLogStore.getState().clearLogs(viewingLog);
     }
-  }, [viewingLog, running, failed, cachedServices]);
+  }, [viewingLog, cachedServices, stopSignal]);
 
   // 日志保留策略：日志仅在「服务已从项目配置中删除」时由 prune 清理；
   // running 首次加载成功后才清理，避免挂载瞬间（running 尚为 []）误删日志
@@ -294,8 +314,15 @@ export function useProjectDetail(projectId: string) {
 
   const handleViewLog = useCallback((service: Service) => {
     if (!detail) return;
-    setViewingLog(prev => prev === service.id ? null : service.id);
-  }, [detail]);
+    if (viewingLog === service.id) {
+      setViewingLog(null);
+      return;
+    }
+    // 打开时快照停止信号序号：此后只有**新的**停止动作才会关闭这个面板
+    // （上一次停止留下的 id 不能让重新打开的日志立刻消失）
+    openedStopSeqRef.current = useRunningStore.getState().stopSignal.seq;
+    setViewingLog(service.id);
+  }, [detail, viewingLog]);
 
   return {
     detail,

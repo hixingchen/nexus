@@ -3,6 +3,7 @@ import { notify } from '../utils/notify';
 import { reportError } from '../utils/error';
 import { getExtension } from '../utils/path';
 import { isMarkdownFile } from '../utils/markdown';
+import { toMessage } from '../utils/message';
 import type { FileTab } from '../types/editor';
 import * as editorService from '../services/editor';
 
@@ -143,8 +144,14 @@ async function fetchTextContent(path: string): Promise<{ content: string; size: 
     return { content: res.content, size: res.size };
   }
   if (getExtension(path, { lower: true }) === 'class') {
-    const content = await editorService.readClassFile(path);
-    return { content, size: 0 };
+    try {
+      const content = await editorService.readClassFile(path);
+      return { content, size: 0 };
+    } catch (e) {
+      // CFR 与内置字节码解析都失败（文件损坏 / 被截断 / 根本不是 class）：交给上层切十六进制
+      // 视图。直接走通用错误分支会打开一个**空标签**——文件打不开时连原始字节都看不到。
+      throw new Error(`CLASS_UNREADABLE::${toMessage(e)}`, { cause: e });
+    }
   }
   const res = await editorService.readFile(path);
   if (res.is_binary) throw new Error('BINARY');
@@ -503,6 +510,20 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
       }
       openLoadedTab(tab, content, mySeq);
     } catch (e) {
+      if (e instanceof Error && e.message.startsWith('CLASS_UNREADABLE::')) {
+        // class 的反编译与字节码视图都失败：退回十六进制视图（原始字节仍然可看），
+        // 并把原因说出来——否则用户不知道为什么打开的是十六进制、而不是反编译结果
+        tab.readonly = true;
+        tab.viewerType = 'hex';
+        notify({
+          variant: 'warning',
+          title: '无法显示该 class 的反编译/字节码视图',
+          description: `已切换为十六进制视图。原因：${e.message.slice('CLASS_UNREADABLE::'.length)}`,
+          duration: 8000,
+        });
+        openLoadedTab(tab, '', mySeq);
+        return;
+      }
       if (e instanceof Error && e.message === 'BINARY') {
         // 扩展名未命中黑名单的二进制：NUL 嗅探后进 hex 视图
         tab.readonly = true;
@@ -555,6 +576,16 @@ export async function openJarEntry(jarPath: string, nested: string[], entry: { n
     const res = await editorService.readJarEntry(jarPath, nested, entry.name);
     if (res.kind === 'binary') {
       tab.viewerType = 'hex';
+      // class 条目只有"反编译 + 字节码视图都失败"时后端才会按 binary 返回——解释一下，
+      // 否则用户会以为打开方式错了
+      if (entry.name.toLowerCase().endsWith('.class')) {
+        notify({
+          variant: 'warning',
+          title: '无法显示该 class 的反编译/字节码视图',
+          description: '已切换为十六进制视图',
+          duration: 8000,
+        });
+      }
       openLoadedTab(tab, '', mySeq);
     } else {
       openLoadedTab(tab, res.content, mySeq);
@@ -570,6 +601,20 @@ export async function openJarEntry(jarPath: string, nested: string[], entry: { n
  */
 export async function locateFile(path: string, name: string, line: number, query: string): Promise<void> {
   await loadAndOpenFile(path, name);
+  /**
+   * Markdown 默认打开的是渲染预览，而"定位到第 N 行 + 高亮命中词"是 CodeViewer 的能力：
+   * 预览没有行号/行锚点，locate 请求会被静默丢弃——表现是"点了搜索结果，打开的 md
+   * 停在第一屏，什么都没跳"。定位本身就是"我要看这一行"，所以把这个标签切回源码模式
+   * （与 VS Code 从搜索跳转的行为一致）；用户之后仍可用标签栏的眼睛图标切回预览。
+   */
+  const st = useEditorStore.getState();
+  const tab = st.tabs.find((t) => t.path === path);
+  if (tab && st.activeTabId === tab.id && isMarkdownFile(tab.path)
+    && (tab.preview ?? MD_PREVIEW_BY_DEFAULT)) {
+    useEditorStore.setState((s) => ({
+      tabs: s.tabs.map((t) => (t.id === tab.id ? { ...t, preview: false } : t)),
+    }));
+  }
   useEditorStore.getState().setLocate({ path, line, query });
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { marked } from 'marked';
 import DOMPurify, { type Config as PurifyConfig } from 'dompurify';
@@ -7,6 +7,9 @@ import { useEditorStore, loadAndOpenFile, saveActiveFile, flushPendingEdits } fr
 import { reportError } from '../../utils/error';
 import { imageMimeOf } from '../../utils/path';
 import { markdownImageSrc, resolveMdLink, headingSlug } from '../../utils/markdown';
+import { rememberScroll, recallScroll } from '../../utils/editorScroll';
+import { isSubmitEnter } from '../../utils/keyboard';
+import { useUiStore } from '../../stores/uiStore';
 
 /**
  * Markdown 预览（只读）。
@@ -41,27 +44,67 @@ const SANITIZE_CONFIG: PurifyConfig = {
   FORBID_ATTR: ['style'],
 };
 
+// ── 预览内查找（Ctrl+F）────────────────────────────────────────
+/** CSS Custom Highlight API 的两个高亮名：全部命中 / 当前命中（只画，不改 DOM） */
+const FIND_ALL_HIGHLIGHT = 'nexus-md-find';
+const FIND_CURRENT_HIGHLIGHT = 'nexus-md-find-current';
+/** 查找输入防抖（与日志面板搜索同量级） */
+const FIND_DEBOUNCE_MS = 150;
+/** 命中数上限：再长的文档也不值得把整篇都标成高亮 */
+const MAX_FIND_MATCHES = 1000;
+
+/** 转义正则元字符：查找词按字面匹配（与源码查找一致） */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * 每个文件「上次看到哪儿」的滚动**比例**（模块级，跨组件实例与跨会话存活）。
+ * 在**渲染后的文本节点**里找命中（大小写不敏感、字面匹配）。
  *
- * 为什么需要：预览是**随标签切换整体卸载重挂**的（`ProjectDetail` 只渲染活动标签的查看器），
- * 而滚动位置挂在 DOM 上——重挂之后它就是 0，于是切走再切回会回到第一行。
- * `CodeViewer` 早就有同一套机制（它那里的 `scrollByPath`），预览当初漏了；
- * 而 md 现在**默认就是预览**，所以这个缺口从"偶尔"变成了"每次"。
+ * 用带 `i` 标志的正则而不是 `toLowerCase().indexOf`：Unicode 小写化会改变字符长度
+ * （İ → i̇），小写副本里的下标套回原文会错位；正则的 `match.index` 始终是原文下标。
+ *
+ * 已知边界：命中**不跨行内元素**——`hello **world**` 里搜 "hello world" 找不到。
+ * 源码模式搜的是原始 markdown（`**` 还在文本里），两种模式的"同一句话"本来就不完全等价；
+ * 这里按用户看到的渲染文本匹配，符合"预览里查找"的直觉。
+ */
+function collectFindRanges(root: HTMLElement, query: string): Range[] {
+  const ranges: Range[] = [];
+  if (!query) return ranges;
+  const re = new RegExp(escapeRegExp(query), 'gi');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    const text = node.nodeValue ?? '';
+    if (!text) continue;
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      if (m[0].length === 0) { re.lastIndex += 1; continue; }
+      const range = document.createRange();
+      range.setStart(node, m.index);
+      range.setEnd(node, m.index + m[0].length);
+      ranges.push(range);
+      if (ranges.length >= MAX_FIND_MATCHES) return ranges;
+    }
+  }
+  return ranges;
+}
+
+/**
+ * 预览的滚动位置与**源码模式共享**（`utils/editorScroll`）：两边都按"滚动比例"记录。
+ *
+ * 为什么需要：预览随标签切换整体卸载重挂（`ProjectDetail` 只渲染活动标签的查看器），
+ * 滚动位置挂在 DOM 上——重挂之后就是 0，切走再切回会回到第一行。
  *
  * 为什么是**持续跟踪**而不是"卸载前读一把"：React 卸载时先摘 DOM 再跑清理，
  * 那时读 `scrollTop` 永远是 0（`CodeViewer` 的 `trackScroll` 注释里记着这个坑的完整推理：
  * "症状极具误导性——每次都忠实地还原到第一行"）。
  *
  * 为什么存**比例**而不是像素：文件可能被改过（内容重排），窗口或面板宽度也可能变过，
- * 那时像素值指的是另一个位置；比例至少还停在文档的同一个相对位置。
- * 布局没变时比例是精确还原（同一个 max 乘回去）——也就是最常见的"切走又切回"。
+ * 那时像素值指的是另一个位置；比例至少还停在文档的同一个相对位置。**跨模式**也只能
+ * 用比例——预览拿不到源码行号（见 `utils/editorScroll` 的说明）。
  */
-const scrollRatioByPath = new Map<string, number>();
-
-/** 最多记多少个文件的比例（与 CodeViewer 的缓存上限同一个量级，防长期使用后无限增长） */
-const MAX_SCROLL_ENTRIES = 64;
-
 export function MarkdownPreview({ filePath }: { filePath: string }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   /**
@@ -79,6 +122,16 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
    * 改动只可能来自外部（重新读盘），订阅放在本组件里最省。
    */
   const content = useEditorStore(s => s.fileContent) ?? '';
+
+  // ── 预览内查找（Ctrl+F）──
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findCount, setFindCount] = useState(0);
+  const [findIndex, setFindIndex] = useState(0);
+  const findInputRef = useRef<HTMLInputElement | null>(null);
+  /** 当前命中的 Range（导航/滚动用；不参与渲染） */
+  const findRangesRef = useRef<Range[]>([]);
+
 
   // 挂载时先结算未合帧的编辑（PERF-13）：否则首帧渲染的是 store 里的旧内容
   useEffect(() => { flushPendingEdits(); }, []);
@@ -107,16 +160,21 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
     if (!el) return;
     const max = el.scrollHeight - el.clientHeight;
     if (max <= 0) return;   // 内容不足一屏：无处可滚（也不该把记录覆盖成 0）
-    const ratio = scrollRatioByPath.get(filePath);
     /**
-     * 没有记录 = 本次会话还没看过这个文件 → **从头开始**。
+     * 记忆里可能是**源码模式**刚写下的比例（用户从源码切过来，正是要接上的位置），
+     * 也可能是预览自己上次的比例。
      *
-     * 这个显式置 0 不能省：md→md 切换时组件不重新挂载、DOM 元素被复用，
-     * `scrollTop` 会原样留在**上一个文件**的像素值上（只被新内容的长度夹一下），
-     * 于是"打开一个没看过的文件"会停在文档中间——那不叫"记住了位置"，
-     * 而是把上一个文件的位置错当成这个文件的。
+     * 没有记录 = 本次会话还没在任何模式里看过这个文件 → **从头开始**。这个显式置 0
+     * 不能省：md→md 切换时组件不重新挂载、DOM 元素被复用，`scrollTop` 会原样留在
+     * **上一个文件**的像素值上（只被新内容的长度夹一下），于是"打开一个没看过的文件"
+     * 会停在文档中间——那不叫"记住了位置"，而是把上一个文件的位置错当成这个文件的。
      */
-    el.scrollTop = ratio === undefined ? 0 : ratio * max;
+    const memory = recallScroll(filePath);
+    el.scrollTop = memory === undefined ? 0 : memory.ratio * max;
+    // 落位后立刻记一次（写者=预览）：md→md 切换时滚动事件可能早于本 effect，
+    // 由这里保证"当前文件、当前位置"一定写进了共享表（源码切回来时要用它）
+    const after = el.scrollHeight - el.clientHeight;
+    if (after > 0) rememberScroll(filePath, 'preview', el.scrollTop / after);
   }, [html, filePath]);
 
   /**
@@ -141,15 +199,7 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
       const max = el.scrollHeight - el.clientHeight;
       // 不足一屏时 max ≤ 0：不记（否则一个恒为 0 的比例会盖掉之前记住的位置）
       if (max <= 0) return;
-      const path = filePathRef.current;
-      // 先删再设：让它排到 Map 末尾，下面按插入序淘汰最旧的
-      scrollRatioByPath.delete(path);
-      scrollRatioByPath.set(path, el.scrollTop / max);
-      while (scrollRatioByPath.size > MAX_SCROLL_ENTRIES) {
-        const oldest = scrollRatioByPath.keys().next().value;
-        if (oldest === undefined) break;
-        scrollRatioByPath.delete(oldest);
-      }
+      rememberScroll(filePathRef.current, 'preview', el.scrollTop / max);
     };
     // passive：滚动是高频事件，我们只是记录，不阻止默认行为
     el.addEventListener('scroll', onScroll, { passive: true });
@@ -212,6 +262,114 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
     return () => document.removeEventListener('keydown', onKey);
   }, []);
 
+  // ── 预览内查找（Ctrl+F）：与源码模式同一套肌肉记忆 ──────────
+
+  /** 把命中集合注册成高亮（全部 + 当前）；老 WebView 没有 Highlight API 时降级为只滚动 */
+  const applyFindHighlights = useCallback((ranges: Range[], index: number) => {
+    if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
+    if (ranges.length === 0) {
+      CSS.highlights.delete(FIND_ALL_HIGHLIGHT);
+      CSS.highlights.delete(FIND_CURRENT_HIGHLIGHT);
+      return;
+    }
+    CSS.highlights.set(FIND_ALL_HIGHLIGHT, new Highlight(...ranges));
+    const current = ranges[index];
+    if (current) CSS.highlights.set(FIND_CURRENT_HIGHLIGHT, new Highlight(current));
+    else CSS.highlights.delete(FIND_CURRENT_HIGHLIGHT);
+  }, []);
+
+  /** 把命中滚进视口（已在视口内则不动，避免每输入一个字就跳） */
+  const scrollToMatch = useCallback((range: Range | undefined) => {
+    const root = rootRef.current;
+    if (!root || !range) return;
+    const rect = range.getBoundingClientRect();
+    const box = root.getBoundingClientRect();
+    // 顶部留出查找条的高度：被浮层盖住的命中不能算"已经看得到"
+    if (rect.top >= box.top + 48 && rect.bottom <= box.bottom - 8) return;
+    root.scrollTop += rect.top - box.top - box.height / 3;
+  }, []);
+
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setFindCount(0);
+    setFindIndex(0);
+    findRangesRef.current = [];
+    if (typeof CSS !== 'undefined' && 'highlights' in CSS) {
+      CSS.highlights.delete(FIND_ALL_HIGHLIGHT);
+      CSS.highlights.delete(FIND_CURRENT_HIGHLIGHT);
+    }
+  }, []);
+
+  const goFind = useCallback((dir: 1 | -1) => {
+    const ranges = findRangesRef.current;
+    if (ranges.length === 0) return;
+    setFindIndex((prev) => {
+      const next = ((prev + dir) % ranges.length + ranges.length) % ranges.length;
+      applyFindHighlights(ranges, next);
+      scrollToMatch(ranges[next]);
+      return next;
+    });
+  }, [applyFindHighlights, scrollToMatch]);
+
+  /** Ctrl+F：打开/聚焦查找。只在预览挂载期间生效（源码模式由 CodeViewer 自己那套处理） */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== 'f') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setFindOpen(true);
+      requestAnimationFrame(() => {
+        findInputRef.current?.focus();
+        findInputRef.current?.select();
+      });
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
+  /** Esc 关闭查找（焦点不在输入框里也生效；有弹窗时让弹窗优先） */
+  useEffect(() => {
+    if (!findOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (useUiStore.getState().modalCount > 0) return;
+      e.stopPropagation();
+      closeFind();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [findOpen, closeFind]);
+
+  /**
+   * 查找词 / 渲染内容变化 → 重新收集命中（防抖）。
+   *
+   * 依赖 `html`：预览内容被外部更新时 DOM 会被整块替换，旧的 Range 全部失效，
+   * 必须按新 DOM 重算；文件在两种模式间切换时这条也会把"同一查找词"带到新内容上。
+   */
+  useEffect(() => {
+    if (!findOpen) return;
+    const t = setTimeout(() => {
+      const root = rootRef.current;
+      if (!root) return;
+      const ranges = collectFindRanges(root, findQuery);
+      findRangesRef.current = ranges;
+      setFindCount(ranges.length);
+      setFindIndex(0);
+      applyFindHighlights(ranges, 0);
+      scrollToMatch(ranges[0]);
+    }, FIND_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [findQuery, findOpen, html, applyFindHighlights, scrollToMatch]);
+
+  /** 卸载：高亮注册在 document 上，不随组件消失，必须主动清 */
+  useEffect(() => () => {
+    if (typeof CSS !== 'undefined' && 'highlights' in CSS) {
+      CSS.highlights.delete(FIND_ALL_HIGHLIGHT);
+      CSS.highlights.delete(FIND_CURRENT_HIGHLIGHT);
+    }
+  }, []);
+
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const anchor = (e.target as Element | null)?.closest?.('a');
     if (!anchor) return;
@@ -233,11 +391,64 @@ export function MarkdownPreview({ filePath }: { filePath: string }) {
   };
 
   return (
-    <div
-      ref={rootRef}
-      className="md-preview h-full overflow-auto bg-nexus-editor px-6 py-5"
-      onClick={handleClick}
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
+    <div className="relative h-full">
+      <div
+        ref={rootRef}
+        className="md-preview h-full overflow-auto bg-nexus-editor px-6 py-5"
+        onClick={handleClick}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+
+      {/* 查找条：浮在预览右上角（不参与文档流，内容滚动时不跟着滚） */}
+      {findOpen && (
+        <div className="absolute right-4 top-3 z-10 flex items-center gap-1.5 h-[32px] px-2.5 rounded-lg bg-nexus-surface border border-nexus-border shadow-lg">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"
+            className="text-nexus-muted flex-shrink-0">
+            <circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4 4"/>
+          </svg>
+          <input
+            ref={findInputRef}
+            aria-label="在预览中查找"
+            className="w-[150px] bg-transparent text-[12px] text-nexus-text outline-none placeholder:text-nexus-muted/50 font-mono"
+            placeholder="查找…"
+            value={findQuery}
+            onChange={e => setFindQuery(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                closeFind();
+                return;
+              }
+              if (isSubmitEnter(e)) {
+                e.preventDefault();
+                goFind(e.shiftKey ? -1 : 1);
+              }
+            }}
+          />
+          <span className="w-[46px] text-right text-[11px] text-nexus-muted font-mono tabular-nums flex-shrink-0">
+            {findCount > 0 ? `${findIndex + 1}/${findCount}` : '0/0'}
+          </span>
+          <button
+            aria-label="上一个匹配（Shift+Enter）"
+            className="text-[10px] text-nexus-muted hover:text-nexus-text flex-shrink-0"
+            onClick={() => goFind(-1)}
+          >▲</button>
+          <button
+            aria-label="下一个匹配（Enter）"
+            className="text-[10px] text-nexus-muted hover:text-nexus-text flex-shrink-0"
+            onClick={() => goFind(1)}
+          >▼</button>
+          <button
+            aria-label="关闭查找"
+            className="ml-0.5 flex-shrink-0 p-0.5 rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50"
+            onClick={closeFind}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+              <line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/>
+            </svg>
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

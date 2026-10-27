@@ -79,7 +79,7 @@ export function CloseGuard() {
   }, [beginExit]);
 
   // 浏览器级加速键：WebView2 默认仍然响应刷新与关窗，一次习惯性的 Ctrl+R/F5 就会把
-  // 内存里的草稿全部冲掉（代码里已经专门吞掉 Ctrl+F 阻止原生查找框，这里是同一类缺口）。
+  // 内存里的草稿全部冲掉（Ctrl+F 的原生查找框已在 main.tsx 全局拦掉，这里是同一类缺口）。
   // 有未保存草稿时拦下刷新并说明原因；Ctrl+W 与标题栏 ✕ 走同一条确认路径。
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {

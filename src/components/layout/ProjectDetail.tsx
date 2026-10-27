@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, lazy, Suspense } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
 import { EditorTabs } from '../editor/EditorTabs';
 // CodeViewer 是首屏最大的一块（CodeMirror 核心 326KB），改为按需加载（PERF-19）：
@@ -89,6 +89,36 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）。
   // 判据走 store 的选择器（按标签各记 + 默认预览），**不要在这里另算一遍**——见它的说明
   const mdPreviewOnThisTab = useEditorStore(selectMdPreviewOnActiveTab);
+
+  /**
+   * 主区当前分支的标识（日志 / 文件标签 / 空态）：分支宿主的 `key` 由它派生。
+   *
+   * key 随分支变化 → 切换时整块宿主重建。历史上出现过"日志已经关了、DOM 却还留在
+   * 主区里"的脱节态（日志冻结不再更新、✕ 点了没反应、再打开的日志被挤到最下方）。
+   * 把分支放进带 key 的宿主后，旧宿主是一个**单个宿主节点**——即便上一次的卸载没能
+   * 清干净它内部的节点，整个宿主被替换时也会连同残留一并从 DOM 摘掉。
+   *
+   * **必须带前缀**：这个宿主的兄弟节点里有服务编辑面板，它的 key 是服务 id；而日志
+   * 分支的 key 就是 `viewingLog`（也是服务 id）。同一个服务的日志开着、编辑面板也开着时，
+   * 父级里会同时出现两个 `s1` —— React 报 duplicate key 后不再保证回收旧节点，
+   * 表现正是"日志关不掉、新旧日志一叠一叠往下排"。
+   */
+  const branchKey = `branch-${viewingLog ?? activeTab?.path ?? 'empty'}`;
+  const mainContentRef = useRef<HTMLDivElement>(null);
+  const branchHostRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * 切分支时把主区滚动位置归零（layout effect：绘制前完成）。
+   *
+   * 主容器是 `overflow-hidden`，但**程序化滚动仍然生效**——`EditorTabs` 会对自己
+   * 的活动标签调用 `scrollIntoView`，一旦容器被滚下去，日志头部（含关闭 ✕）就被顶出
+   * 可视区，表现为"日志关不掉、布局全乱"。滚动位置不属于任何一个分支的状态，
+   * 切分支必须显式清零。
+   */
+  useLayoutEffect(() => {
+    if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
+    if (branchHostRef.current) branchHostRef.current.scrollTop = 0;
+  }, [branchKey]);
 
   // 工具命令执行（订阅事件流 / 跑命令 / 失败态 / 停止）抽到独立 hook（ARCH-7 ②）
   const {
@@ -338,61 +368,71 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           水平方向的让位（pr-*，给服务列）早就在做了，这里补上垂直方向。
           absolute 定位相对的是 padding box，所以面板自己仍然贴着容器底边 */}
       <div
+        ref={mainContentRef}
         className={`flex-1 flex flex-col overflow-hidden relative ${servicePanelCollapsed ? 'pr-[32px]' : 'pr-[360px]'}`}
         style={{ paddingBottom: 'var(--nexus-search-panel-h, 0px)' }}
       >
-        {/* ErrorBoundary：CodeMirror/各查看器任何渲染异常都不击穿应用白屏。
-            key 随内容变化 → 出错后切文件/日志即自动重置（新内容重试） */}
-        <ErrorBoundary key={viewingLog ?? activeTab?.path ?? 'empty'}>
-          {viewingLog ? (
-            <LogViewer
-              serviceKey={viewingLog}
-              serviceName={services.find(s => s.id === viewingLog)?.name}
-              fill
-              onClose={() => setViewingLog(null)}
-            />
-          ) : activeTab ? (
-            <>
-              <EditorTabs />
-              <div className="flex-1 overflow-hidden">
-                {activeTab.viewerType === 'image' ? (
-                  <ImageViewer path={activeTab.path} name={activeTab.name} />
-                ) : activeTab.viewerType === 'hex' ? (
-                  <HexViewer path={activeTab.path} />
-                ) : activeTab.viewerType === 'jar' ? (
-                  <JarViewer path={activeTab.path} />
-                ) : mdPreviewOnThisTab ? (
-                  // Markdown 预览：内容取 store 里的当前文本（含未保存的编辑）——
-                  // 预览要从正在编辑的内容渲染，而不是磁盘上的旧版本
-                  <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
-                    <MarkdownPreview filePath={activeTab.path} />
-                  </Suspense>
-                ) : (
-                  // fallback 用编辑器自身的底色占位：chunk 从本地盘加载（几十 ms），
-                  // 空白会让"打开文件"看起来像闪了一下
-                  <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
-                    <CodeViewer
-                      filePath={activeTab.path}
-                      editable={!activeTab.readonly}
-                      onChange={(content) => useEditorStore.getState().updateDraft(content)}
-                    />
-                  </Suspense>
-                )}
+        {/* 分支宿主：key 随分支变化（见 branchKey 的说明）。它同时是一个 flex 容器，
+            因为日志视图用 `h-full`、编辑区用 `flex-1`，两者都要求父级有确定高度 */}
+        <div
+          key={branchKey}
+          ref={branchHostRef}
+          className="flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden"
+        >
+          {/* ErrorBoundary：CodeMirror/各查看器任何渲染异常都不击穿应用白屏。
+              key 随内容变化 → 出错后切文件/日志即自动重置（新内容重试） */}
+          <ErrorBoundary key={branchKey}>
+            {viewingLog ? (
+              <LogViewer
+                serviceKey={viewingLog}
+                serviceName={services.find(s => s.id === viewingLog)?.name}
+                fill
+                onClose={() => setViewingLog(null)}
+              />
+            ) : activeTab ? (
+              <>
+                <EditorTabs />
+                <div className="flex-1 overflow-hidden">
+                  {activeTab.viewerType === 'image' ? (
+                    <ImageViewer path={activeTab.path} name={activeTab.name} />
+                  ) : activeTab.viewerType === 'hex' ? (
+                    <HexViewer path={activeTab.path} />
+                  ) : activeTab.viewerType === 'jar' ? (
+                    <JarViewer path={activeTab.path} />
+                  ) : mdPreviewOnThisTab ? (
+                    // Markdown 预览：内容取 store 里的当前文本（含未保存的编辑）——
+                    // 预览要从正在编辑的内容渲染，而不是磁盘上的旧版本
+                    <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                      <MarkdownPreview filePath={activeTab.path} />
+                    </Suspense>
+                  ) : (
+                    // fallback 用编辑器自身的底色占位：chunk 从本地盘加载（几十 ms），
+                    // 空白会让"打开文件"看起来像闪了一下
+                    <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                      <CodeViewer
+                        filePath={activeTab.path}
+                        editable={!activeTab.readonly}
+                        onChange={(content) => useEditorStore.getState().updateDraft(content)}
+                      />
+                    </Suspense>
+                  )}
+                </div>
+              </>
+            ) : project ? (
+              <EmptyState name={project.name} path={project.path} />
+            ) : (
+              // 详情在途：只让主区显示加载态（原先是整片 "加载中…"，见上方 UX-18 的说明）
+              <div className="flex-1 flex items-center justify-center text-[12px] text-nexus-muted">
+                加载中…
               </div>
-            </>
-          ) : project ? (
-            <EmptyState name={project.name} path={project.path} />
-          ) : (
-            // 详情在途：只让主区显示加载态（原先是整片 "加载中…"，见上方 UX-18 的说明）
-            <div className="flex-1 flex items-center justify-center text-[12px] text-nexus-muted">
-              加载中…
-            </div>
-          )}
-        </ErrorBoundary>
+            )}
+          </ErrorBoundary>
+        </div>
 
         {editingService && (
           <ServiceEditPanel
-            key={editingService.id}
+            // 带前缀：分支宿主的 key 可能是同一个服务 id（日志开着时），不加前缀会撞名
+            key={`svc-${editingService.id}`}
             service={editingService}
             onSave={async () => { await load(); setEditingService(null); }}
             onSavedAsTemplate={loadTemplates}

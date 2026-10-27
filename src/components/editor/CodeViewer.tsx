@@ -11,6 +11,7 @@ import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
 import { CODE_FONT_STACK, parseEditorFontSize } from '../../utils/editorFont';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { getExtension } from '../../utils/path';
+import { rememberScroll, recallScroll } from '../../utils/editorScroll';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { javascript } from '@codemirror/lang-javascript';
@@ -117,10 +118,24 @@ function trackScroll(filePath: string, view: EditorView): () => void {
       if (oldest === undefined) break;
       scrollByPath.delete(oldest);
     }
+    // 同步给预览：源码↔源码仍用上面的精确快照，这份比例只在切到预览时被读取
+    rememberScrollRatio(filePath, view);
   };
   // passive：滚动是高频事件，我们只是记录，不阻止默认行为
   view.scrollDOM.addEventListener('scroll', onScroll, { passive: true });
   return () => view.scrollDOM.removeEventListener('scroll', onScroll);
+}
+
+/**
+ * 把当前滚动位置折算成 0~1 的比例写进跨模式记忆（无滚动空间时不写）。
+ *
+ * 预览按这个比例落位：它拿不到源码行号，比例是两种模式唯一能互通的单位
+ * （见 utils/editorScroll 的说明）。
+ */
+function rememberScrollRatio(filePath: string, view: EditorView): void {
+  const el = view.scrollDOM;
+  const max = el.scrollHeight - el.clientHeight;
+  if (max > 0) rememberScroll(filePath, 'source', el.scrollTop / max);
 }
 
 /**
@@ -364,6 +379,7 @@ const searchHitField = StateField.define({
   provide: f => EditorView.decorations.from(f),
 });
 
+
 // ── 自定义文件内搜索面板（中文 UI，项目风格） ──
 
 function SearchPanelView({ view }: { view: EditorView }) {
@@ -511,7 +527,6 @@ function createSearchPanel(view: EditorView): Panel {
     destroy: () => { root.unmount(); },
   };
 }
-
 /** 光标是否在 HTML 注释节点内（<!-- -->；主树节点，script/style 的内嵌树不会误判） */
 function isInsideHtmlComment(view: EditorView, pos: number): boolean {
   const resolved = syntaxTree(view.state).resolveInner(pos, 1);
@@ -1080,16 +1095,41 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       stateCacheSet(key, state);
     }
 
-    viewRef.current = new EditorView({
+    /**
+     * 跨模式滚动记忆：最后一次是**预览**在滚动 → 用它的比例落位。源码快照记的是上一次
+     * 源码会话的位置，与用户刚在预览里看到的地方无关（反之亦然，见 utils/editorScroll）。
+     */
+    const sharedScroll = recallScroll(filePath);
+    const restoreFromPreview = sharedScroll?.writer === 'preview';
+    const nextView = new EditorView({
       state,
       parent: editorRef.current,
       // 上次看到哪儿就回到哪儿（切标签 / 开日志面板都会把这个 view 销毁重建）。
       // 没有记录时传 undefined——构造函数有 `config.scrollTo && …` 的守卫。
       // 构造函数内部会拿这份快照对新文档 clip 一次，锚点落在文档外不会抛
-      scrollTo: scrollByPath.get(filePath),
+      scrollTo: restoreFromPreview ? undefined : snapshot,
     });
-    activeEditorView = viewRef.current;
-    const untrackScroll = trackScroll(filePath, viewRef.current);
+    viewRef.current = nextView;
+    // 从预览切回来：预览没有行号，只能按共享比例近似落位；布局未就绪时下一帧再试一次
+    if (restoreFromPreview && sharedScroll) {
+      const el = nextView.scrollDOM;
+      const max = el.scrollHeight - el.clientHeight;
+      if (max > 0) {
+        el.scrollTop = sharedScroll.ratio * max;
+      } else {
+        requestAnimationFrame(() => {
+          if (viewRef.current !== nextView) return;
+          const m = el.scrollHeight - el.clientHeight;
+          if (m > 0) el.scrollTop = sharedScroll.ratio * m;
+        });
+      }
+    }
+    // 挂载后记一次当前比例：用户打开文件后**没滚动**就切到预览时，预览也要能接上位置
+    requestAnimationFrame(() => {
+      if (viewRef.current === nextView) rememberScrollRatio(filePath, nextView);
+    });
+    activeEditorView = nextView;
+    const untrackScroll = trackScroll(filePath, nextView);
 
     // 把"未合帧的编辑"登记到 store（PERF-13）：登记的是 (tabId, 取文本) 一对，
     // 于是即便结算发生在用户切走之后，内容也会落到**当时那个标签**头上。
@@ -1233,6 +1273,18 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     return () => document.removeEventListener('keydown', handler, true);
   }, []);
 
+  // 搜索弹窗关闭：清空命中高亮。
+  //
+  // **必须排在下面的「定位请求」effect 之前**：文件是由"点击搜索结果"打开的时候，
+  // 挂载这一拍两个 effect 都会跑——先清空（空 dispatch，无害），再应用定位与高亮。
+  // 反过来（清空在后）会把刚加上的命中 `<mark>` 立刻擦掉，表现为"跳到了那一行，
+  // 但一个命中都没高亮"——这是搜索结果打开新文件时的常见路径。
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: searchHitEffect.of([]) });
+  }, [hitSeq]);
+
   // 定位请求（搜索结果点击）：滚动到指定行 + 高亮全文命中词
   useEffect(() => {
     if (!locate || locate.path !== filePath) return;
@@ -1283,13 +1335,6 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
     });
     clearLocate();
   }, [locate, filePath, clearLocate]);
-
-  // 搜索弹窗关闭：清空命中高亮（首轮渲染的无害空 dispatch 除外）
-  useEffect(() => {
-    const view = viewRef.current;
-    if (!view) return;
-    view.dispatch({ effects: searchHitEffect.of([]) });
-  }, [hitSeq]);
 
   return (
     <div className="relative h-full">

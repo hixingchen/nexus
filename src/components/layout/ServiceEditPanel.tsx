@@ -8,6 +8,7 @@ import { readServiceDraft, serviceDraftKey, useServiceDraftStore } from '../../s
 import { ToolsManagerModal } from './ToolsManagerModal';
 import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
+import { watchPathsAfterCwdChange } from '../../utils/watchPaths';
 import { useClickOutside } from '../../hooks/useClickOutside';
 
 const WATCH_MODE_OFF = 0;
@@ -79,6 +80,14 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [command, setCommand] = useState(initialDraft?.command ?? service.command);
   const [cwd, setCwd] = useState(initialDraft?.cwd ?? service.cwd);
   const [watchPaths, setWatchPaths] = useState(initialDraft?.watchPaths ?? service.watch_paths);
+  /**
+   * 用户是否在本面板里**手动编辑过**监听路径（不是 ref 触发渲染，只是状态标记）。
+   *
+   * 工作目录一变就把监听路径重置为跟随新目录（见 utils/watchPaths 的说明：模板带过来的
+   * 路径多半指向模板作者的机器）。但用户亲手改过的监听路径是明确意图（多根监听等），
+   * 不能被一次目录改动静默覆盖——这个标记就是两者的分界。
+   */
+  const watchPathsTouchedRef = useRef(false);
   const [watchInclude, setWatchInclude] = useState(initialDraft?.watchInclude ?? service.watch_include);
   const [watchExclude, setWatchExclude] = useState(initialDraft?.watchExclude ?? service.watch_exclude);
   const [envVars, setEnvVars] = useState(initialDraft?.envVars ?? service.env_vars);
@@ -151,6 +160,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
   /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
   const handleDiscard = () => {
+    // 表单已回到持久化值 = 重新回到"用户没碰过监听路径"的状态
+    watchPathsTouchedRef.current = false;
     setName(service.name);
     setCommand(service.command);
     setCwd(service.cwd);
@@ -214,21 +225,17 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   };
 
   /**
-   * 更新工作目录；若监听路径还处于"跟随工作目录"的默认状态
-   * （空 / [] / 恰好等于 [旧 cwd]），则同步更新为 [新 cwd]
+   * 更新工作目录，并默认把监听路径重置为跟随新目录。
+   *
+   * 为什么是"默认重置"而不是"只在原本等于旧目录时才跟随"：从模板添加的服务会带着
+   * 模板里的 watch_paths（模板作者机器上的绝对路径，或相对旧目录的写法），旧判据
+   * （空 / [] / 恰好 [旧 cwd]）识别不出这种情况——用户改完 cwd 很容易忘了改监听路径，
+   * 服务于是盯着一个无关位置，"改代码不重启"且界面上看不出任何异常。
    */
   const applyCwd = (next: string) => {
-    const prev = cwd;
     setCwd(next);
-    const trimmed = watchPaths.trim();
-    let follows = trimmed === '' || trimmed === '[]';
-    if (!follows) {
-      try {
-        const arr = JSON.parse(trimmed) as unknown;
-        follows = Array.isArray(arr) && arr.length === 1 && arr[0] === prev;
-      } catch { /* 非 JSON（用户自定义格式）：不跟随 */ }
-    }
-    if (follows) setWatchPaths(next ? JSON.stringify([next]) : '[]');
+    const nextWatch = watchPathsAfterCwdChange({ touched: watchPathsTouchedRef.current, nextCwd: next });
+    if (nextWatch !== null) setWatchPaths(nextWatch);
   };
 
   const handleSelectCwd = async () => {
@@ -393,31 +400,40 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       {/* 未保存提示：面板的字段改动会随面板卸载/切项目保留（草稿按 id 存），
           但没有持久化——这里给一个显式出口，避免用户以为已经保存 */}
       {formDirty && (
-        <div className="flex items-center gap-2 px-4 h-[28px] flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
-          <span className="w-1.5 h-1.5 rounded-full bg-nexus-warning flex-shrink-0" />
-          <span className="flex-1 text-[11.5px] text-nexus-warning">有未保存的修改（切换服务/面板不会丢失）</span>
-          {/* 放弃修改会**永久清掉草稿**（不只是把表单还原），所以走两步确认（UX-19）：
-              紧挨着提示条的小号文字按钮，一点就没，用户以为只是"撤销这一下" */}
-          {confirmDiscard ? (
-            <span className="flex items-center gap-2">
-              <span className="text-[11.5px] text-nexus-error">丢弃这些修改并清掉草稿？</span>
-              <button
-                className="text-[11.5px] text-nexus-error font-medium hover:underline"
-                onClick={() => { setConfirmDiscard(false); handleDiscard(); }}
-              >确认放弃</button>
-              <button
-                className="text-[11.5px] text-nexus-text-muted hover:text-nexus-text hover:underline"
-                onClick={() => setConfirmDiscard(false)}
-              >取消</button>
-            </span>
-          ) : (
+        /* 放弃修改会**永久清掉草稿**（不只是把表单还原），所以走两步确认（UX-19）。
+           确认态**不再保留**"有未保存的修改"那句：360px 的抽屉里，提示 + 问题 +
+           两个按钮挤在同一行必然换行、又被 28px 的行高裁掉（实际表现是文字溢出/错位）。
+           这一步只需说清后果并给出两个成对的操作，所以换成红底的确认行 + 两个实心按钮。 */
+        confirmDiscard ? (
+          <div className="flex items-center gap-2 px-4 min-h-[30px] py-1 flex-shrink-0 bg-nexus-error/10 border-b border-nexus-error/30">
+            <span className="w-1.5 h-1.5 rounded-full bg-nexus-error flex-shrink-0" />
+            <span
+              className="flex-1 min-w-0 truncate text-[11.5px] text-nexus-error"
+              title="丢弃这些修改并清掉草稿？此操作不可撤销"
+            >丢弃这些修改并清掉草稿？</span>
             <button
-              className="text-[11.5px] text-nexus-warning hover:underline"
+              className="flex-shrink-0 h-[22px] px-2 rounded-md text-[11px] text-nexus-text-muted border border-nexus-border hover:text-nexus-text hover:bg-nexus-hover/50 transition-colors"
+              onClick={() => setConfirmDiscard(false)}
+            >取消</button>
+            <button
+              className="flex-shrink-0 h-[22px] px-2 rounded-md text-[11px] font-medium text-nexus-error border border-nexus-error/40 bg-nexus-error/15 hover:bg-nexus-error/25 transition-colors"
+              onClick={() => { setConfirmDiscard(false); handleDiscard(); }}
+            >确认放弃</button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 px-4 h-[28px] flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
+            <span className="w-1.5 h-1.5 rounded-full bg-nexus-warning flex-shrink-0" />
+            <span
+              className="flex-1 min-w-0 truncate text-[11.5px] text-nexus-warning"
+              title="有未保存的修改（切换服务/面板不会丢失）"
+            >有未保存的修改（切换服务/面板不会丢失）</span>
+            <button
+              className="flex-shrink-0 text-[11.5px] text-nexus-warning hover:underline"
               title="回到已保存的配置（会丢弃本面板里未保存的改动与草稿，不可撤销）"
               onClick={() => setConfirmDiscard(true)}
             >放弃修改</button>
-          )}
-        </div>
+          </div>
+        )
       )}
       <div className="flex-1 overflow-auto p-3 space-y-3">
         {/* ── 基本信息卡片 ── */}
@@ -436,6 +452,9 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
               <label htmlFor={`${uid}-cwd`} className={labelCls}>工作目录</label>
               <div className="relative mt-1">
                 <input id={`${uid}-cwd`} className={`${INPUT_CLS} pr-8`} value={cwd}
+                  // 说清副作用：改目录会重置监听路径（用户手动改过的除外），
+                  // 否则用户会以为"只改了目录"
+                  title="修改工作目录会把监听路径重置为新的工作目录（在本面板里手动改过监听路径则保留）"
                   onChange={e => applyCwd(e.target.value)} placeholder="/path/to/service" />
                 <button
                   aria-label="选择工作目录"
@@ -474,7 +493,9 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
               <div>
                 <label htmlFor={`${uid}-watch-paths`} className={labelCls}>监听路径</label>
                 <input id={`${uid}-watch-paths`} className={`${INPUT_CLS} font-mono mt-1`} value={watchPaths}
-                  onChange={e => setWatchPaths(e.target.value)} placeholder='["./server", "./shared"]' />
+                  // 手动编辑过 = 明确意图：之后改工作目录不再自动重置（见 watchPathsTouchedRef）
+                  onChange={e => { watchPathsTouchedRef.current = true; setWatchPaths(e.target.value); }}
+                  placeholder='["./server", "./shared"]' />
               </div>
               <div>
                 <label htmlFor={`${uid}-watch-include`} className={labelCls}>包含文件</label>

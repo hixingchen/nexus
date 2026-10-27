@@ -584,10 +584,29 @@ pub async fn read_jar_entry(
             Ok(src) => src,
             Err(e) => {
                 log::warn!("[nexus] jar 内 class 反编译失败，回退字节码视图: {}", e);
-                // 回退路径同样是那 1812 行解析器：一并挪出 tokio worker（PERF-30）
-                tokio::task::spawn_blocking(move || crate::core::classfile::disassemble_class(&entry))
-                    .await
-                    .map_err(|e| format!("解析 class 字节码任务失败: {}", e))??
+                // 回退路径同样是那 1812 行解析器：一并挪出 tokio worker（PERF-30）。
+                // 克隆一份字节给阻塞任务——下面的"两种视图都失败 → 二进制"还要用原始 entry
+                let bytes_for_disasm = entry.clone();
+                let disassembled = tokio::task::spawn_blocking(move || {
+                    crate::core::classfile::disassemble_class(&bytes_for_disasm)
+                })
+                .await
+                .map_err(|e| format!("解析 class 字节码任务失败: {}", e))?;
+                match disassembled {
+                    Ok(src) => src,
+                    Err(e2) => {
+                        // 反编译与字节码视图都失败（损坏 / 截断 / 非 class 内容）：
+                        // 按二进制返回，前端用 hex 视图内存模式渲染——直接报错会让用户
+                        // 连原始字节都看不到
+                        log::warn!("[nexus] jar 内 class 字节码视图也失败，回退十六进制: {}", e2);
+                        use base64::{engine::general_purpose::STANDARD, Engine as _};
+                        return Ok(JarEntryContent {
+                            content: STANDARD.encode(&entry),
+                            kind: "binary".into(),
+                            size,
+                        });
+                    }
+                }
             }
         };
         Ok(JarEntryContent { content, kind: "class".into(), size })

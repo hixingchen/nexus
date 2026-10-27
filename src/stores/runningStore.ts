@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { processApi, type FailedService, type RunningService } from '../services/service';
+import type { StopSignal } from '../utils/logPanel';
 
 /**
  * 运行状态共享 store：单一 3 秒轮询，useProjectList / useProjectDetail 共同订阅，
@@ -65,6 +66,17 @@ interface RunningStore {
   failed: FailedService[];
   /** 是否已成功拉取过（供下游区分"空列表"与"尚未加载"） */
   loaded: boolean;
+  /**
+   * **用户显式停止**的信号（`seq` 单调递增，`serviceIds` 是这次确实停掉的服务）。
+   *
+   * 为什么不能拿"running/failed 里暂时没有它"当"已被停止"：自动重启与手动重启都是
+   * 后端 `stop → start`，中间有一段服务既不在 running 也不在 failed 的空窗；按运行态
+   * 差值判断会把日志面板当开关拉，高频挂载/卸载还会让 DOM 与 React 状态脱节
+   * （日志冻结、✕ 点不动、新日志被挤到最下方）。只有显式停止动作才发这个信号。
+   */
+  stopSignal: StopSignal;
+  /** 记录一次显式停止（由 `stores/serviceActions.ts` 的停止动作调用） */
+  markStopped: (serviceIds: string[]) => void;
   setRunning: (running: RunningService[], failed: FailedService[]) => void;
   refresh: () => Promise<void>;
   startPolling: () => void;
@@ -75,6 +87,10 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
   running: [],
   failed: [],
   loaded: false,
+  stopSignal: { seq: 0, serviceIds: [] },
+
+  markStopped: (serviceIds) =>
+    set((s) => ({ stopSignal: { seq: s.stopSignal.seq + 1, serviceIds } })),
 
   setRunning: (running, failed) => {
     const st = get();
