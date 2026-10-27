@@ -62,7 +62,7 @@ pub fn list_entries(jar_bytes: &[u8]) -> Result<Vec<JarEntryInfo>, String> {
             continue;
         }
         out.push(JarEntryInfo {
-            name: f.name().to_string(),
+            name: f.name().map_err(|e| format!("读取条目名失败: {}", e))?.to_string(),
             is_dir: false,
             size: f.size(),
             compressed_size: f.compressed_size(),
@@ -202,9 +202,11 @@ mod tests {
         }
     }
 
-    /// 回归：zip 炸弹防护必须按**实际解压字节数**判定，而不是归档自述的
-    /// `uncompressed_size`。该字段可被伪造成 1KB，而 `zip` crate 的解压链不会
-    /// 按它截断输出——只信声明值的实现会放行并撑爆内存。
+    /// 回归：伪造 `uncompressed_size` 的 zip 炸弹必须被拒绝。
+    ///
+    /// zip 9 自己会按声明值拒绝（"File is larger than its declared uncompressed size"）；
+    /// 我们自己的**实际解压字节**上限仍保留，作为解压链不校验声明值时的兜底。
+    /// 两条防线任一拒绝都算通过，断言只看"被拒绝且原因与大小有关"。
     #[test]
     fn test_read_entry_rejects_lying_declared_size() {
         // 实际 51MB（全零，压缩后极小），谎报 1KB
@@ -217,8 +219,10 @@ mod tests {
 
         let err = read_entry(&bytes, &[], "bomb.bin").unwrap_err();
         assert!(
-            err.contains("zip 炸弹") || err.contains("过大"),
-            "应按实际字节数拒绝伪造声明的条目，实际错误: {}",
+            err.contains("zip 炸弹")
+                || err.contains("过大")
+                || err.contains("declared uncompressed size"),
+            "伪造声明大小的条目必须被拒绝，实际错误: {}",
             err
         );
     }

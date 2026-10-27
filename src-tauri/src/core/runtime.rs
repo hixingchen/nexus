@@ -880,8 +880,8 @@ mod tests {
             use std::io::Write;
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut w = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
             w.add_directory("node-v0.0.0-win-x64/", opts).unwrap();
             w.start_file("node-v0.0.0-win-x64/node.exe", opts).unwrap();
             w.write_all(b"MZ fake").unwrap();
@@ -912,8 +912,8 @@ mod tests {
             use std::io::Write;
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut w = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
             w.start_file("node-v0.0.0-win-x64/../../escaped.txt", opts).unwrap();
             w.write_all(b"pwned").unwrap();
             // 混一条正常条目：光有恶意条目时整个解压会因"没解出任何文件"而失败，
