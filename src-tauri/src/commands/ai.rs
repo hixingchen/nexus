@@ -458,6 +458,11 @@ pub async fn create_ai_panel_webview(
     y: f64,
     width: f64,
     height: f64,
+    // 当前项目目录：据此给 dsh 预置"上次会话"记忆（见 core::ai::latest_session_id）。
+    // None = 不预置（未选项目/项目还没有会话）。
+    project_cwd: Option<String>,
+    // true = 恢复上次会话；false（默认）= 每次打开都新建会话（见 build_panel_init_script）
+    resume_session: bool,
 ) -> Result<(), String> {
     let window = app
         .get_window(&window_label)
@@ -480,6 +485,30 @@ pub async fn create_ai_panel_webview(
     let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
     let width = if width.is_finite() { width.max(1.0) } else { 1.0 };
     let height = if height.is_finite() { height.max(1.0) } else { 1.0 };
+
+    // 首次在新 origin 上打开：预置 dsh 的"当前会话"记忆。
+    //
+    // 稳定端口（core::ai::stable_port_for_project）保证同一项目每次同一个 origin，
+    // 但**升级后的第一次启动**这个 origin 还是空的——dsh 会新建空白会话，而用户想看
+    // 的是已有的上次会话。写 localStorage 必须赶在 dsh 页面脚本之前，所以放进
+    // initialization_script；只在键不存在时写，之后仍由 dsh 自己维护。
+    // 「新建会话」模式不需要扫描会话目录（也就不用为一次打开付扫盘成本）
+    let latest_session = match project_cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(cwd) if resume_session => {
+            let cwd = cwd.to_string();
+            tauri::async_runtime::spawn_blocking(move || crate::core::ai::latest_session_id(&cwd))
+                .await
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    let init_script = crate::core::ai::build_panel_init_script(
+        include_str!("../scripts/ai_focus_restore.js"),
+        latest_session.as_deref(),
+        resume_session,
+    );
+
     let builder = tauri::webview::WebviewBuilder::new(label, url)
         // HTML5 drag and drop（与 JS 创建时 dragDropEnabled: false 同义）
         .disable_drag_drop_handler()
@@ -498,8 +527,8 @@ pub async fn create_ai_panel_webview(
             }
             host_ok && scheme_ok
         })
-        // 文档创建时注入焦点记忆/恢复脚本（每次导航重新执行，幂等）
-        .initialization_script(include_str!("../scripts/ai_focus_restore.js"))
+        // 文档创建时注入焦点记忆/恢复脚本 + 首次"上次会话"预置（每次导航重新执行，幂等）
+        .initialization_script(&init_script)
         // 屏蔽 dsh 页面自带的右键菜单：主界面的全局禁止（src/main.tsx）作用于主文档，
         // 覆盖不到本子 WebView。用 for_all_frames：iframe 内的右键弹的是该帧自己的
         // 菜单，父文档的 contextmenu 监听收不到（Windows 上 wry 本就注入所有帧，

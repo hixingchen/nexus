@@ -9,6 +9,8 @@ import {
 import { copyText } from '../../utils/clipboard';
 import { notify } from '../../utils/notify';
 import { reportError, toMessage } from '../../utils/error';
+import { parseAiSessionMode, type AiSessionMode } from '../../utils/aiSession';
+import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { Modal } from '../ui/Modal';
 
 /**
@@ -38,6 +40,12 @@ export function AiRuntimeSection() {
   const [manualBusy, setManualBusy] = useState(false);
   /** 手动指定保存失败的原因（就地显示——这个失败**不能**只飘一个 toast 就没了） */
   const [manualError, setManualError] = useState('');
+
+  // 打开方式：持久化在 layout KV 表（与字号同一类"非几何设置"），默认新建会话
+  const sessionMode = parseAiSessionMode(
+    useLayoutStore((s) => s.values?.[LAYOUT_KEYS.aiSessionMode]),
+  );
+  const setSessionMode = (mode: AiSessionMode) => saveLayout({ [LAYOUT_KEYS.aiSessionMode]: mode });
 
   const load = useCallback(async () => {
     try {
@@ -277,6 +285,30 @@ export function AiRuntimeSection() {
         </div>
       </section>
 
+      {/* ── AI 会话：打开面板时是新建还是接上上次 ───────────────────
+          默认新建（保持历史行为）：稳定端口 + 不清理记忆会让 dsh 自动恢复上次
+          会话，对"每次都想开新对话"的用户反而是意外。 */}
+      <section>
+        <SectionTitle>AI 会话</SectionTitle>
+        <div className="px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30 space-y-2">
+          <SessionModeOption
+            checked={sessionMode === 'new'}
+            onSelect={() => setSessionMode('new')}
+            title="每次打开新建会话（默认）"
+            detail="打开 AI 面板时停在空白对话页；历史会话仍在侧栏里，不会被删除。"
+          />
+          <SessionModeOption
+            checked={sessionMode === 'resume'}
+            onSelect={() => setSessionMode('resume')}
+            title="打开上次使用的会话"
+            detail="自动接上该项目最近一次真正聊过的会话；空白会话与已归档会话会被跳过。"
+          />
+          <p className="text-[11px] text-nexus-muted leading-relaxed pt-0.5">
+            修改后在下一次启动/重建 AI 会话时生效（关闭面板只是隐藏，当前对话会保留）。
+          </p>
+        </div>
+      </section>
+
       {/* 确认弹窗：这是本面板唯一该用弹窗的地方——用户马上要做一件有代价的事（300MB + 几分钟），
           而且还有回头路可走。失败之后没有回头路，那种场景一律走就地卡片，不弹窗 */}
       <Modal
@@ -367,6 +399,32 @@ function RuntimeProgressInline({ progress, steps }: { progress: RuntimeProgress 
       ))}
       <div className="text-[11px] text-nexus-muted tabular-nums">{progress?.detail ?? '正在开始…'}</div>
     </div>
+  );
+}
+
+/** 单选行：标题 + 一句解释（点击整行可选中，命中区域比那个小圆点大得多） */
+function SessionModeOption({
+  checked, onSelect, title, detail,
+}: {
+  checked: boolean;
+  onSelect: () => void;
+  title: string;
+  detail: string;
+}) {
+  return (
+    <label className="flex items-start gap-2 cursor-pointer rounded px-1 py-1 hover:bg-nexus-hover/30 transition-colors">
+      <input
+        type="radio"
+        name="ai-session-mode"
+        checked={checked}
+        onChange={onSelect}
+        className="mt-[3px] flex-shrink-0 accent-[#74ade8]"
+      />
+      <span className="min-w-0">
+        <span className="block text-[12px] text-nexus-text">{title}</span>
+        <span className="block text-[11px] text-nexus-muted leading-relaxed">{detail}</span>
+      </span>
+    </label>
   );
 }
 

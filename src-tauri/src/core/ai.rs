@@ -326,6 +326,120 @@ fn find_project_sessions(storage: &Path, dir_norm: &str) -> Vec<PathBuf> {
     out
 }
 
+/// 该项目**最近活动**的会话 id（用于首次打开面板时预置 dsh 的"当前会话"记忆）。
+///
+/// **为什么需要**：稳定端口（见 `stable_port_for_project`）只能保证"第二次启动起"
+/// 能恢复；升级后的第一次启动，这个 origin 还没有任何 localStorage 记忆，dsh 只能
+/// 新建空白会话——而用户想看的恰恰是升级前已有的会话。这里找出最新一条，由子
+/// WebView 的 initialization_script 在页面脚本运行前写进 `dsh.sessions.current`
+/// （脚本只在该键不存在时写，之后仍由 dsh 自己维护）。
+///
+/// **为什么看 projection cache 而不是会话文件自己的时间**：Nexus 为了让 dsh 选中
+/// 当前项目，每次切项目都会 `bump_session_activity` 把**所有**会话文件的 header
+/// `createdAt` 和文件 mtime 刷成"现在"（见 `ensure_workspace_active`）——用这两个
+/// 字段判断"最新"只会选中最后被 bump 的那条。`session_projcache` 是 dsh 自己按
+/// 真实事件投影出来的缓存，只在该会话真的有活动时更新，因此它的 mtime 才是
+/// "上次用到它"的时间。
+///
+/// 只认**真正聊过**的会话（`titleInput.count > 0` 或有标题）：每次点开面板都会
+/// 新建一个空白会话，那些不应该被当成"上次的会话"恢复。
+/// 归档会话同样不参与（恢复一个被用户归档的会话比新建还突兀）。
+pub fn latest_session_id(dir: &str) -> Option<String> {
+    latest_session_id_at(&dsh_storage_dir()?, &norm_path(dir))
+}
+
+/// [`latest_session_id`] 的实现：storage 由调用方给（可测）。
+pub(crate) fn latest_session_id_at(storage: &Path, dir_norm: &str) -> Option<String> {
+    let cache_dir = storage.join("storages").join("session_projcache").join("sessions");
+    let archived = archived_session_ids(storage);
+    let entries = std::fs::read_dir(cache_dir).ok()?;
+    // 先按 mtime 收集，最近的先看：通常第一个"非空白且属于本项目"的命中就是答案，
+    // 不必把所有会话缓存都解析一遍（本机约 100 个、单个最大 ~270KB）
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // 缓存文件名就是会话 id：`session-<uuid>.json`
+        let Some(id) = name.strip_suffix(".json") else { continue };
+        if !id.starts_with("session-") {
+            continue;
+        }
+        if archived.iter().any(|a| a == id) {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        candidates.push((mtime, entry.path()));
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    for (_, path) in candidates {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let cwd_matches = doc
+            .pointer("/record/identity/cwd")
+            .and_then(|v| v.as_str())
+            .map(norm_path)
+            .as_deref()
+            == Some(dir_norm);
+        if !cwd_matches {
+            continue;
+        }
+        let prompt_count = doc
+            .pointer("/record/rows/titleInput/val/count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let has_title = doc.pointer("/record/rows/title/val").and_then(|v| v.as_str()).is_some();
+        if prompt_count == 0 && !has_title {
+            continue; // 空白会话
+        }
+        return Some(id.to_string());
+    }
+    None
+}
+
+/// 生成 AI 面板子 WebView 的 initialization_script：焦点脚本 + "打开方式"。
+///
+/// - `resume = true` 且找到最新会话：**仅在 localStorage 还没有记忆时**预置它
+///   （升级后的新 origin 第一次打开也能接上；之后仍由 dsh 自己维护"当前会话"）
+/// - `resume = false`（默认）：清掉 `dsh.sessions.current` → dsh 启动时没有任何
+///   "当前会话"，回到新建会话页（稳定端口带来的 origin 记忆不会把旧会话带出来）
+///
+/// 写成独立函数是为了可测：两种模式只差这一段脚本，而它决定了"打开面板看到的是
+/// 新会话还是上次会话"这个用户可见行为。
+pub fn build_panel_init_script(
+    focus_script: &str,
+    latest_session: Option<&str>,
+    resume: bool,
+) -> String {
+    let mut out = focus_script.to_string();
+    if !resume {
+        out.push_str(
+            "\n(() => { try { localStorage.removeItem('dsh.sessions.current'); } catch (e) {} })();",
+        );
+        return out;
+    }
+    if let Some(id) = latest_session {
+        // id 来自磁盘上的会话文件（外部数据）：JSON 转义后再拼进脚本，防注入
+        let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into());
+        out.push_str(&format!(
+            "\n(() => {{ try {{ const k = 'dsh.sessions.current'; if (!localStorage.getItem(k)) localStorage.setItem(k, JSON.stringify({{ sessionId: {id_json} }})); }} catch (e) {{}} }})();"
+        ));
+    }
+    out
+}
+
+/// dsh 注册表里被归档的会话 id（读不到/格式不对 → 空表，不影响"找最新"）。
+fn archived_session_ids(storage: &Path) -> Vec<String> {
+    let file = storage.join("storages").join("workspace.json");
+    let Ok(raw) = std::fs::read_to_string(file) else { return Vec::new() };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    doc.get("global")
+        .and_then(|g| g.get("archivedSessionIds"))
+        .and_then(|a| a.as_array())
+        .map(|ids| ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 /// createdAt 距今小于该阈值的会话视为"已经够新鲜"，跳过整文件重写。
 ///
 /// 重写一次会话文件 = 整读 + 解压首帧 + 重新压缩 + 写临时文件 + rename（按原大小整体写盘），
@@ -686,12 +800,77 @@ pub fn spawn_dsh_web(
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<AiSession, String> {
-    spawn_web_command(
+    // 优先用"按项目目录派生"的稳定端口：同一项目每次启动同一 origin，dsh 才能从
+    // localStorage 里恢复上次会话（见 stable_port_for_project）。端口被占用等失败时
+    // 回退到 OS 随机分配——那一次读不到旧记忆，但启动本身不受影响。
+    let port = cwd.map(stable_port_for_project).unwrap_or(0);
+    if port == 0 {
+        return spawn_web_command(
+            job,
+            runtime.command(&["web", "--no-open", "--port", "0"]),
+            cwd,
+            timeout,
+        );
+    }
+    let port_arg = port.to_string();
+    let started = Instant::now();
+    match spawn_web_command(
         job,
-        runtime.command(&["web", "--no-open", "--port", "0"]),
+        runtime.command(&["web", "--no-open", "--port", &port_arg]),
         cwd,
         timeout,
-    )
+    ) {
+        Ok(session) => Ok(session),
+        // 只对**快速失败**回退（端口被占用 / dsh 起不来都会立刻退出）。超时路径
+        // （60s 还没打印 URL）不能重试：那会把启动等待翻倍成两分钟
+        Err(e) if started.elapsed() < Duration::from_secs(5) => {
+            log::warn!(
+                "[ai] 固定端口 {} 启动失败，回退随机端口（本次不恢复上次会话）: {}",
+                port,
+                e
+            );
+            spawn_web_command(
+                job,
+                runtime.command(&["web", "--no-open", "--port", "0"]),
+                cwd,
+                timeout,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 稳定端口范围：39000..=39999（1000 个）。
+const STABLE_PORT_BASE: u16 = 39000;
+const STABLE_PORT_COUNT: u32 = 1000;
+
+/// 同一项目目录 → 同一端口。
+///
+/// **为什么必须稳定**：dsh 客户端把"上次打开的会话"存在 localStorage（键
+/// `dsh.sessions.current`，见 `dsh-client-ui-workspace` 的 `restoreSelection`），
+/// 而 localStorage 按 origin（`http://localhost:<port>`）隔离。原来的 `--port 0`
+/// 每次启动都换端口 = 换 origin = 上次的会话记忆读不到，GUI 只能退回"新建会话"
+/// （用户看到的就是每次打开面板都停在「探索未至之境」）。
+///
+/// **为什么按项目目录派生、而不是全局固定一个端口**：dsh 的 `restoreSelection`
+/// 直接恢复 localStorage 里记住的 sessionId，**不校验它属于哪个 workspace**；
+/// 多项目共用一个端口时，从 A 切到 B 会恢复成 A 的会话。按目录哈希给每个项目
+/// 独立的 origin，会话记忆互不串台。
+///
+/// Windows 路径大小写不敏感、分隔符可能混用：先归一化，避免同一个目录派生出
+/// 两个不同端口（那会让"恢复上次会话"时灵时不灵）。
+pub(crate) fn stable_port_for_project(cwd: &str) -> u16 {
+    let mut normalized = cwd.trim().split('/').collect::<Vec<_>>().join("\\").to_lowercase();
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    // FNV-1a：短字符串上分布均匀，且不依赖哈希表的随机种子（每次进程启动结果一致）
+    let mut hash: u32 = 2166136261;
+    for b in normalized.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    STABLE_PORT_BASE + (hash % STABLE_PORT_COUNT) as u16
 }
 
 /// `spawn_dsh_web` 的实体。
@@ -1024,6 +1203,29 @@ mod tests {
         dir.join("storages").join("workspace.json").to_string_lossy().into_owned()
     }
 
+    /// 稳定端口：同一目录的不同写法必须落到同一端口（大小写/分隔符/尾部分隔符
+    /// 的差异不该让"上次会话"时灵时不灵），且必须落在保留的端口区间内。
+    #[test]
+    fn test_stable_port_for_project_normalizes_path() {
+        let a = stable_port_for_project(r"D:\work\GitProject\nexus");
+        let b = stable_port_for_project("d:/work/gitproject/nexus/");
+        assert_eq!(a, b, "同一目录的写法差异不应派生出不同端口");
+        assert!(
+            (STABLE_PORT_BASE..STABLE_PORT_BASE + STABLE_PORT_COUNT as u16).contains(&a),
+            "端口应落在稳定区间内: {}",
+            a
+        );
+    }
+
+    /// 不同项目必须使用不同 origin：dsh 的 restoreSelection 不校验 session 属于
+    /// 哪个 workspace，共用端口会让切项目恢复成另一个项目的会话。
+    #[test]
+    fn test_stable_port_for_project_differs_between_projects() {
+        let a = stable_port_for_project(r"D:\work\a");
+        let b = stable_port_for_project(r"D:\work\b");
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn test_register_new_workspace_prepends_and_wins_recent() {
         let dir = std::env::temp_dir().join(format!("ai-ws-test-{}", uuid::Uuid::new_v4()));
@@ -1176,6 +1378,106 @@ mod tests {
             assert_eq!(found.len(), 1, "`{}` 必须被认到（否则工作区跟随静默失效）", name);
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// 造一条 dsh 的 projection cache（只保留 `latest_session_id` 读的字段）
+    fn make_proj_cache(
+        dir: &std::path::Path,
+        sid: &str,
+        cwd: &str,
+        prompt_count: u64,
+        title: Option<&str>,
+    ) -> PathBuf {
+        let cache = dir.join("storages").join("session_projcache").join("sessions");
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = cache.join(format!("{sid}.json"));
+        let doc = serde_json::json!({
+            "version": 7,
+            "record": {
+                "identity": { "formatVersion": 4, "cwd": cwd },
+                "rows": {
+                    "title": { "ver": 1, "seq": 2, "val": title },
+                    "titleInput": {
+                        "ver": 3, "seq": 2,
+                        "val": { "first": null, "count": prompt_count, "lastSeq": null }
+                    }
+                }
+            }
+        });
+        std::fs::write(&file, doc.to_string()).unwrap();
+        file
+    }
+
+    /// 首次打开面板时预置的"上次会话"：取最新一条**真正聊过**的会话；
+    /// 更晚创建的空白会话（每次点开面板都会新建）和已归档会话都要跳过。
+    #[test]
+    fn test_latest_session_id_skips_blank_and_archived() {
+        let dir = std::env::temp_dir().join(format!("ai-latest-test-{}", uuid::Uuid::new_v4()));
+        let cwd = r"D:\work\GitProject\proj";
+        let older = "session-aaaa-0001";
+        let blank = "session-bbbb-0002";
+        let archived = "session-cccc-0003";
+        make_proj_cache(&dir, older, cwd, 3, Some("旧会话"));
+        std::thread::sleep(Duration::from_millis(20));
+        make_proj_cache(&dir, blank, cwd, 0, None); // 刚点开面板就关掉的空白会话
+        std::thread::sleep(Duration::from_millis(20));
+        make_proj_cache(&dir, archived, cwd, 5, Some("已归档的会话"));
+
+        std::fs::create_dir_all(dir.join("storages")).unwrap();
+        let ws = serde_json::json!({
+            "unit": { "name": "workspace", "version": 2 },
+            "global": { "archivedSessionIds": [archived] },
+            "tables": { "workspaces": {} }
+        });
+        std::fs::write(dir.join("storages").join("workspace.json"), ws.to_string()).unwrap();
+
+        assert_eq!(latest_session_id_at(&dir, &norm_path(cwd)).as_deref(), Some(older));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 只能恢复**当前项目**的会话：别的项目最新也不能拿来用。
+    #[test]
+    fn test_latest_session_id_ignores_other_projects() {
+        let dir = std::env::temp_dir().join(format!("ai-latest-other-{}", uuid::Uuid::new_v4()));
+        let cwd = r"D:\work\GitProject\proj";
+        make_proj_cache(&dir, "session-other-0001", r"D:\work\other", 9, Some("别的项目"));
+        assert_eq!(latest_session_id_at(&dir, &norm_path(cwd)), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 没有任何缓存/会话（新项目）→ 不预置，交给 dsh 正常新建
+    #[test]
+    fn test_latest_session_id_none_without_cache() {
+        let dir = std::env::temp_dir().join(format!("ai-latest-empty-{}", uuid::Uuid::new_v4()));
+        assert_eq!(latest_session_id_at(&dir, &norm_path(r"D:\work\none")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 默认（新建）模式必须**清掉**"当前会话"记忆：稳定端口让 origin 固定后，
+    /// 不清的话 dsh 会把上次会话带出来。即使扫到了最新会话 id 也不能写入。
+    #[test]
+    fn test_panel_init_script_new_mode_clears_selection() {
+        let s = build_panel_init_script("FOCUS();", Some("session-x"), false);
+        assert!(s.starts_with("FOCUS();"));
+        assert!(s.contains("removeItem('dsh.sessions.current')"));
+        assert!(!s.contains("setItem"), "新建模式不应写入任何会话: {}", s);
+    }
+
+    /// 恢复模式：有最新会话才预置，且只在该键不存在时写（之后交给 dsh 自己维护）
+    #[test]
+    fn test_panel_init_script_resume_mode_seeds_latest_once() {
+        let s = build_panel_init_script("FOCUS();", Some("session-x"), true);
+        assert!(s.contains("if (!localStorage.getItem(k))"));
+        assert!(s.contains(r#"JSON.stringify({ sessionId: "session-x" })"#));
+        // 没有会话（新项目）：保持焦点脚本原样，交给 dsh 新建
+        assert_eq!(build_panel_init_script("FOCUS();", None, true), "FOCUS();");
+    }
+
+    /// 会话 id 是磁盘上的外部数据：必须 JSON 转义后拼进脚本，不能原样插值
+    #[test]
+    fn test_panel_init_script_escapes_session_id() {
+        let s = build_panel_init_script("F", Some("a\"b\\c"), true);
+        assert!(s.contains(r#""a\"b\\c""#), "id 未转义: {}", s);
     }
 
     /// 会话目录里的非会话文件不该被当成会话（放宽文件名判据的代价要守住）
@@ -1568,7 +1870,7 @@ mod tests {
 
     /// 成功路径：stdout 里的启动 URL 被解析出来（127.0.0.1 → localhost），会话字段齐备。
     ///
-    /// 用 `cmd` 假冒 dsh：生产命令是写死的 `dsh web --no-open --port 0`，只有测试能替换
+    /// 用 `cmd` 假冒 dsh：生产命令是 `dsh web --no-open --port <稳定端口|0>`，只有测试能替换
     /// （见 `spawn_web_command` 的说明）。cwd 传 `target`、探针用 `.\` 开头的相对路径——
     /// 顺便证明 `current_dir` 确实传给了子进程（裸文件名不行：收口用的
     /// `NoDefaultCurrentDirectoryInExePath=1` 会让 cmd 跳过当前目录，见 spawn_guard.rs）。

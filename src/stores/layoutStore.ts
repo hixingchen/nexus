@@ -35,6 +35,14 @@ export const LAYOUT_KEYS = {
    * `reset_layout` 排除在清除范围之外——见 `commands/layout.rs` 的 `KEEP_ON_RESET`。
    */
   editorFontSize: 'editor_font_size',
+  /**
+   * AI 面板打开方式：`'new'`（默认，每次打开新建会话）/ `'resume'`（恢复上次使用的会话）。
+   *
+   * 与字号同理：它不是几何布局，但本表是唯一的 KV 持久化；`reset_layout` 的保留清单
+   * （`commands/layout.rs` 的 `KEEP_ON_RESET`）里必须带上它，否则"恢复默认布局"会
+   * 顺手改掉用户的 AI 使用偏好。
+   */
+  aiSessionMode: 'ai_session_mode',
 } as const;
 
 export type LayoutKey = (typeof LAYOUT_KEYS)[keyof typeof LAYOUT_KEYS];

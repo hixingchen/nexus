@@ -5,6 +5,8 @@ import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAiStore, selectAiRunningHere, AI_PANEL_MIN_W, AI_PANEL_MAX_W } from '../../stores/aiStore';
+import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { parseAiSessionMode } from '../../utils/aiSession';
 import { useUiStore } from '../../stores/uiStore';
 import {
   aiService,
@@ -360,7 +362,14 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     setWvError(null);
     createLockRef.current = (async () => {
       try {
-        const { wv, sync, unlistens } = await createEmbeddedWebview(url, slot);
+        // currentCwd 从 store 读而不是闭包里的 cwd：避免把 cwd 加进本 effect 的依赖
+        // （切项目时 currentCwd 会先变、url 稍后才变，提前重建一次是纯浪费）。
+        // 打开方式同理在创建这一刻读一次：改了设置后下一次建 WebView 生效。
+        const resumeSession =
+          parseAiSessionMode(useLayoutStore.getState().values?.[LAYOUT_KEYS.aiSessionMode]) === 'resume';
+        const { wv, sync, unlistens } = await createEmbeddedWebview(
+          url, slot, useAiStore.getState().currentCwd, resumeSession,
+        );
         if (desiredKeyRef.current !== key || !useAiStore.getState().panelOpen) {
           // 创建期间被收起/切项目/刷新 → 不展示过期页面，自毁
           sync.dispose();
@@ -896,7 +905,12 @@ function RetryButton({ onClick, children }: { onClick: () => void; children: Rea
  * 低频路径走守卫版 relayout：最小化/无效矩形不写入，错位值进不来）。
  * WebView 对 dsh 是顶层导航，不受父页 CSP 帧策略约束，SameSite=Strict cookie 正常携带
  */
-async function createEmbeddedWebview(url: string, slot: HTMLElement) {
+async function createEmbeddedWebview(
+  url: string,
+  slot: HTMLElement,
+  projectCwd: string | null,
+  resumeSession: boolean,
+) {
   const appWindow = getCurrentWindow();
   const b = boundsFromSlot(slot);
   // 经 Rust 命令创建（带 initialization_script：dsh 页面焦点记忆/恢复脚本安装——
@@ -910,6 +924,8 @@ async function createEmbeddedWebview(url: string, slot: HTMLElement) {
     y: b?.y ?? 0,
     width: b?.width ?? 1,
     height: b?.height ?? 1,
+    projectCwd,
+    resumeSession,
   });
   const all = await getAllWebviews();
   const wv = all.find((w) => w.label === label);

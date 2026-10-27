@@ -50,7 +50,7 @@ pub fn load_layout(state: State<AppState>) -> Result<HashMap<String, String>, St
 /// 这几个字面量与前端 `stores/layoutStore.ts` 的 `LAYOUT_KEYS` 是同一把键。`contract.rs` 管的是
 /// IPC 载荷的字段名，管不到"存进库里的键"，所以这一对只能靠人同步——新增布局键时，
 /// 先问一句"它算不算几何"。
-const KEEP_ON_RESET: &[&str] = &["selected_project_id", "editor_font_size"];
+const KEEP_ON_RESET: &[&str] = &["selected_project_id", "editor_font_size", "ai_session_mode"];
 
 /// 恢复默认布局的**纯逻辑**（单独成函数才测得到，`State<AppState>` 在单测里造不出来）：
 /// 清掉除 [`KEEP_ON_RESET`] 以外的全部布局键，返回删除的行数。

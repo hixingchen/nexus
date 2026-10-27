@@ -75,6 +75,16 @@ interface PanelWebviewBounds {
   y: number;
   width: number;
   height: number;
+  /**
+   * 当前项目目录：后端据此找出该项目最新的会话，在 dsh 页面脚本运行前预置
+   * "上次会话"记忆（新 origin 的第一次打开也能直接恢复，而不是新建空白会话）。
+   */
+  projectCwd: string | null;
+  /**
+   * false（默认）= 每次打开新建会话：清掉 dsh 的"当前会话"记忆；
+   * true = 恢复上次使用的会话。
+   */
+  resumeSession: boolean;
 }
 
 export const aiService = {
