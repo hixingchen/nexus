@@ -13,7 +13,6 @@ import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
-import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ResizablePanel } from './ResizablePanel';
 import { ServiceTreeEntry } from './ServiceTreeEntry';
 import { ServiceContextMenu } from './ServiceContextMenu';
@@ -39,7 +38,7 @@ import { openInExplorer, openTerminal, pickSaveFile } from '../../services/syste
 import { useToolStore } from '../../stores/toolStore';
 import { useServiceActions } from '../../hooks/useServiceActions';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
-import { useToolCommandRunner } from '../../hooks/useToolCommandRunner';
+import { useRunToolCommand } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
 // 模板导入导出用系统文件对话框选路径：后端按"用户显式选择的路径"处理（与打开工具选 exe 同口径）
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -120,13 +119,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     if (branchHostRef.current) branchHostRef.current.scrollTop = 0;
   }, [branchKey]);
 
-  // 工具命令执行（订阅事件流 / 跑命令 / 失败态 / 停止）抽到独立 hook（ARCH-7 ②）
-  const {
-    state: toolCommandState,
-    run: handleRunToolCommand,
-    stop: handleStopToolCommand,
-    close: handleCloseToolCommand,
-  } = useToolCommandRunner();
+  // 工具命令执行（订阅事件流 / 跑命令 / 失败态）抽到独立 hook（ARCH-7 ②）。
+  // 弹窗本身挂在 MainLayout（全局）：关掉弹窗/切项目后命令仍在后台跑，弹窗必须活得比本组件久
+  const handleRunToolCommand = useRunToolCommand();
 
   // ── 服务模板库（全局、跨项目，右侧面板下半区） ──
   const [templates, setTemplates] = useState<ServiceTemplate[]>([]);
@@ -558,18 +553,6 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           </div>
         </div>
       </Modal>
-
-      {/* 工具命令执行结果弹窗（输出行由弹窗自己按 runId 订阅 store） */}
-      <ToolCommandResultDialog
-        open={toolCommandState.open}
-        commandName={toolCommandState.commandName}
-        runId={toolCommandState.runId || null}
-        result={toolCommandState.result}
-        error={toolCommandState.error}
-        loading={toolCommandState.loading}
-        onStop={handleStopToolCommand}
-        onClose={handleCloseToolCommand}
-      />
     </div>
   );
 }

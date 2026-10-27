@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCommandResult } from '../../services/service';
 import { useUiStore } from '../../stores/uiStore';
 import { EMPTY_LOGS, useToolLogStore } from '../../stores/toolLogStore';
@@ -28,8 +28,9 @@ interface Props {
   loading: boolean;
   /** 失败原因（执行失败时展示在弹窗内，不再只靠 3 秒 toast） */
   error?: string | null;
-  /** 停止执行（终止进程树）；仅执行中提供 */
-  onStop?: () => void;
+  /** 停止执行（终止进程树）；返回是否成功（「停止并关闭」据此决定关不关窗） */
+  onStop?: () => Promise<boolean>;
+  /** 关闭弹窗（不停止命令；运行中的命令转入后台，见下方确认条） */
   onClose: () => void;
 }
 
@@ -37,6 +38,14 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
   const outputRef = useRef<HTMLPreElement>(null);
   /** 已请求停止（防重复点击）：命令返回（loading 变 false）后自动复位 */
   const [stopping, setStopping] = useState(false);
+  /**
+   * 执行中点了关闭（X / 关闭 / Esc / 点遮罩）→ 先问清楚。
+   *
+   * 关闭本身**不停止命令**，但用户此前无从判断这一点，关闭后命令变成看不见的后台进程，
+   * 再执行一遍就会并行两份。确认条把"后台继续 / 停止并关闭"摆到眼前，不再靠猜。
+   */
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [stopAndClosing, setStopAndClosing] = useState(false);
   /** 遮罩按下/抬起都在遮罩上才算「点遮罩关闭」（防止框内拖选文本松手时误关） */
   const overlayRef = useRef<HTMLDivElement>(null);
   const mouseDownTarget = useRef<EventTarget | null>(null);
@@ -45,13 +54,15 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
   const streamedLogs = useToolLogStore(s => (runId ? s.logs[runId] : undefined) ?? EMPTY_LOGS);
 
   useEffect(() => {
-    if (!loading) setStopping(false);
+    if (!loading) {
+      setStopping(false);
+      // 命令在确认条开着的时候结束了：不必再问，直接按"已结束"正常展示
+      setConfirmClose(false);
+      setStopAndClosing(false);
+    }
   }, [loading]);
-
-  useEffect(() => {
-    if (!open || !runId) return;
-    return () => { useToolLogStore.getState().drop(runId); };
-  }, [open, runId]);
+  // 注意：**不能**在关闭弹窗时 drop 日志——命令可能还在后台跑，输出要继续缓冲，
+  // 否则「后台运行」后从指示器/通知再打开就是一片空白。日志由 toolCommandStore.remove 清理。
 
   // 全文只在"流式行变化 / 结果到达"时拼一次：原实现每次重渲染都 join 最多 2000 行
   const output = useMemo(() => {
@@ -73,13 +84,19 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
     return () => useUiStore.getState().popModal();
   }, [open]);
 
-  // Esc 关闭（与 Modal 行为一致）：仅隐藏弹窗，执行中的命令在后台继续（结果不再展示）
+  /** 所有关闭入口（X / 关闭 / Esc / 点遮罩）都走这里：执行中先让用户选怎么关 */
+  const requestClose = useCallback(() => {
+    if (loading && onStop) setConfirmClose(true);
+    else onClose();
+  }, [loading, onStop, onClose]);
+
+  // Esc 关闭（与 Modal 行为一致）：执行中先弹确认条，不把命令悄悄丢到后台
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose(); };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [open, onClose]);
+  }, [open, requestClose]);
 
   if (!open) return null;
 
@@ -92,7 +109,7 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
       className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50"
       onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
       onMouseUp={(e) => {
-        if (mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) onClose();
+        if (mouseDownTarget.current === overlayRef.current && e.target === overlayRef.current) requestClose();
         mouseDownTarget.current = null;
       }}
     >
@@ -125,7 +142,7 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
           <button
             aria-label="关闭结果窗口"
             className="w-7 h-7 flex items-center justify-center rounded-lg text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50"
-            onClick={onClose}
+            onClick={requestClose}
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M4 4l8 8M12 4l-8 8" />
@@ -168,24 +185,55 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
           )}
         </div>
 
-        {/* 底部：执行中可停止（终止进程树）；长构建类命令不必等到超时 */}
-        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-nexus-border flex-shrink-0">
-          {loading && onStop && (
+        {/* 底部：执行中可停止（终止进程树）；长构建类命令不必等到超时。
+            执行中点关闭会先切到确认条（见上），把"后台继续 / 停止并关闭"说清楚 */}
+        {confirmClose ? (
+          <div className="flex items-center gap-2 px-4 py-3 border-t border-nexus-warning/40 bg-nexus-warning/5 flex-shrink-0">
+            <span className="flex-1 text-[12px] text-nexus-text">
+              命令仍在执行，关闭窗口不会停止它。
+            </span>
             <button
-              className="px-4 py-1.5 text-[12px] text-nexus-error border border-nexus-error/40 rounded hover:bg-nexus-error/10 disabled:opacity-40 disabled:cursor-not-allowed"
-              disabled={stopping}
-              onClick={() => { setStopping(true); onStop(); }}
+              className="px-3 py-1.5 text-[12px] text-nexus-text-muted rounded hover:bg-nexus-hover/50"
+              disabled={stopAndClosing}
+              onClick={() => setConfirmClose(false)}
+            >取消</button>
+            <button
+              className="px-3 py-1.5 text-[12px] bg-nexus-surface text-nexus-text rounded hover:bg-nexus-hover/50 disabled:opacity-40"
+              disabled={stopAndClosing}
+              onClick={onClose}
+            >后台运行</button>
+            <button
+              className="px-3 py-1.5 text-[12px] text-nexus-error border border-nexus-error/40 rounded hover:bg-nexus-error/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={stopAndClosing}
+              onClick={async () => {
+                if (!onStop) { onClose(); return; }
+                setStopAndClosing(true);
+                const ok = await onStop();
+                setStopAndClosing(false);
+                // 停止失败（进程没杀掉）就留在弹窗里，用户还能继续看输出/再试
+                if (ok) onClose();
+              }}
+            >{stopAndClosing ? '停止中…' : '停止并关闭'}</button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-nexus-border flex-shrink-0">
+            {loading && onStop && (
+              <button
+                className="px-4 py-1.5 text-[12px] text-nexus-error border border-nexus-error/40 rounded hover:bg-nexus-error/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                disabled={stopping}
+                onClick={() => { setStopping(true); void onStop(); }}
+              >
+                {stopping ? '停止中…' : '停止命令'}
+              </button>
+            )}
+            <button
+              className="px-4 py-1.5 text-[12px] bg-nexus-surface text-nexus-text rounded hover:bg-nexus-hover/50"
+              onClick={requestClose}
             >
-              {stopping ? '停止中…' : '停止命令'}
+              关闭
             </button>
-          )}
-          <button
-            className="px-4 py-1.5 text-[12px] bg-nexus-surface text-nexus-text rounded hover:bg-nexus-hover/50"
-            onClick={onClose}
-          >
-            关闭
-          </button>
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

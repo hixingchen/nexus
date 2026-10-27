@@ -10,6 +10,9 @@ import { PasteConflictModal } from '../file-tree/PasteConflictModal';
 import { AiPanel } from '../ai/AiPanel';
 import { CloseGuard } from './CloseGuard';
 import { ProjectRail } from './ProjectRail';
+import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
+import { ToolCommandIndicator } from '../ui/ToolCommandIndicator';
+import { useToolCommandDialog } from '../../hooks/useToolCommandRunner';
 import { securityApi, projectApi } from '../../services/service';
 import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../stores/layoutStore';
 import { parseEditorFontSize } from '../../utils/editorFont';
@@ -44,6 +47,9 @@ export function MainLayout() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
   const [ready, setReady] = useState(false);
+  // 工具命令弹窗挂在这里而不是 ProjectDetail：关掉弹窗/切换项目后命令仍在后台跑，
+  // 弹窗与"运行中"指示器必须活得比详情页久（状态在 stores/toolCommandStore）
+  const toolCommandDialog = useToolCommandDialog();
 
   // ── 全局 service-log 监听 ──
   // 用 useRef 存 unlisten，避免 Strict Mode 双挂载导致 listener 错乱
@@ -317,6 +323,17 @@ export function MainLayout() {
           打开时同时渲染出好几层遮罩（见 stores/pasteConflict 的说明） */}
       <PasteConflictModal />
       <CloseGuard />
+      <ToolCommandResultDialog
+        open={!!toolCommandDialog.state}
+        commandName={toolCommandDialog.state?.commandName ?? ''}
+        runId={toolCommandDialog.state?.runId ?? null}
+        result={toolCommandDialog.state?.result ?? null}
+        error={toolCommandDialog.state?.error ?? null}
+        loading={toolCommandDialog.state?.loading ?? false}
+        onStop={toolCommandDialog.stop}
+        onClose={toolCommandDialog.close}
+      />
+      <ToolCommandIndicator />
       <StatusBar />
     </div>
   );

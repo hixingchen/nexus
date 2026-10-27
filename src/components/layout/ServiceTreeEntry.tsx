@@ -156,9 +156,12 @@ export function ServiceTreeEntry({
           {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
               用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动。
               运行中与失败共用同一组按钮（日志/重启/停止）——失败态也要能"停止"：
-              它既是收尾（结束残留进程，含另开窗口的游离进程），也是清掉红点的入口 */}
+              它既是收尾（结束残留进程，含另开窗口的游离进程），也是清掉红点的入口。
+              键盘可达用 `:has(:focus-visible)` 而不是 `focus-within`：鼠标点过按钮后焦点
+              留在按钮上，`focus-within` 会让这一排按钮在鼠标移开后一直亮着（点「日志」
+              打开面板后尤其明显）；`:focus-visible` 只认真键盘焦点。 */}
           <div
-            className={`flex items-center gap-1 opacity-0 flex-shrink-0 focus-within:opacity-100 ${isDragging ? '' : 'group-hover:opacity-100'}`}
+            className={`flex items-center gap-1 opacity-0 flex-shrink-0 has-[:focus-visible]:opacity-100 ${isDragging ? '' : 'group-hover:opacity-100'}`}
             onPointerDown={(e) => e.stopPropagation()}
           >
             {running || failed ? (

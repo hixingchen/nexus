@@ -638,7 +638,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
                     {/* 操作按钮 */}
                     {editingToolCmd?.id !== cmd.id && (
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 has-[:focus-visible]:opacity-100 transition-opacity">
                         {/* 排序：列表顺序 = 右键菜单顺序。首/尾那侧禁用（点了也是原地不动） */}
                         <button
                           className="p-1.5 text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/50 rounded-md transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-nexus-muted"
