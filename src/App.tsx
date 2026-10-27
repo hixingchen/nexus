@@ -1,10 +1,13 @@
 import { MainLayout } from './components/layout/MainLayout';
 import { Toaster } from 'sonner';
 import { useAiPanelReserve } from './hooks/useAiPanelReserve';
+import { useUpdateNotice } from './hooks/useUpdateNotice';
 
 function App() {
   // 通知让位 AI 面板（原生子 WebView 盖在所有 DOM 之上，见 useAiPanelReserve）
   const panelReserve = useAiPanelReserve();
+  // 启动后静默检查一次新版本（可跳过；手动「检查更新」不受影响）
+  useUpdateNotice();
 
   return (
     <div className="h-screen flex flex-col bg-nexus-bg text-nexus-text">

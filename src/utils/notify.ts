@@ -11,6 +11,17 @@
  * `components/ui/Toast.tsx` 在模块加载时注册进来。谁注册、用什么渲染，是 UI 层的事。
  */
 
+/** 通知上的一个行动按钮 */
+export interface NotifyAction {
+  label: string;
+  run: () => void;
+  /**
+   * `primary`（默认）= 强调按钮；`ghost` = 次要文本按钮。
+   * 用于同一通知有两个以上动作时区分主次（如更新提示的「下载更新」与「跳过此版本」）。
+   */
+  variant?: 'primary' | 'ghost';
+}
+
 /** 与 `Toast.tsx` 的 `ToastOptions` 同形——但这里不能引用它（那正是要断开的依赖） */
 export interface NotifyOptions {
   variant?: 'success' | 'error' | 'warning' | 'info';
@@ -25,6 +36,8 @@ export interface NotifyOptions {
    * 点击后 Toast 自行关闭（由渲染层负责），`run` 只管做事。
    */
   action?: { label: string; run: () => void };
+  /** 多个行动按钮（与 `action` 可共存；`action` 按 primary 渲染） */
+  actions?: NotifyAction[];
 }
 
 type Notifier = (opts: NotifyOptions) => void;

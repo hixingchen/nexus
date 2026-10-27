@@ -1,5 +1,5 @@
 import { toast } from 'sonner';
-import { setNotifier } from '../../utils/notify';
+import { setNotifier, type NotifyAction } from '../../utils/notify';
 
 
 type ToastVariant = 'success' | 'error' | 'warning' | 'info';
@@ -38,6 +38,8 @@ interface ToastOptions {
   duration?: number;
   /** 行动按钮（如保存冲突的「重新加载」）：点了就跑，并把这条通知收掉 */
   action?: { label: string; run: () => void };
+  /** 多个行动按钮：用于需要"主操作 + 次要操作"的通知（如更新提示的下载 / 跳过此版本） */
+  actions?: NotifyAction[];
 }
 
 /**
@@ -65,65 +67,94 @@ export function showNotification({
   description,
   duration,
   action,
+  actions,
 }: ToastOptions) {
   const style = VARIANT_STYLES[variant];
   const hideAfter = duration ?? VARIANT_DURATION[variant];
   // 错误详情可复制：用户能把原文贴进 issue/聊天，而不必凭记忆转述
   const copyDetail = variant === 'error' && !!description;
+  // 旧单数 `action` 与新的 `actions` 合并渲染；旧字段按主按钮处理
+  const allActions: NotifyAction[] = [
+    ...(action ? [{ ...action, variant: 'primary' as const }] : []),
+    ...(actions ?? []),
+  ];
+  /**
+   * 两个及以上动作时改成分行排版。
+   *
+   * 为什么：动作全挤在标题右侧时，文字列只剩一百多像素，标题会被截成
+   * 「Nexus 有新版…」（实测截图）。单独一行放按钮，标题/描述就能用满整行宽度。
+   */
+  const multiAction = allActions.length > 1;
+
+  const actionButtons = (t: string | number) => allActions.length > 0 && (
+    <div className="flex items-center gap-1 flex-shrink-0">
+      {allActions.map((a) => (
+        <button
+          key={a.label}
+          className={a.variant === 'ghost'
+            ? 'px-1.5 py-1 text-[11px] text-nexus-muted hover:text-nexus-text rounded-md flex-shrink-0 transition-colors'
+            : 'px-2 py-1 text-[11px] font-medium text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 flex-shrink-0 transition-colors'}
+          onClick={() => { a.run(); toast.dismiss(t); }}
+        >{a.label}</button>
+      ))}
+    </div>
+  );
 
   toast.custom(
     (t) => (
-      <div className="flex items-center gap-3.5 bg-nexus-surface border border-nexus-border rounded-xl shadow-2xl pl-4 pr-3 py-3 min-w-[280px] max-w-[400px]">
-        {/* 图标 */}
-        <div className={`w-7 h-7 rounded-lg ${style.iconBg} flex items-center justify-center flex-shrink-0`}>
-          <span className={`${style.iconColor} text-sm font-bold`}>{style.icon}</span>
-        </div>
+      <div className={`bg-nexus-surface border border-nexus-border rounded-xl shadow-2xl pl-4 pr-3 py-3 min-w-[280px] max-w-[400px] ${
+        multiAction ? 'flex flex-col gap-2' : 'flex items-center gap-3.5'
+      }`}>
+        <div className="flex items-center gap-3.5 w-full">
+          {/* 图标 */}
+          <div className={`w-7 h-7 rounded-lg ${style.iconBg} flex items-center justify-center flex-shrink-0`}>
+            <span className={`${style.iconColor} text-sm font-bold`}>{style.icon}</span>
+          </div>
 
-        {/* 文本：标题单行截断；描述可换行完整显示（错误/诊断信息不能截断） */}
-        <div className="flex-1 min-w-0">
-          <p className="text-[13px] text-nexus-text font-semibold truncate">{title}</p>
-          {description && (
-            <p className="text-[11px] text-nexus-muted mt-0.5 break-words">{description}</p>
+          {/* 文本：标题单行截断；描述可换行完整显示（错误/诊断信息不能截断） */}
+          <div className="flex-1 min-w-0">
+            <p className="text-[13px] text-nexus-text font-semibold truncate">{title}</p>
+            {description && (
+              <p className="text-[11px] text-nexus-muted mt-0.5 break-words">{description}</p>
+            )}
+          </div>
+
+          {!multiAction && actionButtons(t)}
+
+          {copyDetail && (
+            <button
+              title="复制错误详情"
+              className="p-1 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
+              onClick={() => {
+                // 静默写入：复制失败**不能**弹新通知——那会盖住用户正要复制的这条错误通知。
+                // 这里不调 utils/clipboard 的 copyText：它要弹提示就不得不 import 本文件，
+                // 于是形成 `Toast → clipboard → Toast` 的循环依赖（构建期警告 + 运行期
+                // 绑定可能是 undefined）。三行内联换一个无环的依赖图，值。
+                void navigator.clipboard.writeText(`${title}: ${description}`)
+                  .catch((e) => console.warn('复制错误详情失败:', e));
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+                <rect x="4" y="4" width="6.5" height="6.5" rx="1"/>
+                <path d="M8 4V2.5a1 1 0 00-1-1H2.5a1 1 0 00-1 1V7a1 1 0 001 1H4"/>
+              </svg>
+            </button>
           )}
-        </div>
 
-        {action && (
+          {/* 关闭按钮 */}
           <button
-            className="px-2 py-1 text-[11px] font-medium text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 flex-shrink-0 transition-colors"
-            onClick={() => { action.run(); toast.dismiss(t); }}
-          >{action.label}</button>
-        )}
-
-        {copyDetail && (
-          <button
-            title="复制错误详情"
+            aria-label="关闭通知"
             className="p-1 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
-            onClick={() => {
-              // 静默写入：复制失败**不能**弹新通知——那会盖住用户正要复制的这条错误通知。
-              // 这里不调 utils/clipboard 的 copyText：它要弹提示就不得不 import 本文件，
-              // 于是形成 `Toast → clipboard → Toast` 的循环依赖（构建期警告 + 运行期
-              // 绑定可能是 undefined）。三行内联换一个无环的依赖图，值。
-              void navigator.clipboard.writeText(`${title}: ${description}`)
-                .catch((e) => console.warn('复制错误详情失败:', e));
-            }}
+            onClick={() => toast.dismiss(t)}
           >
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
-              <rect x="4" y="4" width="6.5" height="6.5" rx="1"/>
-              <path d="M8 4V2.5a1 1 0 00-1-1H2.5a1 1 0 00-1 1V7a1 1 0 001 1H4"/>
+            <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/>
             </svg>
           </button>
-        )}
+        </div>
 
-        {/* 关闭按钮 */}
-        <button
-          aria-label="关闭通知"
-          className="p-1 text-nexus-muted/50 hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0"
-          onClick={() => toast.dismiss(t)}
-        >
-          <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/>
-          </svg>
-        </button>
+        {/* 两个及以上动作：单独一行，避免挤压标题 */}
+        {multiAction && <div className="flex justify-end">{actionButtons(t)}</div>}
       </div>
     ),
     { duration: hideAfter },

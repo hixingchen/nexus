@@ -43,6 +43,13 @@ export const LAYOUT_KEYS = {
    * 顺手改掉用户的 AI 使用偏好。
    */
   aiSessionMode: 'ai_session_mode',
+  /**
+   * 用户点过「跳过此版本」的版本号（GitHub tag，如 `v1.9.1`）。
+   *
+   * 只影响**启动时的自动提示**：手动「检查更新」永远显示结果；新版本发布后照常提示。
+   * 与字号同理，`reset_layout` 不清它（见 `commands/layout.rs` 的 `KEEP_ON_RESET`）。
+   */
+  updateSkippedVersion: 'update_skipped_version',
 } as const;
 
 export type LayoutKey = (typeof LAYOUT_KEYS)[keyof typeof LAYOUT_KEYS];
