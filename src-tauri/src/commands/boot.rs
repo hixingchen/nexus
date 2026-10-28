@@ -981,7 +981,7 @@ mod tests {
         std::fs::write(&script_path, script).expect("写脚本");
         std::fs::write(
             &parse_path,
-            "$src = Get-Content -Raw -LiteralPath $args[0]\n\
+            "$src = Get-Content -Raw -LiteralPath $args[0] -Encoding UTF8\n\
              $tokens = $null\n\
              $errors = $null\n\
              [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors) | Out-Null\n\
