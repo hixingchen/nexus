@@ -34,7 +34,10 @@ export function pickDirectory(opts?: { purpose?: PickPurpose; defaultPath?: stri
 }
 
 /** 保存对话框的用途键（标题由后端决定，同 `PickPurpose`） */
-export type SavePurpose = 'exportTemplates';
+export type SavePurpose = 'exportTemplates' | 'exportAiRuntime';
+
+/** 打开对话框的用途键（标题与扩展名过滤同样由后端决定） */
+export type OpenPurpose = 'importAiRuntime';
 
 /**
  * 原生文件保存对话框（由 Rust 侧弹框）。
@@ -54,6 +57,18 @@ export function pickSaveFile(opts?: { purpose?: SavePurpose; defaultName?: strin
 }
 
 /**
+ * 原生文件打开对话框（由 Rust 侧弹框），选中的所在目录当场记为"已确认"。
+ *
+ * 与 `pickSaveFile` 同一套信任模型：导入时要读用户挑的文件，读取路径同样要过白名单，
+ * 而路径不能仅凭 IPC 参数自称"用户选的"。
+ */
+export function pickOpenFile(opts?: { purpose?: OpenPurpose }): Promise<string | null> {
+  return invoke<string | null>('pick_open_file', {
+    purpose: opts?.purpose ?? null,
+  });
+}
+
+/**
  * 当前应用版本号（"关于"与「检查更新」共用）。
  *
  * 为什么由后端答而不是前端读 `package.json`：那是 npm 侧的版本号，与打包出来的安装包
@@ -66,6 +81,24 @@ export function pickSaveFile(opts?: { purpose?: SavePurpose; defaultName?: strin
  */
 export function getAppVersion(): Promise<string> {
   return invoke<string>('get_app_version');
+}
+
+/**
+ * 开机自启是否**对当前这个可执行文件**生效。
+ *
+ * 判断由后端把 Run 键里的路径与 `current_exe()` 比较：值存在但指向旧路径也算"没开"，
+ * 界面上的开关含义是"登录时会启动我现在运行的这份"。
+ */
+export function getAutostartEnabled(): Promise<boolean> {
+  return invoke<boolean>('get_autostart_enabled');
+}
+
+/**
+ * 开 / 关开机自启。写入的路径**由后端取当前 exe**，前端不能指定——
+ * 否则被攻陷的 webview 能把任意程序写进开机启动项。
+ */
+export function setAutostartEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>('set_autostart_enabled', { enabled });
 }
 
 /** 在系统资源管理器中打开（失败带原因提示） */

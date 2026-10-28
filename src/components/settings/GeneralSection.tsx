@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { getAppPaths, openAppDir, type AppDirKind, type AppPaths } from '../../services/system';
+import {
+  getAppPaths,
+  getAutostartEnabled,
+  openAppDir,
+  setAutostartEnabled,
+  type AppDirKind,
+  type AppPaths,
+} from '../../services/system';
 import { resetLayoutToDefaults } from '../../stores/layoutStore';
 import { notify } from '../../utils/notify';
 import { reportError, toMessage } from '../../utils/error';
 
 /**
- * 设置 > 通用：数据与日志、布局。
+ * 设置 > 通用：开机自启、数据与日志、布局。
  *
  * 这两项是"通用"里**现成能力就能支撑**的那部分：路径本来就有唯一来源（`lib.rs::data_dir()`），
  * 布局本来就有持久化。加到设置里不需要任何新的配置存储——而一个点进去空着的「通用」
@@ -25,6 +32,10 @@ export function GeneralSection() {
    */
   const [pathsError, setPathsError] = useState('');
   const [resetting, setResetting] = useState(false);
+  /** 开机自启：null = 还没读到（读取中或失败，失败原因见 autostartError） */
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [autostartError, setAutostartError] = useState('');
+  const [autostartBusy, setAutostartBusy] = useState(false);
 
   const loadPaths = useCallback(async () => {
     try {
@@ -38,6 +49,45 @@ export function GeneralSection() {
   }, []);
 
   useEffect(() => { void loadPaths(); }, [loadPaths]);
+
+  /** 读开机自启状态（以后端与注册表的实际状态为准，不拿本地缓存猜） */
+  const loadAutostart = useCallback(async () => {
+    try {
+      setAutostart(await getAutostartEnabled());
+      setAutostartError('');
+    } catch (e: unknown) {
+      setAutostart(null);
+      setAutostartError(toMessage(e));
+      reportError('读取开机自启状态失败', e, { silent: true });
+    }
+  }, []);
+
+  useEffect(() => { void loadAutostart(); }, [loadAutostart]);
+
+  /**
+   * 切换开机自启：写完后**回读系统实际状态**再更新开关。
+   *
+   * 为什么不直接把 next 塞进 state：写注册表可能被组策略/安全软件拦下，
+   * "界面已开启、登录却没启动"是最难查的一类失败。回读失败时保留原值并就地报错。
+   */
+  const toggleAutostart = async (next: boolean) => {
+    setAutostartBusy(true);
+    setAutostartError('');
+    try {
+      await setAutostartEnabled(next);
+      setAutostart(await getAutostartEnabled());
+    } catch (e: unknown) {
+      setAutostartError(toMessage(e));
+      reportError('设置开机自启失败', e, { silent: true });
+      try {
+        setAutostart(await getAutostartEnabled());
+      } catch {
+        // 回读也失败：保留原值，界面上的错误已经说明这次操作没成功
+      }
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
 
   /**
    * 恢复默认布局。
@@ -66,6 +116,56 @@ export function GeneralSection() {
 
   return (
     <div className="space-y-5">
+      <section>
+        <SectionTitle>启动</SectionTitle>
+        <div className="flex items-start gap-3 px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-[12px] text-nexus-text">开机自启</span>
+              <span
+                className={`text-[10px] leading-[16px] px-1.5 rounded-full transition-colors ${
+                  autostart == null && autostartError
+                    ? 'bg-nexus-error/10 text-nexus-error'
+                    : autostart
+                      ? 'bg-nexus-accent/15 text-nexus-accent'
+                      : 'bg-nexus-hover/40 text-nexus-muted'
+                }`}
+              >
+                {autostart == null
+                  ? (autostartError ? '读取失败' : '读取中…')
+                  : autostartBusy
+                    ? '保存中…'
+                    : autostart ? '已开启' : '已关闭'}
+              </span>
+            </div>
+            <div className="text-[11px] text-nexus-muted mt-1 leading-relaxed">
+              登录 Windows 时自动启动 Nexus。默认关闭，只写入当前用户启动项，不需要管理员权限。
+            </div>
+            {autostartError && (
+              <div className="text-[11px] text-nexus-error leading-relaxed whitespace-pre-wrap break-all mt-1">
+                {autostartError}
+              </div>
+            )}
+          </div>
+          {autostart == null && autostartError ? (
+            <button
+              className="px-2 py-1 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded hover:bg-nexus-accent/10 flex-shrink-0 mt-0.5"
+              onClick={() => {
+                setAutostartError('');
+                void loadAutostart();
+              }}
+            >重试</button>
+          ) : (
+            <Switch
+              checked={autostart ?? false}
+              disabled={autostart == null || autostartBusy}
+              label="开机自启"
+              onChange={(next) => void toggleAutostart(next)}
+            />
+          )}
+        </div>
+      </section>
+
       <section>
         <SectionTitle>数据与日志</SectionTitle>
 
@@ -125,6 +225,42 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
     <div className="text-[11px] font-semibold text-nexus-muted uppercase tracking-wider mb-2">
       {children}
     </div>
+  );
+}
+
+/**
+ * 滑动开关（`role="switch"` 的 button）。
+ *
+ * 为什么不用原生 checkbox：原生样式在各平台/主题下差异大，而且这一行的视觉重心
+ * 应该在右侧那颗滑钮上。button 还能直接响应空格/回车，键盘可用性不打折。
+ */
+function Switch({
+  checked, disabled, label, onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-[22px] w-[40px] flex-shrink-0 items-center rounded-full transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-nexus-accent/60 disabled:cursor-not-allowed disabled:opacity-40 ${
+        checked ? 'bg-nexus-accent' : 'bg-nexus-border'
+      }`}
+    >
+      <span
+        aria-hidden="true"
+        className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform duration-150 ${
+          checked ? 'translate-x-[21px]' : 'translate-x-[3px]'
+        }`}
+      />
+    </button>
   );
 }
 

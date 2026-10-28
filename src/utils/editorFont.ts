@@ -44,5 +44,27 @@ export function parseEditorFontSize(raw: string | null | undefined): number {
   if (raw == null || raw.trim() === '') return EDITOR_FONT_SIZE_DEFAULT;
   const n = Number(raw);
   if (!Number.isFinite(n)) return EDITOR_FONT_SIZE_DEFAULT;
-  return Math.min(EDITOR_FONT_SIZE_MAX, Math.max(EDITOR_FONT_SIZE_MIN, Math.round(n)));
+  return clampEditorFontSize(n);
+}
+
+/**
+ * 把任意数值夹到合法区间并取整。
+ *
+ * 与 `parseEditorFontSize` 的区别：后者负责"字符串 → 数字"的容错（空值回落默认），
+ * 这一个只管"数字 → 合法字号"——设置面板的 ± 按钮与 Ctrl+滚轮都用它，
+ * 否则三处各写一遍 `Math.min(MAX, Math.max(MIN, …))`，改区间时必漏一处。
+ */
+export function clampEditorFontSize(px: number): number {
+  return Math.min(EDITOR_FONT_SIZE_MAX, Math.max(EDITOR_FONT_SIZE_MIN, Math.round(px)));
+}
+
+/**
+ * Ctrl+滚轮的一步：`deltaY < 0`（向上滚）增大字号，否则减小；结果已夹到区间内。
+ *
+ * 抽成纯函数是为了能直接测边界（12 再减、20 再加都不能越界）；
+ * DOM 事件与 `preventDefault` 在 `hooks/useCtrlWheelFontSize.ts` 里。
+ */
+export function stepEditorFontSize(current: number, deltaY: number): number {
+  if (deltaY === 0) return clampEditorFontSize(current);
+  return clampEditorFontSize(current + (deltaY < 0 ? 1 : -1));
 }

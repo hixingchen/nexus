@@ -36,6 +36,13 @@ export const LAYOUT_KEYS = {
    */
   editorFontSize: 'editor_font_size',
   /**
+   * AI 运行时安装 / 升级 dsh 使用的 npm 源（见 `utils/npmRegistry.ts`）。
+   *
+   * 默认值是淘宝镜像；存空或缺省时后端也回落默认值。它不是面板几何，
+   * `reset_layout` 的保留清单（`commands/layout.rs` 的 `KEEP_ON_RESET`）里必须带它。
+   */
+  npmRegistry: 'npm_registry',
+  /**
    * AI 面板打开方式：`'new'`（默认，每次打开新建会话）/ `'resume'`（恢复上次使用的会话）。
    *
    * 与字号同理：它不是几何布局，但本表是唯一的 KV 持久化；`reset_layout` 的保留清单

@@ -5,12 +5,21 @@ import {
   AI_RUNTIME_PROGRESS_EVENT,
   type AiRuntimeStatus,
   type RuntimeProgress,
+  type RuntimeTransferProgress,
 } from '../../services/aiService';
+import { useAiRuntimeTransferStore } from '../../stores/aiRuntimeTransferStore';
+import {
+  DEFAULT_NPM_REGISTRY,
+  OFFICIAL_NPM_REGISTRY,
+  normalizeNpmRegistry,
+} from '../../utils/npmRegistry';
+import { pickOpenFile, pickSaveFile } from '../../services/system';
 import { copyText } from '../../utils/clipboard';
+import { isSubmitEnter } from '../../utils/keyboard';
 import { notify } from '../../utils/notify';
 import { reportError, toMessage } from '../../utils/error';
 import { parseAiSessionMode, type AiSessionMode } from '../../utils/aiSession';
-import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
+import { LAYOUT_KEYS, flushLayoutWrites, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { Modal } from '../ui/Modal';
 
 /**
@@ -31,8 +40,8 @@ export function AiRuntimeSection() {
   const [loadError, setLoadError] = useState('');
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [busy, setBusy] = useState(false);
-  /** 非 null = 正开着确认弹窗（'uninstall' | 'reinstall'） */
-  const [confirming, setConfirming] = useState<'uninstall' | 'reinstall' | null>(null);
+  /** 非 null = 正开着确认弹窗（'uninstall' | 'reinstall' | 'import'） */
+  const [confirming, setConfirming] = useState<'uninstall' | 'reinstall' | 'import' | null>(null);
   /** 手动指定（A 方案）那块是否展开 */
   const [showManual, setShowManual] = useState(false);
   const [nodeExe, setNodeExe] = useState('');
@@ -40,12 +49,46 @@ export function AiRuntimeSection() {
   const [manualBusy, setManualBusy] = useState(false);
   /** 手动指定保存失败的原因（就地显示——这个失败**不能**只飘一个 toast 就没了） */
   const [manualError, setManualError] = useState('');
+  // 导出 / 导入状态放在**全局 store**：设置面板关掉后传输还在后端跑，
+  // 局部 state 会随组件卸载一起消失（重新打开时看不到进度，还会让人以为没在传）
+  const transferKind = useAiRuntimeTransferStore((s) => s.kind);
+  const transferProgress = useAiRuntimeTransferStore((s) => s.progress);
+  const transferError = useAiRuntimeTransferStore((s) => s.error);
+  /** 已经选好、等确认的压缩包路径 */
+  const [importPath, setImportPath] = useState<string | null>(null);
 
   // 打开方式：持久化在 layout KV 表（与字号同一类"非几何设置"），默认新建会话
   const sessionMode = parseAiSessionMode(
     useLayoutStore((s) => s.values?.[LAYOUT_KEYS.aiSessionMode]),
   );
   const setSessionMode = (mode: AiSessionMode) => saveLayout({ [LAYOUT_KEYS.aiSessionMode]: mode });
+
+  // npm 源：存的是用户配置；空/缺省时后端回落默认淘宝源（见 utils/npmRegistry.ts）
+  const rawRegistry = useLayoutStore((s) => s.values?.[LAYOUT_KEYS.npmRegistry]);
+  const effectiveRegistry = normalizeNpmRegistry(rawRegistry);
+  const [registryInput, setRegistryInput] = useState(DEFAULT_NPM_REGISTRY);
+  const [registryError, setRegistryError] = useState('');
+  useEffect(() => {
+    // 存的是无效值时也原样展示，让用户能就地改掉（而不是被输入框悄悄改成默认值）
+    const stored = rawRegistry ?? '';
+    setRegistryInput(stored.trim() ? stored : DEFAULT_NPM_REGISTRY);
+    const checked = normalizeNpmRegistry(stored);
+    setRegistryError(checked.ok ? '' : checked.error);
+  }, [rawRegistry]);
+
+  const saveRegistry = (raw: string) => {
+    const checked = normalizeNpmRegistry(raw);
+    if (!checked.ok) {
+      setRegistryError(checked.error);
+      return;
+    }
+    setRegistryError('');
+    saveLayout({ [LAYOUT_KEYS.npmRegistry]: checked.value });
+    // 安装 / 升级命令是**从库里读**这个源的；500ms 防抖内点安装会读到旧值。
+    // 这是一次离散保存（不是拖滑块），立刻落库。
+    void flushLayoutWrites();
+    setRegistryInput(checked.value);
+  };
 
   const load = useCallback(async () => {
     try {
@@ -68,6 +111,9 @@ export function AiRuntimeSection() {
       .catch((e) => reportError('订阅 AI 运行时进度失败', e));
     return () => { alive = false; unlisten?.(); };
   }, []);
+
+  // 传输进度的订阅在 App 层（常驻组件）：面板关掉后它仍要往 store 里写，
+  // 否则重新打开时只能看到关闭前那一刻的旧进度
 
   const runInstall = async () => {
     setBusy(true);
@@ -103,6 +149,74 @@ export function AiRuntimeSection() {
     }
   };
 
+  /**
+   * 导出：先让用户挑位置（后端弹框，选中的目录会被记为已确认），再打包。
+   *
+   * 传输状态一律写全局 store（`useAiRuntimeTransferStore.getState()` 取动作）：
+   * 这个异步函数可能在组件卸载之后才结束，用局部 setState 会把结果丢掉。
+   */
+  const runExport = async () => {
+    const transfer = useAiRuntimeTransferStore.getState();
+    transfer.clearError();
+    try {
+      const path = await pickSaveFile({
+        purpose: 'exportAiRuntime',
+        defaultName: `nexus-ai-runtime-${status?.node_version ?? 'runtime'}.zip`,
+      });
+      if (!path) return; // 用户取消
+      transfer.start('export');
+      const res = await aiService.runtimeExport(path);
+      transfer.succeed();
+      notify({
+        variant: 'success',
+        title: `已导出 AI 运行时（${formatBytes(res.bytes)}）`,
+        description: res.path,
+        duration: 6000,
+      });
+    } catch (e: unknown) {
+      // 就地显示 + 正常上报：面板可能已经被用户关掉，错误不能只留在卡片里
+      transfer.fail(toMessage(e));
+      reportError('导出 AI 运行时失败', e);
+    }
+  };
+
+  /** 导入第一步：选包。真正开始导入前还有一次确认（会停会话、替换运行时） */
+  const chooseImport = async () => {
+    const transfer = useAiRuntimeTransferStore.getState();
+    transfer.clearError();
+    try {
+      const path = await pickOpenFile({ purpose: 'importAiRuntime' });
+      if (!path) return;
+      setImportPath(path);
+      setConfirming('import');
+    } catch (e: unknown) {
+      transfer.fail(toMessage(e));
+      reportError('选择运行时压缩包失败', e, { silent: true });
+    }
+  };
+
+  const runImport = async () => {
+    const path = importPath;
+    if (!path) return;
+    const transfer = useAiRuntimeTransferStore.getState();
+    transfer.start('import');
+    try {
+      const next = await aiService.runtimeImport(path);
+      transfer.succeed();
+      setStatus(next);
+      notify({ variant: 'success', title: 'AI 运行时已导入', duration: 5000 });
+    } catch (e: unknown) {
+      // 失败原因要留在原地：这条链上的错误（包不完整 / 平台不对 / 跑不起来）
+      // 用户需要照着改，飘一个 toast 就没了等于没说。此外仍然上报一次——
+      // 面板可能已经被关掉，那种情况下 toast 是唯一的提示。
+      transfer.fail(toMessage(e));
+      reportError('导入 AI 运行时失败', e);
+    } finally {
+      setImportPath(null);
+      await load();
+    }
+  };
+
   const runUninstall = async () => {
     setBusy(true);
     try {
@@ -121,6 +235,17 @@ export function AiRuntimeSection() {
       <section>
         <SectionTitle>AI 运行时</SectionTitle>
         <div className="px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30 space-y-2">
+          {/* 传输进度放在状态块**之外**：重新打开面板时运行时状态可能还在读、或读失败
+              （导入替换目录的那一瞬间），但后台传输的进度必须看得见 */}
+          {transferKind && (
+            <TransferProgressInline kind={transferKind} progress={transferProgress} />
+          )}
+          {transferError && (
+            <div className="text-[11px] text-nexus-error leading-relaxed whitespace-pre-wrap break-all">
+              {transferError}
+            </div>
+          )}
+
           {loadError ? (
             <div className="text-[12px] text-nexus-error leading-relaxed break-all">
               读取运行时状态失败：{loadError}
@@ -169,8 +294,8 @@ export function AiRuntimeSection() {
 
               {busy ? (
                 <RuntimeProgressInline progress={progress} steps={status.steps} />
-              ) : (
-                <div className="flex items-center gap-2 pt-0.5">
+              ) : transferKind ? null : (
+                <div className="flex flex-wrap items-center gap-2 pt-0.5">
                   {/* 手动指定时**不给「重新安装」**：那份不是 Nexus 装的，重装指的是自带那份，
                       而手动指定优先于它——点了会白下 300MB 且看不出任何变化。这条路的出口是下面的「清除」 */}
                   {status.source !== 'manual' && (
@@ -194,6 +319,18 @@ export function AiRuntimeSection() {
                       }}
                     >清除手动指定，回到自带那份</button>
                   )}
+                  {/* 导出的前提是"自带那份、且真的跑得起来"——手动那份的依赖闭包不可靠，
+                      不完整的包搬过去比不搬更糟（见 core::runtime::export_package） */}
+                  {status.ready && status.source === 'private' && (
+                    <button
+                      className="px-2 py-1 text-[11px] text-nexus-text border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent"
+                      onClick={() => void runExport()}
+                    >导出运行时（压缩包）</button>
+                  )}
+                  <button
+                    className="px-2 py-1 text-[11px] text-nexus-text border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent"
+                    onClick={() => void chooseImport()}
+                  >从压缩包导入</button>
                   {status.ready && status.source !== 'manual' && (
                     <button
                       className="px-2 py-1 text-[11px] text-nexus-muted border border-nexus-border rounded hover:border-nexus-error hover:text-nexus-error"
@@ -236,6 +373,11 @@ export function AiRuntimeSection() {
                       机器上已经有能跑 dsh 的 Node 时，填这两条路径就能跳过那 300MB 下载。
                       保存前会<span className="text-nexus-text">当场跑一次</span>
                       <span className="font-mono"> dsh --version </span>验证，跑不起来不会存。
+                      <span className="block pt-1">
+                        这份<span className="text-nexus-text">不能</span>导出成压缩包——依赖散落在任意
+                        安装目录里，换台机器不一定完整。要离线搬运，请在上面的「准备 AI 运行时」
+                        装好自带那份后再「导出运行时」。
+                      </span>
                     </p>
                     <ManualField
                       label="node.exe 完整路径"
@@ -285,6 +427,67 @@ export function AiRuntimeSection() {
         </div>
       </section>
 
+      {/* ── 安装源（npm）────────────────────────────────────────
+          dsh 是通过私有 npm 装的；官方源在国内常见慢到超时，默认走淘宝镜像。
+          只影响 Nexus 自带的运行时：手动指定那份是用户自己的环境，沿用其 ~/.npmrc。 */}
+      <section>
+        <SectionTitle>安装源（npm）</SectionTitle>
+        <div className="px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30 space-y-2">
+          <p className="text-[11px] text-nexus-muted leading-relaxed">
+            安装 / 升级 / 检查更新 dsh 时使用的 npm 源。默认淘宝镜像，只影响 Nexus 自带的运行时；
+            手动指定的那份沿用你系统 npm（<span className="font-mono">~/.npmrc</span>）的配置。
+            这里填的源<span className="text-nexus-text">优先于</span>系统 npm 的 registry
+            （缓存、代理、认证仍沿用 <span className="font-mono">~/.npmrc</span>）。
+            Node 压缩包走的是另一条镜像，不受这里影响。
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              className="flex-1 min-w-0 px-2 py-1 text-[11.5px] font-mono text-nexus-text bg-nexus-editor border border-nexus-border rounded outline-none focus:border-nexus-accent"
+              value={registryInput}
+              placeholder={DEFAULT_NPM_REGISTRY}
+              spellCheck={false}
+              aria-label="npm 源地址"
+              onChange={(e) => {
+                setRegistryInput(e.target.value);
+                setRegistryError('');
+              }}
+              onKeyDown={(e) => {
+                if (isSubmitEnter(e)) saveRegistry(registryInput);
+              }}
+            />
+            <button
+              className="px-2 py-1 text-[11px] text-nexus-text border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent flex-shrink-0"
+              onClick={() => saveRegistry(registryInput)}
+            >保存</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <button
+              className="px-2 py-0.5 text-nexus-muted border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent"
+              onClick={() => saveRegistry(DEFAULT_NPM_REGISTRY)}
+            >淘宝源</button>
+            <button
+              className="px-2 py-0.5 text-nexus-muted border border-nexus-border rounded hover:border-nexus-accent hover:text-nexus-accent"
+              onClick={() => saveRegistry(OFFICIAL_NPM_REGISTRY)}
+            >官方源</button>
+            <span className="text-nexus-muted break-all">
+              当前生效：
+              <span className="font-mono">
+                {effectiveRegistry.ok ? effectiveRegistry.value : '配置不合法'}
+              </span>
+            </span>
+          </div>
+          {registryError && (
+            <div className="text-[11px] text-nexus-error leading-relaxed whitespace-pre-wrap break-all">
+              {registryError}
+            </div>
+          )}
+          <p className="text-[11px] text-nexus-muted leading-relaxed">
+            改源后下一次安装 / 升级生效；已经装好的运行时不需要重装。
+            使用私有源时，认证信息请配在 <span className="font-mono">~/.npmrc</span> 里，不要写进地址。
+          </p>
+        </div>
+      </section>
+
       {/* ── AI 会话：打开面板时是新建还是接上上次 ───────────────────
           默认新建（保持历史行为）：稳定端口 + 不清理记忆会让 dsh 自动恢复上次
           会话，对"每次都想开新对话"的用户反而是意外。 */}
@@ -313,7 +516,13 @@ export function AiRuntimeSection() {
           而且还有回头路可走。失败之后没有回头路，那种场景一律走就地卡片，不弹窗 */}
       <Modal
         open={confirming !== null}
-        title={confirming === 'uninstall' ? '卸载 AI 运行时' : '重新安装 AI 运行时'}
+        title={
+          confirming === 'uninstall'
+            ? '卸载 AI 运行时'
+            : confirming === 'import'
+              ? '导入 AI 运行时'
+              : '重新安装 AI 运行时'
+        }
         onClose={() => setConfirming(null)}
       >
         <div className="space-y-3 text-[12px] text-nexus-text leading-relaxed">
@@ -323,6 +532,22 @@ export function AiRuntimeSection() {
               <p className="text-nexus-muted">
                 <span className="text-nexus-text">不会</span>删除你的登录信息与全部 AI 会话历史
                 ——它们在 <span className="font-mono">~/.dsh</span> 下，这里一个字节都不动。
+              </p>
+            </>
+          ) : confirming === 'import' ? (
+            <>
+              <p>会先停止当前 AI 会话，然后用压缩包里的运行时替换 Nexus 自带的那份。</p>
+              {importPath && (
+                <p className="text-[11px] font-mono text-nexus-muted break-all">{importPath}</p>
+              )}
+              {status?.has_manual && (
+                <p className="text-nexus-warning">
+                  当前的手动指定会被清除，导入后使用压缩包里的运行时。
+                </p>
+              )}
+              <p className="text-nexus-muted">
+                不会碰 <span className="font-mono">~/.dsh</span>（登录信息与会话历史）。
+                只导入你自己导出或信任的包——包里的 <span className="font-mono">node.exe</span> 会被直接执行。
               </p>
             </>
           ) : (
@@ -338,7 +563,7 @@ export function AiRuntimeSection() {
           <div className="flex justify-end gap-2 pt-1">
             <button
               className="px-3 py-1 text-[12px] text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50"
-              onClick={() => setConfirming(null)}
+              onClick={() => { setConfirming(null); setImportPath(null); }}
             >取消</button>
             <button
               className={`px-3 py-1 text-[12px] rounded-md ${
@@ -349,9 +574,15 @@ export function AiRuntimeSection() {
               onClick={() => {
                 const which = confirming;
                 setConfirming(null);
-                void (which === 'uninstall' ? runUninstall() : runInstall());
+                void (
+                  which === 'uninstall'
+                    ? runUninstall()
+                    : which === 'import'
+                      ? runImport()
+                      : runInstall()
+                );
               }}
-            >{confirming === 'uninstall' ? '卸载' : '重新安装'}</button>
+            >{confirming === 'uninstall' ? '卸载' : confirming === 'import' ? '导入' : '重新安装'}</button>
           </div>
         </div>
       </Modal>
@@ -381,6 +612,31 @@ function ManualField({
         onChange={(e) => onChange(e.target.value)}
       />
     </label>
+  );
+}
+
+/** 导出 / 导入进行中的就地进度（只有一条线，没有安装那套固定步骤） */
+function TransferProgressInline({
+  kind, progress,
+}: {
+  kind: 'export' | 'import';
+  progress: RuntimeTransferProgress | null;
+}) {
+  const pct = progress && progress.total > 0
+    ? Math.min(100, Math.round((progress.done / progress.total) * 100))
+    : null;
+  return (
+    <div className="space-y-1 pt-0.5">
+      <div className="flex items-center gap-2 text-[11.5px] text-nexus-text">
+        <span className="w-2 h-2 flex-shrink-0 rounded-full bg-nexus-accent animate-pulse" />
+        <span>{kind === 'export' ? '正在导出运行时…' : '正在导入运行时…'}</span>
+        <span className="text-nexus-muted">{progress?.phase ?? '准备中'}</span>
+      </div>
+      <div className="text-[11px] text-nexus-muted leading-snug break-all tabular-nums">
+        {progress?.detail ?? '正在开始…'}
+        {pct != null ? ` · ${pct}%` : ''}
+      </div>
+    </div>
   );
 }
 

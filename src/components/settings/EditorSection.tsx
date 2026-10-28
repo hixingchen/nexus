@@ -4,6 +4,7 @@ import {
   EDITOR_FONT_SIZE_DEFAULT,
   EDITOR_FONT_SIZE_MAX,
   EDITOR_FONT_SIZE_MIN,
+  clampEditorFontSize,
   parseEditorFontSize,
 } from '../../utils/editorFont';
 
@@ -46,9 +47,8 @@ export function EditorSection() {
   const isDefault = size === EDITOR_FONT_SIZE_DEFAULT;
 
   const apply = (next: number) => {
-    const clamped = Math.min(EDITOR_FONT_SIZE_MAX, Math.max(EDITOR_FONT_SIZE_MIN, Math.round(next)));
     // 走 layoutStore 的统一写入口（防抖 + 合并 + 错误上报都在那里）
-    saveLayout({ [LAYOUT_KEYS.editorFontSize]: String(clamped) });
+    saveLayout({ [LAYOUT_KEYS.editorFontSize]: String(clampEditorFontSize(next)) });
   };
 
   return (
@@ -97,9 +97,12 @@ export function EditorSection() {
         </div>
 
         <p className="mt-2 text-[11px] text-nexus-muted/80 leading-relaxed">
-          影响<span className="text-nexus-text">代码视图</span>与
-          <span className="text-nexus-text">Markdown 预览</span>（编辑器里的预览、帮助 &gt; 使用文档），
+          影响<span className="text-nexus-text">代码视图</span>、
+          <span className="text-nexus-text">Markdown 预览</span>（编辑器里的预览、帮助 &gt; 使用文档）
+          与<span className="text-nexus-text">日志面板</span>，
           立即生效、已打开的标签页也跟着变（不会重置光标位置与撤销记录）。
+          在文件视图或日志面板里按住 <span className="text-nexus-text">Ctrl</span>
+          （macOS 为 <span className="text-nexus-text">Cmd</span>）滚动滚轮，也能直接调这个字号。
           这个值不受「通用 &gt; 恢复默认布局」影响。
         </p>
       </section>

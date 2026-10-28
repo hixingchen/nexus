@@ -1,6 +1,7 @@
 import { MainLayout } from './components/layout/MainLayout';
 import { Toaster } from 'sonner';
 import { useAiPanelReserve } from './hooks/useAiPanelReserve';
+import { useAiRuntimeTransferEvents } from './hooks/useAiRuntimeTransferEvents';
 import { useUpdateNotice } from './hooks/useUpdateNotice';
 
 function App() {
@@ -8,6 +9,8 @@ function App() {
   const panelReserve = useAiPanelReserve();
   // 启动后静默检查一次新版本（可跳过；手动「检查更新」不受影响）
   useUpdateNotice();
+  // 运行时导出 / 导入进度：必须活得比设置面板久（面板关掉后传输还在后端跑）
+  useAiRuntimeTransferEvents();
 
   return (
     <div className="h-screen flex flex-col bg-nexus-bg text-nexus-text">

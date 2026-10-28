@@ -331,14 +331,21 @@ pub fn run() {
             commands::ai::ai_runtime_uninstall,
             commands::ai::ai_runtime_set_manual,
             commands::ai::ai_runtime_clear_manual,
+            // 离线搬运：导出 / 导入运行时压缩包（内网 / 下载不通时用）
+            commands::ai::ai_runtime_export,
+            commands::ai::ai_runtime_import,
             commands::ai::create_ai_panel_webview,
             commands::ai::ai_panel_focus,
             commands::app::prepare_exit,
+            // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
+            commands::autostart::get_autostart_enabled,
+            commands::autostart::set_autostart_enabled,
             // 前端日志回传（NEW-28）：打包版没有控制台/devtools，前端错误只能这样落进
             // 与 Rust 侧同一条日志流水（截断 / 换行过滤 / 限流都在 logger 里做）
             commands::app::log_frontend,
             commands::app::pick_directory,
             commands::app::pick_save_file,
+            commands::app::pick_open_file,
             commands::app::get_app_version,
             // Nexus 自己的数据/日志目录（设置 > 通用 > 数据与日志）：
             // 读取用 get_app_paths，打开用 open_app_dir（用途键，不收路径）

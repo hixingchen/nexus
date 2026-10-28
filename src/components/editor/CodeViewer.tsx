@@ -8,6 +8,7 @@ import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setS
 import { createRoot } from 'react-dom/client';
 import { useEditorStore, saveActiveFile, setPendingEditSource, clearPendingEditSource, flushPendingEdits } from '../../stores/editor';
 import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { useCtrlWheelFontSize } from '../../hooks/useCtrlWheelFontSize';
 import { CODE_FONT_STACK, parseEditorFontSize } from '../../utils/editorFont';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { getExtension } from '../../utils/path';
@@ -1011,6 +1012,9 @@ const MatchMarksOverlay = memo(function MatchMarksOverlay({ matchMarks }: { matc
 
 export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerProps) {
   const editorRef = useRef<HTMLDivElement>(null);
+  // Ctrl+滚轮调文本字号：挂在编辑器外层容器上（事件从 scrollDOM 冒泡上来），
+  // 与设置里的同一个键，改完立即重配 CodeMirror 的字号槽
+  useCtrlWheelFontSize(editorRef);
   const viewRef = useRef<EditorView | null>(null);
   /** 选中匹配的滚动条标记（选区变化时由 updateListener 计算） */
   const [matchMarks, setMatchMarks] = useState<MatchMarks | null>(null);

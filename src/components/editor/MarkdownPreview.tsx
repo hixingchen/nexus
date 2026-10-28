@@ -9,6 +9,7 @@ import { imageMimeOf } from '../../utils/path';
 import { markdownImageSrc, resolveMdLink, headingSlug } from '../../utils/markdown';
 import { rememberScroll, recallScroll } from '../../utils/editorScroll';
 import { isSubmitEnter } from '../../utils/keyboard';
+import { useCtrlWheelFontSize } from '../../hooks/useCtrlWheelFontSize';
 import { useUiStore } from '../../stores/uiStore';
 
 /**
@@ -107,6 +108,8 @@ function collectFindRanges(root: HTMLElement, query: string): Range[] {
  */
 export function MarkdownPreview({ filePath }: { filePath: string }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  // Ctrl+滚轮调文本字号：Markdown 正文通过 --nexus-text-size 跟随设置
+  useCtrlWheelFontSize(rootRef);
   /**
    * 当前文件路径的 ref：滚动监听只挂一次，事件里读它拿最新值。
    *

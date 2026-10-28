@@ -4,6 +4,7 @@ import { useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
 import { useUiStore } from '../../stores/uiStore';
+import { useCtrlWheelFontSize } from '../../hooks/useCtrlWheelFontSize';
 import { parseEditorFontSize } from '../../utils/editorFont';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
@@ -57,6 +58,8 @@ const SEARCH_DEBOUNCE_MS = 200;
  */
 export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onClose }: LogViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Ctrl+滚轮调文本字号：日志正文与行高估算都跟着同一个设置走
+  useCtrlWheelFontSize(scrollRef);
   const searchRef = useRef<HTMLInputElement>(null);
   /** 暂停开始时的累计新增行数（差值 = 暂停期间新增 N 行） */
   const baseAddedRef = useRef(0);

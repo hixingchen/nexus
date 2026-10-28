@@ -30,11 +30,12 @@
 //! 指针最后写 = 天然的原子性：中途失败留下的半成品永远不会被 `resolve()` 认成"已就绪"。
 //! 换运行时前必须先停会话（`node.exe` 在 Windows 上被占用就删/覆盖不掉），由调用方负责。
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::job_object::JobObject;
 
@@ -231,11 +232,13 @@ impl AiRuntime {
 pub fn install_or_upgrade_dsh(
     rt: &AiRuntime,
     job: Option<&JobObject>,
+    registry: Option<&str>,
 ) -> Result<String, RuntimeFailure> {
     let node_exe = Path::new(&rt.node_exe);
     let npm = npm_cli_beside(Path::new(&rt.node_exe))
         .ok_or_else(|| RuntimeFailure::new(3, "这份 Node 旁边找不到 npm，无法升级 dsh", String::new()))?;
-    install_dsh(job, node_exe, &npm).map_err(|e| RuntimeFailure::new(3, "npm 安装 dsh 失败", e))?;
+    install_dsh(job, node_exe, &npm, registry)
+        .map_err(|e| RuntimeFailure::new(3, "npm 安装 dsh 失败", e))?;
     rt.probe(job)
         .map_err(|e| RuntimeFailure::new(3, "装完了但 dsh 跑不起来，本次升级未生效", e))
 }
@@ -492,14 +495,23 @@ impl RuntimeFailure {
         }
     }
 
-    /// 已经有一次安装在进行（两个安装并发写同一个目录会互相踩）
+    /// 已经有一次运行时写操作在进行（安装 / 导入 / 导出 / 卸载 / 升级互斥）
     pub fn busy() -> Self {
-        Self::custom("准备安装", "已经在安装了，请等这一次跑完再试", String::new())
+        Self::custom(
+            "准备安装",
+            "已经在安装 / 导入 / 导出 AI 运行时了，请等这一次跑完再试",
+            String::new(),
+        )
     }
 
     /// 任务本身异常结束（如工作线程 panic）
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::custom("安装任务", "安装任务异常结束", msg.into())
+    }
+
+    /// 用户设置不合法（如 npm 源地址写错）：与具体安装步骤无关，界面据此提示去改设置
+    pub fn setting(summary: impl Into<String>, raw: impl Into<String>) -> Self {
+        Self::custom("检查设置", summary, raw)
     }
 
     /// 拼成一段既给人看、也给排障看的文本：**先说卡在哪、再说人话、最后贴原话**。
@@ -514,7 +526,10 @@ impl RuntimeFailure {
     }
 }
 
-/// 安装中标志：防并发（两个安装同时写同一个目录会互相踩）
+/// 运行时目录的**写操作互斥**：安装、导入、导出、卸载、升级 dsh 共用一把锁。
+///
+/// 它们都会碰 `runtime/` 下的同一批文件（导出是读，但会和安装/升级的半成品撞上），
+/// 两个同时跑会互相踩。
 static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 拿安装许可；拿不到（已有安装在进行）返回 `None`
@@ -546,6 +561,7 @@ pub fn try_acquire_install() -> Option<InstallSlot> {
 /// 下载步另按字节数持续回调。失败一律返回 [`RuntimeFailure`]，**绝不写指针**。
 pub fn install(
     job: Option<&JobObject>,
+    npm_registry: Option<&str>,
     on_progress: &dyn Fn(RuntimeProgress),
 ) -> Result<AiRuntime, RuntimeFailure> {
     let root = runtime_root();
@@ -613,7 +629,8 @@ pub fn install(
             format!("找不到 {}", node_dir(NODE_VERSION).join("node_modules/npm/bin/npm-cli.js").display()),
         )
     })?;
-    install_dsh(job, &node_exe, &npm).map_err(|e| RuntimeFailure::new(3, "npm 安装 dsh 失败", e))?;
+    install_dsh(job, &node_exe, &npm, npm_registry)
+        .map_err(|e| RuntimeFailure::new(3, "npm 安装 dsh 失败", e))?;
 
     // ── 5. 验证 ──────────────────────────────────────────────
     on_progress(RuntimeProgress { step_index: 4, detail: "正在确认真能跑起来…".into(), downloaded: 0, total: 0 });
@@ -751,13 +768,71 @@ fn extract_node_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// dsh 安装 / 升级 / 检查更新默认使用的 npm 源（淘宝镜像）。
+///
+/// 为什么默认镜像：官方 `registry.npmjs.org` 在国内常慢到超时；Node 压缩包已经
+/// 第一顺位走 npmmirror，而 dsh 是整条链上最大的下载（约 269MB），更需要镜像。
+/// 用户可在「设置 > AI 运行时」改成官方源或私有源——见 `normalize_npm_registry`。
+pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
+
+/// 校验并归一化用户配置的 npm 源；未配置 / 空串 → 默认淘宝镜像。
+///
+/// 只做**必要的**合法性判断（这个值会作为 `--registry` 单独传给 npm，不存在 shell 注入）：
+/// - 必须是 http / https；
+/// - 必须有主机名；
+/// - 不含空白字符；
+/// - 不带用户名 / 密码（凭据应配在 `~/.npmrc`；而且这个串可能出现在日志与错误原话里）。
+///
+/// 返回值去掉末尾斜杠：`https://host/repo/` 与 `https://host/repo` 对 npm 等价，
+/// 归一化后存 / 比较更不容易出现"看起来同一个源却是两个值"。
+pub fn normalize_npm_registry(raw: Option<&str>) -> Result<String, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_NPM_REGISTRY.to_string());
+    };
+    if raw.chars().any(char::is_whitespace) {
+        return Err(format!("地址不能包含空白字符：{:?}", raw));
+    }
+    let lower = raw.to_ascii_lowercase();
+    let rest = if lower.starts_with("https://") {
+        &raw[8..]
+    } else if lower.starts_with("http://") {
+        &raw[7..]
+    } else {
+        return Err(format!("地址必须以 http:// 或 https:// 开头：{}", raw));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return Err(format!("地址缺少主机名：{}", raw));
+    }
+    if authority.contains('@') {
+        return Err(format!(
+            "地址里不要写用户名/密码（认证请配置在 ~/.npmrc）：{}",
+            raw
+        ));
+    }
+    // 端口必须是数字（IPv6 字面量以 `]` 结尾时不当成 host:port，跳过）
+    if !authority.ends_with(']') {
+        if let Some((_, port)) = authority.rsplit_once(':') {
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!("端口不是数字：{}", raw));
+            }
+        }
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
 /// 用**私有 node 跑私有 npm**，把 dsh 装进私有目录。
 ///
 /// **必须是 `--prefix` 而不是 `-g`**：`-g` 的落地位置由用户级 `~/.npmrc` 里的 `prefix=` 决定
 /// （本机是 `node_global`），于是新版会被装进**用户那份**、私有目录里还是旧的——
 /// 界面报"升级成功"、实际跑的还是老版本，且**不报任何错**。
 /// 命令行 `--prefix` 的优先级高于 npmrc，显式压过它。
-fn install_dsh(job: Option<&JobObject>, node_exe: &Path, npm_cli: &Path) -> Result<(), String> {
+fn install_dsh(
+    job: Option<&JobObject>,
+    node_exe: &Path,
+    npm_cli: &Path,
+    registry: Option<&str>,
+) -> Result<(), String> {
     let prefix = ai_dir();
     std::fs::create_dir_all(&prefix).map_err(|e| format!("建目录 {} 失败: {}", prefix.display(), e))?;
     let mut cmd = direct_command(node_exe);
@@ -767,9 +842,22 @@ fn install_dsh(job: Option<&JobObject>, node_exe: &Path, npm_cli: &Path) -> Resu
         .arg(&prefix)
         .arg(format!("{}@latest", DSH_PACKAGE))
         .arg("--no-fund")
-        .arg("--no-audit")
-        .current_dir(&prefix);
-    let label = format!("{} {} install --prefix {} {}@latest", node_exe.display(), npm_cli.display(), prefix.display(), DSH_PACKAGE);
+        .arg("--no-audit");
+    // 显式传 > npmrc：默认淘宝源只在没有用户配置时兜底，这里给出的是用户在
+    // 「设置 > AI 运行时」里选的那一个（见 `normalize_npm_registry`）
+    if let Some(reg) = registry {
+        cmd.arg(format!("--registry={}", reg));
+    }
+    cmd.current_dir(&prefix);
+    let registry_arg = registry.map(|r| format!(" --registry={}", r)).unwrap_or_default();
+    let label = format!(
+        "{} {} install --prefix {} {}@latest{}",
+        node_exe.display(),
+        npm_cli.display(),
+        prefix.display(),
+        DSH_PACKAGE,
+        registry_arg
+    );
     crate::core::process::run_captured_command(job, &mut cmd, &label, crate::core::ai::AiTimeouts::NPM_INSTALL).map(|_| ())
 }
 
@@ -788,6 +876,734 @@ fn run_direct(
     }
     let label = format!("{} {}", exe.display(), args.join(" "));
     crate::core::process::run_captured_command(job, &mut cmd, &label, timeout)
+}
+
+// ─── 离线搬运：打包 / 导入整份运行时 ───────────────────────────
+//
+// 内网机器拿不到那 300MB 下载时，用一台能联网的机器「准备运行时」→ 导出压缩包 →
+// 拷贝到目标机导入。包内只有 `node/<版本>` 与 `ai` 两棵相对路径树，**不含任何绝对路径**，
+// 也不含 `~/.dsh`（登录凭据、会话历史留在各自机器上）。
+
+/// 包格式标识（manifest.format）——认错包时要说清"这不是 Nexus 的运行时包"
+const PACKAGE_FORMAT: &str = "nexus-ai-runtime";
+/// 包格式版本（将来加字段时能认出旧包）
+const PACKAGE_VERSION: u32 = 1;
+/// zip 里的顶层目录名（用户手工解压时也是一棵干净的树）
+const PACKAGE_TOP_DIR: &str = "nexus-ai-runtime";
+/// 运行时是 Windows x64 的（与 `NODE_URLS` 的下载目标一致）
+const PACKAGE_PLATFORM: &str = "windows-x64";
+/// manifest 大小上限（防止把一个巨型文件当 manifest 整读进内存）
+const MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+/// 解压总量上限（zip bomb 兜底；本机实测整份运行时约 617MB）
+const PACKAGE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// 条目数上限（本机实测约 3 万）
+const PACKAGE_MAX_ENTRIES: usize = 200_000;
+/// 进度事件的节流粒度：每处理 1MB 报一次（3 万个文件逐个报会把事件队列刷爆）
+const PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
+
+/// 进度事件的 kind（导出 / 导入）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    Export,
+    Import,
+}
+
+/// 打包 / 导入进度（经 Tauri 事件推给界面）
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeTransferProgress {
+    pub kind: TransferKind,
+    /// 阶段名（"打包" / "解压" / "验证" / "替换"）
+    pub phase: String,
+    /// 阶段内的细节（当前文件 / 字节数）
+    pub detail: String,
+    /// 已处理字节
+    pub done: u64,
+    /// 预期字节（0 = 未知）
+    pub total: u64,
+}
+
+/// 导出成功的结果（界面用来提示"导到哪、多大"）
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeExportResult {
+    pub path: String,
+    pub bytes: u64,
+    pub entries: u64,
+    pub node_version: String,
+    pub dsh_version: String,
+}
+
+/// 包里的 manifest（**文件格式**，不是 IPC 载荷；snake_case 便于阅读与手工检查）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RuntimeManifest {
+    format: String,
+    version: u32,
+    platform: String,
+    app_version: String,
+    node_version: String,
+    dsh_version: String,
+    exported_at: String,
+    file_count: u64,
+    total_bytes: u64,
+}
+
+/// 待打包的一个文件（绝对路径 + zip 内名称 + 字节数）
+struct PackFile {
+    abs: PathBuf,
+    name: String,
+    size: u64,
+}
+
+/// 导出一份**自带**运行时（`resolve()` 必须指向 private 且实测可跑）。
+///
+/// 手动指定的那份**不导出**：它的 Node 可能是 nvm / 全局安装，dsh 的依赖散落在任意
+/// `node_modules` 里，无法可靠收集出完整依赖闭包——导出出来"能装不能用"比拒绝更糟。
+pub fn export_package(
+    dest: &Path,
+    job: Option<&JobObject>,
+    on_progress: &dyn Fn(RuntimeTransferProgress),
+) -> Result<RuntimeExportResult, String> {
+    let rt = resolve().ok_or_else(|| {
+        "AI 运行时还没准备好。请先在能联网的机器上点「准备 AI 运行时」，再导出".to_string()
+    })?;
+    if rt.source != RuntimeSource::Private {
+        return Err(
+            "当前使用的是手动指定的运行时，不能打包：它的 Node / dsh 依赖散落在任意安装目录里，\
+             换台机器不一定完整。请在能联网的机器上使用 Nexus 自带的运行时（先点「准备 AI 运行时」）再导出"
+                .into(),
+        );
+    }
+    // 导出前实测一次：把一份已经跑不起来的运行时打包给别人，等于把故障一起搬过去
+    let dsh_version = rt.probe(job)?;
+    export_rooted(&runtime_root(), &rt.node_version, dest, &dsh_version, on_progress)
+}
+
+/// `export_package` 的本体：运行时根目录作参数，便于用例指向临时目录。
+fn export_rooted(
+    root: &Path,
+    node_version: &str,
+    dest: &Path,
+    dsh_version: &str,
+    on_progress: &dyn Fn(RuntimeTransferProgress),
+) -> Result<RuntimeExportResult, String> {
+    let node_dir = root.join("node").join(node_version);
+    let ai = root.join("ai");
+    if !node_dir.join("node.exe").is_file() {
+        return Err(format!("运行时目录里没有 node.exe：{}", node_dir.join("node.exe").display()));
+    }
+    if !dsh_js_in(&ai).is_file() {
+        return Err(format!("运行时目录里没有 dsh 入口：{}", dsh_js_in(&ai).display()));
+    }
+
+    let mut files: Vec<PackFile> = Vec::new();
+    collect_pack_files(&node_dir, &format!("node/{}", node_version), &mut files)?;
+    collect_pack_files(&ai, "ai", &mut files)?;
+    if files.is_empty() {
+        return Err("运行时目录是空的，没有可打包的文件".into());
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+
+    let manifest = RuntimeManifest {
+        format: PACKAGE_FORMAT.into(),
+        version: PACKAGE_VERSION,
+        platform: PACKAGE_PLATFORM.into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        node_version: node_version.into(),
+        dsh_version: dsh_version.trim().into(),
+        exported_at: chrono::Local::now().to_rfc3339(),
+        file_count: files.len() as u64,
+        total_bytes,
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("生成 manifest 失败: {}", e))?;
+
+    // 先写临时文件再改名：中途失败不会留下一个"看着像 zip"的半截文件
+    let partial = partial_path(dest);
+    let _ = std::fs::remove_file(&partial);
+    let written = (|| -> Result<u64, String> {
+        let f = std::fs::File::create(&partial)
+            .map_err(|e| format!("创建 {} 失败: {}", partial.display(), e))?;
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        w.start_file(format!("{}/manifest.json", PACKAGE_TOP_DIR), opts)
+            .map_err(|e| format!("写 manifest 失败: {}", e))?;
+        w.write_all(&manifest_json)
+            .map_err(|e| format!("写 manifest 失败: {}", e))?;
+
+        let mut done = 0u64;
+        let mut last_emit = 0u64;
+        let mut buf = vec![0u8; 256 * 1024];
+        for file in &files {
+            w.start_file(format!("{}/{}", PACKAGE_TOP_DIR, file.name), opts)
+                .map_err(|e| format!("写 zip 条目 {} 失败: {}", file.name, e))?;
+            let mut src = std::fs::File::open(&file.abs)
+                .map_err(|e| format!("打开 {} 失败: {}", file.abs.display(), e))?;
+            loop {
+                let n = src.read(&mut buf)
+                    .map_err(|e| format!("读取 {} 失败: {}", file.abs.display(), e))?;
+                if n == 0 {
+                    break;
+                }
+                w.write_all(&buf[..n])
+                    .map_err(|e| format!("写 zip 条目 {} 失败: {}", file.name, e))?;
+                done += n as u64;
+                if done.saturating_sub(last_emit) >= PROGRESS_STEP_BYTES {
+                    last_emit = done;
+                    on_progress(RuntimeTransferProgress {
+                        kind: TransferKind::Export,
+                        phase: "打包".into(),
+                        detail: file.name.clone(),
+                        done,
+                        total: total_bytes,
+                    });
+                }
+            }
+        }
+        let f = w.finish().map_err(|e| format!("收尾 zip 失败: {}", e))?;
+        f.sync_all().map_err(|e| format!("刷盘 {} 失败: {}", partial.display(), e))?;
+        Ok(done)
+    })();
+
+    let written = match written {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+    };
+    // 对话框里用户已确认覆盖；Windows 的 rename 不覆盖已存在文件
+    if dest.exists() {
+        std::fs::remove_file(dest)
+            .map_err(|e| format!("覆盖已有文件 {} 失败: {}", dest.display(), e))?;
+    }
+    std::fs::rename(&partial, dest)
+        .map_err(|e| format!("把 {} 改名到 {} 失败: {}", partial.display(), dest.display(), e))?;
+
+    let bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(written);
+    on_progress(RuntimeTransferProgress {
+        kind: TransferKind::Export,
+        phase: "打包".into(),
+        detail: format!("已写入 {}", human_mb(bytes)),
+        done: total_bytes,
+        total: total_bytes,
+    });
+    log::info!(
+        "[nexus] 已导出 AI 运行时：{}（{} 个文件，{}）",
+        path_for_display(dest),
+        files.len(),
+        human_mb(bytes)
+    );
+    Ok(RuntimeExportResult {
+        // 展示给用户看：去掉 canonicalize 的 \\?\ 前缀
+        path: path_for_display(dest),
+        bytes,
+        entries: files.len() as u64,
+        node_version: node_version.to_string(),
+        dsh_version: dsh_version.trim().to_string(),
+    })
+}
+
+/// **仅用于展示**：去掉 Windows canonicalize 返回的 `\\?\` / `\\?\UNC\` 前缀。
+///
+/// 不要把这个结果再拿去做 IO 或路径比较——verbatim 前缀是句柄级复核与
+/// `starts_with` 比较用的（见 `commands::paths`），剥掉就会永不命中。
+pub fn path_for_display(p: &Path) -> String {
+    let s = p.display().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    s
+}
+
+/// 递归收集要打包的文件。`zip_prefix` 是**当前目录在 zip 里的路径**（逐层拼出来），
+/// 不能从传入的 `root` 重新算相对路径——那会把父目录丢掉。
+fn collect_pack_files(
+    root: &Path,
+    zip_prefix: &str,
+    out: &mut Vec<PackFile>,
+) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(root)
+        .map_err(|e| format!("读目录 {} 失败: {}", root.display(), e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读目录 {} 失败: {}", root.display(), e))?;
+    entries.sort_by_key(|e| e.file_name());
+    for ent in entries {
+        let path = ent.path();
+        let ft = ent.file_type().map_err(|e| format!("读取 {} 失败: {}", path.display(), e))?;
+        // 符号链接 / 联接点不打包：目标可能在运行时目录之外，换台机器后失效或指到别处
+        if ft.is_symlink() {
+            log::warn!("[nexus] 跳过符号链接，不打包: {}", path.display());
+            continue;
+        }
+        let name = format!(
+            "{}/{}",
+            zip_prefix,
+            ent.file_name().to_string_lossy().replace('\\', "/")
+        );
+        if ft.is_dir() {
+            collect_pack_files(&path, &name, out)?;
+        } else if ft.is_file() {
+            let size = ent
+                .metadata()
+                .map_err(|e| format!("读取 {} 失败: {}", path.display(), e))?
+                .len();
+            out.push(PackFile { abs: path, name, size });
+        }
+    }
+    Ok(())
+}
+
+/// 目标文件同目录下的临时名（同卷 rename 才是原子的）
+fn partial_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "nexus-ai-runtime.zip".into());
+    dest.with_file_name(format!("{}.partial", name))
+}
+
+/// 从压缩包导入运行时到 `runtime_root()`。调用方必须先停掉 AI 会话
+/// （Windows 上 node.exe 被占用就换不掉旧目录）。
+pub fn import_package(
+    file: std::fs::File,
+    source_label: &str,
+    job: Option<&JobObject>,
+    on_progress: &dyn Fn(RuntimeTransferProgress),
+) -> Result<AiRuntime, String> {
+    import_package_rooted(&runtime_root(), file, source_label, job, on_progress)
+}
+
+/// `import_package` 的本体：运行时根目录作参数，便于用例指向临时目录。
+///
+/// 顺序是 **解压到 staging → 实测 → 换入 → 最后写指针**。任何一步失败都不动现有运行时；
+/// 指针最后写保证"导入到一半"永远不会被 `resolve()` 认成已就绪。
+fn import_package_rooted(
+    root: &Path,
+    file: std::fs::File,
+    source_label: &str,
+    job: Option<&JobObject>,
+    on_progress: &dyn Fn(RuntimeTransferProgress),
+) -> Result<AiRuntime, String> {
+    std::fs::create_dir_all(root.join("node"))
+        .map_err(|e| format!("建目录 {} 失败: {}", root.join("node").display(), e))?;
+    let staging = root.join(".import.partial");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("建目录 {} 失败: {}", staging.display(), e))?;
+
+    let manifest = match extract_package(file, &staging, on_progress) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    let node_exe = staging.join("node").join(&manifest.node_version).join("node.exe");
+    let dsh_js = dsh_js_in(&staging.join("ai"));
+    if !node_exe.is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!(
+            "压缩包里缺少 node.exe：{}\n包可能不完整，或不是 Nexus 导出的运行时包",
+            node_exe.display()
+        ));
+    }
+    if !dsh_js.is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!(
+            "压缩包里缺少 dsh 入口：{}\n包可能不完整，或 dsh 没装成功",
+            dsh_js.display()
+        ));
+    }
+
+    // **落位前**实测：与安装收尾同一条判据（拿不到版本号 = 不能启用）。
+    // 这一步在 staging 上跑，验证失败不会影响现有运行时。
+    let staged = AiRuntime {
+        node_exe: node_exe.display().to_string(),
+        dsh_js: dsh_js.display().to_string(),
+        node_version: manifest.node_version.clone(),
+        source: RuntimeSource::Private,
+    };
+    on_progress(RuntimeTransferProgress {
+        kind: TransferKind::Import,
+        phase: "验证".into(),
+        detail: "正在实跑 dsh --version…".into(),
+        done: 0,
+        total: 0,
+    });
+    let dsh_version = match staged.probe(job) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!(
+                "压缩包里的 dsh 跑不起来（Node 版本不兼容或包不完整），现有运行时未改动：\n{}",
+                e
+            ));
+        }
+    };
+    if !manifest.dsh_version.trim().is_empty()
+        && !dsh_version.contains(manifest.dsh_version.trim())
+    {
+        // 包的 manifest 只作参考，实测才是事实；不一致说明包被改过或导出后升过级
+        log::warn!(
+            "[nexus] 导入包的 dsh 版本与实测不一致：manifest={} 实测={}",
+            manifest.dsh_version,
+            dsh_version.trim()
+        );
+    }
+
+    on_progress(RuntimeTransferProgress {
+        kind: TransferKind::Import,
+        phase: "替换".into(),
+        detail: "正在换入新的运行时…".into(),
+        done: 0,
+        total: 0,
+    });
+    if let Err(e) = swap_in(root, &staging, &manifest.node_version) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    log::info!(
+        "[nexus] 已从 {} 导入 AI 运行时：Node {} / dsh {}",
+        source_label,
+        manifest.node_version,
+        dsh_version.trim()
+    );
+    Ok(AiRuntime {
+        node_exe: root
+            .join("node")
+            .join(&manifest.node_version)
+            .join("node.exe")
+            .display()
+            .to_string(),
+        dsh_js: dsh_js_in(&root.join("ai")).display().to_string(),
+        node_version: manifest.node_version,
+        source: RuntimeSource::Private,
+    })
+}
+
+/// 解压包到 staging，并返回校验过的 manifest。只解 `node/<版本>/` 与 `ai/` 两棵树，
+/// 其余条目（含 manifest 自身）忽略。
+fn extract_package(
+    file: std::fs::File,
+    staging: &Path,
+    on_progress: &dyn Fn(RuntimeTransferProgress),
+) -> Result<RuntimeManifest, String> {
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("不是有效的 zip 文件: {}", e))?;
+
+    // ① 找 manifest：只认根下或**唯一**顶层目录下的 manifest.json
+    let mut found: Option<(usize, String)> = None;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let parts: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+        let top = match parts.as_slice() {
+            ["manifest.json"] => "",
+            [top, "manifest.json"] => *top,
+            _ => continue,
+        };
+        if found.is_some() {
+            return Err("压缩包里有多份 manifest.json，无法判断哪份是运行时包".into());
+        }
+        found = Some((i, top.to_string()));
+    }
+    let Some((manifest_index, top)) = found else {
+        return Err("这不是 Nexus 导出的 AI 运行时包（压缩包里没有 manifest.json）".into());
+    };
+
+    let manifest: RuntimeManifest = {
+        let entry = archive
+            .by_index(manifest_index)
+            .map_err(|e| format!("读取 manifest 失败: {}", e))?;
+        if entry.size() > MANIFEST_MAX_BYTES {
+            return Err(format!(
+                "manifest.json 过大（{} 字节），不是运行时包",
+                entry.size()
+            ));
+        }
+        let mut raw = Vec::new();
+        entry
+            .take(MANIFEST_MAX_BYTES)
+            .read_to_end(&mut raw)
+            .map_err(|e| format!("读取 manifest 失败: {}", e))?;
+        serde_json::from_slice(&raw).map_err(|e| format!("manifest.json 解析失败: {}", e))?
+    };
+    if manifest.format != PACKAGE_FORMAT {
+        return Err(format!(
+            "不是 Nexus 的 AI 运行时包（format={}，期望 {}）",
+            manifest.format, PACKAGE_FORMAT
+        ));
+    }
+    if manifest.version != PACKAGE_VERSION {
+        return Err(format!(
+            "运行时包版本 {} 不受支持（当前支持 {}）",
+            manifest.version, PACKAGE_VERSION
+        ));
+    }
+    if manifest.platform != PACKAGE_PLATFORM {
+        return Err(format!(
+            "这个包是给 {} 的，当前机器需要 {}；请用同平台的 Nexus 重新导出",
+            manifest.platform, PACKAGE_PLATFORM
+        ));
+    }
+    if !is_safe_path_component(&manifest.node_version) {
+        return Err(format!(
+            "manifest 里的 Node 版本名不合法：{:?}（不能包含路径分隔符）",
+            manifest.node_version
+        ));
+    }
+    if manifest.total_bytes > PACKAGE_MAX_BYTES {
+        return Err(format!(
+            "运行时包声明的解压大小 {} 超过上限 {}",
+            human_mb(manifest.total_bytes),
+            human_mb(PACKAGE_MAX_BYTES)
+        ));
+    }
+
+    let prefix = if top.is_empty() { String::new() } else { format!("{}/", top) };
+    let node_prefix = format!("{}node/{}/", prefix, manifest.node_version);
+    let ai_prefix = format!("{}ai/", prefix);
+
+    // ② 预扫：条目数与声明大小（先挡 zip bomb，再落盘）
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if !name.starts_with(&node_prefix) && !name.starts_with(&ai_prefix) {
+            continue;
+        }
+        count += 1;
+        if count > PACKAGE_MAX_ENTRIES {
+            return Err(format!("压缩包条目过多（超过 {} 个），拒绝解压", PACKAGE_MAX_ENTRIES));
+        }
+        total = total
+            .checked_add(entry.size())
+            .ok_or_else(|| "压缩包声明的解压大小溢出".to_string())?;
+        if total > PACKAGE_MAX_BYTES {
+            return Err(format!(
+                "压缩包解压后超过上限 {}，拒绝解压",
+                human_mb(PACKAGE_MAX_BYTES)
+            ));
+        }
+    }
+    if count == 0 {
+        return Err("压缩包里没有 node/ 与 ai/ 内容（不是完整的运行时包）".into());
+    }
+
+    // ③ 解压
+    on_progress(RuntimeTransferProgress {
+        kind: TransferKind::Import,
+        phase: "解压".into(),
+        detail: format!("{}（{} 个文件）", human_mb(total), count),
+        done: 0,
+        total,
+    });
+    let mut done = 0u64;
+    let mut last_emit = 0u64;
+    let mut extracted = 0usize;
+    let mut buf = vec![0u8; 256 * 1024];
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let dest_rel = if let Some(rest) = name.strip_prefix(&node_prefix) {
+            Path::new("node").join(&manifest.node_version).join(rest)
+        } else if let Some(rest) = name.strip_prefix(&ai_prefix) {
+            Path::new("ai").join(rest)
+        } else {
+            continue;
+        };
+        if dest_rel.as_os_str().is_empty() {
+            continue;
+        }
+        // 符号链接一律跳过：zip 里链接的目标不受 enclosed_name 约束
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            log::warn!("[nexus] 跳过压缩包里的符号链接: {}", name);
+            continue;
+        }
+        let out_path = staging.join(&dest_rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)
+                .map_err(|e| format!("建目录 {} 失败: {}", out_path.display(), e))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("建目录 {} 失败: {}", parent.display(), e))?;
+        }
+        let mut out = std::fs::File::create(&out_path)
+            .map_err(|e| format!("写 {} 失败: {}", out_path.display(), e))?;
+        loop {
+            let n = entry
+                .read(&mut buf)
+                .map_err(|e| format!("解压 {} 失败: {}", name, e))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])
+                .map_err(|e| format!("写 {} 失败: {}", out_path.display(), e))?;
+            done += n as u64;
+            if done > PACKAGE_MAX_BYTES {
+                return Err(format!(
+                    "解压内容超过上限 {}，已中止",
+                    human_mb(PACKAGE_MAX_BYTES)
+                ));
+            }
+            if done.saturating_sub(last_emit) >= PROGRESS_STEP_BYTES {
+                last_emit = done;
+                on_progress(RuntimeTransferProgress {
+                    kind: TransferKind::Import,
+                    phase: "解压".into(),
+                    detail: name.clone(),
+                    done,
+                    total,
+                });
+            }
+        }
+        extracted += 1;
+    }
+    if extracted == 0 {
+        return Err("压缩包里没有解出任何文件".into());
+    }
+    on_progress(RuntimeTransferProgress {
+        kind: TransferKind::Import,
+        phase: "解压".into(),
+        detail: format!("已解压 {} 个文件", extracted),
+        done: total.max(done),
+        total: total.max(done),
+    });
+    Ok(manifest)
+}
+
+/// 把 staging 里的 `node/<版本>` 与 `ai` 换入正式目录。**指针最后写**；
+/// 失败时把已经挪动过的目录逐个挪回去（尽力而为）。
+fn swap_in(root: &Path, staging: &Path, version: &str) -> Result<(), String> {
+    let node_root = root.join("node");
+    std::fs::create_dir_all(&node_root)
+        .map_err(|e| format!("建目录 {} 失败: {}", node_root.display(), e))?;
+
+    let live_node = node_root.join(version);
+    let stage_node = staging.join("node").join(version);
+    let old_node = node_root.join(format!("{}.old-{}", version, std::process::id()));
+    let live_ai = root.join("ai");
+    let stage_ai = staging.join("ai");
+    let old_ai = root.join(format!("ai.old-{}", std::process::id()));
+
+    if !stage_node.is_dir() {
+        return Err(format!("解压结果里没有 Node 目录：{}", stage_node.display()));
+    }
+    if !stage_ai.is_dir() {
+        return Err(format!("解压结果里没有 dsh 目录：{}", stage_ai.display()));
+    }
+    // 上次导入失败可能留下同名 .old 目录；先清掉，免得 rename 撞名
+    let _ = std::fs::remove_dir_all(&old_node);
+    let _ = std::fs::remove_dir_all(&old_ai);
+
+    let mut old_node_moved = false;
+    let mut new_node_moved = false;
+    let mut old_ai_moved = false;
+    let mut new_ai_moved = false;
+
+    let result = (|| -> Result<(), String> {
+        if live_node.exists() {
+            std::fs::rename(&live_node, &old_node).map_err(|e| {
+                format!(
+                    "移走旧 Node 目录 {} 失败（还有进程占用 node.exe：先停止 AI 会话；\
+                     若另一个 Nexus 实例也在用这份运行时，先退出它）：{}",
+                    live_node.display(),
+                    e
+                )
+            })?;
+            old_node_moved = true;
+        }
+        std::fs::rename(&stage_node, &live_node)
+            .map_err(|e| format!("Node 目录落位失败：{}", e))?;
+        new_node_moved = true;
+
+        if live_ai.exists() {
+            std::fs::rename(&live_ai, &old_ai)
+                .map_err(|e| format!("移走旧 dsh 目录 {} 失败：{}", live_ai.display(), e))?;
+            old_ai_moved = true;
+        }
+        std::fs::rename(&stage_ai, &live_ai)
+            .map_err(|e| format!("dsh 目录落位失败：{}", e))?;
+        new_ai_moved = true;
+
+        // 指针最后写：中途失败时 resolve() 必须看不见这次导入
+        std::fs::write(node_root.join("current.txt"), version)
+            .map_err(|e| format!("写指针失败：{}", e))?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // 回滚顺序与落位相反；某一步失败只记录，不再覆盖原始错误
+        if new_ai_moved {
+            if let Err(re) = std::fs::rename(&live_ai, &stage_ai) {
+                log::warn!("[nexus] 导入回滚: dsh 目录挪回 staging 失败: {}", re);
+            }
+        }
+        if old_ai_moved {
+            if let Err(re) = std::fs::rename(&old_ai, &live_ai) {
+                log::warn!("[nexus] 导入回滚: 旧 dsh 目录挪回失败: {}", re);
+            }
+        }
+        if new_node_moved {
+            if let Err(re) = std::fs::rename(&live_node, &stage_node) {
+                log::warn!("[nexus] 导入回滚: Node 目录挪回 staging 失败: {}", re);
+            }
+        }
+        if old_node_moved {
+            if let Err(re) = std::fs::rename(&old_node, &live_node) {
+                log::warn!("[nexus] 导入回滚: 旧 Node 目录挪回失败: {}", re);
+            }
+        }
+        return Err(e);
+    }
+
+    // 新运行时已就位：旧目录删不掉（杀软/残留句柄）不影响使用，只留警告
+    if old_node_moved {
+        if let Err(e) = std::fs::remove_dir_all(&old_node) {
+            log::warn!("[nexus] 清理旧 Node 目录 {} 失败: {}", old_node.display(), e);
+        }
+    }
+    if old_ai_moved {
+        if let Err(e) = std::fs::remove_dir_all(&old_ai) {
+            log::warn!("[nexus] 清理旧 dsh 目录 {} 失败: {}", old_ai.display(), e);
+        }
+    }
+    Ok(())
+}
+
+/// manifest 里的 Node 版本名会被拼进解压路径：必须是一个**单一路径分量**
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains(':')
 }
 
 // ─── 卸载与状态 ───────────────────────────────────────────────
@@ -989,7 +1805,7 @@ mod tests {
         std::env::set_var("NEXUS_DATA_DIR", &tmp);
 
         let seen = std::sync::Mutex::new(Vec::<String>::new());
-        let rt = install(None, &|p| {
+        let rt = install(None, None, &|p| {
             let line = format!("[{}] {}", STEPS[p.step_index.min(STEPS.len() - 1)], p.detail);
             let mut g = seen.lock().unwrap();
             // 只留每种状态一条，避免逐字节进度刷屏
@@ -1167,6 +1983,305 @@ mod tests {
         assert!(manual_runtime(&tmp).is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── 离线搬运：打包 / 导入 ───────────────────────────────
+
+    /// 造一个包（manifest + 指定条目）。用例需要精确控制 zip 里的条目名，
+    /// 所以不能用 `export_rooted` 生成。
+    fn write_test_package(path: &Path, manifest: &RuntimeManifest, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file(format!("{}/manifest.json", PACKAGE_TOP_DIR), opts).unwrap();
+        w.write_all(&serde_json::to_vec(manifest).unwrap()).unwrap();
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn test_manifest(platform: &str, node_version: &str) -> RuntimeManifest {
+        RuntimeManifest {
+            format: PACKAGE_FORMAT.into(),
+            version: PACKAGE_VERSION,
+            platform: platform.into(),
+            app_version: "0.0.0".into(),
+            node_version: node_version.into(),
+            dsh_version: "1.0.0".into(),
+            exported_at: "2026-01-01T00:00:00+08:00".into(),
+            file_count: 1,
+            total_bytes: 1,
+        }
+    }
+
+    /// 导出 → 解压 → 换入 → `resolve_in` 的整条结构链。
+    ///
+    /// 不执行 node（假 exe 跑不起来），所以走的是 `export_rooted` / `extract_package` /
+    /// `swap_in` 三个可分步验证的函数；真正"能不能跑"由 ignored 的真机用例守。
+    #[test]
+    fn test_package_roundtrip_structure() {
+        let base = std::env::temp_dir().join(format!("nexus_pkg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let node_dir = src.join("node").join("v9.9.9");
+        let ai = src.join("ai");
+        std::fs::create_dir_all(node_dir.join("node_modules").join("npm").join("bin")).unwrap();
+        std::fs::create_dir_all(
+            ai.join("node_modules").join("@deepseek-ai").join("dsh").join("lib"),
+        )
+        .unwrap();
+        std::fs::write(node_dir.join("node.exe"), b"MZ fake").unwrap();
+        std::fs::write(node_dir.join("node_modules/npm/bin/npm-cli.js"), b"// npm").unwrap();
+        std::fs::write(ai.join("node_modules/@deepseek-ai/dsh/lib/bin.js"), b"// dsh").unwrap();
+
+        // 命令层传给导出函数的是 canonicalize 后的路径（Windows 上是 `\\?\` verbatim）——
+        // 用例也走这个形状，别只测普通路径
+        let zip_path = std::fs::canonicalize(&base).unwrap().join("runtime.zip");
+        let exported = export_rooted(&src, "v9.9.9", &zip_path, "1.2.3", &|_| {}).unwrap();
+        assert!(zip_path.is_file(), "导出后必须真的落了一个 zip");
+        assert_eq!(exported.entries, 3, "只打包文件，不含目录条目");
+        assert_eq!(exported.node_version, "v9.9.9");
+
+        let dst_root = base.join("dst");
+        std::fs::create_dir_all(&dst_root).unwrap();
+        let staging = dst_root.join(".import.partial");
+        std::fs::create_dir_all(&staging).unwrap();
+        let manifest = extract_package(
+            std::fs::File::open(&zip_path).unwrap(),
+            &staging,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(manifest.node_version, "v9.9.9");
+        assert_eq!(manifest.dsh_version, "1.2.3");
+
+        swap_in(&dst_root, &staging, &manifest.node_version).unwrap();
+        let rt = resolve_in(&dst_root).expect("换入后必须能 resolve（指针已写）");
+        assert_eq!(rt.node_version, "v9.9.9");
+        assert_eq!(rt.source, RuntimeSource::Private);
+        assert!(Path::new(&rt.node_exe).is_file());
+        assert!(Path::new(&rt.dsh_js).is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 恶意条目：路径穿越必须被丢掉，符号链接必须被跳过。
+    ///
+    /// 解压目标是我们即将执行的 `node.exe` 的所在目录；`enclosed_name` 挡 `..`，
+    /// 符号链接则要单独挡——它的**目标**不受 `enclosed_name` 约束。
+    #[test]
+    fn test_extract_skips_traversal_and_symlink() {
+        let base = std::env::temp_dir().join(format!("nexus_pkg_evil_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let zip_path = base.join("evil.zip");
+
+        {
+            use std::io::Write as _;
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file(format!("{}/manifest.json", PACKAGE_TOP_DIR), opts).unwrap();
+            w.write_all(&serde_json::to_vec(&test_manifest(PACKAGE_PLATFORM, "v1")).unwrap())
+                .unwrap();
+            // 路径穿越
+            w.start_file("nexus-ai-runtime/node/v1/../../escaped.txt", opts).unwrap();
+            w.write_all(b"pwned").unwrap();
+            // 正常条目：光有恶意条目时解压会因"什么都没解出来"而失败，
+            // 那样就分不清是挡住了穿越还是压根没解析
+            w.start_file("nexus-ai-runtime/node/v1/node.exe", opts).unwrap();
+            w.write_all(b"MZ").unwrap();
+            w.start_file("nexus-ai-runtime/ai/node_modules/@deepseek-ai/dsh/lib/bin.js", opts)
+                .unwrap();
+            w.write_all(b"// dsh").unwrap();
+            // 真正的符号链接条目（unix_permissions 会被 zip 改写成普通文件，必须用 add_symlink）
+            w.add_symlink("nexus-ai-runtime/ai/link", "../../outside", opts).unwrap();
+            w.finish().unwrap();
+        }
+
+        let staging = base.join("out");
+        std::fs::create_dir_all(&staging).unwrap();
+        extract_package(std::fs::File::open(&zip_path).unwrap(), &staging, &|_| {}).unwrap();
+
+        assert!(!base.join("escaped.txt").exists(), "带 .. 的条目不能落到目标目录之外");
+        assert!(!staging.join("escaped.txt").exists(), "也不能被塞进目标目录里");
+        assert!(staging.join("node/v1/node.exe").is_file(), "正常条目要照常解出来");
+        assert!(!staging.join("ai/link").exists(), "符号链接条目必须被跳过");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// manifest 是外部输入：版本名会被拼进解压路径，平台不对必须拒绝。
+    #[test]
+    fn test_manifest_rejects_unsafe_version_and_wrong_platform() {
+        let base = std::env::temp_dir().join(format!("nexus_pkg_manifest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // ① 版本名带路径分隔符：必须在解压前拒绝
+        let bad_version_zip = base.join("bad-version.zip");
+        write_test_package(
+            &bad_version_zip,
+            &test_manifest(PACKAGE_PLATFORM, "../../evil"),
+            &[("nexus-ai-runtime/node/v1/node.exe", b"MZ")],
+        );
+        let staging = base.join("out1");
+        std::fs::create_dir_all(&staging).unwrap();
+        let err = extract_package(
+            std::fs::File::open(&bad_version_zip).unwrap(),
+            &staging,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("版本名不合法"), "{}", err);
+
+        // ② 平台不一致：换机前就该看出"这个包不是给 Windows x64 的"
+        let bad_platform_zip = base.join("bad-platform.zip");
+        write_test_package(
+            &bad_platform_zip,
+            &test_manifest("linux-x64", "v1"),
+            &[("nexus-ai-runtime/node/v1/node.exe", b"MZ")],
+        );
+        let staging = base.join("out2");
+        std::fs::create_dir_all(&staging).unwrap();
+        let err = extract_package(
+            std::fs::File::open(&bad_platform_zip).unwrap(),
+            &staging,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("linux-x64"), "错误里要说清包是给谁的：{}", err);
+
+        // ③ 没有 manifest：不是本功能的包
+        let plain_zip = base.join("plain.zip");
+        {
+            use std::io::Write as _;
+            let f = std::fs::File::create(&plain_zip).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("readme.txt", opts).unwrap();
+            w.write_all(b"hi").unwrap();
+            w.finish().unwrap();
+        }
+        let err = extract_package(
+            std::fs::File::open(&plain_zip).unwrap(),
+            &staging,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("manifest.json"), "{}", err);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **真机跑一次**（铁律 19）：拿本机**真实**的自带运行时走一遍
+    /// 导出 → 导入到临时目录 → 实测 `dsh --version`。
+    ///
+    /// 覆盖的是单测碰不到的东西：真实 node_modules 的深路径与 3 万个条目、
+    /// zip 压缩/解压的真实字节、以及"导出的这对 node + dsh 在另一处还能跑起来"。
+    ///
+    /// 本机没有自带运行时（或当前是手动指定）就跳过：
+    /// ```text
+    /// cargo test --lib -- --ignored real_package_roundtrip --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_real_package_roundtrip() {
+        let Some(rt) = resolve() else {
+            println!("本机没有可用的 AI 运行时，跳过");
+            return;
+        };
+        if rt.source != RuntimeSource::Private {
+            println!("当前是手动指定的运行时，跳过（导出只支持自带那份）");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("nexus_pkg_real_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let zip_path = base.join("runtime.zip");
+        let exported = export_package(&zip_path, None, &|p| {
+            if p.done == p.total {
+                println!("[导出] {}：{}", p.phase, p.detail);
+            }
+        })
+        .unwrap_or_else(|e| panic!("导出失败：{}", e));
+        println!(
+            "导出完成：{} 个文件，{} → {}",
+            exported.entries,
+            human_mb(exported.bytes),
+            exported.path
+        );
+
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let imported = import_package_rooted(
+            &dst,
+            std::fs::File::open(&zip_path).unwrap(),
+            "real-roundtrip-test",
+            None,
+            &|p| {
+                if p.phase != "解压" || p.done == p.total {
+                    println!("[导入] {}：{}", p.phase, p.detail);
+                }
+            },
+        )
+        .unwrap_or_else(|e| panic!("导入失败：{}", e));
+        let ver = imported
+            .probe(None)
+            .unwrap_or_else(|e| panic!("导入后跑不起来：{}", e));
+        println!("导入后实测 dsh 版本 = {}", ver);
+        assert!(
+            ver.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "拿不到真版本号 = Node 不兼容那种静默形态：{:?}",
+            ver
+        );
+        assert!(resolve_in(&dst).is_some(), "导入后必须能 resolve");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 展示用路径：canonicalize 的 `\\?\` 前缀不能出现在提示与日志里（用户复制不走），
+    /// 但**只用于展示**——保留同样的测试也提醒后来者别拿它做 IO。
+    #[test]
+    fn test_path_for_display_strips_verbatim_prefix() {
+        assert_eq!(path_for_display(Path::new(r"\\?\C:\x\y.zip")), r"C:\x\y.zip");
+        assert_eq!(
+            path_for_display(Path::new(r"\\?\UNC\srv\share\x.zip")),
+            r"\\srv\share\x.zip"
+        );
+        assert_eq!(path_for_display(Path::new(r"C:\x\y.zip")), r"C:\x\y.zip");
+    }
+
+    /// npm 源是外部输入：不合法要在**开始下载前**拒绝；没配置时默认淘宝镜像。
+    #[test]
+    fn test_normalize_npm_registry() {
+        assert_eq!(normalize_npm_registry(None).unwrap(), DEFAULT_NPM_REGISTRY);
+        assert_eq!(normalize_npm_registry(Some("   ")).unwrap(), DEFAULT_NPM_REGISTRY);
+        assert_eq!(
+            normalize_npm_registry(Some(" https://registry.npmmirror.com/ ")).unwrap(),
+            "https://registry.npmmirror.com",
+            "两端空白与末尾斜杠要归一化"
+        );
+        assert_eq!(
+            normalize_npm_registry(Some("http://host:8080/repository/npm/")).unwrap(),
+            "http://host:8080/repository/npm",
+            "私有源允许带端口与路径"
+        );
+        assert!(normalize_npm_registry(Some("ftp://host")).is_err());
+        assert!(normalize_npm_registry(Some("https://")).is_err());
+        assert!(normalize_npm_registry(Some("https:///repo")).is_err());
+        assert!(normalize_npm_registry(Some("https://user:pw@host")).is_err(),
+            "凭据不能写进地址（会进日志/错误原话），应配在 ~/.npmrc");
+        assert!(normalize_npm_registry(Some("https://host/a b")).is_err());
+        assert!(normalize_npm_registry(Some("https://host:abc")).is_err());
+        assert!(DEFAULT_NPM_REGISTRY.contains("npmmirror"), "默认源应是淘宝镜像");
     }
 
     #[test]

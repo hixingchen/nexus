@@ -66,6 +66,32 @@ export interface RuntimeProgress {
 /** 运行时安装进度事件名（与 `commands/ai.rs` 的 `app.emit` 一致） */
 export const AI_RUNTIME_PROGRESS_EVENT = 'ai-runtime-progress';
 
+/** 导出 / 导入进度（`ai-runtime-transfer-progress` 事件载荷） */
+export interface RuntimeTransferProgress {
+  /** 这次是导出还是导入（决定界面文案） */
+  kind: 'export' | 'import';
+  /** 阶段名（"打包" / "解压" / "验证" / "替换"） */
+  phase: string;
+  /** 阶段内的细节（当前文件 / 字节数） */
+  detail: string;
+  /** 已处理字节 */
+  done: number;
+  /** 预期字节（0 = 未知） */
+  total: number;
+}
+
+/** 运行时打包 / 导入进度事件名（与 `commands/ai.rs` 的常量一致） */
+export const AI_RUNTIME_TRANSFER_PROGRESS_EVENT = 'ai-runtime-transfer-progress';
+
+/** 导出结果（`ai_runtime_export` 返回值） */
+export interface RuntimeExportResult {
+  path: string;
+  bytes: number;
+  entries: number;
+  node_version: string;
+  dsh_version: string;
+}
+
 /** 创建 AI 面板子 WebView 的入参（矩形以内容区 DOM 槽为准） */
 interface PanelWebviewBounds {
   windowLabel: string;
@@ -135,6 +161,16 @@ export const aiService = {
     invoke<AiRuntimeStatus>('ai_runtime_set_manual', { nodeExe, dshPath }),
   /** 清除手动指定，回到用 Nexus 自带的那份 */
   runtimeClearManual: () => invoke<AiRuntimeStatus>('ai_runtime_clear_manual'),
+  /**
+   * 导出自带的 AI 运行时为 zip（内网 / 下载不通时搬到目标机）。
+   * 只支持 `source === 'private'` 且实测可跑的那份。
+   */
+  runtimeExport: (path: string) => invoke<RuntimeExportResult>('ai_runtime_export', { path }),
+  /**
+   * 从 zip 导入并替换 Nexus 自带的运行时。
+   * 后端会先停 AI 会话；解压/验证失败不动现有运行时；成功后清除会遮住它的手动指定。
+   */
+  runtimeImport: (path: string) => invoke<AiRuntimeStatus>('ai_runtime_import', { path }),
 };
 
 // ─── 错误结构化 ────────────────────────────────────────────────

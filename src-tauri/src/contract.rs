@@ -11,7 +11,10 @@
 
 use crate::commands::ai::{AiRuntimeStatus, AiStatus, DshVersionInfo};
 use crate::core::ai::DshProbe;
-use crate::core::runtime::{RuntimeFailure, RuntimeProgress, RuntimeSource};
+use crate::core::runtime::{
+    RuntimeExportResult, RuntimeFailure, RuntimeProgress, RuntimeSource, RuntimeTransferProgress,
+    TransferKind,
+};
 use crate::commands::app::AppPaths;
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
@@ -143,6 +146,38 @@ fn test_response_dtos_are_snake_case() {
     // 安装进度（`ai-runtime-progress` 事件载荷）：界面按 step_index 高亮步骤条
     let progress = RuntimeProgress { step_index: 0, detail: "d".into(), downloaded: 0, total: 0 };
     assert_eq!(keys_of(&progress), sorted(&["step_index", "detail", "downloaded", "total"]));
+
+    // 导出 / 导入进度（`ai-runtime-transfer-progress` 事件载荷）
+    let transfer = RuntimeTransferProgress {
+        kind: TransferKind::Export,
+        phase: "打包".into(),
+        detail: "d".into(),
+        done: 1,
+        total: 2,
+    };
+    assert_eq!(keys_of(&transfer), sorted(&["kind", "phase", "detail", "done", "total"]));
+    // kind 的取值也是契约：前端按 'export' / 'import' 决定文案
+    assert_eq!(
+        serde_json::to_value(TransferKind::Export).unwrap(),
+        serde_json::Value::String("export".into()),
+    );
+    assert_eq!(
+        serde_json::to_value(TransferKind::Import).unwrap(),
+        serde_json::Value::String("import".into()),
+    );
+
+    // 导出结果（`ai_runtime_export` 的返回值）：界面提示"导到哪、多大"
+    let exported = RuntimeExportResult {
+        path: "p".into(),
+        bytes: 1,
+        entries: 2,
+        node_version: "v".into(),
+        dsh_version: "d".into(),
+    };
+    assert_eq!(
+        keys_of(&exported),
+        sorted(&["path", "bytes", "entries", "node_version", "dsh_version"]),
+    );
 
     // 安装失败（`ai_runtime_install` 的错误体）：四段分开，界面才能"先说卡在哪、再贴原话"
     let failure = RuntimeFailure::busy();
@@ -630,6 +665,11 @@ const COVERED_RESPONSE: &[&str] = &[
         // AI 私有运行时：状态走 invoke，进度走 `ai-runtime-progress` 事件，失败体是
         // `ai_runtime_install` 的 Err 载荷——三条都出前端，字段名都得钉住
         "DshProbe", "AiRuntimeStatus", "RuntimeProgress", "RuntimeFailure",
+        // 导出 / 导入：进度走 `ai-runtime-transfer-progress` 事件，导出结果走 invoke 返回值
+        "RuntimeTransferProgress", "RuntimeExportResult",
+        // 豁免：`RuntimeManifest` 是**压缩包里的文件格式**（manifest.json），只在
+        // core::runtime 内部读写，不经 IPC。它同时 derive 了 Deserialize，请求侧守卫也看得见
+        "RuntimeManifest",
         // 豁免：`AiRuntime` 是**进程内的句柄**（一对绝对路径 + 版本号），只给 `spawn_dsh_web`
         // 用，从不经 IPC 出前端——前端看到的是 `AiRuntimeStatus`（它才是那个载荷的 DTO）。
         // 保留 `Serialize` 只为一件事：安装成功时记一条含它的日志（`log::info!` 的 `{}` 需要）

@@ -194,6 +194,7 @@ pub async fn pick_directory(
 fn save_picker_title(purpose: Option<&str>) -> &'static str {
     match purpose {
         Some("exportTemplates") => "导出模板文件",
+        Some("exportAiRuntime") => "导出 AI 运行时",
         _ => "保存文件",
     }
 }
@@ -216,8 +217,15 @@ pub async fn pick_save_file(
 ) -> Result<Option<String>, String> {
     let title = save_picker_title(purpose.as_deref());
     let picker = app.clone();
+    let filter = purpose.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
-        let mut builder = picker.dialog().file().set_title(title).add_filter("JSON", &["json"]);
+        let mut builder = picker.dialog().file().set_title(title);
+        // 扩展名过滤也按用途决定：导出运行时给 .zip，模板导出给 .json
+        builder = match filter.as_deref() {
+            Some("exportAiRuntime") => builder.add_filter("ZIP", &["zip"]),
+            Some("exportTemplates") => builder.add_filter("JSON", &["json"]),
+            _ => builder,
+        };
         if let Some(name) = default_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             builder = builder.set_file_name(name);
         }
@@ -229,6 +237,48 @@ pub async fn pick_save_file(
 
     let Some(file_path) = picked else { return Ok(None) };
     let path = file_path.into_path().map_err(|e| format!("保存对话框结果无法转为路径: {}", e))?;
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        if let Some(parent) = path.parent() {
+            state.paths.remember_confirmed_dir(parent);
+        }
+    }
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// 文件打开对话框的**用途** → 对话框标题。理由同 `picker_title`（SEC-17）。
+fn open_picker_title(purpose: Option<&str>) -> &'static str {
+    match purpose {
+        Some("importAiRuntime") => "选择 AI 运行时压缩包",
+        _ => "选择文件",
+    }
+}
+
+/// 原生文件打开对话框（Rust 侧弹框），并把用户选中的**所在目录**记为"已确认"。
+///
+/// 为什么也走后端：导入时要读用户挑的 zip，读取路径同样要过授权检查
+/// （见 `commands::ai::open_import_source`）。若前端自己弹框再把路径经 IPC 传进来，
+/// 服务端分辨不出它是不是用户刚选的——与 `pick_save_file`（SEC-19）同一套信任模型。
+#[tauri::command]
+pub async fn pick_open_file(
+    app: AppHandle,
+    purpose: Option<String>,
+) -> Result<Option<String>, String> {
+    let title = open_picker_title(purpose.as_deref());
+    let picker = app.clone();
+    let filter = purpose.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut builder = picker.dialog().file().set_title(title);
+        if filter.as_deref() == Some("importAiRuntime") {
+            builder = builder.add_filter("ZIP", &["zip"]);
+        }
+        // 同 pick_directory：blocking_* 必须放在 spawn_blocking 里，别卡住 IPC 线程
+        builder.blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("打开对话框任务失败: {}", e))?;
+
+    let Some(file_path) = picked else { return Ok(None) };
+    let path = file_path.into_path().map_err(|e| format!("打开对话框结果无法转为路径: {}", e))?;
     if let Some(state) = app.try_state::<crate::AppState>() {
         if let Some(parent) = path.parent() {
             state.paths.remember_confirmed_dir(parent);
@@ -259,7 +309,11 @@ mod tests {
         );
         // 保存对话框同一套口径（SEC-19）
         assert_eq!(save_picker_title(Some("exportTemplates")), "导出模板文件");
+        assert_eq!(save_picker_title(Some("exportAiRuntime")), "导出 AI 运行时");
         assert_eq!(save_picker_title(Some("whatever")), "保存文件");
+        // 打开对话框（导入运行时）同理
+        assert_eq!(open_picker_title(Some("importAiRuntime")), "选择 AI 运行时压缩包");
+        assert_eq!(open_picker_title(Some("whatever")), "选择文件");
     }
 
     /// SEC-17 同口径：应用目录**只认用途键**，未知用途一律拒绝（且不回落成某个目录）。

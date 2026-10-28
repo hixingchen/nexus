@@ -3,6 +3,28 @@ use rusqlite::Connection;
 use tauri::State;
 use crate::AppState;
 
+/// 布局 KV 里 npm 源的键（与前端 `LAYOUT_KEYS.npmRegistry` 同值）。
+///
+/// 收在这里而不是 `commands::ai`：读写都走本模块的统一 KV，键名只留一个字面量。
+pub const KEY_NPM_REGISTRY: &str = "npm_registry";
+
+/// 读一个布局键（非布局模块共用的入口；不存在返回 `None`，读库失败如实返回）。
+pub fn read_layout_value(db: &crate::database::Database, key: &str) -> Result<Option<String>, String> {
+    db.with_conn(|conn| read_layout_value_from_conn(conn, key))
+}
+
+fn read_layout_value_from_conn(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    match conn.query_row(
+        "SELECT value FROM layout WHERE key = ?1",
+        [key],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("读取布局项 '{}' 失败: {}", key, e)),
+    }
+}
+
 /// 保存布局键值对（批量）
 #[tauri::command]
 pub fn save_layout(state: State<AppState>, items: HashMap<String, String>) -> Result<(), String> {
@@ -46,6 +68,8 @@ pub fn load_layout(state: State<AppState>) -> Result<HashMap<String, String>, St
 ///   项目——一起清掉的话，下次启动就停在"选择一个项目开始"。
 /// - `editor_font_size`：文本字号（代码视图 + Markdown 预览）属于设置里的「编辑器」分类，
 ///   在"恢复默认布局"里被顺手清掉，用户会觉得"我就想调个面板宽度，字怎么变小了"。
+/// - `npm_registry`：AI 运行时的 npm 源（设置 > AI 运行时），同样不是面板几何；
+///   清掉会让用户的镜像/私有源配置静默回到默认。
 ///
 /// 这几个字面量与前端 `stores/layoutStore.ts` 的 `LAYOUT_KEYS` 是同一把键。`contract.rs` 管的是
 /// IPC 载荷的字段名，管不到"存进库里的键"，所以这一对只能靠人同步——新增布局键时，
@@ -55,6 +79,7 @@ const KEEP_ON_RESET: &[&str] = &[
     "editor_font_size",
     "ai_session_mode",
     "update_skipped_version",
+    KEY_NPM_REGISTRY,
 ];
 
 /// 恢复默认布局的**纯逻辑**（单独成函数才测得到，`State<AppState>` 在单测里造不出来）：
@@ -102,6 +127,19 @@ mod tests {
     fn put(conn: &Connection, key: &str, value: &str) {
         conn.execute("INSERT OR REPLACE INTO layout (key, value) VALUES (?1, ?2)", rusqlite::params![key, value])
             .expect("写入布局项");
+    }
+
+    /// 读单个键：**不存在**要返回 `None`（调用方据此走默认值），而不是报错——
+    /// 把"没设置过"当成读库失败，会让首次安装直接报一个与事实不符的错误。
+    #[test]
+    fn test_read_layout_value_distinguishes_missing() {
+        let conn = conn_with_layout();
+        assert_eq!(read_layout_value_from_conn(&conn, KEY_NPM_REGISTRY).unwrap(), None);
+        put(&conn, KEY_NPM_REGISTRY, "https://registry.npmmirror.com");
+        assert_eq!(
+            read_layout_value_from_conn(&conn, KEY_NPM_REGISTRY).unwrap().as_deref(),
+            Some("https://registry.npmmirror.com")
+        );
     }
 
     /// 「恢复默认布局」清掉几何类布局键，**但留住**当前选中的项目与编辑器字号。

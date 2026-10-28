@@ -5,7 +5,9 @@ import {
   EDITOR_FONT_SIZE_DEFAULT,
   EDITOR_FONT_SIZE_MAX,
   EDITOR_FONT_SIZE_MIN,
+  clampEditorFontSize,
   parseEditorFontSize,
+  stepEditorFontSize,
 } from '../editorFont.ts';
 
 /**
@@ -61,4 +63,20 @@ test('区间常量本身自洽（下限 ≤ 默认值 ≤ 上限）', () => {
   assert.ok(EDITOR_FONT_SIZE_MIN <= EDITOR_FONT_SIZE_DEFAULT);
   assert.ok(EDITOR_FONT_SIZE_DEFAULT <= EDITOR_FONT_SIZE_MAX);
   assert.ok(EDITOR_FONT_SIZE_MIN < EDITOR_FONT_SIZE_MAX);
+});
+
+test('clampEditorFontSize：越界与小数统一收口（设置按钮 / Ctrl+滚轮共用）', () => {
+  assert.equal(clampEditorFontSize(0), EDITOR_FONT_SIZE_MIN);
+  assert.equal(clampEditorFontSize(999), EDITOR_FONT_SIZE_MAX);
+  assert.equal(clampEditorFontSize(13.4), 13);
+  assert.equal(clampEditorFontSize(13.5), 14);
+});
+
+test('stepEditorFontSize：向上滚 +1、向下滚 −1，两端不越界', () => {
+  assert.equal(stepEditorFontSize(14, -100), 15);
+  assert.equal(stepEditorFontSize(14, 100), 13);
+  assert.equal(stepEditorFontSize(14, -1), 15);
+  assert.equal(stepEditorFontSize(14, 0), 14, '横向滚轮/零增量不该改字号');
+  assert.equal(stepEditorFontSize(EDITOR_FONT_SIZE_MAX, -100), EDITOR_FONT_SIZE_MAX);
+  assert.equal(stepEditorFontSize(EDITOR_FONT_SIZE_MIN, 100), EDITOR_FONT_SIZE_MIN);
 });

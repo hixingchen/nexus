@@ -756,9 +756,21 @@ pub fn query_dsh_version(rt: &AiRuntime, job: Option<&JobObject>) -> Option<Stri
 ///
 /// 走**私有 npm**：私有化之后目标机器上可能根本没有 Node，PATH 上没有 npm 可用；
 /// 就算有，那也是别的 Node 的 npm。镜像配置（用户的 `~/.npmrc`）依然生效。
-pub fn query_dsh_latest(rt: &AiRuntime, job: Option<&JobObject>) -> Result<String, String> {
+pub fn query_dsh_latest(
+    rt: &AiRuntime,
+    job: Option<&JobObject>,
+    registry: Option<&str>,
+) -> Result<String, String> {
     let mut cmd = rt.npm_command(&["view", crate::core::runtime::DSH_PACKAGE, "version"])?;
-    let label = format!("npm view {} version（私有运行时）", crate::core::runtime::DSH_PACKAGE);
+    if let Some(reg) = registry {
+        cmd.arg(format!("--registry={}", reg));
+    }
+    let registry_arg = registry.map(|r| format!(" --registry={}", r)).unwrap_or_default();
+    let label = format!(
+        "npm view {} version（私有运行时{}）",
+        crate::core::runtime::DSH_PACKAGE,
+        registry_arg
+    );
     let out = crate::core::process::run_captured_command(job, &mut cmd, &label, AiTimeouts::NPM_QUERY)?;
     extract_version(&out).ok_or_else(|| format!("无法从 npm 响应解析版本号：{}", crate::core::process::tail_of(&out)))
 }

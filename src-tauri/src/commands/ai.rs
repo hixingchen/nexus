@@ -255,17 +255,38 @@ pub struct DshVersionInfo {
     pub outdated: bool,
 }
 
+/// 读并校验用户在「设置 > AI 运行时」里配置的 npm 源。
+///
+/// **只给 Nexus 自带运行时用**：手动指定那份是用户自己的环境，沿用其 `~/.npmrc`
+/// （不替用户覆盖他自己的 registry 选择）。
+fn configured_npm_registry(db: &crate::database::Database) -> Result<String, String> {
+    let raw = crate::commands::layout::read_layout_value(
+        db,
+        crate::commands::layout::KEY_NPM_REGISTRY,
+    )?;
+    crate::core::runtime::normalize_npm_registry(raw.as_deref())
+}
+
 /// 检查 dsh 更新：本地版本 + npm 最新版（联网，失败返回错误供前端提示）
 #[tauri::command]
 pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let job = app.state::<AppState>().process_mgr.job_arc();
+        let state = app.state::<AppState>();
+        let job = state.process_mgr.job_arc();
         let Some(rt) = crate::core::runtime::resolve() else {
             // 运行时都没准备：无需联网查，UI 直接给「准备运行时」入口
             return Ok(DshVersionInfo { dsh_found: false, current: None, latest: None, outdated: false });
         };
+        // 自带运行时走设置里的源；手动那份沿用用户自己的 npm 配置
+        let registry = if rt.source == crate::core::runtime::RuntimeSource::Private {
+            Some(configured_npm_registry(&state.db).map_err(|e| {
+                format!("npm 源设置不合法，请到「设置 > AI 运行时」修正：{}", e)
+            })?)
+        } else {
+            None
+        };
         let current = crate::core::ai::query_dsh_version(&rt, job.as_deref());
-        let latest = crate::core::ai::query_dsh_latest(&rt, job.as_deref())?;
+        let latest = crate::core::ai::query_dsh_latest(&rt, job.as_deref(), registry.as_deref())?;
         let outdated = current.as_ref()
             .map(|c| crate::core::ai::version_cmp(c, &latest) == Some(std::cmp::Ordering::Less))
             .unwrap_or(false);
@@ -282,16 +303,30 @@ pub async fn ai_check_update(app: AppHandle) -> Result<DshVersionInfo, String> {
 #[tauri::command]
 pub async fn ai_upgrade_dsh(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let job = app.state::<AppState>().process_mgr.job_arc();
+        // 与安装 / 导入 / 导出共用同一把锁：升级会改写 ai/node_modules，
+        // 和正在打包或在跑的安装撞上会得到一份"文件互相打架"的目录
+        let Some(_slot) = crate::core::runtime::try_acquire_install() else {
+            return Err("已经在安装 / 导入 / 导出 AI 运行时了，请等这次跑完再升级 dsh".into());
+        };
+        let state = app.state::<AppState>();
+        let job = state.process_mgr.job_arc();
         let Some(rt) = crate::core::runtime::resolve() else {
             return Err(format!(
                 "{}::AI 运行时还没准备好，请先在「设置 > AI 运行时」里准备",
                 ERR_RUNTIME_MISSING
             ));
         };
+        // 自带运行时走设置里的源；手动那份沿用用户自己的 npm 配置
+        let registry = if rt.source == crate::core::runtime::RuntimeSource::Private {
+            Some(configured_npm_registry(&state.db).map_err(|e| {
+                format!("npm 源设置不合法，请到「设置 > AI 运行时」修正：{}", e)
+            })?)
+        } else {
+            None
+        };
         // 先停会话再动 dsh 的文件（Windows 文件锁）
         stop_current_session(&app)?;
-        crate::core::runtime::install_or_upgrade_dsh(&rt, job.as_deref())
+        crate::core::runtime::install_or_upgrade_dsh(&rt, job.as_deref(), registry.as_deref())
             .map_err(|f| format!("{}::{}", ERR_RUNTIME_BROKEN, f.to_message()))
     })
     .await
@@ -369,12 +404,20 @@ pub async fn ai_runtime_install(
         let Some(_slot) = crate::core::runtime::try_acquire_install() else {
             return Err(crate::core::runtime::RuntimeFailure::busy());
         };
+        let state = app.state::<AppState>();
+        // 源设置写错要在下载 36MB Node 之前就失败，而不是等到装 dsh 那一步
+        let registry = configured_npm_registry(&state.db).map_err(|e| {
+            crate::core::runtime::RuntimeFailure::setting(
+                "npm 源设置不合法，请先在「设置 > AI 运行时」修正",
+                e,
+            )
+        })?;
         stop_current_session(&app)
             .map_err(|e| crate::core::runtime::RuntimeFailure::internal(format!("先停会话失败: {}", e)))?;
-        let job = app.state::<AppState>().process_mgr.job_arc();
+        let job = state.process_mgr.job_arc();
 
         let emitter = app.clone();
-        let result = crate::core::runtime::install(job.as_deref(), &|p| {
+        let result = crate::core::runtime::install(job.as_deref(), Some(&registry), &|p| {
             // 进度推送失败不影响安装本身（前端没监听就没人收），但必须留痕
             if let Err(e) = emitter.emit("ai-runtime-progress", p) {
                 log::warn!("[ai] 推运行时进度失败: {}", e);
@@ -395,6 +438,10 @@ pub async fn ai_runtime_install(
 #[tauri::command]
 pub async fn ai_runtime_uninstall(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // 卸载会删掉整个 runtime 目录：与安装 / 导入 / 导出互斥，否则会删到一半被读/写
+        let Some(_slot) = crate::core::runtime::try_acquire_install() else {
+            return Err("已经在安装 / 导入 / 导出 AI 运行时了，请等这次跑完再卸载".into());
+        };
         // 正在跑的 dsh 就是私有 node.exe：不先停就是 EBUSY（删不掉）
         stop_current_session(&app)?;
         crate::core::runtime::uninstall()
@@ -436,6 +483,194 @@ pub async fn ai_runtime_clear_manual(app: AppHandle) -> Result<AiRuntimeStatus, 
     })
     .await
     .map_err(|e| format!("清除手动指定的运行时失败: {}", e))?
+}
+
+// ─── 离线搬运：导出 / 导入运行时压缩包 ─────────────────────────
+
+/// 打包 / 导入进度事件名（与前端 `AI_RUNTIME_TRANSFER_PROGRESS_EVENT` 一致）
+pub const AI_RUNTIME_TRANSFER_PROGRESS_EVENT: &str = "ai-runtime-transfer-progress";
+
+/// 进度回调 → Tauri 事件。推送失败不影响传输本身（前端没监听就没人收），但必须留痕。
+fn transfer_progress_emitter(
+    app: &AppHandle,
+) -> impl Fn(crate::core::runtime::RuntimeTransferProgress) + 'static {
+    let app = app.clone();
+    move |p| {
+        if let Err(e) = app.emit(AI_RUNTIME_TRANSFER_PROGRESS_EVENT, p) {
+            log::warn!("[ai] 推运行时传输进度失败: {}", e);
+        }
+    }
+}
+
+/// 目标目录是否属于"用户已授权"的范围：**原生对话框里刚确认的目录**，或已登记的项目/
+/// 服务目录。
+///
+/// 为什么不用 `check_write_path_allowed`：它只认 `allowed_roots`（项目/服务目录），
+/// 不含 `confirmed_dirs`——而导出运行时的典型落点恰恰是桌面、下载目录或别的盘，
+/// 用那套会把正常流程拒掉。这里直接认对话框的确认结果（SEC-19 的授权点本来就是对话框），
+/// 并额外套用与 `open_verified_file` 相同的禁区判定（系统目录 / 主目录 / 自身安装目录）。
+fn dir_is_authorized(
+    paths: &crate::commands::paths::PathAllowlist,
+    roots: &[std::path::PathBuf],
+    dir: &std::path::Path,
+) -> bool {
+    if paths.confirmed_dirs().iter().any(|d| d == dir) {
+        return true;
+    }
+    roots.iter().any(|root| dir.starts_with(root))
+}
+
+/// 导出目标路径的校验 + 规范化（目标可以尚不存在，按父目录校验）。
+fn resolve_export_target(
+    paths: &crate::commands::paths::PathAllowlist,
+    roots: &[std::path::PathBuf],
+    target: &str,
+) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(target);
+    let parent = p.parent().ok_or_else(|| "访问被拒绝：导出位置没有父目录".to_string())?;
+    let name = p.file_name().ok_or_else(|| "访问被拒绝：导出路径缺少文件名".to_string())?;
+    let name = name.to_string_lossy();
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name == "." || name == ".." {
+        return Err("访问被拒绝：导出文件名不合法".into());
+    }
+
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("解析导出目录 {} 失败: {}", parent.display(), e))?;
+    if let Some(reason) = crate::commands::paths::dangerous_dir_reason(&canon_parent) {
+        return Err(format!("导出位置不能是{}（{}）", reason, canon_parent.display()));
+    }
+    if !dir_is_authorized(paths, roots, &canon_parent) {
+        return Err("访问被拒绝：请用「导出运行时」按钮里的保存对话框选择位置".into());
+    }
+
+    let resolved = canon_parent.join(&*name);
+    // 目标已存在：按句柄复核最终目标，挡住"对话框确认后父目录被换成联接点"
+    if resolved.exists() {
+        let f = std::fs::File::open(&resolved)
+            .map_err(|e| format!("无法写入 {}: {}", resolved.display(), e))?;
+        let real = crate::commands::paths::final_path_of_handle(&f)?;
+        if let Some(reason) = crate::commands::paths::dangerous_dir_reason(&real) {
+            return Err(format!("导出位置不能是{}（{}）", reason, real.display()));
+        }
+        let real_parent = real.parent().ok_or_else(|| "访问被拒绝".to_string())?;
+        if !dir_is_authorized(paths, roots, real_parent) {
+            return Err("访问被拒绝：导出位置不在已确认的目录内".into());
+        }
+        return Ok(real);
+    }
+    Ok(resolved)
+}
+
+/// 导入来源的校验：打开句柄 + 按最终路径复核（SEC-4）。返回的句柄直接交给解压，
+/// 避免"校验后路径被换掉"的窗口。
+///
+/// 与导出同一套授权口径：文件必须来自**刚在原生打开对话框里确认过的目录**，
+/// 或已登记的项目/服务目录；系统目录 / 主目录 / 临时目录等禁区一律拒绝。
+fn open_import_source(
+    paths: &crate::commands::paths::PathAllowlist,
+    roots: &[std::path::PathBuf],
+    source: &str,
+) -> Result<(std::fs::File, std::path::PathBuf), String> {
+    let file = std::fs::File::open(source)
+        .map_err(|e| format!("无法读取文件 {}: {}", source, e))?;
+    let real = crate::commands::paths::final_path_of_handle(&file)?;
+    let parent = real.parent().ok_or_else(|| "访问被拒绝：文件没有父目录".to_string())?;
+    if let Some(reason) = crate::commands::paths::dangerous_dir_reason(parent) {
+        return Err(format!("导入文件不能来自{}（{}）", reason, parent.display()));
+    }
+    if !dir_is_authorized(paths, roots, parent) {
+        return Err("访问被拒绝：请用「从压缩包导入」按钮选择文件".into());
+    }
+    Ok((file, real))
+}
+
+/// 导出当前**自带**的 AI 运行时为压缩包（内网 / 下载不通时搬运用）。
+///
+/// 只导出自带那份：手动指定的是任意 Node + dsh 安装，依赖闭包不可靠（见
+/// `core::runtime::export_package`）。`path` 来自后端保存对话框——按 SEC-19 的口径
+/// 先过写入白名单，凭空指定 `C:/Windows/...` 会被拒。
+#[tauri::command]
+pub async fn ai_runtime_export(
+    app: AppHandle,
+    path: String,
+) -> Result<crate::core::runtime::RuntimeExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let target = path.trim();
+        if target.is_empty() {
+            return Err("导出路径不能为空".into());
+        }
+        let Some(_slot) = crate::core::runtime::try_acquire_install() else {
+            return Err("已经在安装 / 导入 / 导出 AI 运行时了，请等这次跑完再导出".into());
+        };
+
+        // 授权点是**保存对话框**本身（SEC-19）：目标可能还不存在，按父目录校验；
+        // 目标已存在时再按句柄复核最终路径（见 `resolve_export_target`）。
+        let roots = state.paths.allowed_roots(&state.db);
+        let resolved = resolve_export_target(&state.paths, &roots, target)?;
+
+        let job = state.process_mgr.job_arc();
+        let emit = transfer_progress_emitter(&app);
+        crate::core::runtime::export_package(&resolved, job.as_deref(), &emit)
+    })
+    .await
+    .map_err(|e| format!("导出 AI 运行时任务失败: {}", e))?
+}
+
+/// 从压缩包导入 AI 运行时（替换 Nexus 自带的那份）。
+///
+/// **先停 AI 会话**：正在跑的 dsh 就是旧目录里的 `node.exe`，Windows 上被占用就换不掉。
+/// 解压 / 实测都在 staging 上完成，失败不动现有运行时；成功后最后写指针。
+/// 导入成功会**清掉手动指定**——否则手动那份优先，导入完看起来"没生效"（界面确认框已说明）。
+#[tauri::command]
+pub async fn ai_runtime_import(
+    app: AppHandle,
+    path: String,
+) -> Result<AiRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let source = path.trim();
+        if source.is_empty() {
+            return Err("导入路径不能为空".into());
+        }
+        let Some(_slot) = crate::core::runtime::try_acquire_install() else {
+            return Err("已经在安装 / 导入 / 导出 AI 运行时了，请等这次跑完再导入".into());
+        };
+
+        // 路径来自后端打开对话框；按句柄复核真实目标（SEC-4），并把同一个句柄交给解压，
+        // 避免"校验后路径被换掉"的窗口。
+        let roots = state.paths.allowed_roots(&state.db);
+        let (file, real) = open_import_source(&state.paths, &roots, source)?;
+
+        // 旧会话的 node.exe 还占着文件，不先停就换不掉
+        stop_current_session(&app)?;
+        let job = state.process_mgr.job_arc();
+        let emit = transfer_progress_emitter(&app);
+        let rt = crate::core::runtime::import_package(
+            file,
+            &crate::core::runtime::path_for_display(&real),
+            job.as_deref(),
+            &emit,
+        )?;
+
+        // 手动指定优先于自带运行时：不清掉的话，导入完看起来"没生效"
+        if crate::core::runtime::has_manual() {
+            crate::core::runtime::clear_manual().map_err(|e| {
+                format!(
+                    "导入已完成，但清除手动指定失败：{}。请到「手动指定」里点「清除手动指定」",
+                    e
+                )
+            })?;
+        }
+        log::info!(
+            "[ai] 已导入 AI 运行时：node={} dsh={}",
+            rt.node_version,
+            rt.dsh_js
+        );
+        Ok(runtime_status(job.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("导入 AI 运行时任务失败: {}", e))?
 }
 
 /// 创建 AI 面板的内嵌子 WebView（带文档创建时注入的焦点记忆/恢复脚本）。
@@ -715,6 +950,73 @@ mod tests {
     /// 这条守的是"用户截图/贴 issue 时不顺带泄露凭据"——面板 URL 里 `?token=…` 是一次性的，
     /// 但一次性不等于泄露无害（它同时是 dsh 的会话凭据）。改动若把 `url_hint` 换回原串，
     /// 最后一条断言会红。
+    /// 导出 / 导入的路径授权：**原生对话框确认过的目录必须被接受**（典型落点就是桌面、
+    /// 下载目录或别的盘），未确认目录与禁区必须拒绝。
+    ///
+    /// 这条守的是本功能最容易"看起来能点、点完报访问被拒绝"的地方：`allowed_roots`
+    /// 只含项目/服务目录，不含 `confirmed_dirs`，所以这里刻意不套模板导出那套校验。
+    #[test]
+    fn test_transfer_path_authorization() {
+        let base = std::env::temp_dir().join(format!("nexus_ai_transfer_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let confirmed = base.join("confirmed");
+        let other = base.join("other");
+        std::fs::create_dir_all(&confirmed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let paths = crate::commands::paths::PathAllowlist::new();
+        paths.remember_confirmed_dir(&confirmed);
+
+        // ① 确认过的目录：新文件可以导出
+        let target = confirmed.join("runtime.zip");
+        let resolved = resolve_export_target(&paths, &[], &target.to_string_lossy()).unwrap();
+        assert_eq!(
+            resolved.parent().unwrap(),
+            std::fs::canonicalize(&confirmed).unwrap()
+        );
+        assert!(resolved.ends_with("runtime.zip"));
+
+        // ② 没确认、也没登记：拒绝
+        let unauthorized = other.join("runtime.zip");
+        let err = resolve_export_target(&paths, &[], &unauthorized.to_string_lossy()).unwrap_err();
+        assert!(err.contains("访问被拒绝"), "{}", err);
+
+        // ③ 已登记的根目录同样可用（项目内导出）
+        let roots = [std::fs::canonicalize(&other).unwrap()];
+        let resolved =
+            resolve_export_target(&paths, &roots, &unauthorized.to_string_lossy()).unwrap();
+        assert!(resolved.ends_with("runtime.zip"));
+
+        // ④ 文件名带 ADS 冒号：拒绝
+        let ads = confirmed.join("runtime.zip:evil");
+        let err = resolve_export_target(&paths, &[], &ads.to_string_lossy()).unwrap_err();
+        assert!(err.contains("文件名不合法"), "{}", err);
+
+        // ⑤ 禁区（临时目录本身）：即使被"确认"也拒绝
+        let tmp_target = std::env::temp_dir().join("runtime.zip");
+        let err = resolve_export_target(&paths, &[], &tmp_target.to_string_lossy()).unwrap_err();
+        assert!(err.contains("不能是"), "{}", err);
+
+        // ⑥ 导入来源：句柄 + 父目录授权
+        let zip = confirmed.join("in.zip");
+        std::fs::write(&zip, b"PK").unwrap();
+        let (_f, real) = open_import_source(&paths, &[], &zip.to_string_lossy()).unwrap();
+        assert_eq!(real, std::fs::canonicalize(&zip).unwrap());
+
+        // 不存在的文件：先报"读不到"（也要带路径）
+        let missing = other.join("missing.zip");
+        let err = open_import_source(&paths, &[], &missing.to_string_lossy()).unwrap_err();
+        assert!(err.contains("无法读取文件"), "{}", err);
+
+        // 存在但目录未授权：拒绝
+        let other_zip = other.join("in.zip");
+        std::fs::write(&other_zip, b"PK").unwrap();
+        let err = open_import_source(&paths, &[], &other_zip.to_string_lossy()).unwrap_err();
+        assert!(err.contains("访问被拒绝"), "{}", err);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn test_url_hint_drops_token_and_credentials() {
         let real = "http://127.0.0.1:49152/?token=abc123secret";
