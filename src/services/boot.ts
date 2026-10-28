@@ -19,6 +19,8 @@ export interface BootRunnerStatus {
   /** 稳定目录里的 runner 文件是否存在 */
   runner_installed: boolean;
   runner_reachable: boolean;
+  /** 当前运行实例的模式（state.json）；任务模式可能已切换但实例尚未重启 */
+  running_mode: string;
   runner_pid: number | null;
   heartbeat_at: string;
   /** DB 里开机启动且启用的服务数 */
@@ -37,8 +39,12 @@ export interface BootToggleResult {
 export const bootApi = {
   /** 读取任务 + runner 的真实状态（会回读计划任务，不是读缓存） */
   getStatus: () => invoke<BootRunnerStatus>('get_boot_runner_status'),
-  /** 安装/修复 S4U 开机任务（需要一次管理员授权） */
-  install: () => invoke<BootRunnerStatus>('install_boot_runner'),
+  /**
+   * 安装/修复/切换开机任务（需要一次管理员授权）。
+   * `password` 模式会额外弹出 Windows 原生凭据对话框，密码只交给 Task Scheduler。
+   */
+  install: (mode: 's4u' | 'password') =>
+    invoke<BootRunnerStatus>('install_boot_runner', { mode }),
   uninstall: () => invoke<BootRunnerStatus>('uninstall_boot_runner'),
   /** 用当前 manifest 立即启动一次 runner（通过计划任务） */
   start: () => invoke<BootRunnerStatus>('start_boot_runner'),

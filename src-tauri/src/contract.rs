@@ -459,6 +459,7 @@ fn test_response_dtos_are_snake_case() {
         runner_path: "p".into(),
         runner_installed: false,
         runner_reachable: false,
+        running_mode: String::new(),
         runner_pid: None,
         heartbeat_at: String::new(),
         boot_service_count: 0,
@@ -470,8 +471,8 @@ fn test_response_dtos_are_snake_case() {
         sorted(&[
             "installed", "task_name", "task_logon_type", "task_path_ok",
             "runner_path", "runner_installed",
-            "runner_reachable", "runner_pid", "heartbeat_at", "boot_service_count",
-            "state", "message",
+            "runner_reachable", "running_mode", "runner_pid", "heartbeat_at",
+            "boot_service_count", "state", "message",
         ])
     );
     let toggle = BootToggleResult { boot_enabled: true, boot_manifest_error: String::new() };

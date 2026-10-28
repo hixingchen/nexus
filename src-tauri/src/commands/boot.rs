@@ -41,6 +41,8 @@ pub struct BootRunnerStatus {
     pub runner_installed: bool,
     /// 状态文件里的 runner 是否还活着且心跳新鲜
     pub runner_reachable: bool,
+    /// 当前运行实例的模式（state.json 的 mode；任务模式可能已切换但实例还没重启）
+    pub running_mode: String,
     pub runner_pid: Option<u32>,
     pub heartbeat_at: String,
     /// DB 里 boot_enabled=1 且 enabled=1 的服务数
@@ -155,7 +157,16 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn task_xml(exe: &std::path::Path, manifest: &std::path::Path) -> Result<String, String> {
+fn task_xml(
+    exe: &std::path::Path,
+    manifest: &std::path::Path,
+    mode: &str,
+) -> Result<String, String> {
+    let (logon_type, description) = match mode {
+        "s4u" => ("S4U", "Nexus 服务开机启动器（登录前运行，不保存密码）"),
+        "password" => ("Password", "Nexus 服务开机启动器（登录前运行，凭据保存在 Windows 计划任务）"),
+        other => return Err(format!("未知的开机启动模式: {}", other)),
+    };
     let (domain, user) = current_user();
     // 优先用 SID：微软账户/AAD 下 `DOMAIN\user` 可能无法映射到安全标识
     let user_id = current_user_sid().unwrap_or_else(|| {
@@ -176,7 +187,7 @@ fn task_xml(exe: &std::path::Path, manifest: &std::path::Path) -> Result<String,
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>Nexus</Author>
-    <Description>Nexus 服务开机启动器（登录前运行，S4U，不保存密码）</Description>
+    <Description>{description_escaped}</Description>
   </RegistrationInfo>
   <Triggers>
     <BootTrigger>
@@ -191,7 +202,7 @@ fn task_xml(exe: &std::path::Path, manifest: &std::path::Path) -> Result<String,
   <Principals>
     <Principal id="Author">
       <UserId>{user_id}</UserId>
-      <LogonType>S4U</LogonType>
+      <LogonType>{logon_type}</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -212,13 +223,16 @@ fn task_xml(exe: &std::path::Path, manifest: &std::path::Path) -> Result<String,
   <Actions Context="Author">
     <Exec>
       <Command>{exe_escaped}</Command>
-      <Arguments>--manifest "{manifest_escaped}"</Arguments>
+      <Arguments>--mode {mode_escaped} --manifest "{manifest_escaped}"</Arguments>
       <WorkingDirectory>{work_escaped}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 "#,
         user_id = xml_escape(&user_id),
+        logon_type = logon_type,
+        mode_escaped = xml_escape(mode),
+        description_escaped = xml_escape(description),
         exe_escaped = xml_escape(&exe),
         manifest_escaped = xml_escape(&manifest),
         work_escaped = xml_escape(&working_dir),
@@ -438,8 +452,95 @@ fn install_params(
     ))
 }
 
-fn write_task_xml(exe: &std::path::Path, manifest: &std::path::Path) -> Result<PathBuf, String> {
-    let xml = task_xml(exe, manifest)?;
+/// PowerShell 单引号字符串字面量（内部的 `'` 用 `''` 转义）。
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 保存密码模式的安装脚本。
+///
+/// 密码**不在**脚本/命令行/日志/数据库中：脚本只负责复制 runner 与调用
+/// `Get-Credential`（Windows 原生凭据对话框）和 `Register-ScheduledTask`，
+/// 密码由 Task Scheduler 保存在 LSA secrets 中。
+fn password_install_script(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    task: &str,
+    xml: &std::path::Path,
+    error_path: &std::path::Path,
+) -> Result<String, String> {
+    let dir = dst.parent().ok_or_else(|| "runner 目标路径没有父目录".to_string())?;
+    let (domain, user) = current_user();
+    let username = if domain.is_empty() { user } else { format!("{}\\{}", domain, user) };
+    Ok(format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         try {{\n\
+           New-Item -ItemType Directory -Force -Path {} | Out-Null\n\
+           Copy-Item -LiteralPath {} -Destination {} -Force\n\
+           $cred = Get-Credential -UserName {} -Message 'Nexus 服务开机启动需要 Windows 密码（只保存在 Windows 计划任务中）'\n\
+           if ($null -eq $cred) {{ exit 2 }}\n\
+           $xml = Get-Content -Raw -LiteralPath {}\n\
+           Register-ScheduledTask -TaskName {} -Xml $xml -User $cred.UserName -Password $cred.GetNetworkCredential().Password -Force | Out-Null\n\
+         }} catch {{\n\
+           $_.Exception.Message | Out-File -FilePath {} -Encoding utf8\n\
+           exit 1\n\
+         }}\n",
+        ps_quote(&dir.to_string_lossy()),
+        ps_quote(&src.to_string_lossy()),
+        ps_quote(&dst.to_string_lossy()),
+        ps_quote(&username),
+        ps_quote(&xml.to_string_lossy()),
+        ps_quote(task),
+        ps_quote(&error_path.to_string_lossy()),
+    ))
+}
+
+fn encode_powershell(script: &str) -> String {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+/// 一次 UAC + 一个原生凭据对话框完成“复制 runner + 注册保存密码任务”。
+fn install_password_elevated(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    task: &str,
+    xml: &std::path::Path,
+) -> Result<(), String> {
+    let error_path = boot::boot_dir().join("password-install-error.txt");
+    let _ = std::fs::remove_file(&error_path);
+    let script = password_install_script(src, dst, task, xml, &error_path)?;
+    let encoded = encode_powershell(&script);
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let powershell = format!(r"{}\System32\WindowsPowerShell\v1.0\powershell.exe", root);
+    let params = format!("-NoProfile -ExecutionPolicy Bypass -EncodedCommand {}", encoded);
+    elevated_run(&powershell, &params).map_err(|e| {
+        if e.contains("退出码 2") {
+            return "已取消密码输入，开机启动任务未变更".to_string();
+        }
+        // PowerShell 的 stderr 拿不到（ShellExecuteEx 没有管道），让它把异常写进文件
+        let detail = std::fs::read_to_string(&error_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let _ = std::fs::remove_file(&error_path);
+        match detail {
+            Some(d) => format!("注册保存密码的开机启动任务失败：{}", d),
+            None => format!(
+                "注册保存密码的开机启动任务失败（如启动器正在运行，请先停止它）：{}",
+                e
+            ),
+        }
+    })
+}
+
+fn write_task_xml(
+    exe: &std::path::Path,
+    manifest: &std::path::Path,
+    mode: &str,
+) -> Result<PathBuf, String> {
+    let xml = task_xml(exe, manifest, mode)?;
     let path = boot::boot_dir().join("task.xml");
     // schtasks 对任务 XML 的默认期望是 UTF-16（与其他 Windows 调度文件一致）。
     // 写成 UTF-16LE + BOM，避免“UTF-8 内容 + UTF-16 声明”或者中文描述被误读。
@@ -495,10 +596,10 @@ fn build_status(state: &AppState) -> Result<BootRunnerStatus, String> {
     };
     let runner_state = boot::read_state();
     let reachable = runner_state.as_ref().map(boot::runner_reachable).unwrap_or(false);
-    let (runner_pid, heartbeat_at) = runner_state
+    let (runner_pid, heartbeat_at, running_mode) = runner_state
         .as_ref()
-        .map(|s| (Some(s.runner_pid), s.heartbeat_at.clone()))
-        .unwrap_or((None, String::new()));
+        .map(|s| (Some(s.runner_pid), s.heartbeat_at.clone(), s.mode.clone()))
+        .unwrap_or((None, String::new(), String::new()));
     let count = boot_service_count(state);
 
     let (state_name, message) = if !installed {
@@ -518,8 +619,18 @@ fn build_status(state: &AppState) -> Result<BootRunnerStatus, String> {
     } else if installed && !task_path_ok {
         message.push_str("；任务指向的启动器路径或 manifest 与当前配置不一致，请重新安装");
     }
-    if installed && !logon_type.is_empty() && logon_type != "S4U" {
-        message.push_str(&format!("；当前任务的登录类型是 {}（本版本只支持 S4U）", logon_type));
+    if installed && !logon_type.is_empty() && logon_type != "S4U" && logon_type != "Password" {
+        message.push_str(&format!("；当前任务的登录类型是 {}（只支持 S4U / Password）", logon_type));
+    }
+    // 任务模式与当前运行实例模式不一致：切换在下次启动 runner 时生效
+    if reachable && !running_mode.is_empty() && !logon_type.is_empty() {
+        let task_mode = if logon_type.eq_ignore_ascii_case("password") { "password" } else { "s4u" };
+        if task_mode != running_mode {
+            message.push_str(&format!(
+                "；任务已切换为 {}，当前运行实例仍是 {}，停止/重启启动器后生效",
+                task_mode, running_mode
+            ));
+        }
     }
 
     Ok(BootRunnerStatus {
@@ -530,6 +641,7 @@ fn build_status(state: &AppState) -> Result<BootRunnerStatus, String> {
         runner_path: runner_path.to_string_lossy().to_string(),
         runner_installed,
         runner_reachable: reachable,
+        running_mode,
         runner_pid,
         heartbeat_at,
         boot_service_count: count,
@@ -670,7 +782,13 @@ pub async fn get_boot_runner_status(app: tauri::AppHandle) -> Result<BootRunnerS
 }
 
 #[tauri::command]
-pub async fn install_boot_runner(app: tauri::AppHandle) -> Result<BootRunnerStatus, String> {
+pub async fn install_boot_runner(
+    app: tauri::AppHandle,
+    mode: String,
+) -> Result<BootRunnerStatus, String> {
+    if mode != "s4u" && mode != "password" {
+        return Err(format!("未知的开机启动模式: {}", mode));
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         // 先落 manifest，再建任务：任务首次启动时就要能读到完整配置
@@ -678,17 +796,21 @@ pub async fn install_boot_runner(app: tauri::AppHandle) -> Result<BootRunnerStat
         // 独立 runner：复制到 ProgramData 稳定目录 + 注册任务，**一次 UAC** 完成。
         let bundled = bundled_runner_path()?;
         let runner_path = runner_install_path();
-        let xml_path = write_task_xml(&runner_path, &boot::manifest_path())?;
+        let xml_path = write_task_xml(&runner_path, &boot::manifest_path(), &mode)?;
         let name = task_name();
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let cmd = format!(r"{}\System32\cmd.exe", root);
-        let params = install_params(&bundled, &runner_path, &name, &xml_path)?;
-        let result = elevated_run(&cmd, &params);
+        let result = if mode == "password" {
+            install_password_elevated(&bundled, &runner_path, &name, &xml_path)
+        } else {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            let cmd = format!(r"{}\System32\cmd.exe", root);
+            let params = install_params(&bundled, &runner_path, &name, &xml_path)?;
+            elevated_run(&cmd, &params).map_err(|e| format!(
+                "安装失败（复制启动器或注册任务未完成；如启动器正在运行，请先在设置中停止）：{}",
+                e
+            ))
+        };
         let _ = std::fs::remove_file(&xml_path);
-        result.map_err(|e| format!(
-            "安装失败（复制启动器或注册任务未完成；如启动器正在运行，请先在设置中停止）：{}",
-            e
-        ))?;
+        result?;
         // 回读 + 文件校验：schtasks 返回 0 不等于任务真的按我们要求注册了（铁律 21）
         let src_len = std::fs::metadata(&bundled).map(|m| m.len()).unwrap_or(0);
         let dst_len = std::fs::metadata(&runner_path).map(|m| m.len()).unwrap_or(0);
@@ -698,11 +820,13 @@ pub async fn install_boot_runner(app: tauri::AppHandle) -> Result<BootRunnerStat
                 src_len, dst_len, runner_path.display()
             ));
         }
+        let expected = if mode == "password" { "Password" } else { "S4U" };
         let xml = query_task_xml(&name)?
             .ok_or_else(|| "任务创建后回读失败（任务不存在）".to_string())?;
-        if tag_text(&xml, "LogonType") != "S4U" {
+        if tag_text(&xml, "LogonType") != expected {
             return Err(format!(
-                "任务已创建，但回读到的 LogonType 不是 S4U（实际: {}）",
+                "任务已创建，但回读到的 LogonType 不是 {}（实际: {}）",
+                expected,
                 tag_text(&xml, "LogonType")
             ));
         }
@@ -803,11 +927,11 @@ mod tests {
 
     #[test]
     fn test_task_xml_is_s4u_and_starts_runner() {
-        let xml = task_xml(
-            std::path::Path::new(r"C:\ProgramData\Nexus\boot\runner\nexus-boot-runner.exe"),
-            std::path::Path::new(r"C:\Users\u\.nexus\boot\manifest.json"),
-        ).expect("生成任务 XML");
+        let runner = std::path::Path::new(r"C:\ProgramData\Nexus\boot\runner\nexus-boot-runner.exe");
+        let manifest = std::path::Path::new(r"C:\Users\u\.nexus\boot\manifest.json");
+        let xml = task_xml(runner, manifest, "s4u").expect("生成任务 XML");
         assert!(xml.contains("<LogonType>S4U</LogonType>"));
+        assert!(xml.contains("--mode s4u"));
         assert!(xml.contains("nexus-boot-runner.exe"));
         assert!(xml.contains("--manifest"));
         assert!(!xml.contains("--boot-runner"), "独立 runner 不需要兼容参数");
@@ -815,6 +939,67 @@ mod tests {
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(!xml.contains("Password"));
+
+        let pwd = task_xml(runner, manifest, "password").expect("生成密码模式 XML");
+        assert!(pwd.contains("<LogonType>Password</LogonType>"));
+        assert!(pwd.contains("--mode password"));
+        assert!(pwd.contains("manifest.json"));
+    }
+
+    #[test]
+    fn test_password_install_script_uses_native_credential_dialog() {
+        let script = password_install_script(
+            std::path::Path::new(r"C:\App Folder\nexus-boot-runner.exe"),
+            std::path::Path::new(r"C:\ProgramData\Nexus\boot\runner\nexus-boot-runner.exe"),
+            "Nexus Boot Runner (u-1001)",
+            std::path::Path::new(r"C:\Users\u\.nexus\boot\task.xml"),
+            std::path::Path::new(r"C:\Users\u\.nexus\boot\password-install-error.txt"),
+        ).expect("生成密码安装脚本");
+        assert!(script.contains("Get-Credential"));
+        assert!(script.contains("Register-ScheduledTask"));
+        assert!(script.contains("Copy-Item"));
+        // 脚本里不能出现任何密码字面量/参数
+        assert!(!script.contains("Password="));
+    }
+
+    /// 只做 PowerShell **语法解析**，不执行：密码脚本里有 Get-Credential/注册任务，
+    /// 但语法错误会让密码模式静默失败，值得在 CI 里挡一次。
+    #[cfg(windows)]
+    #[test]
+    fn test_password_install_script_has_valid_powershell_syntax() {
+        let dir = std::env::temp_dir().join(format!("nexus_ps_parse_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let script_path = dir.join("install.ps1");
+        let parse_path = dir.join("parse.ps1");
+        let script = password_install_script(
+            std::path::Path::new(r"C:\App Folder\nexus-boot-runner.exe"),
+            std::path::Path::new(r"C:\ProgramData\Nexus\boot\runner\nexus-boot-runner.exe"),
+            "Nexus Boot Runner (u-1001)",
+            std::path::Path::new(r"C:\Users\u\.nexus\boot\task.xml"),
+            std::path::Path::new(r"C:\Users\u\.nexus\boot\password-install-error.txt"),
+        ).expect("生成密码安装脚本");
+        std::fs::write(&script_path, script).expect("写脚本");
+        std::fs::write(
+            &parse_path,
+            "$src = Get-Content -Raw -LiteralPath $args[0]\n\
+             $tokens = $null\n\
+             $errors = $null\n\
+             [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors) | Out-Null\n\
+             if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error ($_.Message) }; exit 1 }\n",
+        ).expect("写解析脚本");
+
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&parse_path)
+            .arg(&script_path)
+            .output()
+            .expect("运行 PowerShell 语法检查");
+        assert!(
+            out.status.success(),
+            "PowerShell 语法检查失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真跑一次 `if not exist ... mkdir ... && copy ...` 链：

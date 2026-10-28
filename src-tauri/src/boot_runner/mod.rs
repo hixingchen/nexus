@@ -124,6 +124,10 @@ mod imp {
         let manifest_path = arg_value("--manifest")
             .map(PathBuf::from)
             .unwrap_or_else(boot::manifest_path);
+        let mode = arg_value("--mode").unwrap_or_else(|| "s4u".to_string());
+        if mode != "s4u" && mode != "password" {
+            return Err(format!("未知的 --mode: {}（只支持 s4u / password）", mode));
+        }
         let boot_dir = manifest_path
             .parent()
             .ok_or_else(|| format!("manifest 没有父目录: {}", manifest_path.display()))?
@@ -178,7 +182,7 @@ mod imp {
         };
 
         let mut runner = Runner {
-            state: init_state(&manifest, my_pid, my_started),
+            state: init_state(&manifest, my_pid, my_started, &mode),
             manifest,
             manifest_path,
             boot_dir: boot_dir.clone(),
@@ -263,7 +267,12 @@ mod imp {
         Ok(manifest)
     }
 
-    fn init_state(manifest: &BootManifest, pid: u32, started_at_ms: u64) -> BootRunnerState {
+    fn init_state(
+        manifest: &BootManifest,
+        pid: u32,
+        started_at_ms: u64,
+        mode: &str,
+    ) -> BootRunnerState {
         let now = chrono::Utc::now().to_rfc3339();
         let mut services = BTreeMap::new();
         for svc in &manifest.services {
@@ -286,7 +295,7 @@ mod imp {
             runner_started_at_ms: started_at_ms,
             started_at: now.clone(),
             heartbeat_at: now,
-            mode: "s4u".into(),
+            mode: mode.to_string(),
             services,
         }
     }
