@@ -154,8 +154,10 @@ mod win {
             return Err(last_error("读取注册表值", value_name, rc));
         }
         let units: Vec<u16> = buf[..size2 as usize]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let s = String::from_utf16_lossy(&units);
         Ok(Some(s.trim_end_matches('\0').to_string()))

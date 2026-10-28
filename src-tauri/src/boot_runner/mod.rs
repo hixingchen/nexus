@@ -194,7 +194,7 @@ mod imp {
         // 否则任务会一直挂着一个没有用的 runner，且“停止/卸载”还得先找到它。
         if runner.manifest.services.is_empty() {
             runner.log.info("manifest 没有服务，runner 退出");
-            let _ = std::fs::remove_file(&boot_dir.join("runner.lock"));
+            let _ = std::fs::remove_file(boot_dir.join("runner.lock"));
             return Ok(());
         }
 
@@ -244,7 +244,7 @@ mod imp {
         // 正常退出：先停服务，再写最终状态
         runner.stop_all();
         runner.write_state();
-        let _ = std::fs::remove_file(&boot_dir.join("runner.lock"));
+        let _ = std::fs::remove_file(boot_dir.join("runner.lock"));
         runner.log.info("runner 已退出");
         Ok(())
     }

@@ -58,9 +58,10 @@ pub fn service_log_path(service_id: &str) -> PathBuf {
 ///
 /// 空串（DB 里）= `None`，表示进程存活即继续下一个服务。v1 只支持这四种：
 /// 不做任意正则 / 任意命令，避免把“开机启动配置”变成第二个命令执行面。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BootCheck {
+    #[default]
     None,
     Delay {
         seconds: u64,
@@ -80,12 +81,6 @@ pub enum BootCheck {
 
 fn default_timeout_secs() -> u64 {
     60
-}
-
-impl Default for BootCheck {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// 校验并归一化 DB 里的 `boot_check` 文本。
@@ -371,10 +366,9 @@ pub fn runner_reachable(state: &BootRunnerState) -> bool {
     if !fresh {
         return false;
     }
-    let same_process = crate::core::process::process_start_time_millis(state.runner_pid)
+    crate::core::process::process_start_time_millis(state.runner_pid)
         .map(|t| t == state.runner_started_at_ms)
-        .unwrap_or(false);
-    same_process
+        .unwrap_or(false)
 }
 
 // ─── 控制命令（文件队列）─────────────────────────────────────
