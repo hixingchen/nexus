@@ -153,6 +153,20 @@ export function ServiceTreeEntry({
           {/* 名称 */}
           <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{service.name}</span>
 
+          {/* 开机启动标志：与“运行中”是两件事——它表示下次开机是否由启动器在登录前拉起 */}
+          {service.boot_enabled && (
+            <span
+              className={`text-[10px] leading-[15px] px-1.5 rounded-full flex-shrink-0 ${
+                service.enabled
+                  ? 'bg-nexus-accent/12 text-nexus-accent'
+                  : 'bg-nexus-hover/40 text-nexus-muted'
+              }`}
+              title={service.enabled
+                ? '已设置开机启动；需在「设置 > 服务开机启动」安装启动器后生效'
+                : '已设置开机启动，但服务被禁用，实际不会启动'}
+            >开机</span>
+          )}
+
           {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
               用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动。
               运行中与失败共用同一组按钮（日志/重启/停止）——失败态也要能"停止"：

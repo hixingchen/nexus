@@ -95,6 +95,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // ── 运行状态 ──────────────────────────────────────────────
 
   const isRunning = useRunningStore(s => s.running.some(r => r.service_id === serviceKey));
+  /** 开机启动器拉起的服务：没有 service-log-batch 事件，日志靠增量轮询文件 */
+  const isBootRunning = useRunningStore(s => s.running.some(
+    r => r.service_id === serviceKey && r.source === 'boot',
+  ));
   // 失败信息（null = 没失败）。面板头部由此显示"已失败 · 退出码 1"——
   // 用户是**从红色的失败卡片点进来**看原因的，头部不能报"未运行"（更早还报的是绿点）
   const failure = useRunningStore(s => s.failed.find(f => f.service_id === serviceKey) ?? null);
@@ -126,6 +130,14 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
       syncLogsFromBackend();
     }
   }, [isRunning, serviceKey, syncLogsFromBackend]);
+
+  // 开机启动器拉起的服务不经过 service-log-batch（它不在 Nexus 进程表里），
+  // 面板打开期间按 1 秒轮询日志文件尾部；setLogs 按快照整份替换，不会重复。
+  useEffect(() => {
+    if (!isRunning || !isBootRunning) return;
+    const timer = setInterval(syncLogsFromBackend, 1000);
+    return () => clearInterval(timer);
+  }, [isRunning, isBootRunning, syncLogsFromBackend]);
 
   // ── 搜索 ──────────────────────────────────────────────────
 

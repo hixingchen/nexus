@@ -1,3 +1,8 @@
+[workspace]
+# 启动器是独立 crate（不能在主 package 里加第二个 bin，否则 Tauri 的 MSI
+# bundler 会把同一个 externalBin 当成两个组件，报 ICE30）。
+members = ["boot-runner"]
+
 [package]
 name = "nexus"
 version = "1.10.0"

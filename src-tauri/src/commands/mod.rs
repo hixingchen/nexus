@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod app;
 pub mod autostart;
+pub mod boot;
 pub mod editor;
 pub mod fileops;
 pub mod layout;

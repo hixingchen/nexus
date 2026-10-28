@@ -27,11 +27,11 @@ function reset(): void {
 
 test('followed_log 从 null 变成路径：必须落库（否则「取消跟随日志」入口永不出现）', () => {
   reset();
-  const before = { service_id: 's1', project_id: 'p1', followed_log: null };
+  const before = { service_id: 's1', project_id: 'p1', followed_log: null, source: 'local' as const };
   useRunningStore.getState().setRunning([before], []);
 
   // 后端认出日志文件后的那一拍：成员、顺序、其它字段都没变，只有它有了值
-  const after = { service_id: 's1', project_id: 'p1', followed_log: 'D:/p/logs/app.log' };
+  const after = { service_id: 's1', project_id: 'p1', followed_log: 'D:/p/logs/app.log', source: 'local' as const };
   useRunningStore.getState().setRunning([after], []);
 
   assert.equal(
@@ -41,16 +41,27 @@ test('followed_log 从 null 变成路径：必须落库（否则「取消跟随�
   );
 });
 
+test('source 变化要落库：同一个服务从本地运行变成开机启动器运行', () => {
+  reset();
+  useRunningStore.getState().setRunning(
+    [{ service_id: 's1', project_id: 'p1', followed_log: null, source: 'local' }], [],
+  );
+  useRunningStore.getState().setRunning(
+    [{ service_id: 's1', project_id: 'p1', followed_log: null, source: 'boot' }], [],
+  );
+  assert.equal(useRunningStore.getState().running[0]?.source, 'boot');
+});
+
 test('三个字段逐项都比：改项目归属同样要落库（同服务 id 换了项目）', () => {
   reset();
-  useRunningStore.getState().setRunning([{ service_id: 's1', project_id: 'p1' }], []);
-  useRunningStore.getState().setRunning([{ service_id: 's1', project_id: 'p2' }], []);
+  useRunningStore.getState().setRunning([{ service_id: 's1', project_id: 'p1', source: 'local' }], []);
+  useRunningStore.getState().setRunning([{ service_id: 's1', project_id: 'p2', source: 'local' }], []);
   assert.equal(useRunningStore.getState().running[0]?.project_id, 'p2');
 });
 
 test('内容真的没变时不换引用：每 3 秒一次轮询不该让订阅方全量重渲', () => {
   reset();
-  const r = [{ service_id: 's1', project_id: 'p1', followed_log: null }];
+  const r = [{ service_id: 's1', project_id: 'p1', followed_log: null, source: 'local' as const }];
   useRunningStore.getState().setRunning(r, []);
   const first = useRunningStore.getState().running;
 
@@ -61,9 +72,9 @@ test('内容真的没变时不换引用：每 3 秒一次轮询不该让订阅�
 
 test('failed 分支仍是逐字段全比（exit_code / timestamp 变了要落库）', () => {
   reset();
-  const r = [{ service_id: 's1', project_id: 'p1', followed_log: null }];
-  useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 1, timestamp: 't1' }]);
-  useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 2, timestamp: 't1' }]);
+  const r = [{ service_id: 's1', project_id: 'p1', followed_log: null, source: 'local' as const }];
+  useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 1, timestamp: 't1', source: 'local' }]);
+  useRunningStore.getState().setRunning(r, [{ service_id: 's1', exit_code: 2, timestamp: 't1', source: 'local' }]);
   assert.equal(useRunningStore.getState().failed[0]?.exit_code, 2, '退出码变化必须被认出来');
 });
 

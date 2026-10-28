@@ -16,6 +16,7 @@ use crate::core::runtime::{
     TransferKind,
 };
 use crate::commands::app::AppPaths;
+use crate::commands::boot::{BootRunnerStatus, BootToggleResult};
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
 use crate::commands::process::{
@@ -337,13 +338,18 @@ fn test_response_dtos_are_snake_case() {
         show_file_tree: false,
         sort_index: 0,
         tool_commands: "[]".into(),
+        boot_enabled: false,
+        boot_order: 0,
+        boot_check: String::new(),
+        boot_required: false,
     };
     assert_eq!(
         keys_of(&svc),
         sorted(&[
             "id", "project_id", "name", "command", "cwd", "watch_paths", "watch_include",
             "watch_exclude", "env_vars", "restart_mode", "enabled", "show_file_tree",
-            "sort_index", "tool_commands",
+            "sort_index", "tool_commands", "boot_enabled", "boot_order", "boot_check",
+            "boot_required",
         ])
     );
 
@@ -423,17 +429,53 @@ fn test_response_dtos_are_snake_case() {
 
     // 更新服务的结果：保存本身成功，附带的"文件监听是否热刷新成功"（CQ-35 —— 保存成功
     // 而监听没生效时界面必须能说出来，所以它不能是一个只表示成败的 `void`）
-    let upd = UpdateServiceResult { watch_refreshed: true, watch_error: String::new() };
-    assert_eq!(keys_of(&upd), sorted(&["watch_refreshed", "watch_error"]));
+    let upd = UpdateServiceResult {
+        watch_refreshed: true, watch_error: String::new(), boot_manifest_error: String::new(),
+    };
+    assert_eq!(
+        keys_of(&upd),
+        sorted(&["watch_refreshed", "watch_error", "boot_manifest_error"])
+    );
 
     // 运行状态总览（前端按 exit_code 去重 + 失败态渲染；followed_log 供右键菜单
     // 显示「取消跟随日志（文件名）」）
-    let run = RunningService { service_id: "s".into(), project_id: "p".into(), followed_log: None };
-    assert_eq!(keys_of(&run), sorted(&["service_id", "project_id", "followed_log"]));
-    let failed = FailedService { service_id: "s".into(), exit_code: Some(1), timestamp: "t".into() };
-    assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp"]));
+    let run = RunningService {
+        service_id: "s".into(), project_id: "p".into(), followed_log: None, source: "local".into(),
+    };
+    assert_eq!(keys_of(&run), sorted(&["service_id", "project_id", "followed_log", "source"]));
+    let failed = FailedService {
+        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+    };
+    assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp", "source"]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };
     assert_eq!(keys_of(&ps), sorted(&["running", "failed"]));
+
+    // 开机启动器状态（设置 > 服务开机启动）
+    let boot = BootRunnerStatus {
+        installed: false,
+        task_name: "n".into(),
+        task_logon_type: String::new(),
+        task_path_ok: false,
+        runner_path: "p".into(),
+        runner_installed: false,
+        runner_reachable: false,
+        runner_pid: None,
+        heartbeat_at: String::new(),
+        boot_service_count: 0,
+        state: "not_installed".into(),
+        message: String::new(),
+    };
+    assert_eq!(
+        keys_of(&boot),
+        sorted(&[
+            "installed", "task_name", "task_logon_type", "task_path_ok",
+            "runner_path", "runner_installed",
+            "runner_reachable", "runner_pid", "heartbeat_at", "boot_service_count",
+            "state", "message",
+        ])
+    );
+    let toggle = BootToggleResult { boot_enabled: true, boot_manifest_error: String::new() };
+    assert_eq!(keys_of(&toggle), sorted(&["boot_enabled", "boot_manifest_error"]));
 
     // 工具命令结果与实时输出（PERF-11 起输出改成批量事件）
     let tcr = ToolCommandResult { success: true, output: String::new(), exit_code: Some(0) };
@@ -690,6 +732,14 @@ const COVERED_RESPONSE: &[&str] = &[
         "ImportTemplatesResult", "UpdateServiceResult", "OpenToolUsage",
         "NodeRuntimeStatus", "NodeVersionInfo", "NodeVersionIndex",
         "NvmCommandResult", "NvmInstallResult",
+        // 开机启动的命令结果/状态（IPC 载荷）
+        "BootRunnerStatus", "BootToggleResult",
+        // 豁免：以下是**启动器与磁盘之间的文件格式**（manifest.json / state.json / 命令队列），
+        // runner 与 Nexus 只在文件里读写，不经 invoke 出前端——前端看到的是上面的状态 DTO。
+        "BootManifest", "BootService", "BootRunnerState", "BootServiceState",
+        "BootCommand", "BootCommandResult",
+        // runner 的单实例锁文件（pid + 启动时刻），只在 boot_runner 内部读写
+        "LockInfo",
         // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
         // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
         // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）
@@ -781,21 +831,25 @@ fn test_every_deserializable_struct_is_covered() {
 fn test_nullable_fields_stay_nullable_and_typed() {
     // 运行中服务：没在跟随日志文件时必须是 null（前端 `?? null` 后判断）
     let running = RunningService {
-        service_id: "s1".into(), project_id: "p1".into(), followed_log: None,
+        service_id: "s1".into(), project_id: "p1".into(), followed_log: None, source: "local".into(),
     };
     assert_eq!(types_of(&running), vec![
         ("followed_log".to_string(), "null"),
         ("project_id".to_string(), "string"),
         ("service_id".to_string(), "string"),
+        ("source".to_string(), "string"),
     ], "followed_log 为 None 时必须序列化成 null");
     let running2 = RunningService {
         service_id: "s1".into(), project_id: "p1".into(), followed_log: Some("C:/x.log".into()),
+        source: "boot".into(),
     };
     assert_eq!(types_of(&running2).iter().find(|(k, _)| k == "followed_log").unwrap().1, "string",
         "有跟随文件时是字符串——前端据它显示文件名");
 
     // 失败服务：spawn 失败（进程没起来）时 exit_code 为 null
-    let failed = FailedService { service_id: "s1".into(), exit_code: None, timestamp: "t".into() };
+    let failed = FailedService {
+        service_id: "s1".into(), exit_code: None, timestamp: "t".into(), source: "local".into(),
+    };
     assert_eq!(types_of(&failed).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");
 
     // 工具命令结果：超时/被停止时没有退出码

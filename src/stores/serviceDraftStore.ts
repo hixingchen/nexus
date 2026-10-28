@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { ToolCommand } from '../services/service';
+import type { BootCheckKind } from '../utils/bootCheck';
 
 /**
  * 服务/模板编辑面板的**表单草稿**（按编辑对象 id 存在模块级 store）。
@@ -29,6 +30,12 @@ export interface ServiceFormDraft {
   toolCommands: ToolCommand[];
   /** 模板模式的默认打开工具（服务模式不使用） */
   tplToolId: string;
+  /** 开机启动（模板模式不使用；模板不携带开机语义） */
+  bootEnabled: boolean;
+  bootOrder: number;
+  bootCheckKind: BootCheckKind;
+  bootCheckValue: string;
+  bootRequired: boolean;
 }
 
 interface DraftState {

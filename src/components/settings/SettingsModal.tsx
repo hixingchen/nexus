@@ -4,6 +4,7 @@ import { GeneralSection } from './GeneralSection';
 import { EditorSection } from './EditorSection';
 import { NodeVersionSection } from './NodeVersionSection';
 import { AiRuntimeSection } from './AiRuntimeSection';
+import { ServiceBootSection } from './ServiceBootSection';
 
 /**
  * 设置面板：**全部应用设置的唯一容器**（左分类 + 右内容）。
@@ -20,7 +21,7 @@ import { AiRuntimeSection } from './AiRuntimeSection';
  * **两个入口共用本组件**（见 `TitleBar`）：标题栏右侧的「Node v22.22.1」按钮与
  * 菜单里的「设置 > Node 版本」打开的是同一个面板、同一个分类——不是两套界面渲染同一份状态。
  */
-export type SettingsSection = 'general' | 'editor' | 'node' | 'ai';
+export type SettingsSection = 'general' | 'editor' | 'node' | 'ai' | 'serviceBoot';
 
 /** 左栏分类表（顺序即显示顺序） */
 const SECTIONS: { key: SettingsSection; label: string }[] = [
@@ -28,6 +29,7 @@ const SECTIONS: { key: SettingsSection; label: string }[] = [
   { key: 'editor', label: '编辑器' },
   { key: 'node', label: 'Node 版本' },
   { key: 'ai', label: 'AI 运行时' },
+  { key: 'serviceBoot', label: '服务开机启动' },
 ];
 
 interface SettingsModalProps {
@@ -103,6 +105,7 @@ export function SettingsModal({
       {section === 'editor' && <EditorSection />}
       {section === 'node' && <NodeVersionSection onChanged={onNodeChanged} />}
       {section === 'ai' && <AiRuntimeSection />}
+      {section === 'serviceBoot' && <ServiceBootSection />}
     </Modal>
   );
 }

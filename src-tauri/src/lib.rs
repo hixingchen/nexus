@@ -4,6 +4,13 @@ mod database;
 pub mod logger;
 mod models;
 
+/// 登录前启动器入口（独立 `nexus-boot-runner.exe --manifest <path>`；
+/// `Nexus.exe --boot-runner` 分支保留用于旧任务/开发调试）。
+///
+/// 单独成模块而不是塞进 `run()`：runner 不能初始化 Tauri/WebView，也不能注册单实例
+/// 插件——否则它会被 GUI 的启动流程当成第二个 Nexus 拦下。
+pub mod boot_runner;
+
 /// IPC 字段命名契约测试（响应 snake_case / 请求 camelCase），仅测试构建参与编译
 #[cfg(test)]
 mod contract;
@@ -198,6 +205,13 @@ pub fn run() {
         Err(e) => fatal_startup_error(format!("数据库初始化失败: {}", e)),
     };
 
+    // 每次启动刷新开机启动 manifest：环境快照（PATH/NVM_HOME 等）可能因为用户在
+    // Nexus 关闭期间装了 Node/nvm 而变化，而 runner 在登录前读的就是这份快照。
+    // 失败只留痕：服务配置本身不受影响，下次保存/安装会重试。
+    if let Err(e) = crate::core::boot::sync_manifest(&db) {
+        log::warn!("[nexus] 启动时同步开机启动 manifest 失败: {}", e);
+    }
+
     // 创建共享的 Job Object（通过 Arc 在 ProcessManager 间共享）
     // 失败时降级运行：子进程不会在父进程退出时自动终止，但应用仍可正常使用
     #[cfg(windows)]
@@ -340,6 +354,13 @@ pub fn run() {
             // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
+            // 服务开机启动：S4U 计划任务 + 独立 runner（登录前启动）
+            commands::boot::get_boot_runner_status,
+            commands::boot::install_boot_runner,
+            commands::boot::uninstall_boot_runner,
+            commands::boot::start_boot_runner,
+            commands::boot::stop_boot_runner,
+            commands::boot::set_service_boot_enabled,
             // 前端日志回传（NEW-28）：打包版没有控制台/devtools，前端错误只能这样落进
             // 与 Rust 侧同一条日志流水（截断 / 换行过滤 / 限流都在 logger 里做）
             commands::app::log_frontend,

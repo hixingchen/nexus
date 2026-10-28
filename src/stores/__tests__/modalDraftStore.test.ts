@@ -51,6 +51,7 @@ test('服务/模板草稿的清理不会误删弹窗草稿（两套键空间隔�
   const serviceDraft: ServiceFormDraft = {
     name: 'svc', command: 'run', cwd: 'C:/x', watchPaths: '', watchInclude: '*', watchExclude: '',
     envVars: '', restartMode: 0, enabled: true, showFileTree: false, toolCommands: [], tplToolId: '',
+    bootEnabled: false, bootOrder: 0, bootCheckKind: 'none', bootCheckValue: '', bootRequired: false,
   };
   useServiceDraftStore.getState().setDraft('svc-1', serviceDraft);
   useModalDraftStore.getState().setDraft(MODAL_DRAFT_KEYS.projectCreate, { name: 'n', path: 'p' });

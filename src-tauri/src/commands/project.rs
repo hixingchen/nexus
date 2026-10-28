@@ -142,6 +142,14 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 仍继续删除：用户要的是删掉项目，不该因为一个停止失败而拒绝。残留进程由应用级
         // Job Object（KILL_ON_JOB_CLOSE）在 Nexus 退出时兜底回收。
         for sid in &ids {
+            // 开机启动器拥有的服务不在本地进程表里，必须单独经 runner 停止
+            if crate::commands::boot::is_boot_managed(sid)
+                && crate::commands::boot::runner_reachable_now()
+            {
+                if let Err(e) = crate::commands::boot::send_service_command("stop", sid) {
+                    log::warn!("删除项目 {} 时停止开机启动器服务 {} 失败：{}", id, sid, e);
+                }
+            }
             if let Err(e) = state.process_mgr.stop(sid) {
                 log::warn!("删除项目 {} 时停止服务 {} 失败（进程可能残留至应用退出）：{}", id, sid, e);
             }
@@ -158,7 +166,14 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
         state.db.with_conn(|conn| {
             conn.execute("DELETE FROM projects WHERE id=?1", [&id]).map_err(|e| format!("删除项目失败: {}", e))?;
             Ok(())
-        })
+        })?;
+        // 5. 重写开机启动 manifest：删除项目后不能再让 runner 下次开机启动已不存在的服务
+        if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+            log::warn!("删除项目 {} 后同步开机启动 manifest 失败: {}", id, e);
+        } else {
+            crate::commands::boot::reload_if_running();
+        }
+        Ok(())
     }).await.map_err(|e| format!("删除项目任务失败: {}", e))?
 }
 
@@ -230,6 +245,9 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
                     ":env_vars": svc.env_vars, ":restart_mode": svc.restart_mode,
                     ":enabled": en, ":show_file_tree": sft, ":sort_index": svc.sort_index,
                     ":tool_commands": svc.tool_commands,
+                    // 复制项目**不复制开机启动**：两个项目会启动同一套服务/抢同一个端口。
+                    // 这是唯一的例外，见 test_duplicate_project_copies_every_service_column
+                    ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
                 },
             ).map_err(|e| format!("复制服务配置失败: {}", e))?;
             // 打开工具绑定随服务一起复制：service_open_tools 以 service_id 为主键，
@@ -335,6 +353,10 @@ mod tests {
             ("show_file_tree", "0".to_string()),
             ("sort_index", "7".to_string()),
             ("tool_commands", r#"[{"id":"t1","name":"build","command":"npm run build","timeout_secs":1800}]"#.to_string()),
+            ("boot_enabled", "1".to_string()),
+            ("boot_order", "3".to_string()),
+            ("boot_check", r#"{"type":"tcp","host":"127.0.0.1","port":3306,"timeoutSecs":60}"#.to_string()),
+            ("boot_required", "1".to_string()),
         ]);
 
         let missing: Vec<String> = columns_of(conn, "services")
@@ -399,12 +421,17 @@ mod tests {
             let src = row_map(conn, "SELECT * FROM services WHERE project_id=?1", "p1");
             let dup = row_map(conn, "SELECT * FROM services WHERE project_id=?1", &copy.id);
 
-            // 这三列**本来就该不同**：id/project_id 是新生成的；created_at 取复制时刻
-            // （副本的"创建时间"就是现在，继承源时间反而错）。
+            // 这几列**本来就该不同**：
+            // - id/project_id 是新生成的；created_at 取复制时刻（副本的"创建时间"就是现在）；
+            // - 开机启动四项是**有意重置**的：副本若继承 boot_enabled=1，两个项目会在
+            //   下一次开机各启动一份同样的服务（抢端口），所以复制项目不复制开机启动。
             // 其余每一列都必须逐字一致——不一致即说明那列没进 duplicate_project 的列清单。
             let mut compared = 0;
             for (col, want) in &src {
                 if matches!(col.as_str(), "id" | "project_id" | "created_at") { continue; }
+                if matches!(col.as_str(), "boot_enabled" | "boot_order" | "boot_check" | "boot_required") {
+                    continue;
+                }
                 assert_eq!(
                     dup.get(col).map(String::as_str),
                     Some(want.as_str()),
@@ -414,6 +441,11 @@ mod tests {
                 compared += 1;
             }
             assert!(compared >= 12, "比对到的列太少（{}），fixture 或 SQL 可能退化了", compared);
+            // 开机启动被重置：副本不会在下次开机时与源项目抢同一套服务
+            for col in ["boot_enabled", "boot_order", "boot_required"] {
+                assert_eq!(dup.get(col).map(String::as_str), Some("0"), "复制项目应重置 {}", col);
+            }
+            assert_eq!(dup.get("boot_check").map(String::as_str), Some(""), "复制项目应清空 boot_check");
 
             // 打开工具绑定随服务一起复制
             let bound: String = conn

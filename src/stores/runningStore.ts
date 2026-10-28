@@ -51,11 +51,13 @@ function sameStatus(a: RunningService[], b: RunningService[], af: FailedService[
       return y
         && x.service_id === y.service_id
         && x.project_id === y.project_id
+        && x.source === y.source
         && (x.followed_log ?? null) === (y.followed_log ?? null);
     })
     && af.every((x, i) => {
       const y = bf[i];
-      return y && x.service_id === y.service_id && x.exit_code === y.exit_code && x.timestamp === y.timestamp;
+      return y && x.service_id === y.service_id && x.exit_code === y.exit_code
+        && x.timestamp === y.timestamp && x.source === y.source;
     });
 }
 

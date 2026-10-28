@@ -1,0 +1,15 @@
+[package]
+name = "nexus-boot-runner"
+version = "1.10.0"
+edition = "2021"
+description = "Nexus 登录前服务启动器（独立 exe）"
+publish = false
+
+[[bin]]
+name = "nexus-boot-runner"
+path = "src/main.rs"
+
+[dependencies]
+# 复用 Nexus 的 core::boot / boot_runner，不复制业务逻辑；
+# 独立 crate 是为了让 Tauri 的 MSI bundler 不会把同一个 sidecar 当成两个组件。
+nexus = { path = ".." }

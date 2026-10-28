@@ -67,6 +67,14 @@ export interface Service {
   show_file_tree: boolean;
   sort_index: number;
   tool_commands: string;  // JSON array of ToolCommand
+  /** 是否由开机启动器在登录前启动（enabled=false 时被抑制） */
+  boot_enabled: boolean;
+  /** 开机启动顺序（独立于展示排序 sort_index） */
+  boot_order: number;
+  /** 就绪检查 JSON（空串 = 进程存活即继续） */
+  boot_check: string;
+  /** 未就绪时是否阻断后续开机服务 */
+  boot_required: boolean;
 }
 
 export interface Project {
@@ -173,6 +181,10 @@ export const serviceApi = {
     watchExclude?: string;
     enabled?: boolean;
     showFileTree?: boolean;
+    bootEnabled?: boolean;
+    bootOrder?: number;
+    bootCheck?: string;
+    bootRequired?: boolean;
   }) => invoke<Service>('add_service', {
     params: {
       projectId: params.projectId,
@@ -187,6 +199,10 @@ export const serviceApi = {
       watchExclude: params.watchExclude,
       enabled: params.enabled,
       showFileTree: params.showFileTree,
+      bootEnabled: params.bootEnabled,
+      bootOrder: params.bootOrder,
+      bootCheck: params.bootCheck,
+      bootRequired: params.bootRequired,
     }
   }),
 
@@ -210,7 +226,11 @@ export const serviceApi = {
     enabled: boolean;
     showFileTree: boolean;
     toolCommands: string;
-  }) => invoke<{ watch_refreshed: boolean; watch_error: string }>('update_service', {
+    bootEnabled: boolean;
+    bootOrder: number;
+    bootCheck: string;
+    bootRequired: boolean;
+  }) => invoke<{ watch_refreshed: boolean; watch_error: string; boot_manifest_error: string }>('update_service', {
     params: {
       id: params.id,
       name: params.name,
@@ -224,6 +244,10 @@ export const serviceApi = {
       enabled: params.enabled,
       showFileTree: params.showFileTree,
       toolCommands: params.toolCommands,
+      bootEnabled: params.bootEnabled,
+      bootOrder: params.bootOrder,
+      bootCheck: params.bootCheck,
+      bootRequired: params.bootRequired,
     }
   }),
 
@@ -362,6 +386,8 @@ export interface RunningService {
    * 面板读的是它自己写的日志文件——这里告诉前端跟的是哪个文件，菜单据此提供"取消跟随"。
    */
   followed_log?: string | null;
+  /** 进程来源：local = Nexus 自己拉起，boot = 开机启动器（旧后端缺省时按 local 处理） */
+  source?: 'local' | 'boot';
 }
 
 /** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */
@@ -370,6 +396,8 @@ export interface FailedService {
   /** spawn 失败（进程未启动）时为 null */
   exit_code: number | null;
   timestamp: string;
+  /** 失败来源：local = Nexus 自己拉起，boot = 开机启动器（旧后端缺省时按 local 处理） */
+  source?: 'local' | 'boot';
 }
 
 /** 运行状态总览：运行中 + 意外失败 */

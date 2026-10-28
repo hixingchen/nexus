@@ -66,6 +66,16 @@ pub struct UpdateServiceParams {
     pub enabled: bool,
     pub show_file_tree: bool,
     pub tool_commands: String,
+    /// 开机启动（见 core::boot）：保存前会校验 boot_check 并同步 manifest。
+    /// 默认值让旧前端/旧测试的载荷仍能反序列化（不传 = 不开机启动）。
+    #[serde(default)]
+    pub boot_enabled: bool,
+    #[serde(default)]
+    pub boot_order: i32,
+    #[serde(default)]
+    pub boot_check: String,
+    #[serde(default)]
+    pub boot_required: bool,
 }
 
 /// 服务添加参数
@@ -94,6 +104,15 @@ pub struct AddServiceParams {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub show_file_tree: Option<bool>,
+    /// 开机启动四项不传时用默认值（关闭 / 顺序 0 / 无就绪检查 / 非必需）
+    #[serde(default)]
+    pub boot_enabled: Option<bool>,
+    #[serde(default)]
+    pub boot_order: Option<i32>,
+    #[serde(default)]
+    pub boot_check: Option<String>,
+    #[serde(default)]
+    pub boot_required: Option<bool>,
 }
 
 /// 获取某个项目下的所有服务
@@ -124,7 +143,14 @@ pub fn add_service(
     // 必须存在、不是系统/用户敏感目录，且位于项目内或经用户显式选择过
     validate_config_dirs(&state.db, &state.paths, &cwd, &params.watch_paths)?;
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
-    insert_service_row(&state.db, &params, &cwd, &tool_commands)
+    let svc = insert_service_row(&state.db, &params, &cwd, &tool_commands)?;
+    // 配置已落库；manifest 同步失败只留痕，不回滚用户刚保存的服务
+    if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+        log::warn!("[nexus] 添加服务后同步开机启动 manifest 失败: {}", e);
+    } else {
+        crate::commands::boot::reload_if_running();
+    }
+    Ok(svc)
 }
 
 /// 插入服务行（只有 Database 依赖，便于测试；命令侧先做路径收口校验再调它）
@@ -158,6 +184,11 @@ pub(crate) fn insert_service_row(
         let wx = params.watch_exclude.clone().unwrap_or_else(|| DEFAULT_WATCH_EXCLUDE.to_string());
         let en = params.enabled.unwrap_or(true);
         let sft = params.show_file_tree.unwrap_or(false);
+        // 开机启动：不传 = 关闭；boot_check 必须是受支持的 JSON（空串 = 无检查）
+        let boot_enabled = params.boot_enabled.unwrap_or(false);
+        let boot_order = params.boot_order.unwrap_or(0);
+        let boot_check = crate::core::boot::normalize_check(params.boot_check.as_deref().unwrap_or(""))?;
+        let boot_required = params.boot_required.unwrap_or(false);
         conn.execute(
             &format!(
                 "INSERT INTO services ({}) VALUES ({})",
@@ -172,6 +203,8 @@ pub(crate) fn insert_service_row(
                 // 两个展示开关：默认"启用 + 不显示文件树"，面板新建时按用户勾的走
                 ":enabled": en, ":show_file_tree": sft,
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
+                ":boot_enabled": boot_enabled, ":boot_order": boot_order,
+                ":boot_check": boot_check, ":boot_required": boot_required,
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
@@ -181,6 +214,7 @@ pub(crate) fn insert_service_row(
             show_file_tree: sft,
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
+            boot_enabled, boot_order, boot_check, boot_required,
         })
     })
 }
@@ -196,6 +230,8 @@ pub struct UpdateServiceResult {
     pub watch_refreshed: bool,
     /// 未刷新时的原因（`watch_refreshed=false` 时才有内容）
     pub watch_error: String,
+    /// 开机启动 manifest 同步失败的原因（空 = 成功）
+    pub boot_manifest_error: String,
 }
 
 /// 更新服务配置。
@@ -219,6 +255,8 @@ pub async fn update_service(
         // （监听路径为"跟随工作目录"的兜底值时不校验——见 validate_config_dirs）
         validate_config_dirs(&state.db, &state.paths, &cwd, &params.watch_paths)?;
         let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
+        // boot_check 与添加路径同一套校验：非法 JSON 不落库
+        crate::core::boot::normalize_check(&params.boot_check)?;
         let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
         // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）。
         // 刷新失败**不阻塞保存**（配置已经落库，监听下次项目级启停时会自然重建），
@@ -231,7 +269,18 @@ pub async fn update_service(
                     (false, e)
                 }
             };
-        Ok(UpdateServiceResult { watch_refreshed, watch_error })
+        // 开机启动配置变更 → 重写 manifest（配置已落库；失败作为部分成功回传）
+        let boot_manifest_error = match crate::core::boot::sync_manifest(&state.db) {
+            Ok(_) => {
+                crate::commands::boot::reload_if_running();
+                String::new()
+            }
+            Err(e) => {
+                log::warn!("更新服务后同步开机启动 manifest 失败: {}", e);
+                e
+            }
+        };
+        Ok(UpdateServiceResult { watch_refreshed, watch_error, boot_manifest_error })
     }).await.map_err(|e| format!("更新服务任务失败: {}", e))?
 }
 
@@ -264,6 +313,8 @@ pub(crate) fn write_service_update(
         } else {
             params.watch_paths.clone()
         };
+        // 先归一化 boot_check 再写：保存入口与 manifest 生成共用同一套判据
+        let boot_check = crate::core::boot::normalize_check(&params.boot_check)?;
         let affected = conn.execute(
             &format!(
                 "UPDATE services SET {} WHERE id=:id",
@@ -274,7 +325,10 @@ pub(crate) fn write_service_update(
                 ":watch_paths": wp, ":watch_include": params.watch_include,
                 ":watch_exclude": params.watch_exclude, ":env_vars": params.env_vars,
                 ":restart_mode": params.restart_mode, ":enabled": en,
-                ":show_file_tree": sft, ":tool_commands": tool_commands, ":id": params.id,
+                ":show_file_tree": sft, ":tool_commands": tool_commands,
+                ":boot_enabled": params.boot_enabled, ":boot_order": params.boot_order,
+                ":boot_check": boot_check, ":boot_required": params.boot_required,
+                ":id": params.id,
             },
         ).map_err(|e| format!("更新服务失败: {}", e))?;
         if affected == 0 { return Err("服务不存在".into()); }
@@ -353,11 +407,26 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）。
         // 失败留痕（同 delete_project）：静默丢弃会留下仍在跑的孤儿进程，而服务记录已删、
         // UI 里再没有入口去停它。仍继续删除，残留进程由 Job Object 在应用退出时兜底。
+        // 开机启动器拥有的服务不在本地进程表里，必须单独经 runner 停止。
+        if crate::commands::boot::is_boot_managed(&id)
+            && crate::commands::boot::runner_reachable_now()
+        {
+            if let Err(e) = crate::commands::boot::send_service_command("stop", &id) {
+                log::warn!("删除服务 {} 时停止开机启动器进程失败：{}", id, e);
+            }
+        }
         if let Err(e) = state.process_mgr.stop(&id) {
             log::warn!("删除服务 {} 时停止进程失败（进程可能残留至应用退出）：{}", id, e);
         }
         // 3. 删除数据库记录
         delete_service_row(&state.db, &id)?;
+        // 3.5 删除后重写开机启动 manifest：否则 next boot 还会启动一个界面上已经
+        // 不存在的服务（runner 的 Job Object 也再也找不到它的停止入口）
+        if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+            log::warn!("删除服务后同步开机启动 manifest 失败: {}", e);
+        } else {
+            crate::commands::boot::reload_if_running();
+        }
         // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
         if let Some(pid) = project_id {
             // app 已被 state 借用，这里传克隆句柄（AppHandle 克隆是廉价的引用计数）
@@ -530,6 +599,8 @@ pub fn add_service_from_template(
                 ":watch_exclude": watch_exclude, ":env_vars": env_vars,
                 ":restart_mode": restart_mode, ":enabled": en, ":show_file_tree": sft,
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
+                // 模板不携带开机启动：从模板添加的服务默认不参与登录前启动
+                ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
@@ -548,6 +619,7 @@ pub fn add_service_from_template(
         Ok(Service {
             id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
+            boot_enabled: false, boot_order: 0, boot_check: String::new(), boot_required: false,
         })
     })
 }
@@ -752,6 +824,10 @@ mod tests {
             watch_exclude: None,
             enabled: None,
             show_file_tree: None,
+            boot_enabled: None,
+            boot_order: None,
+            boot_check: None,
+            boot_required: None,
         }
     }
 
@@ -812,6 +888,10 @@ mod tests {
             enabled: false,
             show_file_tree: true,
             tool_commands: "[]".into(),
+            boot_enabled: false,
+            boot_order: 0,
+            boot_check: String::new(),
+            boot_required: false,
         };
         let project_id = write_service_update(&db, &params, "C:/p/sub", "[]").unwrap();
         assert_eq!(project_id, "p1", "应回传所属项目，供调用方刷新监听");

@@ -252,6 +252,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       // 也不是"空"——它只是建表时的列默认值。摆进编辑框只会让人以为要填 JSON
       env_vars: '', restart_mode: 0, enabled: true, show_file_tree: false,
       sort_index: 0, tool_commands: '[]',
+      boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
     }));
   }, [projectId, setEditingService, setEditingTemplate]);
 
@@ -751,12 +752,12 @@ function CollapsedView({
               className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors ${
                 clickable ? 'hover:bg-nexus-accent/20 cursor-pointer' : 'cursor-default'
               }`}
-              title={`${svc.name}${running ? '（运行中）' : failure ? `（${failureLabel(failure)}）` : '（未运行）'}${clickable ? ' · 点击查看日志' : ''}
+              title={`${svc.name}${running ? '（运行中）' : failure ? `（${failureLabel(failure)}）` : '（未运行）'}${svc.boot_enabled ? ' · 开机启动' : ''}${clickable ? ' · 点击查看日志' : ''}
 右键：启停 / 重启、工具、打开位置`}
             >
               <span className={`w-[8px] h-[8px] rounded-full flex-shrink-0 ${
                 running ? 'bg-nexus-success' : failure ? 'bg-nexus-error' : 'bg-nexus-muted/25'
-              }`} />
+              } ${svc.boot_enabled ? 'ring-1 ring-nexus-accent/60 ring-offset-1 ring-offset-nexus-bg' : ''}`} />
             </button>
           );
         })}
@@ -927,6 +928,12 @@ function ServiceSection({
             <rect x="1.5" y="1.5" width="11" height="11" rx="2"/><line x1="5" y1="5" x2="9" y2="5"/><line x1="5" y1="7" x2="9" y2="7"/><line x1="5" y1="9" x2="7" y2="9"/>
           </svg>
           <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
+          {services.some(s => s.boot_enabled && s.enabled) && (
+            <span
+              className="text-[10px] leading-[15px] px-1.5 rounded-full bg-nexus-accent/10 text-nexus-accent flex-shrink-0"
+              title="这些服务会在登录前的开机启动器中运行（设置 > 服务开机启动）"
+            >{services.filter(s => s.boot_enabled && s.enabled).length} 个开机启动</span>
+          )}
         </div>
         <div className="flex items-center gap-1">
           <button

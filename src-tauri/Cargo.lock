@@ -2551,6 +2551,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-boot-runner"
+version = "1.10.0"
+dependencies = [
+ "nexus",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

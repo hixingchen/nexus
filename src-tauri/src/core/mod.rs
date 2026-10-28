@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod boot;
 pub mod classfile;
 pub mod decompiler;
 pub mod download;

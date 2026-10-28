@@ -57,6 +57,14 @@ pub struct Service {
     pub show_file_tree: bool,
     pub sort_index: i32,
     pub tool_commands: String,  // JSON array of ToolCommand
+    /// 是否由开机启动器在登录前启动（`enabled=false` 时被抑制）
+    pub boot_enabled: bool,
+    /// 开机启动顺序（与展示用的 `sort_index` 解耦：拖拽排序不能改变启动顺序）
+    pub boot_order: i32,
+    /// 就绪检查 JSON（空串 = 进程存活即算就绪）
+    pub boot_check: String,
+    /// 就绪检查失败时是否阻断后续服务
+    pub boot_required: bool,
 }
 
 /// 服务模板：跨项目复用的服务配置（独立于项目，复制到项目时值拷贝）

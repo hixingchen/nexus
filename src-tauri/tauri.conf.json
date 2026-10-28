@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev:frontend",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build && npm run build:runner"
   },
   "app": {
     "windows": [
@@ -32,6 +32,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
+    "externalBin": ["binaries/nexus-boot-runner"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

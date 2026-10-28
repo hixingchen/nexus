@@ -41,6 +41,9 @@ pub struct FailedService {
     /// spawn 失败（进程未启动）时为 None
     pub exit_code: Option<i32>,
     pub timestamp: String,
+    /// 失败来源：local（Nexus 自己拉起） / boot（开机启动器）
+    #[serde(default)]
+    pub source: String,
 }
 
 /// 取生命周期锁（NEW-17）。锁中毒同样继续用：进程生命周期离硬件更近，
@@ -289,6 +292,7 @@ impl ProcessManager {
                         service_id: key.to_string(),
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        source: "local".into(),
                     });
                 }
                 msg
@@ -317,6 +321,7 @@ impl ProcessManager {
                         service_id: key.to_string(),
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        source: "local".into(),
                     });
                 }
                 return Err(msg);
@@ -699,6 +704,7 @@ impl ProcessManager {
                     service_id: key.clone(),
                     exit_code: *code,
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    source: "local".into(),
                 });
             }
         }
@@ -832,6 +838,7 @@ impl ProcessManager {
                 service_id: key.to_string(),
                 exit_code,
                 timestamp: "test".into(),
+                source: "local".into(),
             });
         }
     }

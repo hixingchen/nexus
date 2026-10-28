@@ -5,9 +5,11 @@
   "type": "module",
   "packageManager": "pnpm@10.4.1",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "npm run build:runner:debug && tauri dev",
     "dev:frontend": "vite",
     "build": "tsc && vite build",
+    "build:runner": "node scripts/build-boot-runner.mjs",
+    "build:runner:debug": "node scripts/build-boot-runner.mjs --debug",
     "build:app": "tauri build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",

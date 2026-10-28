@@ -10,6 +10,10 @@ import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
 import { watchPathsAfterCwdChange } from '../../utils/watchPaths';
 import { useClickOutside } from '../../hooks/useClickOutside';
+import {
+  BOOT_CHECK_KIND_LABEL, parseBootCheck, serializeBootCheck,
+  type BootCheckKind,
+} from '../../utils/bootCheck';
 
 const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
@@ -45,9 +49,17 @@ function maskEnvValues(text: string): string {
  * `project_id` 是**可选**的：编辑既有对象时后端不需要它，而"新建服务"要靠它确定归属
  * （见 handleSave 的 add 分支）——服务对象本来就带着它，模板没有。
  */
-type ServiceConfig = Omit<Service, 'project_id' | 'sort_index'> & {
+type ServiceConfig = Omit<
+  Service,
+  'project_id' | 'sort_index' | 'boot_enabled' | 'boot_order' | 'boot_check' | 'boot_required'
+> & {
   open_tool_id?: string;
   project_id?: string;
+  /** 模板对象没有开机字段（模板不携带开机语义）——服务对象上一定有 */
+  boot_enabled?: boolean;
+  boot_order?: number;
+  boot_check?: string;
+  boot_required?: boolean;
 };
 
 interface Props {
@@ -96,6 +108,19 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [restartMode, setRestartMode] = useState(initialDraft?.restartMode ?? service.restart_mode);
   const [enabled, setEnabled] = useState(initialDraft?.enabled ?? service.enabled);
   const [showFileTree, setShowFileTree] = useState(initialDraft?.showFileTree ?? service.show_file_tree);
+
+  // 开机启动：模板不携带这组字段，service 上可能没有（模板编辑时统统按关闭处理）
+  const [originalBoot] = useState(() => parseBootCheck(service.boot_check));
+  const [bootEnabled, setBootEnabled] = useState(initialDraft?.bootEnabled ?? service.boot_enabled ?? false);
+  const [bootOrder, setBootOrder] = useState(initialDraft?.bootOrder ?? service.boot_order ?? 0);
+  const [bootCheckKind, setBootCheckKind] = useState<BootCheckKind>(
+    initialDraft?.bootCheckKind ?? originalBoot.kind,
+  );
+  const [bootCheckValue, setBootCheckValue] = useState(
+    initialDraft?.bootCheckValue ?? originalBoot.value,
+  );
+  const [bootRequired, setBootRequired] = useState(initialDraft?.bootRequired ?? service.boot_required ?? false);
+
   const [saving, setSaving] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   /** 「放弃修改」的两步确认（UX-19）：它同时会清掉草稿，一次点击不够 */
@@ -145,6 +170,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     || watchExclude !== service.watch_exclude || envVars !== service.env_vars
     || restartMode !== service.restart_mode || enabled !== service.enabled
     || showFileTree !== service.show_file_tree
+    || bootEnabled !== (service.boot_enabled ?? false)
+    || bootOrder !== (service.boot_order ?? 0)
+    || bootRequired !== (service.boot_required ?? false)
+    || bootCheckKind !== originalBoot.kind
+    || bootCheckValue !== originalBoot.value
     || (mode === 'template' && tplToolId !== (service.open_tool_id ?? ''))
     || JSON.stringify(toolCommands) !== originalToolCommands;
 
@@ -154,9 +184,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     useServiceDraftStore.getState().setDraft(draftKey, formDirty ? {
       name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
       restartMode, enabled, showFileTree, toolCommands, tplToolId,
+      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired,
     } : null);
   }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
-      restartMode, enabled, showFileTree, toolCommands, tplToolId]);
+      restartMode, enabled, showFileTree, toolCommands, tplToolId,
+      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired]);
 
   /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
   const handleDiscard = () => {
@@ -172,6 +204,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     setRestartMode(service.restart_mode);
     setEnabled(service.enabled);
     setShowFileTree(service.show_file_tree);
+    setBootEnabled(service.boot_enabled ?? false);
+    setBootOrder(service.boot_order ?? 0);
+    setBootCheckKind(originalBoot.kind);
+    setBootCheckValue(originalBoot.value);
+    setBootRequired(service.boot_required ?? false);
     setTplToolId(service.open_tool_id ?? '');
     setToolCommands(parseToolCommands(service.tool_commands));
     useServiceDraftStore.getState().setDraft(draftKey, null);
@@ -247,7 +284,14 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const handleSave = async () => {
     setSaving(true);
     try {
-      const payload = {
+      // 模板不携带开机字段：只在服务模式校验/提交
+      const boot = serializeBootCheck(bootCheckKind, bootCheckValue);
+      if (mode === 'service' && bootEnabled && !boot.ok) {
+        reportError('开机启动配置有误', new Error(boot.error));
+        setSaving(false);
+        return;
+      }
+      const basePayload = {
         id: service.id, name: name.trim() || service.name,
         command, cwd, watchPaths, watchInclude, watchExclude, envVars, restartMode, enabled,
         showFileTree,
@@ -256,7 +300,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       if (mode === 'template') {
         // 模板：默认打开工具随保存提交（从模板添加服务时复制为绑定）
         if (service.id) {
-          await serviceApi.updateTemplate({ ...payload, openToolId: tplToolId });
+          await serviceApi.updateTemplate({ ...basePayload, openToolId: tplToolId });
         } else {
           // id 为空 = 模板库里刚点「新建」出来的空壳，走 create（id 由后端生成）
           await serviceApi.createServiceTemplate({
@@ -280,6 +324,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           watchExclude: watchExclude || undefined,
           envVars, restartMode, enabled, showFileTree,
           toolCommands: JSON.stringify(toolCommands),
+          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired,
         });
         // 保存拿到 id 之后才能绑：新建时选的打开工具在这里补上
         if (pendingToolId) {
@@ -291,13 +336,22 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           }
         }
       } else {
-        const res = await serviceApi.update(payload);
+        const res = await serviceApi.update({
+          ...basePayload,
+          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired,
+        });
         // 配置已落库，但文件监听没跟上必须说出来（CQ-35）：不说的话界面提示"已保存"，
         // 而用户改文件毫无反应——这正是 file_watcher.rs 把同类结论从 Ok(()) 改成 Err 的原因
         if (!res.watch_refreshed) {
           reportError('配置已保存，但文件监听未生效', res.watch_error, {
             variant: 'warning',
             description: `改文件可能不会触发重启：${res.watch_error}`,
+          });
+        }
+        if (res.boot_manifest_error) {
+          reportError('配置已保存，但开机启动清单未同步', res.boot_manifest_error, {
+            variant: 'warning',
+            description: '下次开机可能仍使用旧的服务清单，请到「设置 > 服务开机启动」检查',
           });
         }
       }
@@ -553,6 +607,120 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
             ))}
           </div>
         </div>
+
+        {/* ── 开机启动卡片（仅服务；模板不携带开机语义） ── */}
+        {mode === 'service' && (
+          <div className={cardCls}>
+            <div
+              className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+              onClick={() => setBootEnabled(v => !v)}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] text-nexus-text">开机自动启动（登录前）</div>
+                <div className="text-[10px] text-nexus-muted/60 mt-0.5">
+                  由开机启动器在登录界面拉起；需要先在「设置 &gt; 服务开机启动」安装启动器
+                </div>
+              </div>
+              <span
+                role="switch"
+                aria-label="开机自动启动"
+                aria-checked={bootEnabled}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setBootEnabled(v => !v);
+                  }
+                }}
+                className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-nexus-accent/40 ${
+                  bootEnabled ? 'bg-nexus-accent' : 'bg-nexus-border'
+                }`}
+              >
+                <span className={`absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
+                  bootEnabled ? 'translate-x-[16px]' : ''
+                }`} />
+              </span>
+            </div>
+
+            {bootEnabled && (
+              <div className="mt-2.5 pt-2.5 border-t border-nexus-border/30 space-y-2.5">
+                {!enabled && (
+                  <p className="text-[11px] text-nexus-warning leading-relaxed">
+                    服务已关闭“跟随项目启动”，开机启动会被抑制；需要同时打开上一个开关。
+                  </p>
+                )}
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`${uid}-boot-order`} className={`${labelCls} flex-shrink-0`}>启动顺序</label>
+                  <input
+                    id={`${uid}-boot-order`}
+                    type="number"
+                    className={`${INPUT_CLS} !mt-0 w-24`}
+                    value={bootOrder}
+                    onChange={e => setBootOrder(Number(e.target.value) || 0)}
+                  />
+                  <span className="text-[10px] text-nexus-muted/50">数字小的先启动；与展示排序无关</span>
+                </div>
+                <div>
+                  <label htmlFor={`${uid}-boot-check-kind`} className={labelCls}>就绪检查</label>
+                  <select
+                    id={`${uid}-boot-check-kind`}
+                    className={`${INPUT_CLS} mt-1`}
+                    value={bootCheckKind}
+                    onChange={e => setBootCheckKind(e.target.value as BootCheckKind)}
+                  >
+                    {(Object.keys(BOOT_CHECK_KIND_LABEL) as BootCheckKind[]).map(k => (
+                      <option key={k} value={k}>{BOOT_CHECK_KIND_LABEL[k]}</option>
+                    ))}
+                  </select>
+                  {bootCheckKind !== 'none' && (
+                    <input
+                      className={`${INPUT_CLS} font-mono mt-1.5`}
+                      value={bootCheckValue}
+                      onChange={e => setBootCheckValue(e.target.value)}
+                      placeholder={
+                        bootCheckKind === 'delay' ? '等待秒数，例如 5'
+                          : bootCheckKind === 'tcp' ? 'host:port，例如 127.0.0.1:3306'
+                            : '日志里出现的关键字，例如 ready for connections'
+                      }
+                    />
+                  )}
+                  <p className="text-[10px] text-nexus-muted/50 mt-1">
+                    {bootCheckKind === 'none'
+                      ? '进程起来就继续下一个服务'
+                      : bootCheckKind === 'delay'
+                        ? '固定等待指定秒数'
+                        : bootCheckKind === 'tcp'
+                          ? '等端口可连接再启动下一个（MySQL 用这个）'
+                          : '等日志出现关键字再启动下一个'}
+                  </p>
+                </div>
+                <div
+                  className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+                  onClick={() => setBootRequired(v => !v)}
+                >
+                  <span className="flex-1 text-[12px] text-nexus-text">未就绪时阻断后续服务</span>
+                  <span
+                    role="checkbox"
+                    aria-label="未就绪时阻断后续服务"
+                    aria-checked={bootRequired}
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setBootRequired(v => !v);
+                      }
+                    }}
+                    className={`w-[15px] h-[15px] rounded border flex items-center justify-center text-[10px] leading-none transition-colors ${
+                      bootRequired
+                        ? 'bg-nexus-accent border-nexus-accent text-white'
+                        : 'border-nexus-border text-transparent'
+                    }`}
+                  >✓</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* ── 打开方式卡片（服务即时绑定；模板存默认值随保存提交，从模板添加服务时复制） ── */}
         <div className={cardCls}>
