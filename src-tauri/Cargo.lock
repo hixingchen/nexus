@@ -2523,7 +2523,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexus"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-boot-runner"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "nexus",
  "tauri-winres",

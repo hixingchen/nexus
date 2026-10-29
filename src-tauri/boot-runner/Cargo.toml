@@ -1,6 +1,6 @@
 [package]
 name = "nexus-boot-runner"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2021"
 description = "Nexus 登录前服务启动器（独立 exe）"
 publish = false
