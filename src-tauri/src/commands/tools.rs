@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 use crate::AppState;
 use crate::models::{OpenTool, ServiceOpenToolBinding};
 
@@ -380,6 +383,284 @@ fn split_args(template: &str) -> Vec<String> {
     out
 }
 
+// ─── 本机工具识别 ───────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct DetectedToolsResult {
+    pub added: Vec<OpenTool>,
+    /// 探测到但已存在（同名或同路径）而跳过的数量
+    pub skipped: usize,
+}
+
+/// 路径比较口径：大小写不敏感、斜杠统一、忽略尾部反斜杠。
+fn normalize_tool_path(path: &str) -> String {
+    path.trim()
+        .trim_end_matches(['/', '\\'])
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+struct ToolCandidate {
+    name: &'static str,
+    path: PathBuf,
+}
+
+/// 一键识别本机已安装的编辑器/IDE/终端，把工具库里还没有的加进去。
+///
+/// 只做注册表 App Paths / PATH / 已知安装目录的**存在性探测**，不执行任何被检测程序；
+/// 已有同名或同路径工具的跳过，不产生重复条目。
+///
+/// 扫描会启动若干 `where.exe` 并读注册表，约几百毫秒到一两秒——放进
+/// `spawn_blocking`，不占 Tauri 的主线程（否则弹窗会卡住不响应）。
+#[tauri::command]
+pub async fn detect_and_add_open_tools(app: tauri::AppHandle) -> Result<DetectedToolsResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        detect_and_add_open_tools_inner(&state)
+    }).await.map_err(|e| format!("识别本机工具任务失败: {}", e))?
+}
+
+fn detect_and_add_open_tools_inner(state: &AppState) -> Result<DetectedToolsResult, String> {
+    let existing: Vec<(String, String)> = state.db.with_conn(|conn| {
+        let mut stmt = conn.prepare("SELECT name, executable FROM open_tools")
+            .map_err(|e| format!("查询打开工具失败: {}", e))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }).map_err(|e| format!("查询打开工具失败: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row.map_err(|e| format!("解析打开工具失败: {}", e))?); }
+        Ok(out)
+    })?;
+    let mut names: HashSet<String> = existing.iter()
+        .map(|(name, _)| name.trim().to_lowercase())
+        .collect();
+    let mut paths: HashSet<String> = existing.iter()
+        .filter(|(_, executable)| !executable.trim().is_empty())
+        .map(|(_, executable)| normalize_tool_path(executable))
+        .collect();
+
+    let mut inserts: Vec<(String, &'static str, String)> = Vec::new();
+    let mut skipped = 0usize;
+    for candidate in detect_tool_candidates() {
+        if !candidate.path.is_file() {
+            continue;
+        }
+        let executable = candidate.path.to_string_lossy().replace('/', "\\");
+        let name_key = candidate.name.to_lowercase();
+        let path_key = normalize_tool_path(&executable);
+        if names.contains(&name_key) || paths.contains(&path_key) {
+            skipped += 1;
+            continue;
+        }
+        names.insert(name_key);
+        paths.insert(path_key);
+        inserts.push((uuid::Uuid::new_v4().to_string(), candidate.name, executable));
+    }
+
+    if !inserts.is_empty() {
+        state.db.with_conn_mut(|conn| {
+            let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+            for (id, name, executable) in &inserts {
+                // Windows Terminal 的目录参数必须用 -d；其他工具接受“路径作为最后一个参数”
+                let args = if *name == "Windows Terminal" { "-d {path}" } else { "" };
+                tx.execute(
+                    "INSERT INTO open_tools (id, name, command, executable, args) VALUES (?1,?2,'',?3,?4)",
+                    rusqlite::params![id, name, executable, args],
+                ).map_err(|e| format!("添加识别到的工具「{}」失败: {}", name, e))?;
+            }
+            tx.commit().map_err(|e| format!("提交工具识别结果失败: {}", e))
+        })?;
+    }
+
+    let added = inserts.into_iter().map(|(id, name, executable)| OpenTool {
+        id,
+        name: name.to_string(),
+        command: String::new(),
+        executable,
+        args: if name == "Windows Terminal" { "-d {path}".to_string() } else { String::new() },
+    }).collect();
+    Ok(DetectedToolsResult { added, skipped })
+}
+
+#[cfg(windows)]
+fn env_dir(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    let path = PathBuf::from(value);
+    path.is_dir().then_some(path)
+}
+
+#[cfg(windows)]
+fn program_files_dir() -> Option<PathBuf> {
+    ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .find_map(|name| env_dir(name))
+}
+
+#[cfg(windows)]
+fn local_app_data_dir() -> Option<PathBuf> {
+    env_dir("LOCALAPPDATA")
+}
+
+#[cfg(windows)]
+fn system_root_dir() -> Option<PathBuf> {
+    env_dir("SystemRoot").or_else(|| env_dir("windir"))
+}
+
+/// 注册表 App Paths（HKCU/HKLM、含 WOW6432Node）：GUI 程序最可靠的发现方式。
+#[cfg(windows)]
+fn app_path(exe: &str) -> Option<PathBuf> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let key = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}", exe);
+    let wow = format!(r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{}", exe);
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        for sub in [&key, &wow] {
+            if let Some(value) = crate::core::winenv::reg_value(root, sub, "") {
+                let path = PathBuf::from(value);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `where.exe` 查 PATH 上的命令（`code`、`cursor`、`wt` 等）。
+#[cfg(windows)]
+fn where_exe(name: &str) -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let root = system_root_dir().unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let where_path = root.join("System32").join("where.exe");
+    let out = std::process::Command::new(where_path)
+        .arg(name)
+        .env("NoDefaultCurrentDirectoryInExePath", "1")
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let path = PathBuf::from(line);
+    path.is_file().then_some(path)
+}
+
+/// 在 JetBrains 安装根下按产品名前缀找 `bin/<exe>`。
+///
+/// 兼容两种布局：
+/// - Program Files：`<product>\bin\idea64.exe`
+/// - Toolbox：`<product>\ch-0\<version>\bin\idea64.exe`
+#[cfg(windows)]
+fn find_product_exe(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
+    let prefix = prefix.to_lowercase();
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten().take(100) {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let base = entry.path();
+        let direct = base.join("bin").join(exe);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let Ok(children) = std::fs::read_dir(&base) else { continue };
+        for child in children.flatten().take(20) {
+            let nested = child.path().join("bin").join(exe);
+            if nested.is_file() {
+                return Some(nested);
+            }
+            let Ok(versions) = std::fs::read_dir(child.path()) else { continue };
+            for version in versions.flatten().take(20) {
+                let path = version.path().join("bin").join(exe);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn jetbrains_ide(prefix: &str, exe: &str) -> Option<PathBuf> {
+    // JetBrains 的 exe 基本不在 PATH 上；不逐个跑 `where`（每个进程约几十毫秒，
+    // 9 个产品会把一次识别拖到数秒）。App Paths + 安装目录已经覆盖实际场景。
+    app_path(exe)
+        .or_else(|| {
+            program_files_dir()
+                .map(|dir| dir.join("JetBrains"))
+                .and_then(|root| find_product_exe(&root, prefix, exe))
+        })
+        .or_else(|| {
+            local_app_data_dir()
+                .map(|dir| dir.join("JetBrains").join("Toolbox").join("apps"))
+                .and_then(|root| find_product_exe(&root, prefix, exe))
+        })
+}
+
+#[cfg(windows)]
+fn detect_tool_candidates() -> Vec<ToolCandidate> {
+    let pf = program_files_dir();
+    let local = local_app_data_dir();
+    let system = system_root_dir();
+    let local_programs = local.as_ref().map(|dir| dir.join("Programs"));
+    let mut out: Vec<ToolCandidate> = Vec::new();
+    let mut add = |name: &'static str, path: Option<PathBuf>| {
+        if let Some(path) = path {
+            out.push(ToolCandidate { name, path });
+        }
+    };
+
+    add("VS Code",
+        app_path("Code.exe")
+            .or_else(|| local_programs.as_ref().map(|dir| dir.join("Microsoft VS Code").join("Code.exe")).filter(|p| p.is_file()))
+            .or_else(|| where_exe("code")));
+    add("VS Code Insiders",
+        app_path("Code - Insiders.exe")
+            .or_else(|| local_programs.as_ref().map(|dir| dir.join("Microsoft VS Code Insiders").join("Code - Insiders.exe")).filter(|p| p.is_file()))
+            .or_else(|| where_exe("code-insiders")));
+    add("Cursor",
+        app_path("Cursor.exe")
+            .or_else(|| local_programs.as_ref().map(|dir| dir.join("cursor").join("Cursor.exe")).filter(|p| p.is_file()))
+            .or_else(|| local_programs.as_ref().map(|dir| dir.join("Cursor").join("Cursor.exe")).filter(|p| p.is_file()))
+            .or_else(|| where_exe("cursor")));
+    add("Sublime Text",
+        app_path("sublime_text.exe")
+            .or_else(|| pf.as_ref().map(|dir| dir.join("Sublime Text").join("sublime_text.exe")).filter(|p| p.is_file()))
+            .or_else(|| pf.as_ref().map(|dir| dir.join("Sublime Text 3").join("sublime_text.exe")).filter(|p| p.is_file()))
+            .or_else(|| where_exe("subl")));
+    add("IntelliJ IDEA", jetbrains_ide("intellij idea", "idea64.exe"));
+    add("PyCharm", jetbrains_ide("pycharm", "pycharm64.exe"));
+    add("WebStorm", jetbrains_ide("webstorm", "webstorm64.exe"));
+    add("GoLand", jetbrains_ide("goland", "goland64.exe"));
+    add("CLion", jetbrains_ide("clion", "clion64.exe"));
+    add("PhpStorm", jetbrains_ide("phpstorm", "phpstorm64.exe"));
+    add("RubyMine", jetbrains_ide("rubymine", "rubymine64.exe"));
+    add("Rider", jetbrains_ide("rider", "rider64.exe"));
+    add("DataGrip", jetbrains_ide("datagrip", "datagrip64.exe"));
+    add("Android Studio",
+        app_path("studio64.exe")
+            .or_else(|| pf.as_ref().map(|dir| dir.join("Android").join("Android Studio").join("bin").join("studio64.exe")).filter(|p| p.is_file()))
+            .or_else(|| where_exe("studio64")));
+    add("HBuilderX",
+        app_path("HBuilderX.exe")
+            .or_else(|| pf.as_ref().map(|dir| dir.join("HBuilderX").join("HBuilderX.exe")).filter(|p| p.is_file()))
+            .or_else(|| local_programs.as_ref().map(|dir| dir.join("HBuilderX").join("HBuilderX.exe")).filter(|p| p.is_file())));
+    add("Windows Terminal",
+        where_exe("wt")
+            .or_else(|| local.as_ref().map(|dir| dir.join("Microsoft").join("WindowsApps").join("wt.exe")).filter(|p| p.is_file())));
+    add("资源管理器", system.as_ref().map(|dir| dir.join("explorer.exe")).filter(|p| p.is_file()));
+
+    out
+}
+
+#[cfg(not(windows))]
+fn detect_tool_candidates() -> Vec<ToolCandidate> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +835,32 @@ mod tests {
         // 没有引用时是空表而不是报错
         let none = open_tool_usage(&db, "t-none").expect("没有引用不应失败");
         assert!(none.services.is_empty() && none.templates.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_tool_path_is_case_and_slash_insensitive() {
+        assert_eq!(
+            normalize_tool_path("C:/Program Files/Code.exe"),
+            normalize_tool_path(r"c:\program files\code.exe"),
+        );
+        assert_eq!(normalize_tool_path(r"C:\Tools\"), r"c:\tools");
+    }
+
+    /// 探测结果不能有重名/重路径；只做结构性检查，不假设本机装了哪些工具。
+    #[cfg(windows)]
+    #[test]
+    fn test_detected_tool_candidates_are_unique_and_exist() {
+        let mut names = HashSet::new();
+        let mut paths = HashSet::new();
+        for candidate in detect_tool_candidates() {
+            assert!(candidate.path.is_file(), "候选路径不存在: {}", candidate.path.display());
+            assert!(names.insert(candidate.name), "重复工具名: {}", candidate.name);
+            assert!(
+                paths.insert(normalize_tool_path(&candidate.path.to_string_lossy())),
+                "重复工具路径: {}",
+                candidate.path.display()
+            );
+        }
     }
 }
 

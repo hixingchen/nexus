@@ -520,9 +520,19 @@ export interface OpenTool {
   args: string;
 }
 
+/** 一键识别本机工具的结果（字段与后端 `DetectedToolsResult` 同名） */
+export interface DetectedToolsResult {
+  added: OpenTool[];
+  /** 探测到但已存在（同名或同路径）而跳过的数量 */
+  skipped: number;
+}
+
 export const openToolsApi = {
   /** 全部工具（全局共享，按添加顺序） */
   list: () => invoke<OpenTool[]>('list_open_tools'),
+
+  /** 扫描本机已安装的编辑器/IDE/终端，自动添加工具库里还没有的项 */
+  detectAndAdd: () => invoke<DetectedToolsResult>('detect_and_add_open_tools'),
 
   /** 新增（id 空）或更新工具 */
   save: (tool: { id?: string | null; name: string; executable: string; args: string }) =>

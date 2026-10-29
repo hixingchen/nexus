@@ -324,6 +324,7 @@ pub fn run() {
             commands::watcher::start_watching,
             commands::watcher::stop_watching,
             commands::tools::list_open_tools,
+            commands::tools::detect_and_add_open_tools,
             commands::tools::save_open_tool,
             commands::tools::delete_open_tool,
             commands::tools::get_open_tool_usage,

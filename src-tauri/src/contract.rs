@@ -32,7 +32,7 @@ use crate::commands::service::{
     UpdateServiceParams, UpdateServiceTemplateParams, UpdateServiceResult,
 };
 use crate::commands::template_io::ImportTemplatesResult;
-use crate::commands::tools::{OpenToolUsage, SaveOpenToolParams};
+use crate::commands::tools::{DetectedToolsResult, OpenToolUsage, SaveOpenToolParams};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
 use crate::core::process::{FailedService, LogLine, ServiceLogBatchPayload};
@@ -425,6 +425,8 @@ fn test_response_dtos_are_snake_case() {
     );
 
     // 删除工具前的引用清单（UX-4：删除入口是个 11px 图标，而它会级联解除所有服务的绑定）
+    let detected = DetectedToolsResult { added: vec![], skipped: 0 };
+    assert_eq!(keys_of(&detected), sorted(&["added", "skipped"]));
     let usage = OpenToolUsage { services: vec![], templates: vec![] };
     assert_eq!(keys_of(&usage), sorted(&["services", "templates"]));
 
@@ -758,6 +760,7 @@ const COVERED_RESPONSE: &[&str] = &[
         "FileChangeEvent", "FileChange", "JarEntryInfo",
         "LogLine", "FailedService", "ServiceLogBatchPayload",
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
+        "DetectedToolsResult",
         "Service", "ServiceTemplate", "ProjectDetail",
         "ImportTemplatesResult", "UpdateServiceResult", "OpenToolUsage",
         "NodeRuntimeStatus", "NodeVersionInfo", "NodeVersionIndex",

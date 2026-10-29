@@ -24,7 +24,7 @@ const SYSTEM_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Envi
 /// 所以不需要自己拼串——这也是没用 `winreg` 的原因之一（那个 crate 在依赖图里只是
 /// tauri 的**构建期**依赖，拿它当运行时依赖等于白塞一个包）。
 #[cfg(windows)]
-fn reg_value(root: windows_sys::Win32::System::Registry::HKEY, subkey: &str, name: &str) -> Option<String> {
+pub(crate) fn reg_value(root: windows_sys::Win32::System::Registry::HKEY, subkey: &str, name: &str) -> Option<String> {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};

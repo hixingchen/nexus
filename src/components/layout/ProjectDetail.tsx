@@ -11,6 +11,7 @@ import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
+import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { PanelToggleIcon } from '../ui/PanelToggleIcon';
 import { ResizablePanel } from './ResizablePanel';
@@ -1069,6 +1070,8 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
     if (oldIndex === -1 || newIndex === -1) return;
     onReorderTemplates(arrayMove(templates, oldIndex, newIndex).map(t => t.id));
   }, [templates, onReorderTemplates]);
+  /** 「更多」菜单的坐标（null = 关闭）。导入/导出放菜单里用文字说清，避免猜图标 */
+  const [moreMenu, setMoreMenu] = useState<{ x: number; y: number } | null>(null);
   return (
     <div className="flex flex-col h-full">
       {/* 头部 */}
@@ -1077,10 +1080,10 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
           <path d="M7 1.5l1.4 2.9 3.1.4-2.3 2.2.6 3.1L7 8.8l-2.8 1.3.6-3.1L2.5 4.8l3.1-.4L7 1.5z"/>
         </svg>
         <span className="text-[13px] text-nexus-text font-medium truncate min-w-0">服务模板库</span>
-        {/* 新建 / 导入 / 导出三个入口都放标题栏：它们是同一层级的**库级**操作，
-            混进列表里反而难找（单个模板的导出在它自己的右键菜单里）。
+        {/* 新建留在标题栏；导入/导出是低频库级操作，收进「⋯」菜单用文字说清
+            （单个模板的导出在它自己的右键菜单里）。
 
-            尺寸与「项目服务」的「+」严格对齐（p-1.5 / rounded-md / 14px 图标 / 描边 1.5）：
+            加号尺寸与「项目服务」的「+」严格对齐（p-1.5 / rounded-md / 14px 图标 / 描边 1.5）：
             两块面板上下相邻，图标差 1px、内边距差 0.5 都看得出来 */}
         <div className="ml-auto flex items-center gap-1 flex-shrink-0">
           <button
@@ -1092,25 +1095,51 @@ function TemplateSection({ templates, busy, editingId, onEdit, onAdd, onRequestD
               <line x1="7" y1="2" x2="7" y2="12" /><line x1="2" y1="7" x2="12" y2="7" />
             </svg>
           </button>
+          {/* 导入/导出是低频库级操作：收进「更多」菜单，用文字而不是图标说清。
+              直接画箭头图标容易被猜成“下载/上传”，配中文标签又会让窄标题栏变挤 */}
           <button
-            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
-            title="从文件导入模板（重名自动改名）"
-            onClick={onImport}
+            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors"
+            title="更多模板操作"
+            aria-label="更多模板操作"
+            aria-haspopup="menu"
+            onMouseDown={e => e.stopPropagation()}
+            onClick={(e) => {
+              if (moreMenu) {
+                setMoreMenu(null);
+                return;
+              }
+              const rect = e.currentTarget.getBoundingClientRect();
+              setMoreMenu({ x: Math.max(8, rect.right - 180), y: rect.bottom + 4 });
+            }}
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M7 2v7" /><polyline points="4,6.5 7,9.5 10,6.5" /><line x1="2.5" y1="12" x2="11.5" y2="12" />
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+              <circle cx="3" cy="7" r="1" /><circle cx="7" cy="7" r="1" /><circle cx="11" cy="7" r="1" />
             </svg>
           </button>
-          <button
-            className="p-1.5 text-nexus-muted hover:text-nexus-text rounded-md hover:bg-nexus-hover/50 flex-shrink-0 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
-            title="导出全部模板"
-            onClick={onExportAll}
-            disabled={templates.length === 0}
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M7 10V3" /><polyline points="4,5.5 7,2.5 10,5.5" /><line x1="2.5" y1="12" x2="11.5" y2="12" />
-            </svg>
-          </button>
+          {moreMenu && createPortal(
+            <ContextMenu x={moreMenu.x} y={moreMenu.y} onClose={() => setMoreMenu(null)}>
+              <div className="py-1">
+                <ContextMenuItem
+                  icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+                    {/* 原导入图标（下箭头），按要求与导入项交换 */}
+                    <path d="M5 1.5v4" /><polyline points="3,3.8 5,5.8 7,3.8" /><path d="M1.5 8.5h7" />
+                  </svg>}
+                  label="导出全部模板"
+                  disabled={templates.length === 0}
+                  onClick={() => { setMoreMenu(null); onExportAll(); }}
+                />
+                <ContextMenuItem
+                  icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+                    {/* 原导出图标（上箭头），按要求与导出项交换 */}
+                    <path d="M5 5.5v-4" /><polyline points="3,3.2 5,1.2 7,3.2" /><path d="M1.5 8.5h7" />
+                  </svg>}
+                  label="从文件导入模板"
+                  onClick={() => { setMoreMenu(null); onImport(); }}
+                />
+              </div>
+            </ContextMenu>,
+            document.body,
+          )}
         </div>
       </div>
 
