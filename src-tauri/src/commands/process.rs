@@ -234,20 +234,38 @@ fn spawn_stream_reader(
         })
 }
 
-/// 查询服务信息（name, command, cwd, project_id, env_vars, boot_enabled）
-fn get_service_info(db: &crate::database::Database, service_id: &str) -> Result<(String, String, String, String, String, bool), String> {
+/// 启动/重启服务所需的配置（收成结构体，避免 7 元组串位与 clippy 的 type_complexity）。
+struct ServiceInfo {
+    name: String,
+    command: String,
+    cwd: String,
+    project_id: String,
+    env_vars: String,
+    /// 服务本身是否启用（"跟随项目启动"）；manifest 只收 `boot_enabled=1 AND enabled=1`
+    enabled: bool,
+    boot_enabled: bool,
+    boot_credential_mode: String,
+}
+
+fn get_service_info(
+    db: &crate::database::Database,
+    service_id: &str,
+) -> Result<ServiceInfo, String> {
     db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, project_id, env_vars, boot_enabled FROM services WHERE id=?1",
+            "SELECT name, command, cwd, project_id, env_vars, enabled, boot_enabled, boot_credential_mode \
+             FROM services WHERE id=?1",
             [service_id],
-            |row| Ok((
-                row.get::<_, String>("name")?,
-                row.get::<_, String>("command")?,
-                row.get::<_, String>("cwd")?,
-                row.get::<_, String>("project_id")?,
-                row.get::<_, String>("env_vars")?,
-                row.get::<_, i32>("boot_enabled")? != 0,
-            )),
+            |row| Ok(ServiceInfo {
+                name: row.get("name")?,
+                command: row.get("command")?,
+                cwd: row.get("cwd")?,
+                project_id: row.get("project_id")?,
+                env_vars: row.get("env_vars")?,
+                enabled: row.get::<_, i32>("enabled")? != 0,
+                boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
+                boot_credential_mode: row.get("boot_credential_mode")?,
+            }),
         )
         .map_err(|e| format!("服务不存在: {}", e))
     })
@@ -317,19 +335,60 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
-        let (name, command, cwd, project_id, env_vars, boot_enabled) = get_service_info(&state.db, &service_id)?;
-        // 所有权：runner 在跑且这个服务归它管 → 只能由 runner 启动，避免同一服务两个进程
-        if (boot_enabled || crate::commands::boot::is_boot_managed(&service_id))
-            && crate::commands::boot::runner_reachable_now()
-        {
-            return crate::commands::boot::send_service_command("start", &service_id)
-                .map_err(|e| format!("服务「{}」{}", name, e));
+        let info = get_service_info(&state.db, &service_id)?;
+        // 本地进程表已有它：无论开机启动配置如何，都不能再交给 runner 起第二份。
+        // 先推进一拍（崩溃/秒退的服务可能还没从表里摘掉）
+        state.process_mgr.tick();
+        if state.process_mgr.is_running(&service_id) {
+            return Err(format!("服务「{}」已在本地运行中", info.name));
         }
-        let envs = crate::core::process::parse_env_vars(&env_vars)?;
+        let configured = crate::core::boot::BootMode::parse(&info.boot_credential_mode)
+            .unwrap_or(crate::core::boot::BootMode::S4u);
+        // manifest 只收 `boot_enabled=1 AND enabled=1`。取消任一项后，启动器就不再负责
+        // 它的未来启停；此时不能再把 start 发给 runner（manifest 里没有它，必然失败）。
+        let boot_active = info.boot_enabled && info.enabled;
+        let live = crate::commands::boot::live_boot_service(&service_id);
+        if boot_active {
+            // 启动按**配置的模式**路由：manifest 是按它生成的，不能被旧模式里的残留条目带偏
+            if crate::commands::boot::runner_reachable_now(configured) {
+                // 已在跑时给明确结论（PID + 下一步动作），而不是把 runner 的
+                // “服务已在运行中”原样抛成一次失败提示
+                if let Some((_, st)) = &live {
+                    return Err(format!(
+                        "服务「{}」已在开机启动器中运行（PID {}）；需要重启请点「重启」，停止请点「停止」。",
+                        info.name, st.pid.unwrap_or(0)
+                    ));
+                }
+                return crate::commands::boot::send_service_command(configured, "start", &service_id)
+                    .map_err(|e| format!("服务「{}」{}", info.name, e));
+            }
+            // 启动器不可达：绝不落回本地启动，否则会出现同名服务的第二个进程
+            if let Some((source, st)) = &live {
+                return Err(format!(
+                    "服务「{}」正在由{}启动器运行（PID {}），但启动器当前不可达；已阻止本地重复启动。可在「设置 > 服务开机启动」强制停止，或重新启动启动器。",
+                    info.name,
+                    if *source == "legacy" { "旧版" } else { "开机" },
+                    st.pid.unwrap_or(0)
+                ));
+            }
+            return Err(format!(
+                "服务「{}」配置为开机启动，但对应启动器未运行；已阻止本地重复启动。请到「设置 > 服务开机启动」启动/修复启动器，或先关闭该服务的开机启动再本地运行。",
+                info.name
+            ));
+        }
+        // 已取消开机启动（或服务被禁用），但启动器里的实例还在跑：不能启动第二份。
+        // 先把实例停掉，下一次「启动」就会走本地进程管理器。
+        if let Some((_, st)) = &live {
+            return Err(format!(
+                "服务「{}」仍由开机启动器运行（PID {}）；已阻止本地重复启动。请先点服务卡片上的「停止」，停止后即可本地启动。",
+                info.name, st.pid.unwrap_or(0)
+            ));
+        }
+        let envs = crate::core::process::parse_env_vars(&info.env_vars)?;
         state.process_mgr.start(crate::core::process::ServiceSpawn {
-            project_id: &project_id, service_id: &service_id, name: &name,
-            command: &command, cwd: &cwd, env_vars: &envs, log_sink: log_sink(&app_handle),
-        }).map_err(|e| format!("服务「{}」{}", name, e))
+            project_id: &info.project_id, service_id: &service_id, name: &info.name,
+            command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app_handle),
+        }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("启动服务任务失败: {}", e))?
 }
 
@@ -339,13 +398,13 @@ pub async fn stop_service(app: tauri::AppHandle, service_id: String) -> Result<(
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        // runner 拥有的服务：停止动作交给 runner（它同时负责 Job Object 内的子进程）
-        if crate::commands::boot::is_boot_managed(&service_id)
-            && crate::commands::boot::runner_reachable_now()
-        {
-            return crate::commands::boot::send_service_command("stop", &service_id);
-        }
-        state.process_mgr.stop(&service_id)
+        // runner 可达 → 走命令队列；启动器失联但子进程还活着 → 按 PID 兜底结束，
+        // 不让“启动器没响应”变成“这个服务再也停不掉”。
+        // 本地进程表也收一次（历史上本地/开机启动双开过时，两边都要停）。
+        let boot_result = crate::commands::boot::stop_boot_service(&service_id);
+        let local_result = state.process_mgr.stop(&service_id);
+        boot_result?;
+        local_result
     }).await.map_err(|e| format!("停止服务任务失败: {}", e))?
 }
 
@@ -368,19 +427,87 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let (name, command, cwd, project_id, env_vars, boot_enabled) = get_service_info(&state.db, &service_id)?;
-        // 同上：runner 拥有的服务，重启也必须经 runner（它会停旧进程再起新进程）
-        if (boot_enabled || crate::commands::boot::is_boot_managed(&service_id))
-            && crate::commands::boot::runner_reachable_now()
-        {
-            return crate::commands::boot::send_service_command("restart", &service_id)
-                .map_err(|e| format!("服务「{}」{}", name, e));
+        let info = get_service_info(&state.db, &service_id)?;
+        let configured = crate::core::boot::BootMode::parse(&info.boot_credential_mode)
+            .unwrap_or(crate::core::boot::BootMode::S4u);
+        let boot_active = info.boot_enabled && info.enabled;
+        let owned = crate::commands::boot::boot_owned_mode(&service_id);
+        state.process_mgr.tick();
+        // 本地与启动器同时有实例（历史遗留）时先收掉本地那份；只有本地实例时直接本地重启，
+        // 不能因为配置了开机启动就把 restart 发给 runner——那会双开。
+        let boot_live = crate::commands::boot::live_boot_service(&service_id).is_some();
+        if state.process_mgr.is_running(&service_id) {
+            if boot_live {
+                if let Err(e) = state.process_mgr.stop(&service_id) {
+                    log::warn!("重启服务时停止重复的本地实例失败: {}", e);
+                }
+            } else {
+                let envs = crate::core::process::parse_env_vars(&info.env_vars)?;
+                return state.process_mgr.restart(crate::core::process::ServiceSpawn {
+                    project_id: &info.project_id, service_id: &service_id, name: &info.name,
+                    command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
+                }).map_err(|e| format!("服务「{}」{}", info.name, e));
+            }
         }
-        let envs = crate::core::process::parse_env_vars(&env_vars)?;
+        // 服务改了凭据模式但旧 runner 还在跑：先停旧模式，再在新模式里启动
+        if let Some(old) = owned {
+            if boot_active {
+                if old != configured {
+                    crate::commands::boot::send_service_command(old, "stop", &service_id)
+                        .map_err(|e| format!("服务「{}」{}", info.name, e))?;
+                    if crate::commands::boot::runner_reachable_now(configured) {
+                        return crate::commands::boot::send_service_command(configured, "start", &service_id)
+                            .map_err(|e| format!("服务「{}」{}", info.name, e));
+                    }
+                    return Err(format!(
+                        "服务「{}」已停止旧模式进程，但 {} 启动器未运行/未安装，无法按新模式启动",
+                        info.name,
+                        configured.display()
+                    ));
+                }
+                return crate::commands::boot::send_service_command(old, "restart", &service_id)
+                    .map_err(|e| format!("服务「{}」{}", info.name, e));
+            }
+            // 已取消开机启动：让拥有它的 runner 先停下，然后走本地重启（交接）。
+            // 不这样做的话，runner 的 manifest 里已经没有它，restart 命令必然失败。
+            crate::commands::boot::send_service_command(old, "stop", &service_id)
+                .map_err(|e| format!("服务「{}」{}", info.name, e))?;
+        }
+        // 没有可达的 owner、但 state 里仍有存活实例（旧版遗留 / runner 已退出）：
+        // 先按 PID 兜底结束，避免“重启”变成在同一台机器上再起一份。
+        // 必须排在“配置为开机启动且新模式可达”之前——否则旧版实例还活着就又启动一份。
+        if let Some((_, st)) = crate::commands::boot::live_boot_service(&service_id) {
+            if let Some(pid) = st.pid {
+                crate::core::process::kill_process_tree(pid)
+                    .map_err(|e| format!("结束开机启动实例失败（PID {}）：{}", pid, e))?;
+            }
+            if boot_active {
+                if crate::commands::boot::runner_reachable_now(configured) {
+                    // 遗留实例已清理，交给目标模式的启动器重启
+                    return crate::commands::boot::send_service_command(configured, "restart", &service_id)
+                        .map_err(|e| format!("服务「{}」{}", info.name, e));
+                }
+                return Err(format!(
+                    "已结束启动器退出后留下的实例（PID {}）；该服务配置为开机启动且启动器未运行，本地重启已被阻止。请到「设置 > 服务开机启动」启动/修复启动器，或先关闭开机启动。",
+                    st.pid.unwrap_or(0)
+                ));
+            }
+        }
+        if boot_active && crate::commands::boot::runner_reachable_now(configured) {
+            return crate::commands::boot::send_service_command(configured, "restart", &service_id)
+                .map_err(|e| format!("服务「{}」{}", info.name, e));
+        }
+        if boot_active {
+            return Err(format!(
+                "服务「{}」配置为开机启动，但对应启动器未运行；本地重启已被阻止。请到「设置 > 服务开机启动」启动/修复启动器，或先关闭该服务的开机启动。",
+                info.name
+            ));
+        }
+        let envs = crate::core::process::parse_env_vars(&info.env_vars)?;
         state.process_mgr.restart(crate::core::process::ServiceSpawn {
-            project_id: &project_id, service_id: &service_id, name: &name,
-            command: &command, cwd: &cwd, env_vars: &envs, log_sink: log_sink(&app),
-        }).map_err(|e| format!("服务「{}」{}", name, e))
+            project_id: &info.project_id, service_id: &service_id, name: &info.name,
+            command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
+        }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
 
@@ -397,7 +524,8 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         let state = app_handle.state::<AppState>();
         let services = state.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, command, cwd, env_vars, boot_enabled FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
+                "SELECT id, name, command, cwd, env_vars, boot_enabled, boot_credential_mode \
+                 FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
             ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
             let rows = stmt.query_map([&project_id], |row| {
                 Ok((
@@ -407,6 +535,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
                     row.get::<_, String>("cwd")?,
                     row.get::<_, String>("env_vars")?,
                     row.get::<_, i32>("boot_enabled")? != 0,
+                    row.get::<_, String>("boot_credential_mode")?,
                 ))
             }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
             let mut svcs = Vec::new();
@@ -417,18 +546,31 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         // 已在运行的服务跳过（start 对已运行返回"已在运行中"，混在 errors 里会误报启动失败）
         let running_ids: std::collections::HashSet<String> = state.process_mgr.running()
             .into_iter().map(|(_, service_id, _)| service_id).collect();
-        let boot_reachable = crate::commands::boot::runner_reachable_now();
         let boot_ids = crate::commands::boot::boot_running_ids();
-        for (id, name, cmd, cwd, env_vars, boot_enabled) in &services {
-            // 开机启动器的服务：即使当前没在跑，也不能由 Nexus 直接启动（所有权必须唯一）
-            if boot_reachable && (*boot_enabled || boot_ids.contains(id)) {
-                if boot_ids.contains(id) { continue; }
-                if let Err(e) = crate::commands::boot::send_service_command("start", id) {
-                    errors.push(format!("{}: {}", name, e));
+        for (id, name, cmd, cwd, env_vars, boot_enabled, boot_mode) in &services {
+            if boot_ids.contains(id) { continue; }
+            // 本地已在运行：直接跳过（必须排在开机启动路由之前，否则本地实例 +
+            // 开机启动配置会再起一份 boot 实例）
+            if running_ids.contains(id) { continue; }
+            // 开机启动服务：按**配置的模式**路由（manifest 按它生成；旧模式的残留条目不能带偏）
+            if *boot_enabled {
+                let configured = crate::core::boot::BootMode::parse(boot_mode)
+                    .unwrap_or(crate::core::boot::BootMode::S4u);
+                if crate::commands::boot::runner_reachable_now(configured) {
+                    if let Err(e) = crate::commands::boot::send_service_command(configured, "start", id) {
+                        errors.push(format!("{}: {}", name, e));
+                    }
+                    continue;
                 }
+                // 启动器不可达：跳过而不是落本地，否则批量启动会造出第二份进程
+                errors.push(format!("{}: 配置为开机启动，但对应启动器未运行；已跳过本地启动", name));
                 continue;
             }
-            if running_ids.contains(id) { continue; }
+            // 已取消开机启动，但启动器里的实例还在跑：同样不能起第二份
+            if crate::commands::boot::live_boot_service(id).is_some() {
+                errors.push(format!("{}: 仍由开机启动器运行；已跳过本地启动（先停止该实例）", name));
+                continue;
+            }
             // 环境变量非法同样计入本次批量启动的失败列表（原实现解析失败会静默忽略该服务）
             let envs = match crate::core::process::parse_env_vars(env_vars) {
                 Ok(v) => v,
@@ -461,16 +603,17 @@ pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) ->
             for r in rows { ids.push(r.map_err(|e| format!("解析项目服务失败: {}", e))?); }
             Ok::<_, String>(ids)
         })?;
-        // runner 拥有的服务交给 runner 停；只有本地服务走 ProcessManager。
+        // runner 拥有的服务交给**拥有它的模式**的 runner 停；只有本地服务走 ProcessManager。
         // 两边的 id 互斥（所有权唯一），因此可以安全地拆开处理。
-        let boot_ids = crate::commands::boot::boot_owned_ids();
-        let (boot_services, local_ids): (Vec<String>, Vec<String>) =
-            ids.into_iter().partition(|id| boot_ids.contains(id));
         let mut errors: Vec<String> = Vec::new();
-        for id in &boot_services {
-            if let Err(e) = crate::commands::boot::send_service_command("stop", id) {
+        let mut local_ids: Vec<String> = Vec::new();
+        for id in ids {
+            // 启动器可达走命令队列；失联时按 state 里的 PID 兜底结束（同一套口径）。
+            // 每个 id 都再过一遍本地清理：历史上双开过时两边都要停，表里没有就是 no-op。
+            if let Err(e) = crate::commands::boot::stop_boot_service(&id) {
                 errors.push(format!("{}: {}", id, e));
             }
+            local_ids.push(id);
         }
         // 停止全部：**一轮只取一次进程快照 + 并行停止**（PERF-21 / PERF-20①）。
         //
@@ -531,20 +674,17 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
         let local_failed: std::collections::HashSet<String> =
             failed.iter().map(|f| f.service_id.clone()).collect();
 
-        if let Some(bs) = crate::core::boot::read_state() {
-            if crate::core::boot::runner_reachable(&bs) {
-                for (id, s) in &bs.services {
-                    if matches!(s.phase.as_str(), "starting" | "ready")
-                        && !local_ids.contains(id)
-                    {
-                        running.push(RunningService {
-                            service_id: id.clone(),
-                            project_id: s.project_id.clone(),
-                            followed_log: None,
-                            source: "boot".into(),
-                        });
-                    }
-                }
+        // 开机服务：只要**进程还活着**就并进运行列表，不以 runner 心跳为门槛。
+        // 否则 runner 退出/卡住后，它拉起的服务在界面上会全部“消失”，连带日志入口也没了
+        // （用户实际遇到的就是这个）。pid + 启动时刻的校验在 boot::service_alive 里。
+        for (id, project_id) in crate::commands::boot::boot_running_services() {
+            if !local_ids.contains(&id) {
+                running.push(RunningService {
+                    service_id: id,
+                    project_id,
+                    followed_log: None,
+                    source: "boot".into(),
+                });
             }
         }
         for f in crate::commands::boot::boot_failed_services() {
@@ -572,19 +712,11 @@ pub async fn get_service_logs(app: tauri::AppHandle, service_key: String) -> Res
         }
         // 本地没有缓冲：只有“开机启动器拥有/曾拥有”的服务才回落到 boot 日志文件，
         // 否则一个普通本地服务会读到同 id 的历史 boot 日志（曾开过开机启动后关掉的情况）。
-        let boot_related = crate::commands::boot::is_boot_managed(&service_key)
-            || state.db.with_conn(|conn| {
-                conn.query_row(
-                    "SELECT boot_enabled FROM services WHERE id=?1",
-                    [&service_key],
-                    |r| r.get::<_, i32>(0),
-                ).map(|v| v != 0).map_err(|e| e.to_string())
-            }).unwrap_or(false);
-        if !boot_related {
+        let Some(mode) = crate::commands::boot::service_log_mode(&state.db, &service_key) else {
             return Ok(Vec::new());
-        }
+        };
         // 日志文件按 service_id 命名，读尾部作为快照；前端在日志面板打开期间会增量轮询。
-        Ok(crate::commands::boot::read_boot_log_tail(&service_key, 2 * 1024 * 1024)
+        Ok(crate::commands::boot::read_boot_log_tail(mode, &service_key, 2 * 1024 * 1024)
             .unwrap_or_default())
     }).await.map_err(|e| format!("读取服务日志任务失败: {}", e))?
 }

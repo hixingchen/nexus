@@ -65,6 +65,8 @@ pub struct Service {
     pub boot_check: String,
     /// 就绪检查失败时是否阻断后续服务
     pub boot_required: bool,
+    /// 开机启动凭据模式：`s4u`（不保存密码）或 `password`（保存凭据）
+    pub boot_credential_mode: String,
 }
 
 /// 服务模板：跨项目复用的服务配置（独立于项目，复制到项目时值拷贝）

@@ -75,7 +75,11 @@ export interface Service {
   boot_check: string;
   /** 未就绪时是否阻断后续开机服务 */
   boot_required: boolean;
+  /** 开机启动凭据模式：s4u / password（两个模式各有一套 runner） */
+  boot_credential_mode: BootCredentialMode;
 }
+
+export type BootCredentialMode = 's4u' | 'password';
 
 export interface Project {
   id: string;
@@ -185,6 +189,7 @@ export const serviceApi = {
     bootOrder?: number;
     bootCheck?: string;
     bootRequired?: boolean;
+    bootCredentialMode?: BootCredentialMode;
   }) => invoke<Service>('add_service', {
     params: {
       projectId: params.projectId,
@@ -203,6 +208,7 @@ export const serviceApi = {
       bootOrder: params.bootOrder,
       bootCheck: params.bootCheck,
       bootRequired: params.bootRequired,
+      bootCredentialMode: params.bootCredentialMode,
     }
   }),
 
@@ -230,6 +236,7 @@ export const serviceApi = {
     bootOrder: number;
     bootCheck: string;
     bootRequired: boolean;
+    bootCredentialMode: BootCredentialMode;
   }) => invoke<{ watch_refreshed: boolean; watch_error: string; boot_manifest_error: string }>('update_service', {
     params: {
       id: params.id,
@@ -248,6 +255,7 @@ export const serviceApi = {
       bootOrder: params.bootOrder,
       bootCheck: params.bootCheck,
       bootRequired: params.bootRequired,
+      bootCredentialMode: params.bootCredentialMode,
     }
   }),
 

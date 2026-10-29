@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { ToolCommand } from '../services/service';
 import type { BootCheckKind } from '../utils/bootCheck';
+import type { BootCredentialMode } from '../services/service';
 
 /**
  * 服务/模板编辑面板的**表单草稿**（按编辑对象 id 存在模块级 store）。
@@ -36,6 +37,7 @@ export interface ServiceFormDraft {
   bootCheckKind: BootCheckKind;
   bootCheckValue: string;
   bootRequired: boolean;
+  bootCredentialMode: BootCredentialMode;
 }
 
 interface DraftState {

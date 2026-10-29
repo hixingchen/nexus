@@ -1,7 +1,10 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { arrayMove } from '@dnd-kit/sortable';
-import { serviceApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
+import {
+  serviceApi, parseToolCommands,
+  type BootCredentialMode, type Service, type ToolCommand,
+} from '../../services/service';
 import { pickDirectory } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
 import { readServiceDraft, serviceDraftKey, useServiceDraftStore } from '../../stores/serviceDraftStore';
@@ -21,6 +24,14 @@ const WATCH_MODE_AUTO = 2;
 
 /** 配置面板输入框统一样式（配置表单与工具命令表单各有一份，逐字相同——改一处漏一处会出现两种输入框） */
 const INPUT_CLS = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
+
+/** 就绪检查分段控件的短标签（完整名称见 BOOT_CHECK_KIND_LABEL，作为 title 提示） */
+const BOOT_CHECK_KIND_SHORT: Record<BootCheckKind, string> = {
+  none: '进程存活',
+  delay: '固定等待',
+  tcp: 'TCP 端口',
+  logContains: '日志关键字',
+};
 
 /**
  * 遮蔽环境变量文本里的**值**（保留键名与行结构，用户仍能看出配了哪些变量）。
@@ -51,7 +62,7 @@ function maskEnvValues(text: string): string {
  */
 type ServiceConfig = Omit<
   Service,
-  'project_id' | 'sort_index' | 'boot_enabled' | 'boot_order' | 'boot_check' | 'boot_required'
+  'project_id' | 'sort_index' | 'boot_enabled' | 'boot_order' | 'boot_check' | 'boot_required' | 'boot_credential_mode'
 > & {
   open_tool_id?: string;
   project_id?: string;
@@ -60,6 +71,7 @@ type ServiceConfig = Omit<
   boot_order?: number;
   boot_check?: string;
   boot_required?: boolean;
+  boot_credential_mode?: BootCredentialMode;
 };
 
 interface Props {
@@ -120,12 +132,17 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     initialDraft?.bootCheckValue ?? originalBoot.value,
   );
   const [bootRequired, setBootRequired] = useState(initialDraft?.bootRequired ?? service.boot_required ?? false);
+  const [bootCredentialMode, setBootCredentialMode] = useState<BootCredentialMode>(
+    initialDraft?.bootCredentialMode ?? service.boot_credential_mode ?? 's4u',
+  );
 
   const [saving, setSaving] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   /** 「放弃修改」的两步确认（UX-19）：它同时会清掉草稿，一次点击不够 */
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  /** 开机启动是低频设置：默认折叠，标题行只显示开关状态，展开后才显示参数 */
+  const [bootExpanded, setBootExpanded] = useState(false);
   /** 表单字段 id 前缀（UX-11）：label 的 htmlFor 要指向真实存在的 id，用 useId 避免多处手写撞车 */
   const uid = useId();
 
@@ -173,6 +190,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     || bootEnabled !== (service.boot_enabled ?? false)
     || bootOrder !== (service.boot_order ?? 0)
     || bootRequired !== (service.boot_required ?? false)
+    || bootCredentialMode !== (service.boot_credential_mode ?? 's4u')
     || bootCheckKind !== originalBoot.kind
     || bootCheckValue !== originalBoot.value
     || (mode === 'template' && tplToolId !== (service.open_tool_id ?? ''))
@@ -184,11 +202,11 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     useServiceDraftStore.getState().setDraft(draftKey, formDirty ? {
       name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
       restartMode, enabled, showFileTree, toolCommands, tplToolId,
-      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired,
+      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
     } : null);
   }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
       restartMode, enabled, showFileTree, toolCommands, tplToolId,
-      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired]);
+      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode]);
 
   /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
   const handleDiscard = () => {
@@ -209,6 +227,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     setBootCheckKind(originalBoot.kind);
     setBootCheckValue(originalBoot.value);
     setBootRequired(service.boot_required ?? false);
+    setBootCredentialMode(service.boot_credential_mode ?? 's4u');
     setTplToolId(service.open_tool_id ?? '');
     setToolCommands(parseToolCommands(service.tool_commands));
     useServiceDraftStore.getState().setDraft(draftKey, null);
@@ -324,7 +343,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           watchExclude: watchExclude || undefined,
           envVars, restartMode, enabled, showFileTree,
           toolCommands: JSON.stringify(toolCommands),
-          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired,
+          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
         });
         // 保存拿到 id 之后才能绑：新建时选的打开工具在这里补上
         if (pendingToolId) {
@@ -338,7 +357,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       } else {
         const res = await serviceApi.update({
           ...basePayload,
-          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired,
+          bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
         });
         // 配置已落库，但文件监听没跟上必须说出来（CQ-35）：不说的话界面提示"已保存"，
         // 而用户改文件毫无反应——这正是 file_watcher.rs 把同类结论从 Ok(()) 改成 Err 的原因
@@ -581,97 +600,153 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 onClick={() => item.onChange(!item.checked)}
               >
                 <span className="flex-1 text-[13px] text-nexus-text">{item.label}</span>
-                {/* 开关：选中时 accent 蓝轨道 + 滑块右移 */}
-                <span
-                  role="switch"
-                  // UX-11：可见文字在兄弟 span 上，开关自己没有可访问名——读屏会只念"开关"
-                  aria-label={item.label}
-                  aria-checked={item.checked}
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    // 键盘切换（Enter/空格与 switch 惯例一致），鼠标走外层 div 点击
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      item.onChange(!item.checked);
-                    }
-                  }}
-                  className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-nexus-accent/40 ${
-                    item.checked ? 'bg-nexus-accent' : 'bg-nexus-border'
-                  }`}
-                >
-                  <span className={`absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
-                    item.checked ? 'translate-x-[16px]' : ''
-                  }`} />
-                </span>
+                <Switch checked={item.checked} onChange={item.onChange} label={item.label} />
               </div>
             ))}
           </div>
         </div>
 
-        {/* ── 开机启动卡片（仅服务；模板不携带开机语义） ── */}
+        {/* ── 开机启动卡片（仅服务；模板不携带开机语义） ──
+            低频设置，默认折叠成一行；展开后才显示开关、说明与全部参数，
+            避免长期占用服务编辑面板的纵向空间。 */}
         {mode === 'service' && (
           <div className={cardCls}>
-            <div
-              className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
-              onClick={() => setBootEnabled(v => !v)}
+            <button
+              type="button"
+              className="flex items-center gap-1.5 w-full text-left"
+              aria-expanded={bootExpanded}
+              onClick={() => setBootExpanded(v => !v)}
             >
-              <div className="flex-1 min-w-0">
-                <div className="text-[13px] text-nexus-text">开机自动启动（登录前）</div>
-                <div className="text-[10px] text-nexus-muted/60 mt-0.5">
-                  由开机启动器在登录界面拉起；需要先在「设置 &gt; 服务开机启动」安装启动器
-                </div>
-              </div>
-              <span
-                role="switch"
-                aria-label="开机自动启动"
-                aria-checked={bootEnabled}
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    setBootEnabled(v => !v);
-                  }
-                }}
-                className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-nexus-accent/40 ${
-                  bootEnabled ? 'bg-nexus-accent' : 'bg-nexus-border'
-                }`}
+              <svg
+                className={`flex-shrink-0 text-nexus-muted transition-transform ${bootExpanded ? 'rotate-90' : ''}`}
+                width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
               >
-                <span className={`absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
-                  bootEnabled ? 'translate-x-[16px]' : ''
-                }`} />
-              </span>
-            </div>
+                <polyline points="3,1 7,5 3,9" />
+              </svg>
+              <span className="flex-1 min-w-0 text-[13px] text-nexus-text truncate">开机自动启动（登录前）</span>
+              <span
+                className={`flex-shrink-0 text-[10px] leading-[16px] px-1.5 rounded-full ${
+                  bootEnabled ? 'bg-nexus-accent/12 text-nexus-accent' : 'bg-nexus-hover/40 text-nexus-muted'
+                }`}
+                title={bootEnabled
+                  ? `顺序 ${bootOrder} · ${bootCredentialMode === 'password' ? '保存密码' : 'S4U'} · ${BOOT_CHECK_KIND_SHORT[bootCheckKind]}${bootRequired ? ' · 未就绪阻断后续' : ''}`
+                  : '当前未启用；展开后可配置'}
+              >{bootEnabled ? '已开启' : '已关闭'}</span>
+            </button>
 
-            {bootEnabled && (
-              <div className="mt-2.5 pt-2.5 border-t border-nexus-border/30 space-y-2.5">
+            {bootExpanded && (
+              <div className="mt-3 pt-3 border-t border-nexus-border/30">
+                <div
+                  className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+                  onClick={() => setBootEnabled(v => !v)}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] text-nexus-text">启用开机自动启动</div>
+                    <div className="text-[10px] text-nexus-muted/60 mt-0.5">
+                      由开机启动器在登录界面拉起；需要先在「设置 &gt; 服务开机启动」安装启动器
+                    </div>
+                  </div>
+                  <Switch checked={bootEnabled} onChange={setBootEnabled} label="开机自动启动" />
+                </div>
+
+                {/* 说清“取消开机启动”的边界：它只改变下次开机，不会停掉当前实例 */}
+                <p className="text-[10px] text-nexus-muted/50 mt-1.5 leading-relaxed">
+                  取消开机启动只影响下次开机，不会停止当前已由启动器运行的实例；
+                  如需立即停止，请点服务卡片上的「停止」，停止后即可本地启动。
+                </p>
+
+                {bootEnabled && (
+              <div className="mt-3 pt-3 border-t border-nexus-border/30 space-y-3">
                 {!enabled && (
                   <p className="text-[11px] text-nexus-warning leading-relaxed">
                     服务已关闭“跟随项目启动”，开机启动会被抑制；需要同时打开上一个开关。
+                    当前已运行的实例不会被自动停止。
                   </p>
                 )}
-                <div className="flex items-center gap-2">
-                  <label htmlFor={`${uid}-boot-order`} className={`${labelCls} flex-shrink-0`}>启动顺序</label>
-                  <input
-                    id={`${uid}-boot-order`}
-                    type="number"
-                    className={`${INPUT_CLS} !mt-0 w-24`}
-                    value={bootOrder}
-                    onChange={e => setBootOrder(Number(e.target.value) || 0)}
-                  />
-                  <span className="text-[10px] text-nexus-muted/50">数字小的先启动；与展示排序无关</span>
+                <div>
+                  <label htmlFor={`${uid}-boot-order`} className={labelCls}>启动顺序</label>
+                  <div className="mt-1.5">
+                    {/* 步进器：去掉 number 输入框的原生上下箭头，改为左右两个按钮 */}
+                    <div className="inline-flex items-stretch h-8 rounded-md border border-nexus-border bg-nexus-bg overflow-hidden focus-within:border-nexus-accent transition-colors">
+                      <button
+                        type="button"
+                        aria-label="启动顺序减一"
+                        className="w-8 flex items-center justify-center text-nexus-muted hover:bg-nexus-hover/60 hover:text-nexus-text transition-colors"
+                        onClick={() => setBootOrder(v => v - 1)}
+                      >
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                          <line x1="2" y1="5" x2="8" y2="5" />
+                        </svg>
+                      </button>
+                      <input
+                        id={`${uid}-boot-order`}
+                        type="number"
+                        className="w-14 bg-transparent text-center text-[13px] text-nexus-text border-x border-nexus-border/70 focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                        value={bootOrder}
+                        onChange={e => setBootOrder(Number(e.target.value) || 0)}
+                      />
+                      <button
+                        type="button"
+                        aria-label="启动顺序加一"
+                        className="w-8 flex items-center justify-center text-nexus-muted hover:bg-nexus-hover/60 hover:text-nexus-text transition-colors"
+                        onClick={() => setBootOrder(v => v + 1)}
+                      >
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                          <line x1="5" y1="2" x2="5" y2="8" />
+                          <line x1="2" y1="5" x2="8" y2="5" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-nexus-muted/50 mt-1">
+                    数字小的先启动；同一凭据模式内所有项目一起排序，与列表展示顺序无关
+                  </p>
                 </div>
                 <div>
-                  <label htmlFor={`${uid}-boot-check-kind`} className={labelCls}>就绪检查</label>
-                  <select
-                    id={`${uid}-boot-check-kind`}
-                    className={`${INPUT_CLS} mt-1`}
-                    value={bootCheckKind}
-                    onChange={e => setBootCheckKind(e.target.value as BootCheckKind)}
-                  >
-                    {(Object.keys(BOOT_CHECK_KIND_LABEL) as BootCheckKind[]).map(k => (
-                      <option key={k} value={k}>{BOOT_CHECK_KIND_LABEL[k]}</option>
+                  <span className={labelCls}>凭据模式</span>
+                  <div className="flex bg-nexus-bg rounded-md p-0.5 mt-1.5">
+                    {([
+                      { value: 's4u', label: 'S4U（免密码）' },
+                      { value: 'password', label: '保存密码' },
+                    ] as const).map(opt => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        aria-pressed={bootCredentialMode === opt.value}
+                        className={`flex-1 py-1.5 text-[12px] rounded transition-colors ${
+                          bootCredentialMode === opt.value
+                            ? 'bg-nexus-surface text-nexus-text font-medium shadow-sm'
+                            : 'text-nexus-muted hover:text-nexus-text'
+                        }`}
+                        onClick={() => setBootCredentialMode(opt.value)}
+                      >{opt.label}</button>
                     ))}
-                  </select>
+                  </div>
+                  <p className="text-[10px] text-nexus-muted/50 mt-1 leading-relaxed">
+                    {bootCredentialMode === 's4u'
+                      ? '无需密码，PIN / 微软账户可用；只能访问本地资源。'
+                      : '安装时弹出 Windows 原生凭据框，密码只交给计划任务；可访问网络共享，PIN 不适用。'}
+                    {' '}两种模式是两套独立启动器，启动顺序和阻断不跨模式生效。
+                  </p>
+                </div>
+                <div>
+                  <span className={labelCls}>就绪检查</span>
+                  <div className="grid grid-cols-4 gap-0.5 bg-nexus-bg rounded-md p-0.5 mt-1.5">
+                    {(Object.keys(BOOT_CHECK_KIND_LABEL) as BootCheckKind[]).map(k => (
+                      <button
+                        key={k}
+                        type="button"
+                        aria-pressed={bootCheckKind === k}
+                        title={BOOT_CHECK_KIND_LABEL[k]}
+                        className={`py-1.5 text-[11px] rounded whitespace-nowrap transition-colors ${
+                          bootCheckKind === k
+                            ? 'bg-nexus-surface text-nexus-text font-medium shadow-sm'
+                            : 'text-nexus-muted hover:text-nexus-text'
+                        }`}
+                        onClick={() => setBootCheckKind(k)}
+                      >{BOOT_CHECK_KIND_SHORT[k]}</button>
+                    ))}
+                  </div>
                   {bootCheckKind !== 'none' && (
                     <input
                       className={`${INPUT_CLS} font-mono mt-1.5`}
@@ -698,25 +773,16 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                   className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
                   onClick={() => setBootRequired(v => !v)}
                 >
-                  <span className="flex-1 text-[12px] text-nexus-text">未就绪时阻断后续服务</span>
-                  <span
-                    role="checkbox"
-                    aria-label="未就绪时阻断后续服务"
-                    aria-checked={bootRequired}
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setBootRequired(v => !v);
-                      }
-                    }}
-                    className={`w-[15px] h-[15px] rounded border flex items-center justify-center text-[10px] leading-none transition-colors ${
-                      bootRequired
-                        ? 'bg-nexus-accent border-nexus-accent text-white'
-                        : 'border-nexus-border text-transparent'
-                    }`}
-                  >✓</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12px] text-nexus-text">未就绪时阻断后续服务</div>
+                    <div className="text-[10px] text-nexus-muted/50 mt-0.5">
+                      本服务未通过就绪检查时，同一模式下所有后续服务（含其他项目）不再启动
+                    </div>
+                  </div>
+                  <Switch checked={bootRequired} onChange={setBootRequired} label="未就绪时阻断后续服务" />
                 </div>
+              </div>
+                )}
               </div>
             )}
           </div>
@@ -987,6 +1053,42 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
       {/* 工具库管理（全局增删改 + 快捷填充） */}
       <ToolsManagerModal open={showToolManager} onClose={() => setShowToolManager(false)} />
     </div>
+  );
+}
+
+// ── 通用开关 ──────────────────────────────────────────────
+
+/**
+ * 行为设置 / 开机启动 / 阻断后续服务三处共用的开关。
+ *
+ * 可见文字在兄弟节点上，开关自己必须带 aria-label（UX-11：否则读屏只念"开关"）。
+ * 鼠标点击走外层行的 onClick，这里只补键盘切换。
+ */
+function Switch({ checked, onChange, label }: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+}) {
+  return (
+    <span
+      role="switch"
+      aria-label={label}
+      aria-checked={checked}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onChange(!checked);
+        }
+      }}
+      className={`relative flex-shrink-0 w-[34px] h-[18px] rounded-full transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-nexus-accent/40 ${
+        checked ? 'bg-nexus-accent' : 'bg-nexus-border'
+      }`}
+    >
+      <span className={`absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
+        checked ? 'translate-x-[16px]' : ''
+      }`} />
+    </span>
   );
 }
 

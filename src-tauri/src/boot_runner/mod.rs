@@ -70,7 +70,13 @@ mod imp {
     }
 
     struct RunningChild {
-        child: Child,
+        /// 直接子进程。`startup.bat`/`start` 这类命令会另开窗口后立即退出，
+        /// 此时置 None，服务是否仍在跑由 `adopted` 判定（与 GUI 的 ProcessManager 同一套逻辑）。
+        child: Option<Child>,
+        /// 直接子进程的启动时刻（ms）：认领游离后代时排除 pid 复用
+        child_started_at: u64,
+        /// 直接子进程退出后接管的存活后代
+        adopted: Vec<crate::core::process::AdoptedChild>,
         name: String,
         log_path: String,
     }
@@ -121,9 +127,9 @@ mod imp {
     }
 
     fn real_main() -> Result<(), String> {
-        let manifest_path = arg_value("--manifest")
-            .map(PathBuf::from)
-            .unwrap_or_else(boot::manifest_path);
+        let Some(manifest_path) = arg_value("--manifest").map(PathBuf::from) else {
+            return Err("缺少 --manifest 参数（任务 action 应由安装命令生成）".into());
+        };
         let mode = arg_value("--mode").unwrap_or_else(|| "s4u".to_string());
         if mode != "s4u" && mode != "password" {
             return Err(format!("未知的 --mode: {}（只支持 s4u / password）", mode));
@@ -198,6 +204,9 @@ mod imp {
         // 否则任务会一直挂着一个没有用的 runner，且“停止/卸载”还得先找到它。
         if runner.manifest.services.is_empty() {
             runner.log.info("manifest 没有服务，runner 退出");
+            // pid=0 = 干净退出：GUI 据此显示“已停止”，而不是把最后一次心跳当成“无响应”
+            runner.state.runner_pid = 0;
+            runner.write_state();
             let _ = std::fs::remove_file(boot_dir.join("runner.lock"));
             return Ok(());
         }
@@ -214,6 +223,10 @@ mod imp {
                     s.phase = "skipped".into();
                     s.error = "前一个必需服务未就绪，已跳过".into();
                 });
+                runner.log.info(&format!(
+                    "跳过服务「{}」：前一个必需服务未就绪（顺序 {}）",
+                    svc.name, svc.order
+                ));
                 continue;
             }
             let result = runner.start_service(svc);
@@ -245,8 +258,10 @@ mod imp {
             std::thread::sleep(COMMAND_POLL);
         }
 
-        // 正常退出：先停服务，再写最终状态
+        // 正常退出：先停服务，再写最终状态。
+        // pid=0 = 干净退出：GUI 据此显示“已停止”，而不是把最后一次心跳当成“无响应”。
         runner.stop_all();
+        runner.state.runner_pid = 0;
         runner.write_state();
         let _ = std::fs::remove_file(boot_dir.join("runner.lock"));
         runner.log.info("runner 已退出");
@@ -368,7 +383,9 @@ mod imp {
             let pid = child.id();
             let process_started_at = crate::core::process::process_start_time_millis(pid).unwrap_or(0);
             self.running.insert(svc.id.clone(), RunningChild {
-                child,
+                child: Some(child),
+                child_started_at: process_started_at,
+                adopted: Vec::new(),
                 name: svc.name.clone(),
                 log_path: svc.log_path.clone(),
             });
@@ -383,6 +400,7 @@ mod imp {
             ));
 
             // 就绪检查：失败不杀进程（它可能只是慢），但状态记为 failed 供界面显示
+            let wait_started = Instant::now();
             let ready = self.wait_ready(svc);
             match ready {
                 Ok(()) => {
@@ -391,6 +409,12 @@ mod imp {
                         s.ready_at = Some(chrono::Utc::now().to_rfc3339());
                     });
                     self.write_state();
+                    // 记下检查耗时：排查“为什么后面的服务半天没起来”时，这行是直接证据
+                    self.log.info(&format!(
+                        "服务「{}」已就绪（就绪检查耗时 {:.1}s）",
+                        svc.name,
+                        wait_started.elapsed().as_secs_f64()
+                    ));
                     Ok(())
                 }
                 Err(e) => {
@@ -439,27 +463,136 @@ mod imp {
             }
         }
 
-        /// 子进程已退出时返回退出码（`Some(None)` = 已退出但拿不到退出码）；
-        /// 仍在运行 / 不在表里时返回 `None`。
+        /// 子进程（含认领的后代）都退出时返回退出码；仍在运行返回 `None`。
+        ///
+        /// 直接子进程退出不代表服务结束：`startup.bat`/`start` 会另开窗口并立即返回，
+        /// 真正的工作进程（java.exe 等）仍在跑。这里复用 `core::process` 的认领逻辑，
+        /// 接管存活后代后继续把服务算作运行中。
         fn child_exit_code(&mut self, id: &str) -> Option<Option<i32>> {
-            let run = self.running.get_mut(id)?;
-            match run.child.try_wait() {
-                Ok(Some(status)) => Some(status.code()),
-                _ => None,
+            let direct = {
+                let run = self.running.get_mut(id)?;
+                match run.child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => Some(status.code()),
+                        _ => return None,
+                    },
+                    None => None,
+                }
+            };
+            if let Some(code) = direct {
+                if self.adopt_if_survivors(id) {
+                    return None;
+                }
+                return Some(code);
             }
+            let run = self.running.get(id)?;
+            if run.adopted.iter().any(|a| a.handle.is_alive()) {
+                None
+            } else {
+                Some(run.adopted.iter().find_map(|a| a.handle.exit_code()))
+            }
+        }
+
+        /// 直接子进程已退出时认领仍存活的后代；返回 true = 服务应继续算运行中。
+        fn adopt_if_survivors(&mut self, id: &str) -> bool {
+            let (pid, started, name) = {
+                let Some(run) = self.running.get(id) else { return false };
+                let Some(child) = run.child.as_ref() else { return false };
+                (child.id(), run.child_started_at, run.name.clone())
+            };
+            let adopted = crate::core::process::adopt_survivors(pid, started);
+            if adopted.is_empty() {
+                return false;
+            }
+            let who = adopted
+                .iter()
+                .map(|a| format!("{} (pid {})", a.name, a.pid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let count = adopted.len();
+            if let Some(run) = self.running.get_mut(id) {
+                run.child = None;
+                run.adopted = adopted;
+            }
+            self.log.info(&format!(
+                "服务「{}」直接子进程已退出，已接管 {} 个仍在运行的进程：{}；按仍在运行处理",
+                name, count, who,
+            ));
+            self.sync_state_pid(id);
+            true
+        }
+
+        /// 把 state.pid/process_started_at 指向当前仍存活的代表进程
+        /// （GUI 用这两个字段判断服务是否在跑、显示 PID）。
+        fn sync_state_pid(&mut self, id: &str) {
+            let leader = {
+                let Some(run) = self.running.get(id) else { return };
+                if let Some(child) = run.child.as_ref() {
+                    Some((child.id(), run.child_started_at))
+                } else {
+                    run.adopted
+                        .iter()
+                        .find(|a| a.handle.is_alive())
+                        .map(|a| (a.pid, crate::core::process::process_start_time_millis(a.pid).unwrap_or(0)))
+                }
+            };
+            let Some((pid, started_at)) = leader else { return };
+            let changed = self.state.services.get(id)
+                .map(|s| s.pid != Some(pid) || s.process_started_at != Some(started_at))
+                .unwrap_or(true);
+            if !changed {
+                return;
+            }
+            self.set_state(id, |s| {
+                s.pid = Some(pid);
+                s.process_started_at = Some(started_at);
+            });
+            self.write_state();
         }
 
         fn poll_children(&mut self) {
             let mut exited: Vec<(String, Option<i32>)> = Vec::new();
+            let mut exited_direct: Vec<String> = Vec::new();
+            let mut poll_errors: Vec<String> = Vec::new();
             for (id, run) in self.running.iter_mut() {
-                match run.child.try_wait() {
-                    Ok(Some(status)) => exited.push((id.clone(), status.code())),
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.log.info(&format!("查询服务「{}」状态失败: {}", run.name, e));
+                match run.child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(_)) => exited_direct.push(id.clone()),
+                        Ok(None) => {}
+                        Err(e) => poll_errors.push(format!("查询服务「{}」状态失败: {}", run.name, e)),
+                    },
+                    // 直接子进程已退出：接管的进程全退才算服务退出
+                    None => {
+                        if !run.adopted.iter().any(|a| a.handle.is_alive()) {
+                            let code = run.adopted.iter().find_map(|a| a.handle.exit_code());
+                            exited.push((id.clone(), code));
+                        }
                     }
                 }
             }
+            for msg in poll_errors {
+                self.log.info(&msg);
+            }
+
+            for id in exited_direct {
+                // 先取直接子进程的退出码（认领失败时它就是服务的退出码）
+                let code = self.running.get_mut(&id)
+                    .and_then(|r| r.child.as_mut())
+                    .and_then(|c| c.try_wait().ok().flatten())
+                    .and_then(|s| s.code());
+                if !self.adopt_if_survivors(&id) {
+                    exited.push((id, code));
+                }
+            }
+            // 接管后代表进程可能换了（原 leader 退出、其余仍活）：同步 state.pid
+            let adopted_ids: Vec<String> = self.running.iter()
+                .filter(|(_, r)| r.child.is_none() && !r.adopted.is_empty())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in adopted_ids {
+                self.sync_state_pid(&id);
+            }
+
             for (id, code) in exited {
                 let run = self.running.remove(&id);
                 let (name, log_path) = run
@@ -485,29 +618,49 @@ mod imp {
                 });
                 return Ok(());
             };
-            let pid = run.child.id();
             let mut kill_error = String::new();
-            if let Err(e) = crate::core::process::kill_process_tree(pid) {
-                kill_error = e;
+            if let Some(child) = run.child.as_mut() {
+                if let Err(e) = crate::core::process::kill_process_tree(child.id()) {
+                    kill_error = e;
+                }
+            }
+            // 直接子进程已经退出时，真正在跑的是认领的后代——必须一起结束，
+            // 否则 Tomcat 这类“另开窗口”的服务点了停止还在跑。
+            for a in &run.adopted {
+                if a.handle.is_alive() {
+                    if let Err(e) = crate::core::process::kill_process_tree(a.pid) {
+                        if kill_error.is_empty() {
+                            kill_error = e;
+                        }
+                    }
+                }
             }
             let deadline = Instant::now() + STOP_WAIT;
             while Instant::now() < deadline {
-                if matches!(run.child.try_wait(), Ok(Some(_))) {
+                let child_dead = match run.child.as_mut() {
+                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                    None => true,
+                };
+                let adopted_dead = run.adopted.iter().all(|a| !a.handle.is_alive());
+                if child_dead && adopted_dead {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let code = run.child.try_wait().ok().flatten().and_then(|s| s.code());
+            let pid_log = run.child.as_ref().map(|c| c.id())
+                .or_else(|| run.adopted.first().map(|a| a.pid))
+                .unwrap_or(0);
+            let code = run.child.as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+                .and_then(|s| s.code())
+                .or_else(|| run.adopted.iter().find_map(|a| a.handle.exit_code()));
             self.set_state(id, |s| {
                 s.phase = "stopped".into();
                 s.pid = None;
                 s.exit_code = code;
                 s.error = if kill_error.is_empty() { String::new() } else { format!("停止未完成: {}", kill_error) };
             });
-            // 主进程已退出后，job 里的游离孙进程交给 Job Object 兜底；
-            // 这里再走一次 taskkill 树是无效的（pid 已消失），不过 kill_process_tree
-            // 在 stop 前执行，已经覆盖了当时的进程树
-            self.log.info(&format!("已停止服务「{}」pid={}", run.name, pid));
+            self.log.info(&format!("已停止服务「{}」pid={}", run.name, pid_log));
             self.write_state();
             Ok(())
         }
@@ -689,6 +842,102 @@ mod imp {
         let path = results_dir.join(format!("{}.json", id));
         if let Ok(bytes) = serde_json::to_vec(&result) {
             let _ = boot::write_atomic(&path, &bytes);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        /// 回归：`startup.bat` / `start` 这类命令的**直接子进程会立即退出**，
+        /// 真正的工作进程另开窗口继续跑。启动器必须接管它并继续算运行中，
+        /// 不能把服务标成“已退出/失败”（用户报的 Tomcat 场景）。
+        #[test]
+        fn test_detached_child_is_adopted_not_marked_exited() {
+            let dir = std::env::temp_dir().join(format!("nexus_runner_adopt_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("建临时目录");
+            let log_path = dir.join("logs").join("s1.log");
+            let svc = BootService {
+                id: "s1".into(),
+                project_id: "p1".into(),
+                name: "TomcatLike".into(),
+                // /b 不开新窗口，但 cmd 会立即退出、ping 继续跑——与 startup.bat 同形
+                command: "start /b ping -n 10 127.0.0.1".into(),
+                cwd: String::new(),
+                env: BTreeMap::new(),
+                // 用 delay 检查走一遍 wait_ready 里的“直接子进程退出 → 认领”路径
+                check: BootCheck::Delay { seconds: 1 },
+                required: false,
+                order: 0,
+                log_path: log_path.to_string_lossy().to_string(),
+            };
+            let manifest = BootManifest {
+                version: MANIFEST_VERSION,
+                generated_at: String::new(),
+                env: BTreeMap::new(),
+                services: vec![svc.clone()],
+            };
+            let log = Arc::new(RunnerLog::open(&dir.join("runner.log")).expect("打开日志"));
+            let mut runner = Runner {
+                state: init_state(&manifest, std::process::id(), 0, "s4u"),
+                manifest,
+                manifest_path: dir.join("manifest.json"),
+                boot_dir: dir.clone(),
+                running: HashMap::new(),
+                log,
+                job: None,
+                shutdown: false,
+            };
+
+            runner.start_service(&svc).expect("启动服务");
+            std::thread::sleep(Duration::from_millis(1200));
+            runner.poll_children();
+
+            let adopted: Vec<u32> = {
+                let run = runner.running.get("s1")
+                    .expect("直接子进程退出后应接管游离进程，而不是标记退出");
+                assert!(!run.adopted.is_empty(), "应认领到 ping 进程");
+                assert!(run.adopted.iter().any(|a| a.handle.is_alive()), "接管的进程应仍在运行");
+                run.adopted.iter().map(|a| a.pid).collect()
+            };
+            let state = &runner.state.services["s1"];
+            assert_eq!(state.phase, "ready");
+            assert!(state.pid.is_some(), "state.pid 应指向接管的代表进程");
+
+            // 取消开机启动 = 新 manifest 里没有它。reload 只更新清单，
+            // **不能**顺手停掉当前已运行的实例（停止由用户显式操作）。
+            let empty = BootManifest {
+                version: MANIFEST_VERSION,
+                generated_at: String::new(),
+                env: BTreeMap::new(),
+                services: Vec::new(),
+            };
+            std::fs::write(&runner.manifest_path, serde_json::to_vec(&empty).expect("序列化"))
+                .expect("写新 manifest");
+            runner.reload().expect("重新加载 manifest");
+            assert!(
+                runner.running.contains_key("s1"),
+                "取消开机启动不应停止当前实例"
+            );
+            assert_eq!(runner.state.services["s1"].phase, "ready");
+
+            runner.stop_service("s1").expect("停止服务");
+            assert!(!runner.running.contains_key("s1"));
+            for pid in adopted {
+                for _ in 0..40 {
+                    if crate::core::process::process_start_time_millis(pid).is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    crate::core::process::process_start_time_millis(pid).is_none(),
+                    "停止后认领的进程仍在运行（pid {}）",
+                    pid
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

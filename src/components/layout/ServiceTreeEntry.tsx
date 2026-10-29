@@ -157,14 +157,16 @@ export function ServiceTreeEntry({
           {service.boot_enabled && (
             <span
               className={`text-[10px] leading-[15px] px-1.5 rounded-full flex-shrink-0 ${
-                service.enabled
-                  ? 'bg-nexus-accent/12 text-nexus-accent'
-                  : 'bg-nexus-hover/40 text-nexus-muted'
+                !service.enabled
+                  ? 'bg-nexus-hover/40 text-nexus-muted'
+                  : service.boot_credential_mode === 'password'
+                    ? 'bg-nexus-warning/12 text-nexus-warning'
+                    : 'bg-nexus-accent/12 text-nexus-accent'
               }`}
               title={service.enabled
-                ? '已设置开机启动；需在「设置 > 服务开机启动」安装启动器后生效'
+                ? `已设置开机启动（${service.boot_credential_mode === 'password' ? '保存密码' : 'S4U'}）；需在「设置 > 服务开机启动」安装对应启动器后生效`
                 : '已设置开机启动，但服务被禁用，实际不会启动'}
-            >开机</span>
+            >{service.boot_credential_mode === 'password' ? '开机·密码' : '开机'}</span>
           )}
 
           {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。

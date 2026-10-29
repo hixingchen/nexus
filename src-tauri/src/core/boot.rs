@@ -21,35 +21,109 @@ pub const HEARTBEAT_STALE_MS: i64 = 10_000;
 /// 启动器状态文件的版本
 pub const STATE_VERSION: u32 = 1;
 
-// ─── 路径（单一来源）─────────────────────────────────────────
+// ─── 凭据模式 ────────────────────────────────────────────────
 
-pub fn boot_dir() -> PathBuf {
-    crate::data_dir().join("boot")
+/// 开机启动凭据模式。一个模式 = 一个计划任务 + 一个 runner + 一套
+/// manifest/state/commands/logs；服务按 `boot_credential_mode` 只进入其中一套。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootMode {
+    S4u,
+    Password,
 }
 
-pub fn manifest_path() -> PathBuf {
-    boot_dir().join("manifest.json")
+impl BootMode {
+    pub const ALL: [BootMode; 2] = [BootMode::S4u, BootMode::Password];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootMode::S4u => "s4u",
+            BootMode::Password => "password",
+        }
+    }
+
+    pub fn display(self) -> &'static str {
+        match self {
+            BootMode::S4u => "S4U",
+            BootMode::Password => "保存密码",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "s4u" => Ok(BootMode::S4u),
+            "password" => Ok(BootMode::Password),
+            other => Err(format!("未知的开机启动模式: {}", other)),
+        }
+    }
 }
 
-pub fn state_path() -> PathBuf {
-    boot_dir().join("state.json")
+/// 每个模式独立的目录：`<data_dir>/boot/s4u/...` / `<data_dir>/boot/password/...`。
+pub fn boot_root(mode: BootMode) -> PathBuf {
+    crate::data_dir().join("boot").join(mode.as_str())
 }
 
-pub fn logs_dir() -> PathBuf {
-    boot_dir().join("logs")
+pub fn manifest_path(mode: BootMode) -> PathBuf {
+    boot_root(mode).join("manifest.json")
 }
 
-pub fn commands_dir() -> PathBuf {
-    boot_dir().join("commands")
+pub fn state_path(mode: BootMode) -> PathBuf {
+    boot_root(mode).join("state.json")
 }
 
-pub fn results_dir() -> PathBuf {
-    boot_dir().join("results")
+pub fn logs_dir(mode: BootMode) -> PathBuf {
+    boot_root(mode).join("logs")
+}
+
+pub fn commands_dir(mode: BootMode) -> PathBuf {
+    boot_root(mode).join("commands")
+}
+
+pub fn results_dir(mode: BootMode) -> PathBuf {
+    boot_root(mode).join("results")
+}
+
+/// 服务 id → 安全文件名。
+///
+/// id 由后端生成 UUID，但 manifest/日志路径直接拼 id；DB 被篡改或导入异常数据时
+/// 不能让 `..\` / 路径分隔符把日志写出日志目录。只保留 UUID 会用到的字符。
+fn safe_file_stem(id: &str) -> String {
+    let stem: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if stem.is_empty() { "unknown".to_string() } else { stem }
 }
 
 /// 服务日志路径：**永远按 id**，同名服务不会写进同一个文件。
-pub fn service_log_path(service_id: &str) -> PathBuf {
-    logs_dir().join(format!("{}.log", service_id))
+pub fn service_log_path(mode: BootMode, service_id: &str) -> PathBuf {
+    logs_dir(mode).join(format!("{}.log", safe_file_stem(service_id)))
+}
+
+/// 旧版单任务的日志路径（升级后未迁移时读取）。
+pub fn legacy_service_log_path(service_id: &str) -> PathBuf {
+    legacy_boot_dir().join("logs").join(format!("{}.log", safe_file_stem(service_id)))
+}
+
+// ─── 旧版单任务路径（迁移用）─────────────────────────────────
+//
+// 1.10.x 之前只有一个任务，路径是 `<data_dir>/boot/...`。混合模式后旧的
+// task/runner 必须被清理，否则它会在开机时和新任务同时拉起同一批服务。
+
+pub fn legacy_boot_dir() -> PathBuf {
+    crate::data_dir().join("boot")
+}
+
+pub fn legacy_state_path() -> PathBuf {
+    legacy_boot_dir().join("state.json")
+}
+
+pub fn legacy_commands_dir() -> PathBuf {
+    legacy_boot_dir().join("commands")
+}
+
+pub fn legacy_results_dir() -> PathBuf {
+    legacy_boot_dir().join("results")
 }
 
 // ─── 就绪检查 ────────────────────────────────────────────────
@@ -219,26 +293,39 @@ fn capture_env_snapshot() -> BTreeMap<String, String> {
     out
 }
 
-/// 从 DB 生成 manifest（会写盘）。
-///
-/// 调用点：服务/项目的增删改之后、安装启动器之前。失败**不影响配置已落库**，
-/// 调用方应把错误带回界面（与 `update_service` 的 watch_error 同一口径）。
-pub fn sync_manifest(db: &crate::database::Database) -> Result<BootManifest, String> {
-    sync_manifest_to(db, &boot_dir())
+/// 生成**两个模式**的 manifest（会写盘）。每个服务只进入其
+/// `boot_credential_mode` 对应的那一个。
+pub fn sync_all_manifests(
+    db: &crate::database::Database,
+) -> Result<Vec<(BootMode, BootManifest)>, String> {
+    let mut out = Vec::with_capacity(BootMode::ALL.len());
+    for mode in BootMode::ALL {
+        out.push((mode, sync_manifest_for(db, mode)?));
+    }
+    Ok(out)
 }
 
-/// `sync_manifest` 的可注入目录版本：测试用临时目录，避免写用户的真实 `~/.nexus`。
+/// 生成指定模式的 manifest（会写盘）。
+pub fn sync_manifest_for(
+    db: &crate::database::Database,
+    mode: BootMode,
+) -> Result<BootManifest, String> {
+    sync_manifest_to(db, &boot_root(mode), mode)
+}
+
+/// `sync_manifest_for` 的可注入目录版本：测试用临时目录，避免写用户的真实 `~/.nexus`。
 pub fn sync_manifest_to(
     db: &crate::database::Database,
     boot_dir: &std::path::Path,
+    mode: BootMode,
 ) -> Result<BootManifest, String> {
     let rows = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, name, command, cwd, env_vars, boot_check, boot_required, boot_order \
-             FROM services WHERE boot_enabled=1 AND enabled=1 \
+             FROM services WHERE boot_enabled=1 AND enabled=1 AND boot_credential_mode=?1 \
              ORDER BY boot_order, sort_index, name",
         ).map_err(|e| format!("查询开机启动服务失败: {}", e))?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([mode.as_str()], |row| {
             Ok((
                 row.get::<_, String>("id")?,
                 row.get::<_, String>("project_id")?,
@@ -271,7 +358,7 @@ pub fn sync_manifest_to(
             env.insert(k, v);
         }
         services.push(BootService {
-            log_path: logs_dir.join(format!("{}.log", id)).to_string_lossy().to_string(),
+            log_path: logs_dir.join(format!("{}.log", safe_file_stem(&id))).to_string_lossy().to_string(),
             id,
             project_id,
             name,
@@ -347,9 +434,43 @@ pub struct BootServiceState {
     pub project_id: String,
 }
 
-pub fn read_state() -> Option<BootRunnerState> {
-    let bytes = std::fs::read(state_path()).ok()?;
+pub fn read_state(mode: BootMode) -> Option<BootRunnerState> {
+    read_state_at(&state_path(mode))
+}
+
+/// 旧版单任务的状态（迁移时用来停止旧 runner）。
+pub fn read_legacy_state() -> Option<BootRunnerState> {
+    read_state_at(&legacy_state_path())
+}
+
+fn read_state_at(path: &std::path::Path) -> Option<BootRunnerState> {
+    let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// runner 进程本身是否还活着（**不看心跳**）。
+///
+/// pid + 启动时刻双重校验，排除 pid 复用。runner 卡住（心跳过期）时进程仍可能活着，
+/// 界面要能区分“进程还在但没响应”和“已经退出”。
+pub fn runner_process_alive(state: &BootRunnerState) -> bool {
+    if state.runner_pid == 0 {
+        return false;
+    }
+    crate::core::process::process_start_time_millis(state.runner_pid)
+        .map(|t| t == state.runner_started_at_ms)
+        .unwrap_or(false)
+}
+
+/// state 里记录的服务进程是否还活着。
+///
+/// 这是“服务在不在跑”的**独立判据**：不依赖 runner 心跳，runner 退出/卡住后
+/// 仍能正确显示由它拉起、且仍然存活的子进程（否则界面会把它们全当成没启动）。
+pub fn service_alive(s: &BootServiceState) -> bool {
+    let Some(pid) = s.pid else { return false; };
+    let Some(expected) = s.process_started_at else { return false; };
+    crate::core::process::process_start_time_millis(pid)
+        .map(|t| t == expected)
+        .unwrap_or(false)
 }
 
 /// 状态是否来自一个仍然存活、且心跳新鲜的 runner。
@@ -366,9 +487,7 @@ pub fn runner_reachable(state: &BootRunnerState) -> bool {
     if !fresh {
         return false;
     }
-    crate::core::process::process_start_time_millis(state.runner_pid)
-        .map(|t| t == state.runner_started_at_ms)
-        .unwrap_or(false)
+    runner_process_alive(state)
 }
 
 // ─── 控制命令（文件队列）─────────────────────────────────────
@@ -399,14 +518,35 @@ fn command_file(dir: &std::path::Path, id: &str) -> PathBuf {
     dir.join(format!("{}.json", id))
 }
 
-/// 发送一条命令并等待 runner 回结果（最长 `timeout`）。
+/// 向指定模式的 runner 发送一条命令并等待结果（最长 `timeout`）。
 ///
 /// 调用方必须在**阻塞线程**里调用（runner 的轮询是 250ms 级）。
-pub fn send_command(command: BootCommand, timeout: Duration) -> Result<BootCommandResult, String> {
-    std::fs::create_dir_all(commands_dir()).map_err(|e| format!("创建命令目录失败: {}", e))?;
-    std::fs::create_dir_all(results_dir()).map_err(|e| format!("创建结果目录失败: {}", e))?;
-    let cmd_path = command_file(&commands_dir(), &command.id);
-    let res_path = command_file(&results_dir(), &command.id);
+pub fn send_command(
+    mode: BootMode,
+    command: BootCommand,
+    timeout: Duration,
+) -> Result<BootCommandResult, String> {
+    send_command_to(&commands_dir(mode), &results_dir(mode), command, timeout)
+}
+
+/// 向旧版单任务 runner 发送命令（迁移时停止它）。
+pub fn send_legacy_command(
+    command: BootCommand,
+    timeout: Duration,
+) -> Result<BootCommandResult, String> {
+    send_command_to(&legacy_commands_dir(), &legacy_results_dir(), command, timeout)
+}
+
+fn send_command_to(
+    commands_dir: &std::path::Path,
+    results_dir: &std::path::Path,
+    command: BootCommand,
+    timeout: Duration,
+) -> Result<BootCommandResult, String> {
+    std::fs::create_dir_all(commands_dir).map_err(|e| format!("创建命令目录失败: {}", e))?;
+    std::fs::create_dir_all(results_dir).map_err(|e| format!("创建结果目录失败: {}", e))?;
+    let cmd_path = command_file(commands_dir, &command.id);
+    let res_path = command_file(results_dir, &command.id);
     let _ = std::fs::remove_file(&res_path);
     let cmd_bytes = serde_json::to_vec(&command)
         .map_err(|e| format!("序列化命令失败: {}", e))?;
@@ -469,7 +609,8 @@ mod tests {
         assert!(normalize_check(r#"{"type":"unknown"}"#).is_err());
     }
 
-    /// manifest 只看 `boot_enabled=1 AND enabled=1`，顺序按 boot_order，服务 env 覆盖快照。
+    /// manifest 只看 `boot_enabled=1 AND enabled=1` 且模式匹配的服务，
+    /// 顺序按 boot_order，服务 env 覆盖快照；两个模式的 manifest 互不混入。
     #[test]
     fn test_sync_manifest_filters_orders_and_merges_env() {
         let conn = rusqlite::Connection::open_in_memory().expect("内存库");
@@ -478,41 +619,64 @@ mod tests {
             "INSERT INTO projects (id, name, path, sort_index, created_at) VALUES ('p1','P','C:/p',0,'t')",
             [],
         ).expect("插入项目");
-        let insert = |id: &str, enabled: i32, boot: i32, order: i32, check: &str, env: &str| {
+        let insert = |id: &str, enabled: i32, boot: i32, order: i32, check: &str, env: &str, mode: &str| {
             conn.execute(
                 "INSERT INTO services (id, project_id, name, command, cwd, env_vars, enabled, \
-                 boot_enabled, boot_order, boot_check, boot_required) \
-                 VALUES (?1,'p1',?2,'echo x','C:/p',?3,?4,?5,?6,?7,1)",
-                rusqlite::params![id, format!("name-{}", id), env, enabled, boot, order, check],
+                 boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode) \
+                 VALUES (?1,'p1',?2,'echo x','C:/p',?3,?4,?5,?6,?7,1,?8)",
+                rusqlite::params![id, format!("name-{}", id), env, enabled, boot, order, check, mode],
             ).expect("插入服务");
         };
-        insert("s2", 1, 1, 2, "", "B=2");
-        insert("s1", 1, 1, 1, r#"{"type":"tcp","host":"127.0.0.1","port":3306,"timeoutSecs":60}"#, "A=1");
-        insert("s3", 0, 1, 0, "", ""); // enabled=0：必须被过滤
-        insert("s4", 1, 0, 0, "", ""); // boot_enabled=0：必须被过滤
+        insert("s2", 1, 1, 2, "", "B=2", "s4u");
+        insert("s1", 1, 1, 1, r#"{"type":"tcp","host":"127.0.0.1","port":3306,"timeoutSecs":60}"#, "A=1", "s4u");
+        insert("s3", 0, 1, 0, "", "", "s4u"); // enabled=0：必须被过滤
+        insert("s4", 1, 0, 0, "", "", "s4u"); // boot_enabled=0：必须被过滤
+        insert("s5", 1, 1, 0, "", "", "password"); // 密码模式：只进 password manifest
 
         let db = crate::database::Database::from_connection(conn);
         let dir = std::env::temp_dir().join(format!("nexus-boot-manifest-{}", uuid::Uuid::new_v4()));
-        let manifest = sync_manifest_to(&db, &dir).expect("生成 manifest");
+        let s4u_dir = dir.join("s4u");
+        let pwd_dir = dir.join("password");
+        let manifest = sync_manifest_to(&db, &s4u_dir, BootMode::S4u).expect("生成 S4U manifest");
+        let pwd = sync_manifest_to(&db, &pwd_dir, BootMode::Password).expect("生成密码 manifest");
 
         assert_eq!(manifest.services.len(), 2);
         assert_eq!(manifest.services[0].id, "s1", "boot_order 小的先出现");
         assert_eq!(manifest.services[1].id, "s2");
+        assert!(manifest.services.iter().all(|s| s.id != "s5"), "密码服务不能进 S4U manifest");
         assert_eq!(manifest.services[0].env.get("A").map(String::as_str), Some("1"));
         assert_eq!(manifest.services[0].env.get("B"), None);
         assert_eq!(
             manifest.services[0].check,
             BootCheck::Tcp { host: "127.0.0.1".into(), port: 3306, timeout_secs: 60 }
         );
+        assert!(manifest.services[0].log_path.contains("s4u"));
         assert!(manifest.services[0].log_path.ends_with("s1.log"));
+
+        assert_eq!(pwd.services.len(), 1);
+        assert_eq!(pwd.services[0].id, "s5");
+        assert!(pwd.services[0].log_path.contains("password"));
 
         // 写盘的是同一份结构（runner 读到的不是内存里的副本）
         let written: BootManifest = serde_json::from_slice(
-            &std::fs::read(dir.join("manifest.json")).expect("读 manifest"),
+            &std::fs::read(s4u_dir.join("manifest.json")).expect("读 manifest"),
         ).expect("解析 manifest");
         assert_eq!(written.services.len(), 2);
         assert_eq!(written.version, MANIFEST_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_service_log_path_cannot_escape_logs_dir() {
+        // DB 被篡改时 id 可能带路径分隔符/上跳；日志必须仍落在 logs 目录内
+        let p = service_log_path(BootMode::S4u, r"..\..\evil");
+        assert!(p.starts_with(logs_dir(BootMode::S4u)));
+        assert!(!p.to_string_lossy().contains(".."));
+        assert_eq!(p.file_name().unwrap().to_string_lossy(), "______evil.log");
+
+        let l = legacy_service_log_path(r"C:\Windows\System32\evil");
+        assert!(l.starts_with(legacy_boot_dir().join("logs")));
+        assert_eq!(l.file_name().unwrap().to_string_lossy(), "C__Windows_System32_evil.log");
     }
 }

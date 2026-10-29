@@ -76,6 +76,9 @@ pub struct UpdateServiceParams {
     pub boot_check: String,
     #[serde(default)]
     pub boot_required: bool,
+    /// s4u / password；空串/旧客户端按 s4u
+    #[serde(default)]
+    pub boot_credential_mode: String,
 }
 
 /// 服务添加参数
@@ -113,6 +116,8 @@ pub struct AddServiceParams {
     pub boot_check: Option<String>,
     #[serde(default)]
     pub boot_required: Option<bool>,
+    #[serde(default)]
+    pub boot_credential_mode: Option<String>,
 }
 
 /// 获取某个项目下的所有服务
@@ -145,10 +150,10 @@ pub fn add_service(
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
     let svc = insert_service_row(&state.db, &params, &cwd, &tool_commands)?;
     // 配置已落库；manifest 同步失败只留痕，不回滚用户刚保存的服务
-    if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+    if let Err(e) = crate::core::boot::sync_all_manifests(&state.db) {
         log::warn!("[nexus] 添加服务后同步开机启动 manifest 失败: {}", e);
     } else {
-        crate::commands::boot::reload_if_running();
+        crate::commands::boot::reload_all_if_running();
     }
     Ok(svc)
 }
@@ -189,6 +194,9 @@ pub(crate) fn insert_service_row(
         let boot_order = params.boot_order.unwrap_or(0);
         let boot_check = crate::core::boot::normalize_check(params.boot_check.as_deref().unwrap_or(""))?;
         let boot_required = params.boot_required.unwrap_or(false);
+        let boot_credential_mode = crate::core::boot::BootMode::parse(
+            params.boot_credential_mode.as_deref().unwrap_or("s4u"),
+        )?.as_str().to_string();
         conn.execute(
             &format!(
                 "INSERT INTO services ({}) VALUES ({})",
@@ -205,6 +213,7 @@ pub(crate) fn insert_service_row(
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
                 ":boot_enabled": boot_enabled, ":boot_order": boot_order,
                 ":boot_check": boot_check, ":boot_required": boot_required,
+                ":boot_credential_mode": boot_credential_mode,
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
@@ -214,7 +223,7 @@ pub(crate) fn insert_service_row(
             show_file_tree: sft,
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
-            boot_enabled, boot_order, boot_check, boot_required,
+            boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode,
         })
     })
 }
@@ -255,8 +264,11 @@ pub async fn update_service(
         // （监听路径为"跟随工作目录"的兜底值时不校验——见 validate_config_dirs）
         validate_config_dirs(&state.db, &state.paths, &cwd, &params.watch_paths)?;
         let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands.clone() };
-        // boot_check 与添加路径同一套校验：非法 JSON 不落库
+        // boot_check / 凭据模式与添加路径同一套校验：非法值不落库
         crate::core::boot::normalize_check(&params.boot_check)?;
+        crate::core::boot::BootMode::parse(
+            if params.boot_credential_mode.trim().is_empty() { "s4u" } else { &params.boot_credential_mode },
+        )?;
         let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
         // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）。
         // 刷新失败**不阻塞保存**（配置已经落库，监听下次项目级启停时会自然重建），
@@ -270,9 +282,9 @@ pub async fn update_service(
                 }
             };
         // 开机启动配置变更 → 重写 manifest（配置已落库；失败作为部分成功回传）
-        let boot_manifest_error = match crate::core::boot::sync_manifest(&state.db) {
+        let boot_manifest_error = match crate::core::boot::sync_all_manifests(&state.db) {
             Ok(_) => {
-                crate::commands::boot::reload_if_running();
+                crate::commands::boot::reload_all_if_running();
                 String::new()
             }
             Err(e) => {
@@ -315,6 +327,12 @@ pub(crate) fn write_service_update(
         };
         // 先归一化 boot_check 再写：保存入口与 manifest 生成共用同一套判据
         let boot_check = crate::core::boot::normalize_check(&params.boot_check)?;
+        let boot_mode_raw = if params.boot_credential_mode.trim().is_empty() {
+            "s4u"
+        } else {
+            params.boot_credential_mode.as_str()
+        };
+        let boot_credential_mode = crate::core::boot::BootMode::parse(boot_mode_raw)?.as_str().to_string();
         let affected = conn.execute(
             &format!(
                 "UPDATE services SET {} WHERE id=:id",
@@ -328,6 +346,7 @@ pub(crate) fn write_service_update(
                 ":show_file_tree": sft, ":tool_commands": tool_commands,
                 ":boot_enabled": params.boot_enabled, ":boot_order": params.boot_order,
                 ":boot_check": boot_check, ":boot_required": params.boot_required,
+                ":boot_credential_mode": boot_credential_mode,
                 ":id": params.id,
             },
         ).map_err(|e| format!("更新服务失败: {}", e))?;
@@ -408,12 +427,8 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 失败留痕（同 delete_project）：静默丢弃会留下仍在跑的孤儿进程，而服务记录已删、
         // UI 里再没有入口去停它。仍继续删除，残留进程由 Job Object 在应用退出时兜底。
         // 开机启动器拥有的服务不在本地进程表里，必须单独经 runner 停止。
-        if crate::commands::boot::is_boot_managed(&id)
-            && crate::commands::boot::runner_reachable_now()
-        {
-            if let Err(e) = crate::commands::boot::send_service_command("stop", &id) {
-                log::warn!("删除服务 {} 时停止开机启动器进程失败：{}", id, e);
-            }
+        if let Err(e) = crate::commands::boot::stop_boot_service(&id) {
+            log::warn!("删除服务 {} 时停止开机启动器进程失败：{}", id, e);
         }
         if let Err(e) = state.process_mgr.stop(&id) {
             log::warn!("删除服务 {} 时停止进程失败（进程可能残留至应用退出）：{}", id, e);
@@ -422,10 +437,10 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         delete_service_row(&state.db, &id)?;
         // 3.5 删除后重写开机启动 manifest：否则 next boot 还会启动一个界面上已经
         // 不存在的服务（runner 的 Job Object 也再也找不到它的停止入口）
-        if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+        if let Err(e) = crate::core::boot::sync_all_manifests(&state.db) {
             log::warn!("删除服务后同步开机启动 manifest 失败: {}", e);
         } else {
-            crate::commands::boot::reload_if_running();
+            crate::commands::boot::reload_all_if_running();
         }
         // 4. 从文件监听中移除该服务（避免残留监听对已删除服务弹"重启"框）
         if let Some(pid) = project_id {
@@ -601,6 +616,7 @@ pub fn add_service_from_template(
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
                 // 模板不携带开机启动：从模板添加的服务默认不参与登录前启动
                 ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
+                ":boot_credential_mode": "s4u",
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
@@ -620,6 +636,7 @@ pub fn add_service_from_template(
             id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
             boot_enabled: false, boot_order: 0, boot_check: String::new(), boot_required: false,
+            boot_credential_mode: "s4u".into(),
         })
     })
 }
@@ -828,6 +845,7 @@ mod tests {
             boot_order: None,
             boot_check: None,
             boot_required: None,
+            boot_credential_mode: None,
         }
     }
 
@@ -844,12 +862,14 @@ mod tests {
         p.watch_exclude = Some("dist".into());
         p.enabled = Some(false);
         p.show_file_tree = Some(true);
+        p.boot_credential_mode = Some("password".into());
 
         let svc = insert_service_row(&db, &p, "C:/s", "[]").expect("插入服务");
         assert_eq!(svc.watch_include, "*.ts");
         assert_eq!(svc.watch_exclude, "dist");
         assert!(!svc.enabled, "传了 false 就该是不启用");
         assert!(svc.show_file_tree, "传了 true 就该显示文件树");
+        assert_eq!(svc.boot_credential_mode, "password", "凭据模式应按传入值保存");
     }
 
     #[test]
@@ -863,6 +883,7 @@ mod tests {
         assert_eq!(a.watch_paths, r#"["C:/p"]"#);
         assert!(a.enabled, "新建服务默认启用");
         assert!(!a.show_file_tree);
+        assert_eq!(a.boot_credential_mode, "s4u", "不开机启动时模式默认 s4u");
         // 项目不存在时拒绝
         let mut p = add_params("c", "C:/p");
         p.project_id = "nope".into();
@@ -892,14 +913,23 @@ mod tests {
             boot_order: 0,
             boot_check: String::new(),
             boot_required: false,
+            boot_credential_mode: "password".into(),
         };
         let project_id = write_service_update(&db, &params, "C:/p/sub", "[]").unwrap();
         assert_eq!(project_id, "p1", "应回传所属项目，供调用方刷新监听");
         let got = db.with_conn(|c| {
             Ok(c.query_row(
-                "SELECT name, cwd, watch_paths, enabled, show_file_tree FROM services WHERE id=?1",
+                "SELECT name, cwd, watch_paths, enabled, show_file_tree, boot_credential_mode \
+                 FROM services WHERE id=?1",
                 [&svc.id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)?, r.get::<_, i32>(4)?)),
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i32>(3)?,
+                    r.get::<_, i32>(4)?,
+                    r.get::<_, String>(5)?,
+                )),
             ).unwrap())
         }).unwrap();
         assert_eq!(got.0, "a2");
@@ -907,6 +937,7 @@ mod tests {
         assert_eq!(got.2, r#"["C:/p/sub"]"#, "监听路径处于跟随状态时应随 cwd 更新");
         assert_eq!(got.3, 0, "enabled=false 应写 0");
         assert_eq!(got.4, 1, "show_file_tree=true 应写 1");
+        assert_eq!(got.5, "password", "凭据模式应随更新落库");
 
         // 自定义监听路径不被 cwd 变化覆盖
         let params2 = UpdateServiceParams { watch_paths: r#"["C:/other"]"#.into(), cwd: "C:/p/x".into(), ..params };

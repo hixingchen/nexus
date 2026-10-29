@@ -13,3 +13,7 @@ path = "src/main.rs"
 # 复用 Nexus 的 core::boot / boot_runner，不复制业务逻辑；
 # 独立 crate 是为了让 Tauri 的 MSI bundler 不会把同一个 sidecar 当成两个组件。
 nexus = { path = ".." }
+
+[build-dependencies]
+# tauri-build 已经在依赖图里，复用它嵌入图标不会新增下载包
+tauri-winres = "0.3"

@@ -253,6 +253,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       env_vars: '', restart_mode: 0, enabled: true, show_file_tree: false,
       sort_index: 0, tool_commands: '[]',
       boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
+      boot_credential_mode: 's4u',
     }));
   }, [projectId, setEditingService, setEditingTemplate]);
 
@@ -931,7 +932,7 @@ function ServiceSection({
           {services.some(s => s.boot_enabled && s.enabled) && (
             <span
               className="text-[10px] leading-[15px] px-1.5 rounded-full bg-nexus-accent/10 text-nexus-accent flex-shrink-0"
-              title="这些服务会在登录前的开机启动器中运行（设置 > 服务开机启动）"
+              title={`S4U ${services.filter(s => s.boot_enabled && s.enabled && s.boot_credential_mode === 's4u').length} 个 · 保存密码 ${services.filter(s => s.boot_enabled && s.enabled && s.boot_credential_mode === 'password').length} 个（设置 > 服务开机启动）`}
             >{services.filter(s => s.boot_enabled && s.enabled).length} 个开机启动</span>
           )}
         </div>

@@ -64,12 +64,12 @@ pub(crate) fn lock_lifecycle<'a>(lock: &'a Arc<Mutex<()>>, key: &str) -> std::sy
 /// ③ 点"停止"时进程表里已经没有这个服务了，是空操作 —— Tomcat 会一直跑下去。
 /// 认领（按父 pid 链走查 + 启动时刻校验，见 `super::winproc`）之后，服务继续算运行中，
 /// 停止能连同它一起结束，"停止"与"运行状态"两个语义都恢复正确。
-struct AdoptedChild {
-    pid: u32,
+pub(crate) struct AdoptedChild {
+    pub(crate) pid: u32,
     /// 映像名（`java.exe` 等），只用于日志里说清接管了谁
-    name: String,
+    pub(crate) name: String,
     /// 句柄：判存活与取退出码都不受 pid 复用影响（见 `winproc::OwnedProcess`）
-    handle: super::winproc::OwnedProcess,
+    pub(crate) handle: super::winproc::OwnedProcess,
 }
 
 /// 进程清理条目：停止 / 退出时交给 `cleanup_process` 的全部信息。
@@ -744,6 +744,14 @@ impl ProcessManager {
         self.snapshot_running()
     }
 
+    /// 进程表里是否有该 key（只读、不触发清理）。
+    ///
+    /// 启停路由用它判断“本地已有实例”：服务在本地跑着、同时又被配置成开机启动时，
+    /// 不能再把 start 发给 runner，否则同一台机器上会出现两份。
+    pub fn is_running(&self, key: &str) -> bool {
+        self.processes.lock().map(|p| p.contains_key(key)).unwrap_or(false)
+    }
+
     /// 只读的运行表快照（不推进任何生命周期）。后台线程 tick 完之后取它来判定/展示
     fn snapshot_running(&self) -> Vec<(String, String, Option<String>)> {
         // Phase 4: 重新获取锁，一次取齐 (project_id, service_id, 跟随的日志文件)。
@@ -954,7 +962,9 @@ fn is_console_host(name: &str) -> bool {
 ///
 /// 返回空 = 确实没有游离进程（调用方按服务真的退出处理）。
 /// 只认得下还在跑的：已退出的进程没必要接管，它的退出也不该让"服务"继续算运行中。
-fn adopt_survivors(pid: u32, started_at: u64) -> Vec<AdoptedChild> {
+/// 供 boot runner 复用：启动器里同样是 `cmd /c startup.bat` 直接退出、
+/// 真正的工作进程另开窗口继续跑，必须按同一套认领逻辑处理。
+pub(crate) fn adopt_survivors(pid: u32, started_at: u64) -> Vec<AdoptedChild> {
     let snapshot = super::winproc::snapshot_processes();
     let mut out = Vec::new();
     for child_pid in super::winproc::descendants(pid, &snapshot) {

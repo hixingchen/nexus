@@ -208,7 +208,7 @@ pub fn run() {
     // 每次启动刷新开机启动 manifest：环境快照（PATH/NVM_HOME 等）可能因为用户在
     // Nexus 关闭期间装了 Node/nvm 而变化，而 runner 在登录前读的就是这份快照。
     // 失败只留痕：服务配置本身不受影响，下次保存/安装会重试。
-    if let Err(e) = crate::core::boot::sync_manifest(&db) {
+    if let Err(e) = crate::core::boot::sync_all_manifests(&db) {
         log::warn!("[nexus] 启动时同步开机启动 manifest 失败: {}", e);
     }
 
@@ -356,6 +356,7 @@ pub fn run() {
             commands::autostart::set_autostart_enabled,
             // 服务开机启动：S4U 计划任务 + 独立 runner（登录前启动）
             commands::boot::get_boot_runner_status,
+            commands::boot::get_boot_services_status,
             commands::boot::install_boot_runner,
             commands::boot::uninstall_boot_runner,
             commands::boot::start_boot_runner,

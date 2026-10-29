@@ -15,7 +15,22 @@ import { failureDetail, failureLabel } from '../../utils/serviceFailure';
 import type { ServiceLogLine } from '../../services/logService';
 import type { FailedService } from '../../services/service';
 
-interface LogViewerProps { serviceKey: string; serviceName?: string; fill?: boolean; onClose?: () => void; }
+interface LogViewerProps {
+  serviceKey: string;
+  serviceName?: string;
+  fill?: boolean;
+  onClose?: () => void;
+  /**
+   * 无条件按 1 秒轮询日志文件。
+   *
+   * 默认只在 `isRunning && isBootRunning` 时轮询（日志事件只覆盖 Nexus 自己拉起的进程，
+   * boot 服务的文件在跑时也值得跟随）。从设置页打开 boot 日志时，running store 可能
+   * 因启动器失联而没有这个服务，但文件仍可读——此时用这个开关强制跟随。
+   */
+  forcePoll?: boolean;
+  /** 覆盖“运行中”判定：boot 服务在 runner 失联时仍可能活着，头部不应显示“未运行” */
+  runningOverride?: boolean;
+}
 
 /** 空数组常量（避免选择器每次返回新引用导致无谓重渲染） */
 const EMPTY_LINES: ServiceLogLine[] = [];
@@ -56,7 +71,7 @@ const SEARCH_DEBOUNCE_MS = 200;
  * 日志再多也不会让拖拽分隔条时逐帧重排上千行文本（原实现为整块 <pre> innerHTML，
  * 宽度一变就要重新断行 2000 行，是拖拽卡顿的主因）。
  */
-export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onClose }: LogViewerProps) {
+export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onClose, forcePoll, runningOverride }: LogViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Ctrl+滚轮调文本字号：日志正文与行高估算都跟着同一个设置走
   useCtrlWheelFontSize(scrollRef);
@@ -94,7 +109,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   // ── 运行状态 ──────────────────────────────────────────────
 
-  const isRunning = useRunningStore(s => s.running.some(r => r.service_id === serviceKey));
+  const storeRunning = useRunningStore(s => s.running.some(r => r.service_id === serviceKey));
+  /** 设置页拉起的 boot 日志：runner 失联时 running store 里没有它，由调用方直接给结论 */
+  const isRunning = runningOverride ?? storeRunning;
   /** 开机启动器拉起的服务：没有 service-log-batch 事件，日志靠增量轮询文件 */
   const isBootRunning = useRunningStore(s => s.running.some(
     r => r.service_id === serviceKey && r.source === 'boot',
@@ -134,10 +151,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // 开机启动器拉起的服务不经过 service-log-batch（它不在 Nexus 进程表里），
   // 面板打开期间按 1 秒轮询日志文件尾部；setLogs 按快照整份替换，不会重复。
   useEffect(() => {
-    if (!isRunning || !isBootRunning) return;
+    if (!forcePoll && (!isRunning || !isBootRunning)) return;
     const timer = setInterval(syncLogsFromBackend, 1000);
     return () => clearInterval(timer);
-  }, [isRunning, isBootRunning, syncLogsFromBackend]);
+  }, [isRunning, isBootRunning, forcePoll, syncLogsFromBackend]);
 
   // ── 搜索 ──────────────────────────────────────────────────
 

@@ -142,13 +142,9 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 仍继续删除：用户要的是删掉项目，不该因为一个停止失败而拒绝。残留进程由应用级
         // Job Object（KILL_ON_JOB_CLOSE）在 Nexus 退出时兜底回收。
         for sid in &ids {
-            // 开机启动器拥有的服务不在本地进程表里，必须单独经 runner 停止
-            if crate::commands::boot::is_boot_managed(sid)
-                && crate::commands::boot::runner_reachable_now()
-            {
-                if let Err(e) = crate::commands::boot::send_service_command("stop", sid) {
-                    log::warn!("删除项目 {} 时停止开机启动器服务 {} 失败：{}", id, sid, e);
-                }
+            // 开机启动器拥有的服务不在本地进程表里：优先走 runner，失联时按 PID 兜底结束
+            if let Err(e) = crate::commands::boot::stop_boot_service(sid) {
+                log::warn!("删除项目 {} 时停止开机启动器服务 {} 失败：{}", id, sid, e);
             }
             if let Err(e) = state.process_mgr.stop(sid) {
                 log::warn!("删除项目 {} 时停止服务 {} 失败（进程可能残留至应用退出）：{}", id, sid, e);
@@ -168,10 +164,10 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
             Ok(())
         })?;
         // 5. 重写开机启动 manifest：删除项目后不能再让 runner 下次开机启动已不存在的服务
-        if let Err(e) = crate::core::boot::sync_manifest(&state.db) {
+        if let Err(e) = crate::core::boot::sync_all_manifests(&state.db) {
             log::warn!("删除项目 {} 后同步开机启动 manifest 失败: {}", id, e);
         } else {
-            crate::commands::boot::reload_if_running();
+            crate::commands::boot::reload_all_if_running();
         }
         Ok(())
     }).await.map_err(|e| format!("删除项目任务失败: {}", e))?
@@ -248,6 +244,7 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
                     // 复制项目**不复制开机启动**：两个项目会启动同一套服务/抢同一个端口。
                     // 这是唯一的例外，见 test_duplicate_project_copies_every_service_column
                     ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
+                    ":boot_credential_mode": "s4u",
                 },
             ).map_err(|e| format!("复制服务配置失败: {}", e))?;
             // 打开工具绑定随服务一起复制：service_open_tools 以 service_id 为主键，
@@ -357,6 +354,7 @@ mod tests {
             ("boot_order", "3".to_string()),
             ("boot_check", r#"{"type":"tcp","host":"127.0.0.1","port":3306,"timeoutSecs":60}"#.to_string()),
             ("boot_required", "1".to_string()),
+            ("boot_credential_mode", "password".to_string()),
         ]);
 
         let missing: Vec<String> = columns_of(conn, "services")
@@ -429,7 +427,10 @@ mod tests {
             let mut compared = 0;
             for (col, want) in &src {
                 if matches!(col.as_str(), "id" | "project_id" | "created_at") { continue; }
-                if matches!(col.as_str(), "boot_enabled" | "boot_order" | "boot_check" | "boot_required") {
+                if matches!(
+                    col.as_str(),
+                    "boot_enabled" | "boot_order" | "boot_check" | "boot_required" | "boot_credential_mode"
+                ) {
                     continue;
                 }
                 assert_eq!(
@@ -446,6 +447,11 @@ mod tests {
                 assert_eq!(dup.get(col).map(String::as_str), Some("0"), "复制项目应重置 {}", col);
             }
             assert_eq!(dup.get("boot_check").map(String::as_str), Some(""), "复制项目应清空 boot_check");
+            assert_eq!(
+                dup.get("boot_credential_mode").map(String::as_str),
+                Some("s4u"),
+                "复制项目应把凭据模式重置为 s4u",
+            );
 
             // 打开工具绑定随服务一起复制
             let bound: String = conn

@@ -16,7 +16,7 @@ use crate::core::runtime::{
     TransferKind,
 };
 use crate::commands::app::AppPaths;
-use crate::commands::boot::{BootRunnerStatus, BootToggleResult};
+use crate::commands::boot::{BootRunnerStatus, BootServiceStatus, BootToggleResult};
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
 use crate::commands::process::{
@@ -342,6 +342,7 @@ fn test_response_dtos_are_snake_case() {
         boot_order: 0,
         boot_check: String::new(),
         boot_required: false,
+        boot_credential_mode: "s4u".into(),
     };
     assert_eq!(
         keys_of(&svc),
@@ -349,7 +350,7 @@ fn test_response_dtos_are_snake_case() {
             "id", "project_id", "name", "command", "cwd", "watch_paths", "watch_include",
             "watch_exclude", "env_vars", "restart_mode", "enabled", "show_file_tree",
             "sort_index", "tool_commands", "boot_enabled", "boot_order", "boot_check",
-            "boot_required",
+            "boot_required", "boot_credential_mode",
         ])
     );
 
@@ -452,6 +453,7 @@ fn test_response_dtos_are_snake_case() {
 
     // 开机启动器状态（设置 > 服务开机启动）
     let boot = BootRunnerStatus {
+        mode: "s4u".into(),
         installed: false,
         task_name: "n".into(),
         task_logon_type: String::new(),
@@ -459,6 +461,7 @@ fn test_response_dtos_are_snake_case() {
         runner_path: "p".into(),
         runner_installed: false,
         runner_reachable: false,
+        runner_alive: false,
         running_mode: String::new(),
         runner_pid: None,
         heartbeat_at: String::new(),
@@ -469,14 +472,40 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(
         keys_of(&boot),
         sorted(&[
-            "installed", "task_name", "task_logon_type", "task_path_ok",
+            "mode", "installed", "task_name", "task_logon_type", "task_path_ok",
             "runner_path", "runner_installed",
-            "runner_reachable", "running_mode", "runner_pid", "heartbeat_at",
+            "runner_reachable", "runner_alive", "running_mode", "runner_pid", "heartbeat_at",
             "boot_service_count", "state", "message",
         ])
     );
     let toggle = BootToggleResult { boot_enabled: true, boot_manifest_error: String::new() };
     assert_eq!(keys_of(&toggle), sorted(&["boot_enabled", "boot_manifest_error"]));
+    let boot_svc = BootServiceStatus {
+        service_id: "s".into(),
+        name: "n".into(),
+        project_id: "p".into(),
+        mode: "s4u".into(),
+        phase: "ready".into(),
+        alive: true,
+        pid: Some(1),
+        started_at: String::new(),
+        ready_at: String::new(),
+        exit_code: None,
+        error: String::new(),
+        log_path: String::new(),
+        runner_reachable: true,
+        runner_alive: true,
+        configured: true,
+        service_enabled: true,
+    };
+    assert_eq!(
+        keys_of(&boot_svc),
+        sorted(&[
+            "service_id", "name", "project_id", "mode", "phase", "alive", "pid",
+            "started_at", "ready_at", "exit_code", "error", "log_path",
+            "runner_reachable", "runner_alive", "configured", "service_enabled",
+        ])
+    );
 
     // 工具命令结果与实时输出（PERF-11 起输出改成批量事件）
     let tcr = ToolCommandResult { success: true, output: String::new(), exit_code: Some(0) };
@@ -734,7 +763,7 @@ const COVERED_RESPONSE: &[&str] = &[
         "NodeRuntimeStatus", "NodeVersionInfo", "NodeVersionIndex",
         "NvmCommandResult", "NvmInstallResult",
         // 开机启动的命令结果/状态（IPC 载荷）
-        "BootRunnerStatus", "BootToggleResult",
+        "BootRunnerStatus", "BootServiceStatus", "BootToggleResult",
         // 豁免：以下是**启动器与磁盘之间的文件格式**（manifest.json / state.json / 命令队列），
         // runner 与 Nexus 只在文件里读写，不经 invoke 出前端——前端看到的是上面的状态 DTO。
         "BootManifest", "BootService", "BootRunnerState", "BootServiceState",
@@ -796,7 +825,8 @@ fn test_every_deserializable_struct_is_covered() {
         // - `ToolCommand`：DB TEXT 列里的 JSON 的元素类型，前端把整串原样存取
         // - `Entry`（`commands/node.rs::parse_index` 内的局部结构）：反序列化的是**网上拉来的**
         //   nodejs.org 版本索引 JSON——外部文件格式，字段名由对方决定，我们无权改
-        "ConflictPolicy", "ToolCommand", "Entry",
+        // - `RunnerLockInfo`：runner 的单实例锁文件（pid + 启动时刻），只在磁盘上读写
+        "ConflictPolicy", "ToolCommand", "Entry", "RunnerLockInfo",
     ];
 
     let found = scan_ipc_structs();

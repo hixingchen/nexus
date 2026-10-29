@@ -21,6 +21,7 @@ function svc(id: string): Service {
     watch_paths: '', watch_include: '*', watch_exclude: '', env_vars: '',
     restart_mode: 0, enabled: true, show_file_tree: true, sort_index: 0, tool_commands: '[]',
     boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
+    boot_credential_mode: 's4u',
   };
 }
 
