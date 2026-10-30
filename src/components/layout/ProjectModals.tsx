@@ -1,4 +1,4 @@
-import { useState, useEffect, useId, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useId, useRef } from 'react';
 import { projectApi, type Project } from '../../services/service';
 import { pickDirectory } from '../../services/system';
 import { Modal } from '../ui/Modal';
@@ -8,6 +8,7 @@ import { isSubmitEnter } from '../../utils/keyboard';
 import {
   MODAL_DRAFT_KEYS, readModalDraft, useModalDraftStore, type ProjectFormDraft,
 } from '../../stores/modalDraftStore';
+import { shouldSyncProjectDraft } from '../../utils/projectEditDraft';
 
 interface CreateModalProps {
   open: boolean;
@@ -149,13 +150,25 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
   const draftKey = project ? MODAL_DRAFT_KEYS.projectEdit(project.id) : null;
   // 与已持久化的值不同才算脏（与 ServiceEditPanel 的 formDirty 同口径）：改回原样自动清草稿
   const dirty = !!project && (name !== project.name || path !== project.path);
+  /**
+   * **在本次渲染里**固定住“表单当前属于哪个项目”。
+   *
+   * 不能直接在 effect 里读 ref：切换项目后的第一帧，`name/path` 还是上一个项目的值，
+   * 而 seed effect 会把 ref 改成新 id；如果草稿 effect 在它之后跑（或读到改过的 ref），
+   * 就会把旧项目的值写进新项目的草稿键，下一次初始化再读回来——用户看到“编辑 B
+   * 显示 A 的信息”。用渲染期快照做闸门，效果顺序和 ref 变更都影响不到判断。
+   */
+  const seededId = seededIdRef.current;
 
   useEffect(() => {
-    if (!draftKey) return; // 已关闭：此刻不再写（关闭前的值已经写过）
+    // 已关闭、或表单还没为当前项目种过值：不写草稿（见 seededId 的说明）
+    if (!draftKey || !project || !shouldSyncProjectDraft(project.id, seededId)) return;
     useModalDraftStore.getState().setDraft(draftKey, dirty ? { name, path } : null);
-  }, [draftKey, dirty, name, path]);
+  }, [draftKey, project, seededId, dirty, name, path]);
 
-  useEffect(() => {
+  // 用 layout effect：切换项目时在**绘制前**把表单换成新项目的值，
+  // 避免先闪一帧上一个项目的名称/路径。
+  useLayoutEffect(() => {
     if (!project) {
       seededIdRef.current = null; // 关闭：下次打开重新种一次（草稿这时才被读回来）
       return;
