@@ -4,6 +4,7 @@ use crate::AppState;
 use crate::commands::paths::PathAllowlist;
 use crate::models::{Service, ServiceTemplate};
 use crate::database::{query_services_by_project, Database};
+use crate::commands::process::DeleteResult;
 
 /// 默认文件监听排除规则
 const DEFAULT_WATCH_EXCLUDE: &str = "node_modules\n.git\ndist\ntarget\n__pycache__\n.next\nbuild\ncoverage\n*.log";
@@ -407,7 +408,7 @@ pub fn reorder_services(state: State<AppState>, project_id: String, ordered_ids:
 /// 异步 + spawn_blocking：内部要停进程（taskkill + 超时等待，最坏数秒），
 /// 同步命令会跑在 IPC/事件循环线程上，导致界面在这期间完全无响应
 #[tauri::command]
-pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<DeleteResult, String> {
     if id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -416,22 +417,30 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
         // 变成一个 None，于是查库故障时第 4 步的监听清理被整个跳过——监听线程仍在，
         // 之后会对一个已删除的服务弹「需要重启 X」，用户点了必然失败，而日志里没有线索
         // （同函数另两处失败都有 warn）。故障就上报，让用户重试一次即可，别留下孤儿监听。
-        let project_id: Option<String> = state.db.with_conn(|conn| {
-            match conn.query_row("SELECT project_id FROM services WHERE id=?1", [&id], |r| r.get::<_, String>(0)) {
-                Ok(pid) => Ok(Some(pid)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        let (project_id, service_name): (Option<String>, Option<String>) = state.db.with_conn(|conn| {
+            match conn.query_row(
+                "SELECT project_id, name FROM services WHERE id=?1",
+                [&id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                Ok((pid, name)) => Ok((Some(pid), Some(name))),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None)),
                 Err(e) => Err(format!("查询服务所属项目失败: {}", e)),
             }
         })?;
+        let display_name = service_name.unwrap_or_else(|| id.clone());
         // 2. 停止运行中的进程（进程 key = service_id，锁外执行避免阻塞 DB 操作）。
-        // 失败留痕（同 delete_project）：静默丢弃会留下仍在跑的孤儿进程，而服务记录已删、
-        // UI 里再没有入口去停它。仍继续删除，残留进程由 Job Object 在应用退出时兜底。
+        // 失败必须带回前端：服务记录删掉后界面上再没有入口，用户只能在现场处理。
+        // 仍继续删除，残留进程由 Job Object 在应用退出时兜底。
         // 开机启动器拥有的服务不在本地进程表里，必须单独经 runner 停止。
+        let mut stop_warnings = Vec::new();
         if let Err(e) = crate::commands::boot::stop_boot_service(&id) {
             log::warn!("删除服务 {} 时停止开机启动器进程失败：{}", id, e);
+            stop_warnings.push(format!("「{}」停止开机启动实例失败：{}", display_name, e));
         }
         if let Err(e) = state.process_mgr.stop(&id) {
             log::warn!("删除服务 {} 时停止进程失败（进程可能残留至应用退出）：{}", id, e);
+            stop_warnings.push(format!("「{}」停止本地进程失败：{}", display_name, e));
         }
         // 3. 删除数据库记录
         delete_service_row(&state.db, &id)?;
@@ -449,7 +458,7 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<(), Str
                 log::warn!("删除服务后清理文件监听失败: {}", e);
             }
         }
-        Ok(())
+        Ok(DeleteResult { stop_warnings })
     }).await.map_err(|e| format!("删除服务任务失败: {}", e))?
 }
 

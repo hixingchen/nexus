@@ -323,6 +323,16 @@ pub struct ProcessStatus {
     pub failed: Vec<crate::core::process::FailedService>,
 }
 
+/// 删除服务/项目的结果。
+///
+/// 删除本身成功，但停止进程可能失败（安全软件拦截、启动器失联、外部进程不受管等）。
+/// 不能再用 `void` 把失败吞掉：数据库记录已经删了，界面是用户唯一的知情人。
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteResult {
+    /// 停止失败的项（空 = 进程都已停下）；前端据此提示“已删除，但进程未停止”
+    pub stop_warnings: Vec<String>,
+}
+
 // ─── Tauri Commands ───────────────────────────────────────────
 
 /// 启动单个服务。

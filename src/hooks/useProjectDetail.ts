@@ -301,10 +301,19 @@ export function useProjectDetail(projectId: string) {
     if (!deleteSvcTarget) return;
     setDeleting(true);
     try {
-      await serviceApi.delete(deleteSvcTarget.id);
+      const result = await serviceApi.delete(deleteSvcTarget.id);
       await load();
       if (editingService?.id === deleteSvcTarget.id) setEditingService(null);
-      showNotification({ variant: 'warning', title: `已删除服务「${deleteSvcTarget.name}」` });
+      if (result.stop_warnings.length > 0) {
+        showNotification({
+          variant: 'warning',
+          title: `已删除服务「${deleteSvcTarget.name}」，但有进程未能停止`,
+          description: result.stop_warnings.join('；'),
+          duration: 10000,
+        });
+      } else {
+        showNotification({ variant: 'warning', title: `已删除服务「${deleteSvcTarget.name}」` });
+      }
     } catch (e: unknown) {
       reportError(`删除服务「${deleteSvcTarget.name}」失败`, e);
     }

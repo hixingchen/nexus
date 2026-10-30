@@ -425,6 +425,15 @@ pub struct BootServiceState {
     pub phase: String,
     pub pid: Option<u32>,
     pub process_started_at: Option<u64>,
+    /// 启动器最近一次**亲自观测**到的存活状态。
+    ///
+    /// 为什么要它：S4U 启动器在登录前以另一个登录会话创建服务进程，交互会话里的 GUI
+    /// 用 OpenProcess 查这些 pid 可能失败（S4U 是独立的受限登录会话）。GUI 因此会把
+    /// 仍在运行的进程判成“已退出”。启动器自己能可靠地查自己的子进程，所以把结论写进
+    /// state；GUI 在心跳新鲜时直接采信它，只有心跳过期才回退到 pid 校验。
+    /// 旧版 state 没有这个字段 → None，按 pid 校验处理。
+    #[serde(default)]
+    pub process_alive: Option<bool>,
     pub started_at: Option<String>,
     pub ready_at: Option<String>,
     pub exit_code: Option<i32>,
@@ -461,7 +470,7 @@ pub fn runner_process_alive(state: &BootRunnerState) -> bool {
         .unwrap_or(false)
 }
 
-/// state 里记录的服务进程是否还活着。
+/// state 里记录的服务进程是否还活着（本地 pid + 启动时刻校验）。
 ///
 /// 这是“服务在不在跑”的**独立判据**：不依赖 runner 心跳，runner 退出/卡住后
 /// 仍能正确显示由它拉起、且仍然存活的子进程（否则界面会把它们全当成没启动）。
@@ -473,21 +482,51 @@ pub fn service_alive(s: &BootServiceState) -> bool {
         .unwrap_or(false)
 }
 
-/// 状态是否来自一个仍然存活、且心跳新鲜的 runner。
+/// 服务是否存活：runner 心跳新鲜时采信它亲自观测的结论，否则回退到本地 pid 校验。
 ///
-/// 心跳新鲜还不够：runner 被强杀后状态文件会停在最后一次心跳（10 秒内），
-/// 必须再用 pid 身份复核一次，避免“进程已死但状态看起来还活着”。
-pub fn runner_reachable(state: &BootRunnerState) -> bool {
+/// 为什么不能只靠 pid：S4U 启动器在**另一个登录会话**里创建服务进程，交互会话里的
+/// GUI 用 OpenProcess 查这些 pid 可能返回拒绝访问——进程活着，但本地校验一律 false，
+/// 界面就显示“进程已退出”，项目服务卡片也变灰（服务器上的实际形态）。
+pub fn service_alive_in(runner: &BootRunnerState, s: &BootServiceState) -> bool {
+    if runner_heartbeat_fresh(runner) {
+        if let Some(alive) = s.process_alive {
+            return alive;
+        }
+    }
+    service_alive(s)
+}
+
+/// runner 的心跳是否新鲜（只证明“最近 10 秒内它写过 state”，不查 pid）。
+///
+/// 为什么单独拆出来：跨会话查 runner 的 pid 也可能被拒绝；心跳是 runner 自己写的，
+/// 不依赖调用方的进程访问权限。代价是 runner 崩溃后最多 10 秒的“看起来还活着”。
+pub fn runner_heartbeat_fresh(state: &BootRunnerState) -> bool {
     if state.runner_pid == 0 {
         return false;
     }
-    let fresh = chrono::DateTime::parse_from_rfc3339(&state.heartbeat_at)
-        .map(|t| chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc)).num_milliseconds() <= HEARTBEAT_STALE_MS)
-        .unwrap_or(false);
-    if !fresh {
+    chrono::DateTime::parse_from_rfc3339(&state.heartbeat_at)
+        .map(|t| {
+            chrono::Utc::now()
+                .signed_duration_since(t.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                <= HEARTBEAT_STALE_MS
+        })
+        .unwrap_or(false)
+}
+
+/// 状态是否来自一个仍然存活、且心跳新鲜的 runner。
+///
+/// 心跳是 runner 自己写的，能跨登录会话证明它还活着；但心跳新鲜也要排除
+/// “刚崩溃、最后一次心跳还没过期”的情况——进程探测明确是 `Gone` 时按不可达处理。
+/// `Denied`（跨会话查不到）不能当成已退出，此时采信心跳。
+pub fn runner_reachable(state: &BootRunnerState) -> bool {
+    if !runner_heartbeat_fresh(state) {
         return false;
     }
-    runner_process_alive(state)
+    !matches!(
+        crate::core::process::probe_process_start_time(state.runner_pid),
+        crate::core::process::ProcessProbe::Gone
+    )
 }
 
 // ─── 控制命令（文件队列）─────────────────────────────────────
@@ -665,6 +704,58 @@ mod tests {
         assert_eq!(written.version, MANIFEST_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跨登录会话：GUI 查不了 S4U 进程的 pid，但 runner 心跳新鲜时它上报的
+    /// `process_alive` 才是权威结论。心跳过期后必须回退到本地 pid 校验，
+    /// 不能继续采信旧 state 的最后一次上报。
+    #[test]
+    fn test_service_alive_prefers_fresh_runner_report() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let own_pid = std::process::id();
+        let own_started = crate::core::process::process_start_time_millis(own_pid);
+        let mut state = BootRunnerState {
+            runner_pid: 999_999, // GUI 无权/无法打开 runner 进程
+            heartbeat_at: now,
+            ..Default::default()
+        };
+        let mut svc = BootServiceState {
+            // 一个不存在的 pid：本地校验必然 false
+            pid: Some(999_998),
+            process_started_at: Some(1),
+            process_alive: Some(true),
+            ..Default::default()
+        };
+        state.services.insert("s".into(), svc.clone());
+
+        // 心跳新鲜 → 采信 runner 的“活着”，即使本地 pid 校验失败
+        assert!(runner_heartbeat_fresh(&state));
+        assert!(
+            !runner_reachable(&state),
+            "runner pid 已确认不存在时，心跳再新鲜也不能判可达"
+        );
+        assert!(service_alive_in(&state, &svc));
+        assert!(!service_alive(&svc), "本地 pid 校验本身仍是 false");
+
+        // runner 进程确实活着（这里用测试进程自己）→ 心跳新鲜即可达
+        let live = BootRunnerState {
+            runner_pid: own_pid,
+            heartbeat_at: state.heartbeat_at.clone(),
+            ..Default::default()
+        };
+        assert!(runner_reachable(&live));
+
+        // runner 说“已退出”时同样以它为准（即使本地能查到 pid）
+        svc.pid = Some(own_pid);
+        svc.process_started_at = own_started;
+        svc.process_alive = Some(false);
+        assert!(!service_alive_in(&state, &svc));
+
+        // 心跳过期 → 回退本地 pid 校验（这里指向当前测试进程，确实活着）
+        state.heartbeat_at = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        assert!(!runner_heartbeat_fresh(&state));
+        assert!(!runner_reachable(&state));
+        assert!(service_alive_in(&state, &svc));
     }
 
     #[test]

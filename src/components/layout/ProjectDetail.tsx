@@ -521,7 +521,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
           <p className="text-[13px] text-nexus-text">
             确定要删除服务 <span className="text-nexus-warning font-medium">「{deleteSvcTarget?.name}」</span> 吗？
           </p>
-          <p className="text-[12px] text-nexus-muted">此操作不可撤销。</p>
+          <p className="text-[12px] text-nexus-muted">正在运行的服务会先被停止。此操作不可撤销。</p>
           <div className="flex items-center justify-end gap-2">
             <button
               className="px-4 py-1.5 text-[12px] text-nexus-text-muted hover:text-nexus-text rounded hover:bg-nexus-hover/50"

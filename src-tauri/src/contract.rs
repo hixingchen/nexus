@@ -20,8 +20,8 @@ use crate::commands::boot::{BootRunnerStatus, BootServiceStatus, BootToggleResul
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
 use crate::commands::process::{
-    ProcessStatus, RunningService, ToolCommandLogBatchPayload, ToolCommandLogLine,
-    ToolCommandResult,
+    DeleteResult, ProcessStatus, RunningService, ToolCommandLogBatchPayload,
+    ToolCommandLogLine, ToolCommandResult,
 };
 use crate::commands::search::{SearchParams, SearchResponse, SearchResultItem};
 use crate::commands::node::{
@@ -452,6 +452,9 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp", "source"]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };
     assert_eq!(keys_of(&ps), sorted(&["running", "failed"]));
+    // 删除结果：删除成功但停止进程失败时必须能把原因带回前端
+    let del = DeleteResult { stop_warnings: vec![] };
+    assert_eq!(keys_of(&del), sorted(&["stop_warnings"]));
 
     // 开机启动器状态（设置 > 服务开机启动）
     let boot = BootRunnerStatus {
@@ -499,6 +502,8 @@ fn test_response_dtos_are_snake_case() {
         runner_alive: true,
         configured: true,
         service_enabled: true,
+        service_exists: true,
+        project_exists: true,
     };
     assert_eq!(
         keys_of(&boot_svc),
@@ -506,6 +511,7 @@ fn test_response_dtos_are_snake_case() {
             "service_id", "name", "project_id", "mode", "phase", "alive", "pid",
             "started_at", "ready_at", "exit_code", "error", "log_path",
             "runner_reachable", "runner_alive", "configured", "service_enabled",
+            "service_exists", "project_exists",
         ])
     );
 
@@ -755,7 +761,7 @@ const COVERED_RESPONSE: &[&str] = &[
         "FileEntry", "ReadFileResponse", "HexPage", "JarEntryContent",
         "PasteFilesResult", "PasteConflict",
         "ToolCommandResult", "ToolCommandLogLine", "ToolCommandLogBatchPayload",
-        "RunningService", "ProcessStatus",
+        "RunningService", "ProcessStatus", "DeleteResult",
         "SearchResultItem", "SearchResponse",
         "FileChangeEvent", "FileChange", "JarEntryInfo",
         "LogLine", "FailedService", "ServiceLogBatchPayload",

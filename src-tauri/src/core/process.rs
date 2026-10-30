@@ -1177,13 +1177,37 @@ fn cleanup_process(entry: CleanupEntry, snapshot: Option<&[super::winproc::ProcE
     outcome
 }
 
-/// 进程启动时间（毫秒，距 UNIX 纪元）；进程不存在/无权限时返回 None。
+/// 进程探测结果。
+///
+/// 为什么要区分 Gone / Denied：「进程不在了」和「我没权限查」都会让
+/// `OpenProcess` 失败，但处置完全不同——后者不能据此宣布进程已退出，
+/// 也不能据此跳过停止/修复流程（跨登录会话查 S4U 进程时正是这种形态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessProbe {
+    Alive(u64),
+    Gone,
+    Denied,
+}
+
+/// 进程启动时间（毫秒，距 UNIX 纪元）；进程不存在/无权限时返回 `None`。
 ///
 /// 用途：pid 会被系统回收复用，"按 pid 杀进程"必须先确认这个 pid 还是当初那个进程。
 /// 启动时间是 (pid, 启动时刻) 二元组的第二半——同一个 pid 两次启动的时间不可能相同，
 /// 而存活中的进程启动时间不变，所以"记录时 == 现在"即可判定身份未变。
+///
+/// 注意：已退出但**仍有句柄被别的进程持有**时，进程对象不会立刻销毁，
+/// `OpenProcess` + `GetProcessTimes` 能成功——单看启动时间会把尸体判成活的。
+/// `probe_process_start_time` 会再用 `GetExitCodeProcess` 复核退出状态。
 #[cfg(windows)]
 pub(crate) fn process_start_time_millis(pid: u32) -> Option<u64> {
+    match probe_process_start_time(pid) {
+        ProcessProbe::Alive(started) => Some(started),
+        ProcessProbe::Gone | ProcessProbe::Denied => None,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn probe_process_start_time(pid: u32) -> ProcessProbe {
     // Win32 类型别名（按 clippy 命名习惯写，避免 upper_case_acronyms 抑制）
     type WinHandle = isize;
     type WinBool = i32;
@@ -1202,40 +1226,60 @@ pub(crate) fn process_start_time_millis(pid: u32) -> Option<u64> {
             kernel: *mut FileTime,
             user: *mut FileTime,
         ) -> WinBool;
+        fn GetExitCodeProcess(handle: WinHandle, code: *mut u32) -> WinBool;
         fn CloseHandle(handle: WinHandle) -> WinBool;
     }
-    // PROCESS_QUERY_LIMITED_INFORMATION：查启动时间所需的最小权限
+    // PROCESS_QUERY_LIMITED_INFORMATION：查启动时间/退出码所需的最小权限
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     // FILETIME 起点是 1601-01-01，与 UNIX 纪元差 11644473600 秒
     const FILETIME_UNIX_DIFF_SECS: u64 = 11_644_473_600;
+    // GetExitCodeProcess 的“仍在运行”哨兵值（Win32 文档：259）
+    const STILL_ACTIVE: u32 = 259;
+    // ERROR_INVALID_PARAMETER / ERROR_NOT_FOUND：pid 已不存在
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const ERROR_NOT_FOUND: i32 = 1168;
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle == 0 {
-            return None;
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(ERROR_INVALID_PARAMETER) | Some(ERROR_NOT_FOUND) => ProcessProbe::Gone,
+                _ => ProcessProbe::Denied,
+            };
         }
         let mut creation = FileTime::default();
         let mut exit = FileTime::default();
         let mut kernel = FileTime::default();
         let mut user = FileTime::default();
-        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let times_ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let mut code: u32 = 0;
+        let exit_ok = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
-        if ok == 0 {
-            return None;
+        if times_ok == 0 || exit_ok == 0 {
+            return ProcessProbe::Denied;
+        }
+        // 句柄仍被他人持有的已退出进程：对象还在，但退出码已不是 STILL_ACTIVE
+        if code != STILL_ACTIVE {
+            return ProcessProbe::Gone;
         }
         // 100ns 单位 → 毫秒；跨度远超 u64 溢出范围（584 年），只做一次减法
         let ticks = ((creation.high as u64) << 32) | creation.low as u64;
         let secs = ticks / 10_000_000;
         if secs < FILETIME_UNIX_DIFF_SECS {
-            return None;
+            return ProcessProbe::Denied;
         }
-        Some((secs - FILETIME_UNIX_DIFF_SECS) * 1000 + (ticks % 10_000_000) / 10_000)
+        ProcessProbe::Alive((secs - FILETIME_UNIX_DIFF_SECS) * 1000 + (ticks % 10_000_000) / 10_000)
     }
 }
 
 #[cfg(not(windows))]
 pub(crate) fn process_start_time_millis(_pid: u32) -> Option<u64> {
     None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn probe_process_start_time(_pid: u32) -> ProcessProbe {
+    ProcessProbe::Gone
 }
 
 /// 服务进程的创建标志：`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`。
@@ -1634,6 +1678,41 @@ mod tests {
         // 测试无效 PID 不会 panic
         // 不存在的 pid：taskkill 会返回非零，这条用例只要求不 panic（返回值这里不关心）
         let _ = kill_process_tree(999999999);
+    }
+
+    /// 回归：已退出但仍有句柄被持有（例如 runner 还没 try_wait）的进程，
+    /// OpenProcess/GetProcessTimes 仍会成功——不能据此判活，必须用退出码复核。
+    /// 否则“服务包装进程已退出、真实服务还在跑”会被误判成包装进程活着。
+    #[cfg(windows)]
+    #[test]
+    fn test_probe_distinguishes_exited_process_with_held_handle() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit /b 0"])
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .expect("起测试进程");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(probe_process_start_time(pid), ProcessProbe::Gone) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("进程已退出但探测仍说存活（pid {}）", pid);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            process_start_time_millis(pid).is_none(),
+            "已退出进程不应再返回启动时间（pid {}）",
+            pid
+        );
+        let _ = child.wait();
     }
 
     // ── ProcessManager 生命周期（不依赖 AppHandle 的部分）──────────────

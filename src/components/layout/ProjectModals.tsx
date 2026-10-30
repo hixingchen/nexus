@@ -272,9 +272,18 @@ export function DeleteProjectModal({ target, onClose, onDeleted, onDeselectIfSel
     if (!target) return;
     setDeleting(true);
     try {
-      await projectApi.delete(target.id);
+      const result = await projectApi.delete(target.id);
       onDeselectIfSelected?.();
-      showNotification({ variant: 'warning', title: `已删除「${target.name}」` });
+      if (result.stop_warnings.length > 0) {
+        showNotification({
+          variant: 'warning',
+          title: `已删除「${target.name}」，但有进程未能停止`,
+          description: result.stop_warnings.join('；'),
+          duration: 10000,
+        });
+      } else {
+        showNotification({ variant: 'warning', title: `已删除「${target.name}」` });
+      }
       onDeleted(target.id);
       onClose();
     } catch (e: unknown) {
@@ -290,7 +299,7 @@ export function DeleteProjectModal({ target, onClose, onDeleted, onDeselectIfSel
           确定要删除项目 <span className="text-nexus-warning font-medium">「{target?.name}」</span> 吗？
         </p>
         <p className="text-[12px] text-nexus-muted">
-          该项目下的所有服务配置也会被一并删除，此操作不可撤销。
+          该项目下的所有服务配置也会被一并删除；正在运行的服务会先被停止。此操作不可撤销。
         </p>
         <div className="flex items-center justify-end gap-2">
           <button

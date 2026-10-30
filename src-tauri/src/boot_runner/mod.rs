@@ -140,6 +140,18 @@ mod imp {
             .to_path_buf();
         std::fs::create_dir_all(&boot_dir).map_err(|e| format!("创建 boot 目录失败: {}", e))?;
         let log = Arc::new(RunnerLog::open(&boot_dir.join("runner.log"))?);
+        // 登录前运行的进程没有控制台可看：panic 默认写到 stderr，用户拿不到。
+        // 落进 runner.log 才能在“界面说启动器已退出、服务却还在跑”时回答是不是崩溃。
+        {
+            let panic_log = Arc::clone(&log);
+            std::panic::set_hook(Box::new(move |info| {
+                let loc = info
+                    .location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                    .unwrap_or_else(|| "?".into());
+                panic_log.info(&format!("PANIC at {}: {}", loc, info));
+            }));
+        }
 
         // 单实例：同一份 manifest 只允许一个 runner。
         // 用 pid + 进程启动时刻复核，避免 pid 复用把“旧锁”误判成“还活着”。
@@ -295,6 +307,7 @@ mod imp {
                 phase: "pending".into(),
                 pid: None,
                 process_started_at: None,
+                process_alive: None,
                 started_at: None,
                 ready_at: None,
                 exit_code: None,
@@ -316,7 +329,48 @@ mod imp {
     }
 
     impl Runner {
+        /// 把 runner 亲自观测到的存活状态与代表 pid 写进 state。
+        ///
+        /// GUI 在另一个登录会话里可能查不了 S4U 进程（OpenProcess 拒绝访问），必须由
+        /// runner 提供结论；同时把 pid 同步到真正在跑的代表进程（start/脚本的直接子
+        /// 进程退出后，state 里不能一直指向死掉的包装进程，否则停止/重启会作用在死进程上）。
+        fn refresh_liveness(&mut self) {
+            let ids: Vec<String> = self.running.keys().cloned().collect();
+            for id in ids {
+                let (alive, leader) = {
+                    let Some(run) = self.running.get_mut(&id) else { continue };
+                    if let Some(child) = run.child.as_mut() {
+                        let alive = matches!(child.try_wait(), Ok(None));
+                        (alive, alive.then_some((child.id(), run.child_started_at)))
+                    } else {
+                        let leader = run
+                            .adopted
+                            .iter()
+                            .find(|a| a.handle.is_alive())
+                            .map(|a| {
+                                (
+                                    a.pid,
+                                    crate::core::process::process_start_time_millis(a.pid)
+                                        .unwrap_or(0),
+                                )
+                            });
+                        (leader.is_some(), leader)
+                    }
+                };
+                if let Some(s) = self.state.services.get_mut(&id) {
+                    s.process_alive = Some(alive);
+                    if let Some((pid, started_at)) = leader {
+                        if s.pid != Some(pid) || s.process_started_at != Some(started_at) {
+                            s.pid = Some(pid);
+                            s.process_started_at = Some(started_at);
+                        }
+                    }
+                }
+            }
+        }
+
         fn write_state(&mut self) {
+            self.refresh_liveness();
             self.state.heartbeat_at = chrono::Utc::now().to_rfc3339();
             let bytes = match serde_json::to_vec_pretty(&self.state) {
                 Ok(b) => b,
@@ -392,6 +446,7 @@ mod imp {
             self.set_state(&svc.id, |s| {
                 s.pid = Some(pid);
                 s.process_started_at = Some(process_started_at);
+                s.process_alive = Some(true);
             });
             self.write_state();
             self.log.info(&format!(
@@ -436,11 +491,22 @@ mod imp {
                 BootCheck::LogContains { timeout_secs, .. } => Duration::from_secs(*timeout_secs),
             };
             let deadline = Instant::now() + timeout;
+            self.log.info(&format!(
+                "等待服务「{}」就绪（超时 {:?}）",
+                svc.name, timeout
+            ));
             // 就绪等待可能几十秒；期间必须继续写心跳，否则 GUI 会把“正在启动”误判成
             // “启动器无响应”（runner_reachable 的心跳窗口是 10 秒）。
             let mut last_beat = Instant::now();
             loop {
-                if let Some(code) = self.child_exit_code(&svc.id) {
+                // **等待期间也要监管其他服务**：start_service 是串行的，前面的服务
+                // 用 startup.bat/`start` 拉起的直接子进程（cmd）会先退出。如果这里只看
+                // 当前服务，前面服务的 state.pid 会一直指向已退出的包装进程——界面显示
+                // 进程不可用、项目卡片变灰，而真实服务仍在运行（实际案例）。
+                self.poll_children();
+                // 当前服务可能在 poll_children 里被判退出并从进程表移除
+                if !self.running.contains_key(&svc.id) {
+                    let code = self.state.services.get(&svc.id).and_then(|s| s.exit_code);
                     return Err(format!("进程在就绪前退出（退出码: {:?}）", code));
                 }
                 let ok = match &svc.check {
@@ -460,36 +526,6 @@ mod imp {
                     last_beat = Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-
-        /// 子进程（含认领的后代）都退出时返回退出码；仍在运行返回 `None`。
-        ///
-        /// 直接子进程退出不代表服务结束：`startup.bat`/`start` 会另开窗口并立即返回，
-        /// 真正的工作进程（java.exe 等）仍在跑。这里复用 `core::process` 的认领逻辑，
-        /// 接管存活后代后继续把服务算作运行中。
-        fn child_exit_code(&mut self, id: &str) -> Option<Option<i32>> {
-            let direct = {
-                let run = self.running.get_mut(id)?;
-                match run.child.as_mut() {
-                    Some(child) => match child.try_wait() {
-                        Ok(Some(status)) => Some(status.code()),
-                        _ => return None,
-                    },
-                    None => None,
-                }
-            };
-            if let Some(code) = direct {
-                if self.adopt_if_survivors(id) {
-                    return None;
-                }
-                return Some(code);
-            }
-            let run = self.running.get(id)?;
-            if run.adopted.iter().any(|a| a.handle.is_alive()) {
-                None
-            } else {
-                Some(run.adopted.iter().find_map(|a| a.handle.exit_code()))
             }
         }
 
@@ -604,6 +640,7 @@ mod imp {
                     s.phase = "exited".into();
                     s.exit_code = code;
                     s.pid = None;
+                    s.process_alive = Some(false);
                     s.error = format!("进程{}（退出码: {:?}）", note, code);
                     s.log_path = log_path;
                 });
@@ -611,11 +648,19 @@ mod imp {
         }
 
         fn stop_service(&mut self, id: &str) -> Result<(), String> {
+            // 不在当前 manifest 里（已删除服务/已取消开机自启）的记录在停止后没有保留价值：
+            // 直接删掉，设置页就不会再显示一条点不动的历史项。仍在 manifest 里的保留
+            // （配置还在，只是这次停了）。
+            let keep_in_manifest = self.find_service(id).is_some();
             let Some(mut run) = self.running.remove(id) else {
                 self.set_state(id, |s| {
                     s.phase = "stopped".into();
                     s.pid = None;
+                    s.process_alive = Some(false);
                 });
+                if !keep_in_manifest {
+                    self.state.services.remove(id);
+                }
                 return Ok(());
             };
             let mut kill_error = String::new();
@@ -657,9 +702,13 @@ mod imp {
             self.set_state(id, |s| {
                 s.phase = "stopped".into();
                 s.pid = None;
+                s.process_alive = Some(false);
                 s.exit_code = code;
                 s.error = if kill_error.is_empty() { String::new() } else { format!("停止未完成: {}", kill_error) };
             });
+            if !keep_in_manifest {
+                self.state.services.remove(id);
+            }
             self.log.info(&format!("已停止服务「{}」pid={}", run.name, pid_log));
             self.write_state();
             Ok(())
@@ -688,6 +737,8 @@ mod imp {
         fn reload(&mut self) -> Result<(), String> {
             let manifest = read_manifest(&self.manifest_path)?;
             // 保留运行中服务的状态；新服务补一条 pending
+            let manifest_ids: std::collections::HashSet<String> =
+                manifest.services.iter().map(|s| s.id.clone()).collect();
             for svc in &manifest.services {
                 self.state.services.entry(svc.id.clone()).or_insert_with(|| BootServiceState {
                     phase: "pending".into(),
@@ -698,6 +749,13 @@ mod imp {
                 });
             }
             self.manifest = manifest;
+            // 清理已不在 manifest、且也不在运行的旧记录（删除服务/项目、取消开机自启后
+            // 已停止的服务不应继续出现在设置页）。仍在运行的保留，否则失去停止入口。
+            let running_ids: std::collections::HashSet<String> =
+                self.running.keys().cloned().collect();
+            self.state.services.retain(|id, _| {
+                manifest_ids.contains(id) || running_ids.contains(id)
+            });
             self.log.info("manifest 已重新加载");
             self.write_state();
             Ok(())
@@ -924,6 +982,10 @@ mod imp {
 
             runner.stop_service("s1").expect("停止服务");
             assert!(!runner.running.contains_key("s1"));
+            assert!(
+                !runner.state.services.contains_key("s1"),
+                "取消开机启动后停止的实例，状态记录应被清掉（设置页不再显示死记录）"
+            );
             for pid in adopted {
                 for _ in 0..40 {
                     if crate::core::process::process_start_time_millis(pid).is_none() {
@@ -937,6 +999,108 @@ mod imp {
                     pid
                 );
             }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// 回归：等待某个服务就绪期间，启动器必须继续监管**其他**服务。
+        ///
+        /// 实际场景：前面 5 个服务用 `startup.bat`/`start` 拉起真身后，直接子进程（cmd）
+        /// 已退出；第 6 个服务（Tomcat）的就绪检查长时间不通过。旧实现只在 wait_ready
+        /// 里检查当前服务，前面服务的 state.pid 会一直指向已退出的 cmd——停止/重启作用
+        /// 在死进程上，界面也无法据此确认真实服务仍在运行。
+        #[test]
+        fn test_wait_ready_keeps_supervising_previous_services() {
+            let dir = std::env::temp_dir().join(format!("nexus_runner_supervise_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("建临时目录");
+            let make = |id: &str, command: &str, check: BootCheck| BootService {
+                id: id.into(),
+                project_id: "p1".into(),
+                name: format!("svc-{}", id),
+                command: command.into(),
+                cwd: String::new(),
+                env: BTreeMap::new(),
+                check,
+                required: false,
+                order: 0,
+                log_path: dir.join("logs").join(format!("{}.log", id)).to_string_lossy().to_string(),
+            };
+            // A：包装进程（cmd）立即退出，真正的 ping 留在后台
+            let svc_a = make("a", "start /b ping -n 30 127.0.0.1", BootCheck::None);
+            // B：就绪检查要等 3 秒，模拟“卡在 Tomcat 就绪检查”的窗口
+            let svc_b = make("b", "ping -n 30 127.0.0.1", BootCheck::Delay { seconds: 3 });
+            let manifest = BootManifest {
+                version: MANIFEST_VERSION,
+                generated_at: String::new(),
+                env: BTreeMap::new(),
+                services: vec![svc_a.clone(), svc_b.clone()],
+            };
+            std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).expect("序列化"))
+                .expect("写 manifest");
+            let log = Arc::new(RunnerLog::open(&dir.join("runner.log")).expect("打开日志"));
+            let mut runner = Runner {
+                state: init_state(&manifest, std::process::id(), 0, "s4u"),
+                manifest,
+                manifest_path: dir.join("manifest.json"),
+                boot_dir: dir.clone(),
+                running: HashMap::new(),
+                log,
+                job: None,
+                shutdown: false,
+            };
+
+            runner.start_service(&svc_a).expect("启动 A");
+            // 前置：A 的直接子进程（cmd）已经退出，但启动器还没轮询认领——state.pid 仍指向它。
+            // 用 Child::try_wait 确认它真的退出（进程对象可能还被句柄持有，单看 pid 不可靠）。
+            let wrapper_pid = runner.state.services["a"].pid.expect("A 的包装进程 pid");
+            let mut wrapper_exited = false;
+            for _ in 0..30 {
+                let exited = runner.running.get_mut("a")
+                    .and_then(|r| r.child.as_mut())
+                    .and_then(|c| c.try_wait().ok().flatten())
+                    .is_some();
+                if exited {
+                    wrapper_exited = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(wrapper_exited, "前置不成立：A 的包装进程 3 秒内仍未退出");
+            assert_eq!(
+                runner.state.services["a"].pid, Some(wrapper_pid),
+                "前置不成立：A 的 state.pid 已经指向别处"
+            );
+
+            // B 的就绪等待开始 1.5 秒后读一次 state.json：此时 A 的 state.pid 必须已经
+            // 从死掉的包装进程换成真正在跑的 ping。旧实现只在 wait_ready 里看当前服务，
+            // 这个文件会一直停留在包装进程的 pid 上（停止/重启随之作用在死进程上）。
+            let state_path = dir.join("state.json");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let monitor = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                let bytes = std::fs::read(&state_path).expect("读 state.json");
+                let st: BootRunnerState = serde_json::from_slice(&bytes).expect("解析 state.json");
+                let s = st.services.get("a").expect("A 的状态");
+                let pid = s.pid.expect("A 的 state.pid");
+                let snap = crate::core::winproc::snapshot_processes();
+                let name = crate::core::winproc::name_of(pid, &snap);
+                let _ = tx.send((pid, name));
+            });
+
+            runner.start_service(&svc_b).expect("启动 B（等待就绪期间应继续监管 A）");
+            let (pid, name) = rx.recv_timeout(Duration::from_secs(2)).expect("监控线程应返回结果");
+            assert_ne!(
+                pid, wrapper_pid,
+                "等待 B 就绪期间 A 没有被重新认领：state.pid 仍指向已退出的包装进程"
+            );
+            assert!(
+                name.eq_ignore_ascii_case("PING.EXE"),
+                "state.pid 应指向真正在跑的 ping，实际是 {} (pid={})",
+                name, pid
+            );
+            monitor.join().expect("监控线程");
+
+            runner.stop_service("a").expect("停止 A");
+            runner.stop_service("b").expect("停止 B");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -81,6 +81,16 @@ export interface Service {
 
 export type BootCredentialMode = 's4u' | 'password';
 
+/**
+ * 删除服务/项目的结果。
+ *
+ * 删除本身成功，但停止进程可能失败（安全软件拦截、启动器失联、外部进程不受管等）。
+ * 数据库记录删掉后界面上再没有入口，必须把失败原因带回前端提示。
+ */
+export interface DeleteResult {
+  stop_warnings: string[];
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -259,8 +269,8 @@ export const serviceApi = {
     }
   }),
 
-  /** 删除服务 */
-  delete: (id: string) => invoke<void>('delete_service', { id }),
+  /** 删除服务（会先停止运行中的实例；stop_warnings 非空 = 有进程没停掉） */
+  delete: (id: string) => invoke<DeleteResult>('delete_service', { id }),
 
   /** 重排项目服务顺序（orderedIds 为新的展示顺序） */
   reorderServices: (projectId: string, orderedIds: string[]) =>
@@ -371,8 +381,8 @@ export const projectApi = {
   update: (id: string, name: string, path: string) =>
     invoke<void>('update_project', { id, name, path }),
 
-  /** 删除项目 */
-  delete: (id: string) => invoke<void>('delete_project', { id }),
+  /** 删除项目（会先停止项目下运行中的实例；stop_warnings 非空 = 有进程没停掉） */
+  delete: (id: string) => invoke<DeleteResult>('delete_project', { id }),
 
   /** 复制项目（含所有服务配置） */
   duplicate: (id: string) => invoke<Project>('duplicate_project', { id }),

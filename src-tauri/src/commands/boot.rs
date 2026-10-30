@@ -20,6 +20,7 @@ use tauri::{Manager, State};
 
 use crate::core::boot::{self, BootCommand, BootMode, BootServiceState};
 use crate::core::logpipe::LogLine;
+use crate::core::process::ProcessProbe;
 use crate::AppState;
 
 /// 任务名前缀；实际名字带用户名，避免同一台机器上多个 Windows 账户撞任务。
@@ -85,6 +86,10 @@ pub struct BootServiceStatus {
     pub configured: bool,
     /// DB 里服务的「跟随项目启动」开关；false 时 manifest 会排除它（开机不会启动）
     pub service_enabled: bool,
+    /// 服务本身是否还在 DB 里（false = 服务已删除；若进程还活着，列表只保留停止/日志入口）
+    pub service_exists: bool,
+    /// 服务所属项目是否还在 DB 里（false = 项目已删除）
+    pub project_exists: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -795,7 +800,9 @@ fn build_status(state: &AppState, mode: BootMode) -> Result<BootRunnerStatus, St
     let lock_pid = runner_lock_pid(&boot::boot_root(mode));
     let reachable = runner_state.as_ref().map(boot::runner_reachable).unwrap_or(false);
     let state_alive = runner_state.as_ref().map(boot::runner_process_alive).unwrap_or(false);
-    let runner_alive = state_alive || lock_pid.is_some();
+    // 心跳新鲜也算“进程还在”：GUI 与 S4U runner 可能不在同一登录会话，
+    // OpenProcess 查不到它，但 runner 自己写的心跳能证明它还活着（跨会话场景）。
+    let runner_alive = state_alive || lock_pid.is_some() || reachable;
     let (runner_pid, heartbeat_at, running_mode) = runner_state
         .as_ref()
         .map(|s| (
@@ -869,10 +876,15 @@ pub fn runner_reachable_now(mode: BootMode) -> bool {
 ///
 /// state.json 可能被删/写失败，锁文件是第二判据（同样做 pid + 启动时刻校验）。
 pub fn runner_alive_now(mode: BootMode) -> bool {
-    let state_alive = boot::read_state(mode)
-        .map(|s| boot::runner_process_alive(&s))
-        .unwrap_or(false);
-    state_alive || runner_lock_pid(&boot::boot_root(mode)).is_some()
+    let (state_alive, heartbeat_fresh) = boot::read_state(mode)
+        .map(|s| {
+            (
+                boot::runner_process_alive(&s),
+                boot::runner_heartbeat_fresh(&s),
+            )
+        })
+        .unwrap_or((false, false));
+    state_alive || heartbeat_fresh || runner_lock_pid(&boot::boot_root(mode)).is_some()
 }
 
 /// 所有已知状态源：新版本两个模式 + 旧版单任务（升级遗留）。
@@ -900,7 +912,10 @@ pub fn boot_running_ids() -> HashSet<String> {
     for (_, state) in state_sources() {
         out.extend(
             state.services.iter()
-                .filter(|(_, s)| matches!(s.phase.as_str(), "starting" | "ready") && boot::service_alive(s))
+                .filter(|(_, s)| {
+                    matches!(s.phase.as_str(), "starting" | "ready")
+                        && boot::service_alive_in(&state, s)
+                })
                 .map(|(id, _)| id.clone()),
         );
     }
@@ -917,7 +932,7 @@ pub fn boot_running_services() -> Vec<(String, String)> {
     for (_, state) in state_sources() {
         for (id, s) in &state.services {
             if matches!(s.phase.as_str(), "starting" | "ready")
-                && boot::service_alive(s)
+                && boot::service_alive_in(&state, s)
                 && seen.insert(id.clone())
             {
                 out.push((id.clone(), s.project_id.clone()));
@@ -960,7 +975,7 @@ pub fn boot_owned_mode(service_id: &str) -> Option<BootMode> {
         let Some(state) = boot::read_state(mode) else { continue };
         if !boot::runner_reachable(&state) { continue; }
         let Some(s) = state.services.get(service_id) else { continue };
-        if boot::service_alive(s) {
+        if boot::service_alive_in(&state, s) {
             return Some(mode);
         }
         if fallback.is_none() {
@@ -977,7 +992,7 @@ pub fn boot_owned_mode(service_id: &str) -> Option<BootMode> {
 pub fn live_boot_service(service_id: &str) -> Option<(&'static str, BootServiceState)> {
     for (label, state) in state_sources() {
         if let Some(s) = state.services.get(service_id) {
-            if boot::service_alive(s) {
+            if boot::service_alive_in(&state, s) {
                 return Some((label, s.clone()));
             }
         }
@@ -1061,7 +1076,18 @@ fn wait_runner_exit(mode: BootMode, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let gone = match boot::read_state(mode) {
-            Some(s) => s.runner_pid == 0 || !boot::runner_process_alive(&s),
+            Some(s) => {
+                if s.runner_pid == 0 {
+                    true
+                } else {
+                    match crate::core::process::probe_process_start_time(s.runner_pid) {
+                        ProcessProbe::Gone => true,
+                        ProcessProbe::Alive(_) => false,
+                        // 无权限查（跨登录会话）：只要心跳还在更新就认为它还活着
+                        ProcessProbe::Denied => !boot::runner_heartbeat_fresh(&s),
+                    }
+                }
+            }
             None => true,
         };
         if gone {
@@ -1108,7 +1134,14 @@ fn stop_runner_now(mode: BootMode, timeout: Duration) -> Result<(), String> {
         }
         return Ok(());
     };
-    if state.runner_pid == 0 || !boot::runner_process_alive(&state) {
+    // 只有确认“进程确实不在了”才走早退；Denied 不能当退出——跨会话查不到 S4U
+    // runner 时（服务器场景）早退会让停止/修复/卸载全部跳过，runner 继续在后台跑。
+    if state.runner_pid == 0
+        || matches!(
+            crate::core::process::probe_process_start_time(state.runner_pid),
+            ProcessProbe::Gone
+        )
+    {
         if let Some(pid) = lock_pid {
             crate::core::process::kill_process_tree(pid)
                 .map_err(|e| format!("结束残留启动器进程失败（PID {}）：{}", pid, e))?;
@@ -1156,7 +1189,14 @@ fn stop_runner_now(mode: BootMode, timeout: Duration) -> Result<(), String> {
 /// runner 已经死了，不会有别的写入者；否则界面会把一次成功的停止显示成“已退出”。
 fn mark_runner_stopped(mode: BootMode) {
     let Some(mut state) = boot::read_state(mode) else { return };
-    if state.runner_pid == 0 || boot::runner_process_alive(&state) {
+    // 只有确认 runner 进程已经结束才改写状态；Denied（跨会话查不到）时不能把
+    // 仍在运行的启动器标成“已停止”（否则后续停止/修复会以为没有实例）。
+    if state.runner_pid == 0
+        || !matches!(
+            crate::core::process::probe_process_start_time(state.runner_pid),
+            ProcessProbe::Gone
+        )
+    {
         return;
     }
     state.runner_pid = 0;
@@ -1235,13 +1275,13 @@ pub fn service_log_mode(
     // 只读一遍 state 文件（日志面板每秒轮询一次）
     let mut fallback = None;
     for mode in BootMode::ALL {
-        if let Some(s) = boot::read_state(mode).as_ref().and_then(|st| st.services.get(service_id)) {
-            if boot::service_alive(s) {
-                return Some(mode);
-            }
-            if fallback.is_none() {
-                fallback = Some(mode);
-            }
+        let Some(state) = boot::read_state(mode) else { continue };
+        let Some(s) = state.services.get(service_id) else { continue };
+        if boot::service_alive_in(&state, s) {
+            return Some(mode);
+        }
+        if fallback.is_none() {
+            fallback = Some(mode);
         }
     }
     if fallback.is_some() {
@@ -1328,21 +1368,66 @@ pub async fn get_boot_runner_status(app: tauri::AppHandle) -> Result<Vec<BootRun
     }).await.map_err(|e| format!("读取开机启动器状态失败: {}", e))?
 }
 
+/// 设置页逐服务列表的保留规则。
+///
+/// 只保留仍配置为开机启动（且服务/项目都还在）的服务，或仍有存活进程的实例。
+/// 删除服务/项目后残留的死记录、取消开机自启后已停止的记录不再展示；但删除后
+/// 仍有进程在跑的必须保留，否则数据库记录已删、界面上没有停止入口。
+fn keep_boot_service_item(item: &BootServiceStatus) -> bool {
+    item.alive || (item.configured && item.service_exists && item.project_exists)
+}
+
 /// 逐服务状态：合并两个模式的 state.json、旧版遗留 state 与 DB 里已配置但从未启动的服务。
 ///
-/// 读取不依赖 runner 心跳：服务是否在跑由 pid + 启动时刻判断，启动器状态单独给出。
+/// 列表只保留两类：**仍配置为开机启动的服务**，以及**仍有存活进程的实例**。
+/// 服务/项目删除后死掉的旧记录、取消开机自启且已停止的记录会被过滤掉；删除后进程
+/// 仍残留的则不隐藏（否则数据库记录已删，界面上就再也没有停止入口了）。
+///
+/// 存活判断优先采信 runner 心跳里上报的观测结果；启动器不可达时再回退到 pid 校验。
 #[tauri::command]
 pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootServiceStatus>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
+        // 判断 state 里的记录对应服务/项目是否还存在：已删除的、且进程已不在的记录
+        // 不再展示；进程仍在的保留一条警示项（否则数据库记录没了，界面上没有停止入口）。
+        let (service_project, project_ids): (
+            std::collections::HashMap<String, String>,
+            std::collections::HashSet<String>,
+        ) = state.db.with_conn(|conn| {
+            let mut svc_stmt = conn.prepare("SELECT id, project_id FROM services")
+                .map_err(|e| format!("查询服务存在性失败: {}", e))?;
+            let svc_rows = svc_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| format!("读取服务存在性失败: {}", e))?;
+            let mut service_project = std::collections::HashMap::new();
+            for row in svc_rows {
+                let (id, project_id) = row.map_err(|e| format!("解析服务存在性失败: {}", e))?;
+                service_project.insert(id, project_id);
+            }
+            let mut proj_stmt = conn.prepare("SELECT id FROM projects")
+                .map_err(|e| format!("查询项目存在性失败: {}", e))?;
+            let proj_rows = proj_stmt.query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("读取项目存在性失败: {}", e))?;
+            let mut project_ids = std::collections::HashSet::new();
+            for row in proj_rows {
+                project_ids.insert(row.map_err(|e| format!("解析项目存在性失败: {}", e))?);
+            }
+            Ok((service_project, project_ids))
+        })?;
+
         let mut out: Vec<BootServiceStatus> = Vec::new();
         let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for (label, rs) in state_sources() {
             let runner_reachable = boot::runner_reachable(&rs);
-            let runner_alive = boot::runner_process_alive(&rs);
+            let runner_alive = runner_reachable || boot::runner_process_alive(&rs);
             for (id, s) in &rs.services {
-                let alive = boot::service_alive(s);
+                let alive = boot::service_alive_in(&rs, s);
+                let service_exists = service_project.contains_key(id);
+                // 服务还在时以 DB 的归属为准；服务已删时只能用 state 里记录的 project_id
+                let project_exists = service_project
+                    .get(id)
+                    .map(|p| project_ids.contains(p))
+                    .unwrap_or_else(|| project_ids.contains(&s.project_id));
                 let item = BootServiceStatus {
                     service_id: id.clone(),
                     name: s.name.clone(),
@@ -1360,6 +1445,8 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
                     runner_alive,
                     configured: false,
                     service_enabled: true,
+                    service_exists,
+                    project_exists,
                 };
                 match index.get(id) {
                     // 同一服务同时出现在旧/新状态里：保留进程仍活着的记录
@@ -1409,6 +1496,8 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
                 runner_alive: false,
                 configured: true,
                 service_enabled: *enabled,
+                service_exists: true,
+                project_exists: project_ids.contains(project_id),
             });
         }
         for item in &mut out {
@@ -1417,6 +1506,9 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
                 item.service_enabled = *enabled;
             }
         }
+        // 只保留：仍配置为开机启动（且服务/项目都在）的，或仍有存活进程的。
+        // 删除服务/项目后残留的死记录、取消开机自启后已停止的记录，都不再显示。
+        out.retain(keep_boot_service_item);
         // 还在跑的排前面，其余按名称；界面不必再排一次
         out.sort_by(|a, b| b.alive.cmp(&a.alive).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
@@ -1870,5 +1962,48 @@ mod tests {
         assert_eq!(classify_runner_state(false, false, None, "S4U").0, "not_installed");
         assert_eq!(classify_runner_state(true, true, None, "S4U").0, "running");
         assert_eq!(classify_runner_state(true, false, None, "S4U").0, "installed_stopped");
+    }
+
+    fn boot_item(alive: bool, configured: bool, service_exists: bool, project_exists: bool) -> BootServiceStatus {
+        BootServiceStatus {
+            service_id: "s".into(),
+            name: "n".into(),
+            project_id: "p".into(),
+            mode: "s4u".into(),
+            phase: if alive { "ready" } else { "stopped" }.into(),
+            alive,
+            pid: None,
+            started_at: String::new(),
+            ready_at: String::new(),
+            exit_code: None,
+            error: String::new(),
+            log_path: String::new(),
+            runner_reachable: true,
+            runner_alive: true,
+            configured,
+            service_enabled: true,
+            service_exists,
+            project_exists,
+        }
+    }
+
+    /// 设置页的保留规则：配置在 → 显示；进程活着 → 显示（即使服务/项目已删除）；
+    /// 取消开机自启且已停止 → 隐藏；删除且进程已停 → 隐藏。
+    #[test]
+    fn test_keep_boot_service_item_rules() {
+        // 仍配置、服务/项目都在：显示（哪怕当前没跑）
+        assert!(keep_boot_service_item(&boot_item(false, true, true, true)));
+        // 取消开机自启、已停止：隐藏
+        assert!(!keep_boot_service_item(&boot_item(false, false, true, true)));
+        // 取消开机自启、但进程还在跑：保留停止入口
+        assert!(keep_boot_service_item(&boot_item(true, false, true, true)));
+        // 服务已删除、进程还在：保留警告项
+        assert!(keep_boot_service_item(&boot_item(true, false, false, true)));
+        // 服务已删除、进程已停：隐藏
+        assert!(!keep_boot_service_item(&boot_item(false, false, false, true)));
+        // 项目已删除、进程还在：保留
+        assert!(keep_boot_service_item(&boot_item(true, true, true, false)));
+        // 项目已删除、进程已停：隐藏
+        assert!(!keep_boot_service_item(&boot_item(false, true, true, false)));
     }
 }

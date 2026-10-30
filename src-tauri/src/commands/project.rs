@@ -2,6 +2,7 @@ use tauri::{Manager, State};
 use crate::AppState;
 use crate::models::{Project, ProjectDetail};
 use crate::database::query_services_by_project;
+use crate::commands::process::DeleteResult;
 
 /// 获取所有项目（不含服务详情，列表用）
 #[tauri::command]
@@ -125,29 +126,30 @@ pub fn update_project(state: State<AppState>, id: String, name: String, path: St
 
 /// 删除项目（先停进程，再删数据；进程清理含长等待 → 异步执行避免阻塞 IPC）
 #[tauri::command]
-pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<DeleteResult, String> {
     if id.trim().is_empty() { return Err("项目ID不能为空".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        // 1. 查询服务 id（在 DB 锁外）
-        let ids: Vec<String> = state.db.with_conn(|conn| {
+        // 1. 查询项目下的服务（在 DB 锁外）；带名字，停止失败的提示才能说清是哪个服务
+        let services: Vec<(String, String)> = state.db.with_conn(|conn| {
             Ok(query_services_by_project(conn, &id)?
-                .into_iter().map(|s| s.id).collect())
+                .into_iter().map(|s| (s.id, s.name)).collect())
         })?;
 
-        // 2. 停止所有运行中的服务进程。
-        // 失败必须留痕：原先 `let _ = stop(sid)` 丢弃错误，用户看到"删除成功"而进程仍在跑
-        // （占端口/CPU），且项目记录已删、UI 里再没有入口去停它。与 stop_project_services
-        // （commands/process.rs 的"逐个停止并收集失败"）同一收口。
+        // 2. 停止所有运行中的服务进程（不论是否配置了开机自启）。
+        // 失败必须带回前端：项目记录删掉后界面里再没有入口，用户只能在现场处理。
         // 仍继续删除：用户要的是删掉项目，不该因为一个停止失败而拒绝。残留进程由应用级
         // Job Object（KILL_ON_JOB_CLOSE）在 Nexus 退出时兜底回收。
-        for sid in &ids {
+        let mut stop_warnings = Vec::new();
+        for (sid, name) in &services {
             // 开机启动器拥有的服务不在本地进程表里：优先走 runner，失联时按 PID 兜底结束
             if let Err(e) = crate::commands::boot::stop_boot_service(sid) {
                 log::warn!("删除项目 {} 时停止开机启动器服务 {} 失败：{}", id, sid, e);
+                stop_warnings.push(format!("「{}」停止开机启动实例失败：{}", name, e));
             }
             if let Err(e) = state.process_mgr.stop(sid) {
                 log::warn!("删除项目 {} 时停止服务 {} 失败（进程可能残留至应用退出）：{}", id, sid, e);
+                stop_warnings.push(format!("「{}」停止本地进程失败：{}", name, e));
             }
         }
 
@@ -169,7 +171,7 @@ pub async fn delete_project(app: tauri::AppHandle, id: String) -> Result<(), Str
         } else {
             crate::commands::boot::reload_all_if_running();
         }
-        Ok(())
+        Ok(DeleteResult { stop_warnings })
     }).await.map_err(|e| format!("删除项目任务失败: {}", e))?
 }
 

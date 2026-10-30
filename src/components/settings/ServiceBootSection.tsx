@@ -375,7 +375,8 @@ export function ServiceBootSection() {
           <span className="ml-auto text-[10px] text-nexus-muted/50">每 5 秒自动刷新</span>
         </div>
         <p className="text-[11px] text-nexus-muted/80 leading-relaxed mb-2">
-          包含两个启动器记录过的服务与旧版遗留实例；「日志」读取对应模式目录下的日志文件。
+          只列出仍配置为开机启动的服务，以及仍由启动器管理的存活实例；「日志」读取对应模式目录下的日志文件。
+          已删除服务的残留进程会标出来，只能停止或查看日志。
         </p>
         {services.length === 0 ? (
           <p className="text-[11px] text-nexus-muted/40 py-2">暂无开机启动服务</p>
@@ -383,6 +384,7 @@ export function ServiceBootSection() {
           <div className="space-y-1.5">
             {services.map(svc => {
               const phase = servicePhase(svc);
+              const deleted = !svc.service_exists || !svc.project_exists;
               const busyNow = busyService.endsWith(`:${svc.service_id}`);
               return (
                 <div key={svc.service_id} className="rounded-md border border-nexus-border/50 bg-nexus-bg/30 px-3 py-2 space-y-1.5">
@@ -396,12 +398,20 @@ export function ServiceBootSection() {
                           ? 'bg-nexus-error/10 text-nexus-error'
                           : 'bg-nexus-accent/12 text-nexus-accent'
                     }`}>{modeLabel(svc.mode)}</span>
-                    {!svc.configured && (
+                    {!svc.service_exists ? (
+                      <span className="text-[9px] leading-[14px] px-1.5 rounded-full flex-shrink-0 bg-nexus-error/10 text-nexus-error">
+                        服务已删除
+                      </span>
+                    ) : !svc.project_exists ? (
+                      <span className="text-[9px] leading-[14px] px-1.5 rounded-full flex-shrink-0 bg-nexus-error/10 text-nexus-error">
+                        项目已删除
+                      </span>
+                    ) : !svc.configured ? (
                       <span className="text-[9px] leading-[14px] px-1.5 rounded-full flex-shrink-0 bg-nexus-hover/40 text-nexus-muted">
                         已关闭开机启动
                       </span>
-                    )}
-                    {svc.configured && !svc.service_enabled && (
+                    ) : null}
+                    {svc.configured && svc.service_exists && svc.project_exists && !svc.service_enabled && (
                       <span className="text-[9px] leading-[14px] px-1.5 rounded-full flex-shrink-0 bg-nexus-hover/40 text-nexus-muted">
                         服务已禁用 · 开机不启动
                       </span>
@@ -423,7 +433,8 @@ export function ServiceBootSection() {
                       className="px-2 py-1 text-[11px] text-nexus-info border border-nexus-info/30 rounded hover:bg-nexus-info/10 disabled:opacity-40"
                       onClick={() => setLogTarget(svc)}
                     >日志</button>
-                    {!svc.alive && (
+                    {/* 已删除的服务没有可启动/重启的配置，只留停止（进程可能还在跑）与日志 */}
+                    {!svc.alive && !deleted && (
                       <button
                         className="px-2 py-1 text-[11px] text-nexus-success border border-nexus-success/30 rounded hover:bg-nexus-success/10 disabled:opacity-40"
                         disabled={!!busy || !!busyService}
@@ -432,11 +443,13 @@ export function ServiceBootSection() {
                     )}
                     {svc.alive && (
                       <>
-                        <button
-                          className="px-2 py-1 text-[11px] text-nexus-warning border border-nexus-warning/30 rounded hover:bg-nexus-warning/10 disabled:opacity-40"
-                          disabled={!!busy || !!busyService}
-                          onClick={() => void runService(svc, 'restart')}
-                        >{busyNow && busyService.startsWith('restart:') ? '重启中…' : '重启'}</button>
+                        {!deleted && (
+                          <button
+                            className="px-2 py-1 text-[11px] text-nexus-warning border border-nexus-warning/30 rounded hover:bg-nexus-warning/10 disabled:opacity-40"
+                            disabled={!!busy || !!busyService}
+                            onClick={() => void runService(svc, 'restart')}
+                          >{busyNow && busyService.startsWith('restart:') ? '重启中…' : '重启'}</button>
+                        )}
                         <button
                           className="px-2 py-1 text-[11px] text-nexus-error border border-nexus-error/30 rounded hover:bg-nexus-error/10 disabled:opacity-40"
                           disabled={!!busy || !!busyService}
@@ -531,8 +544,12 @@ function servicePhase(s: BootServiceStatus): {
     case 'pending':
       return { text: '等待启动', textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
     case 'ready':
-      // phase 说 ready 但 PID 已不存在：runner 退出/被强杀后状态没来得及更新
-      return { text: '进程已退出（状态未更新）', textCls: 'text-nexus-warning', dot: 'bg-nexus-warning' };
+      // phase 说 ready 但存活校验没通过：可能是 runner 退出/被强杀后状态没来得及更新，
+      // 也可能是 GUI 所在登录会话无权查询 S4U 进程。**不能断言“进程已退出”**——
+      // 用户实际看到过“显示已退出、进程还在跑”的误报（服务器场景）。
+      return s.runner_reachable
+        ? { text: '进程状态待确认（启动器仍在运行）', textCls: 'text-nexus-warning', dot: 'bg-nexus-warning' }
+        : { text: '无法确认进程状态（启动器已退出）', textCls: 'text-nexus-warning', dot: 'bg-nexus-warning' };
     default:
       return { text: s.phase, textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
   }

@@ -48,7 +48,7 @@ export interface BootServiceStatus {
   mode: string;
   /** state.json 的 phase；空串 = 已配置开机启动但启动器从未记录过它 */
   phase: string;
-  /** 进程是否仍活着（pid + 启动时刻校验） */
+  /** 进程是否仍活着（runner 心跳上报优先，回退 pid + 启动时刻校验） */
   alive: boolean;
   pid: number | null;
   started_at: string;
@@ -64,6 +64,10 @@ export interface BootServiceStatus {
   configured: boolean;
   /** DB 里服务的「跟随项目启动」开关；false 时 manifest 会排除它（开机不会启动） */
   service_enabled: boolean;
+  /** 服务本身是否还在 DB 里；false = 已删除（进程若仍在，只保留停止/日志入口） */
+  service_exists: boolean;
+  /** 服务所属项目是否还在 DB 里；false = 项目已删除 */
+  project_exists: boolean;
 }
 
 export interface BootToggleResult {
