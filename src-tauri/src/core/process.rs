@@ -46,6 +46,14 @@ pub struct FailedService {
     pub source: String,
 }
 
+/// 后台生命周期心跳线程是否成功启动。
+///
+/// `get_running` 正常读 `snapshot_running()`（不重复 tick）；但心跳线程创建失败时，
+/// 崩溃判定/游离进程认领/日志文件发现就没人推进了，此时必须退回 `running()`（先 tick）。
+/// 这是 `lib.rs` 注释里“失败态/认领将只靠前端轮询”的兜底，不能因为优化把它删掉。
+pub(crate) static LIFECYCLE_TICKER_ALIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 取生命周期锁（NEW-17）。锁中毒同样继续用：进程生命周期离硬件更近，
 /// 让一次无关的 panic 变成"该服务永远起不来"是更坏的结局。
 pub(crate) fn lock_lifecycle<'a>(lock: &'a Arc<Mutex<()>>, key: &str) -> std::sync::MutexGuard<'a, ()> {
@@ -552,15 +560,23 @@ impl ProcessManager {
     /// 都阻塞在 `push_log_line` 的同一把锁上（已读到的行既不进缓冲也不 emit）。
     pub fn get_logs(&self, key: &str) -> Vec<Arc<LogLine>> {
         let log_key: LogKey = Arc::from(key);
-        match self.log_buffers.lock() {
-            Ok(b) => b.get(&*log_key)
-                .map(|buf| buf.lines.iter().cloned().collect())
-                .unwrap_or_default(),
+        // 外层只取服务缓冲的 Arc，随后释放；内层锁只挡这一个服务，其他服务照常写日志。
+        let buf = match self.log_buffers.lock() {
+            Ok(b) => b.get(&*log_key).map(Arc::clone),
             Err(e) => {
-                log::error!("ProcessManager log_buffers 锁已中毒: {}", e);
+                log::error!("ProcessManager log_buffers 外层锁已中毒: {}", e);
+                return Vec::new();
+            }
+        };
+        let Some(buf) = buf else { return Vec::new() };
+        let out = match buf.lock() {
+            Ok(b) => b.lines.iter().cloned().collect(),
+            Err(e) => {
+                log::error!("ProcessManager 服务日志锁已中毒: {}", e);
                 Vec::new()
             }
-        }
+        };
+        out
     }
 
     /// 取某服务的 (工作目录, 启动时刻)；服务不在表里时 None
@@ -577,6 +593,14 @@ impl ProcessManager {
     /// `catalina.bat start` → `start "Tomcat" java`，见 `AdoptedChild`）。
     /// 认领到就继续算运行中，认领不到才按退出处理。
     /// 当前运行中的服务：(project_id, service_id, 正在跟随的日志文件)
+    /// 同一个服务表项是否仍是 Phase 1 观察到的那个进程实例。
+    ///
+    /// pid 可能被复用；`spawn_started_at` 是启动时刻，同一 pid 的两次启动不可能相同。
+    /// 二者同时相等才允许对表项做 take/remove 这类破坏性动作。
+    fn same_generation(info_pid: u32, info_started_at: u64, ended_pid: u32, ended_started_at: u64) -> bool {
+        info_pid == ended_pid && info_started_at == ended_started_at
+    }
+
     /// 生命周期心跳：推进"崩溃判定 / 游离进程认领 / 日志文件自动发现"这三件带副作用的事。
     ///
     /// 为什么要独立成一个函数（ARCH-22）：这三件事原先**只**写在 `running()` 里，而
@@ -665,9 +689,18 @@ impl ProcessManager {
 
         // Phase 2（锁内）：落实。认领成功的摘掉 child（已退出，只回收句柄）并存入 adopted；
         // 其余摘表，交给 Phase 2.5 收尸。
+        //
+        // **必须复核进程代际**：Phase 1 释放锁到 Phase 2 重新加锁之间的窗口里，用户可能
+        // 已经 stop + start/restart 了同一个 key。此时 e.pid / e.started_at 描述的是**旧**
+        // 进程，直接 take/remove 会：
+        // ① 把新 Child 的 wait() 放进全局 processes 锁里 → 整个进程管理假死；
+        // ② 摘掉新实例并 taskkill → 刚重启的服务被杀；
+        // ③ 对已被 stop 的 key 写“进程已退出”并插入 failed。
         let mut exited: Vec<(String, Option<i32>)> = Vec::new();
         let mut dead: Vec<CleanupEntry> = Vec::new();
         let mut adopted_logs: Vec<(String, String)> = Vec::new();
+        // child.wait() 不能在锁内做：新启动的进程可能长期运行，持锁等待会冻结所有 IPC。
+        let mut wait_after: Vec<(String, Child)> = Vec::new();
         {
             let mut procs = self.processes.lock().unwrap_or_else(|e| {
                 log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
@@ -675,23 +708,42 @@ impl ProcessManager {
             });
             for e in ended {
                 let Some(list) = survived.remove(&e.key) else {
-                    // 没有游离后代：按退出处理
-                    exited.push((e.key.clone(), e.exit_code));
-                    if let Some(mut info) = procs.remove(&e.key) {
-                        dead.push(take_cleanup_entry(e.key, &mut info));
+                    // 没有游离后代：按退出处理（但只处理 Phase 1 看到的那个实例）
+                    let stale = procs.get(&e.key)
+                        .map(|info| !Self::same_generation(info.pid, info.spawn_started_at, e.pid, e.started_at))
+                        .unwrap_or(true);
+                    if stale {
+                        log::debug!("[nexus] tick: {} 的代际已变（stop/restart），跳过旧退出事件", e.key);
+                        continue;
                     }
+                    let Some(mut info) = procs.remove(&e.key) else { continue };
+                    exited.push((e.key.clone(), e.exit_code));
+                    dead.push(take_cleanup_entry(e.key, &mut info));
                     continue;
                 };
-                // 认领成功。期间可能已被 stop 摘走 —— 那就什么都不做，
-                // 句柄随 list 在这里 drop（进程已被 stop 结束）
+                // 认领成功。期间可能已被 stop 摘走/重启 —— 不是同一代就什么都不做，
+                // 句柄随 list 在这里 drop。
                 let Some(info) = procs.get_mut(&e.key) else { continue };
-                if let Some(mut child) = info.child.take() {
-                    let _ = child.wait(); // 已退出：只回收句柄，不 taskkill
+                if !Self::same_generation(info.pid, info.spawn_started_at, e.pid, e.started_at) {
+                    log::warn!(
+                        "[nexus] tick: {} 的代际已变，丢弃过期的认领结果（{} 个进程不再跟踪）",
+                        e.key, list.len()
+                    );
+                    continue;
+                }
+                if let Some(child) = info.child.take() {
+                    wait_after.push((e.key.clone(), child)); // 已退出：只回收句柄，不 taskkill
                 }
                 let who = list.iter().map(|a| format!("{} (pid {})", a.name, a.pid))
                     .collect::<Vec<_>>().join("、");
                 info.adopted = list;
                 adopted_logs.push((e.key, who));
+            }
+        }
+        // 锁外等待已退出的直接子进程回收句柄。它们已被 try_wait 观测到退出，wait 通常立即返回。
+        for (key, mut child) in wait_after {
+            if let Err(err) = child.wait() {
+                log::warn!("[nexus] 回收已退出进程句柄失败 ({}): {}", key, err);
             }
         }
 
@@ -753,17 +805,21 @@ impl ProcessManager {
     }
 
     /// 只读的运行表快照（不推进任何生命周期）。后台线程 tick 完之后取它来判定/展示
-    fn snapshot_running(&self) -> Vec<(String, String, Option<String>)> {
+    pub(crate) fn snapshot_running(&self) -> Vec<(String, String, Option<String>)> {
         // Phase 4: 重新获取锁，一次取齐 (project_id, service_id, 跟随的日志文件)。
         //
         // `followed_log` 一并在这里取走（PERF-33）：它就在同一张表里，而原实现是
         // 调用方拿着这串 id **每个服务再各取一次锁**（18 服务 = 一轮 18 次加锁，
         // 只为读一个字段）。表是同一张、锁是同一把，没有分两次取的理由。
-        self.processes.lock()
+        let mut out: Vec<(String, String, Option<String>)> = self.processes.lock()
             .map(|procs| procs.iter().map(|(k, v)| {
                 (v.project_id.clone(), k.clone(), v.follow.as_ref().map(|f| f.path.clone()))
             }).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // HashMap 顺序不稳定：前端 sameStatus 按下标比较，顺序一变就会被判成“内容变了”，
+        // 抵消“内容没变不重渲染”的优化。排序后快照与轮询之间才是逐字段稳定的。
+        out.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        out
     }
 
     pub fn stop_all(&self) {
@@ -810,13 +866,16 @@ impl ProcessManager {
 
     /// 返回意外退出的服务列表（前端显示失败状态）
     pub fn failed(&self) -> Vec<FailedService> {
-        match self.failed.lock() {
+        let mut out: Vec<FailedService> = match self.failed.lock() {
             Ok(f) => f.values().cloned().collect(),
             Err(e) => {
                 log::error!("ProcessManager failed 锁已中毒: {}", e);
                 Vec::new()
             }
-        }
+        };
+        // 同 snapshot_running：给前端一个稳定顺序（sameStatus 按下标比较）
+        out.sort_unstable_by(|a, b| a.service_id.cmp(&b.service_id));
+        out
     }
 
     /// 测试用：取某服务当前认领到的游离进程 (pid, 映像名)。
@@ -1104,6 +1163,28 @@ fn survivors_of(pids: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// 结束 `pid` 名下仍存活的后代进程；返回清理数量。
+///
+/// 用途：命令主进程已退出，但后代继承了 stdout/stderr 管道并继续持有写端——reader 永远
+/// 等不到 EOF。先清掉这些后代，管道关闭后 reader 才能退出。只在“主进程已 wait”之后调用，
+/// 且调用方仍持有主进程句柄（pid 不会被复用）。
+#[cfg(windows)]
+pub(crate) fn kill_descendants_of(pid: u32) -> usize {
+    let snapshot = super::winproc::snapshot_processes();
+    let descendants = super::winproc::descendants(pid, &snapshot);
+    for child in &descendants {
+        if let Err(e) = kill_process_tree(*child) {
+            log::warn!("[nexus] 清理命令后代进程失败 (pid={}): {}", child, e);
+        }
+    }
+    descendants.len()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn kill_descendants_of(_pid: u32) -> usize {
+    0
+}
+
 fn cleanup_process(entry: CleanupEntry, snapshot: Option<&[super::winproc::ProcEntry]>) -> CleanupOutcome {
     let CleanupEntry { key: _key, pid, started_at, mut child, adopted, follow, done_stdout, done_stderr, stop_flag } = entry;
     // 先置停止标志：reader 线程立刻停止写缓冲与 emit。
@@ -1139,7 +1220,15 @@ fn cleanup_process(entry: CleanupEntry, snapshot: Option<&[super::winproc::ProcE
     }
     // 还活着的直接子进程名下，可能已经有"另开窗口"跑出去的后代（此刻它们尚未被认领，
     // 或刚被认领前就被 stop 撞上）。一并收掉，避免留下占端口的孤儿。
-    let orphans = candidate_descendants(pid, started_at, snapshot);
+    //
+    // **child 为 None（认领模式）时不能按 pid 走查**：直接子进程早已被回收，我们不再持有
+    // 它的句柄，pid 随时可能被系统复用；此时按旧 pid 找“后代”会把无关进程树当孤儿
+    // taskkill 掉。认领到的进程本身已在 `adopted` 里按句柄处理。
+    let orphans = if child.is_some() {
+        candidate_descendants(pid, started_at, snapshot)
+    } else {
+        Vec::new()
+    };
     for orphan in &orphans {
         log::info!("[nexus] 结束游离孙进程 (pid={})", orphan);
         kill(*orphan, "游离孙进程");
@@ -1227,10 +1316,12 @@ pub(crate) fn probe_process_start_time(pid: u32) -> ProcessProbe {
             user: *mut FileTime,
         ) -> WinBool;
         fn GetExitCodeProcess(handle: WinHandle, code: *mut u32) -> WinBool;
+        fn WaitForSingleObject(handle: WinHandle, milliseconds: u32) -> u32;
         fn CloseHandle(handle: WinHandle) -> WinBool;
     }
-    // PROCESS_QUERY_LIMITED_INFORMATION：查启动时间/退出码所需的最小权限
+    // PROCESS_QUERY_LIMITED_INFORMATION：查启动时间/退出码；SYNCHRONIZE：零超时等待（按需二次打开）
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
     // FILETIME 起点是 1601-01-01，与 UNIX 纪元差 11644473600 秒
     const FILETIME_UNIX_DIFF_SECS: u64 = 11_644_473_600;
     // GetExitCodeProcess 的“仍在运行”哨兵值（Win32 文档：259）
@@ -1254,12 +1345,28 @@ pub(crate) fn probe_process_start_time(pid: u32) -> ProcessProbe {
         let times_ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
         let mut code: u32 = 0;
         let exit_ok = GetExitCodeProcess(handle, &mut code);
+        // 退出码 259 有歧义（仍在运行 / 恰好以 259 退出）：零超时等待 signaled 才是真退出。
+        // 等待需要 SYNCHRONIZE，而主句柄只申请 QUERY_LIMITED（受保护进程也能查）；仅在 259
+        // 这一支按需再开一个等待句柄，打不开就按“可能还活着”的保守方向处理。
+        let signaled = if code == STILL_ACTIVE {
+            let syn = OpenProcess(SYNCHRONIZE, 0, pid);
+            if syn == 0 {
+                false
+            } else {
+                let w = WaitForSingleObject(syn, 0) == 0;
+                CloseHandle(syn);
+                w
+            }
+        } else {
+            false
+        };
         CloseHandle(handle);
         if times_ok == 0 || exit_ok == 0 {
             return ProcessProbe::Denied;
         }
-        // 句柄仍被他人持有的已退出进程：对象还在，但退出码已不是 STILL_ACTIVE
-        if code != STILL_ACTIVE {
+        // 句柄仍被他人持有的已退出进程：对象还在，但退出码已不是 STILL_ACTIVE。
+        // 反过来，**退出码恰好是 259** 的进程也不能当成活着的。
+        if code != STILL_ACTIVE || signaled {
             return ProcessProbe::Gone;
         }
         // 100ns 单位 → 毫秒；跨度远超 u64 溢出范围（584 年），只做一次减法
@@ -1517,6 +1624,12 @@ pub fn run_captured_command(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // 主进程已退出，但后代可能仍持有 stdout/stderr 管道写端：reader 等不到 EOF。
+                // 这些是内部命令（npm/version probe），不应留下后台进程；清掉后代让管道关闭。
+                let killed = kill_descendants_of(child.id());
+                if killed > 0 {
+                    log::warn!("[nexus] 命令 {} 退出后仍有 {} 个后代进程占用输出管道，已清理", label, killed);
+                }
                 // 等 reader 把管道里剩下的读完。固定睡一段时间在机器繁忙时会读到空 buffer，
                 // 于是"命令失败（退出码 1）。（无输出）"——把唯一的原因丢了（用户报过）。
                 // 改成"长度连续两次不变"：既等得住慢 reader，也不会白等。
@@ -1715,6 +1828,32 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// 回归：退出码恰好是 259 的进程不能被当成“仍在运行”。
+    #[cfg(windows)]
+    #[test]
+    fn test_probe_exit_259_is_gone() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit /b 259"])
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .expect("起测试进程");
+        let pid = child.id();
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(probe_process_start_time(pid), ProcessProbe::Gone) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("退出码 259 的进程被当成存活（pid {}）", pid);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     // ── ProcessManager 生命周期（不依赖 AppHandle 的部分）──────────────
     //
     // 为什么这些能测：spawn 需要 AppHandle（要向上 emit 事件），但"没有进程时"的
@@ -1861,6 +2000,15 @@ mod tests {
             !mgr.running().iter().any(|(_, id, _)| id == "s1"),
             "失败的启动不得留在运行表"
         );
+    }
+
+    /// tick 的 Phase 2 只允许处理 Phase 1 看到的同一代进程；pid 相同但启动时刻不同
+    /// 说明期间发生了 stop + start，必须丢弃旧退出事件。
+    #[test]
+    fn test_tick_generation_matches_only_same_instance() {
+        assert!(ProcessManager::same_generation(42, 1000, 42, 1000));
+        assert!(!ProcessManager::same_generation(42, 1001, 42, 1000), "启动时刻不同 = 新实例");
+        assert!(!ProcessManager::same_generation(43, 1000, 42, 1000), "pid 不同 = 新实例");
     }
 
     /// NEW-17 的回归：同一 key 的 stop 必须等 start 的生命周期锁释放。
@@ -2161,3 +2309,46 @@ mod tests {
 }
 
 
+
+#[cfg(all(test, windows))]
+mod descendant_cleanup_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// 主进程退出后，`start /b` 派生的后代仍活着并继承输出管道；清理函数必须能找到并结束它。
+    #[test]
+    fn test_kill_descendants_of_detached_child() {
+        let mut parent = Command::new("cmd")
+            .args(["/C", "start /b ping -n 20 127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("起父进程");
+        let pid = parent.id();
+        let _ = parent.wait();
+
+        // `start /b` 后 ping 由 cmd 派生；等它出现在快照里
+        let mut descendants = Vec::new();
+        for _ in 0..40 {
+            let snap = crate::core::winproc::snapshot_processes();
+            descendants = crate::core::winproc::descendants(pid, &snap);
+            if !descendants.is_empty() { break; }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!descendants.is_empty(), "未观察到 start /b 的后代进程（测试前提不成立）");
+
+        let killed = kill_descendants_of(pid);
+        assert!(killed > 0, "应清理到至少一个后代");
+        for child in descendants {
+            for _ in 0..40 {
+                if process_start_time_millis(child).is_none() { break; }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                process_start_time_millis(child).is_none(),
+                "后代进程未被清理 (pid={})",
+                child
+            );
+        }
+    }
+}

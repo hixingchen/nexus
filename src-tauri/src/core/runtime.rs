@@ -710,6 +710,21 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// 取 zip 条目的相对路径，并挡住跨平台差异造成的 zip-slip。
+///
+/// `enclosed_name` 按当前平台的 `Path` 语义判断：Windows 上 `\` 是分隔符，
+/// `..\..\evil` 会被识别并拒绝；Unix 上 `\` 只是普通字符，整个名字被当成单段文件名
+/// 放行，随后 `replace('\\', "/")` 才把它变成 `../../evil`。打包版只发 Windows，
+/// 但开发机/未来 Unix 构建不能留这个洞——含反斜杠的条目直接跳过。
+fn safe_zip_name<R: std::io::Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    if entry.name().contains('\\') {
+        log::warn!("[nexus] 跳过含反斜杠的压缩包条目: {}", entry.name());
+        return None;
+    }
+    entry.enclosed_name()
+}
+
 /// 解压 Node 官方 zip，**剥掉顶层目录**（`node-v24.21.0-win-x64/`）落到 `dest`。
 ///
 /// 顶层目录名从条目里**探测**而不是拼常量：官方 zip 的命名随平台/版本变过，
@@ -727,7 +742,7 @@ fn extract_node_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
             .by_index(i)
             .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
         // `enclosed_name` 挡路径穿越（zip-slip）：带 `..` 的条目直接跳过
-        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = safe_zip_name(&entry) else { continue };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let mut parts = rel.splitn(2, '/');
         let first = parts.next().unwrap_or("");
@@ -1307,7 +1322,7 @@ fn extract_package(
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
-        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = safe_zip_name(&entry) else { continue };
         let name = rel.to_string_lossy().replace('\\', "/");
         let parts: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
         let top = match parts.as_slice() {
@@ -1387,7 +1402,7 @@ fn extract_package(
         if entry.is_dir() {
             continue;
         }
-        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = safe_zip_name(&entry) else { continue };
         let name = rel.to_string_lossy().replace('\\', "/");
         if !name.starts_with(&node_prefix) && !name.starts_with(&ai_prefix) {
             continue;
@@ -1426,7 +1441,7 @@ fn extract_package(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("读取 zip 第 {} 个条目失败: {}", i, e))?;
-        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = safe_zip_name(&entry) else { continue };
         let name = rel.to_string_lossy().replace('\\', "/");
         let dest_rel = if let Some(rest) = name.strip_prefix(&node_prefix) {
             Path::new("node").join(&manifest.node_version).join(rest)

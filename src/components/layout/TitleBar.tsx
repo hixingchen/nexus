@@ -6,11 +6,17 @@ import { compareVersions } from '../../utils/version';
 import { nodeApi } from '../../services/service';
 import { getAppVersion } from '../../services/system';
 import { LATEST_RELEASE_API, NEW_ISSUE_URL, REPO_URL } from '../../utils/links';
-import { SettingsModal, type SettingsSection } from '../settings/SettingsModal';
-import { AboutModal } from '../help/AboutModal';
-import { UsageDocsModal } from '../help/UsageDocsModal';
-import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
+import type { SettingsSection } from '../settings/SettingsModal';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useClickOutside } from '../../hooks/useClickOutside';
+
+// 设置/帮助弹窗体量大且只在用户点开时用：拆成按需 chunk，别拖慢首屏。
+const SettingsModal = lazy(() =>
+  import('../settings/SettingsModal').then(m => ({ default: m.SettingsModal })));
+const UsageDocsModal = lazy(() =>
+  import('../help/UsageDocsModal').then(m => ({ default: m.UsageDocsModal })));
+const AboutModal = lazy(() =>
+  import('../help/AboutModal').then(m => ({ default: m.AboutModal })));
 
 /**
  * 标题栏左上角的两个顶级菜单。
@@ -209,14 +215,26 @@ export function TitleBar({ projectName }: TitleBarProps) {
 
     {/* 所有浮层都在标题栏的拖拽区**之外**（见 handleMouseDown：它只跳过 button/[data-menu]，
         而这些浮层里大片区域两者都不是——挂在里面就会"点弹窗把窗口拖走"，用户报过） */}
-    <SettingsModal
-      open={settings.open}
-      initialSection={settings.section}
-      onClose={() => setSettings(s => ({ ...s, open: false }))}
-      onNodeChanged={() => setNodeRefreshSeq(s => s + 1)}
-    />
-    <UsageDocsModal open={helpDialog === 'docs'} onClose={() => setHelpDialog(null)} />
-    <AboutModal open={helpDialog === 'about'} onClose={() => setHelpDialog(null)} />
+    {settings.open && (
+      <Suspense fallback={null}>
+        <SettingsModal
+          open
+          initialSection={settings.section}
+          onClose={() => setSettings(s => ({ ...s, open: false }))}
+          onNodeChanged={() => setNodeRefreshSeq(s => s + 1)}
+        />
+      </Suspense>
+    )}
+    {helpDialog === 'docs' && (
+      <Suspense fallback={null}>
+        <UsageDocsModal open onClose={() => setHelpDialog(null)} />
+      </Suspense>
+    )}
+    {helpDialog === 'about' && (
+      <Suspense fallback={null}>
+        <AboutModal open onClose={() => setHelpDialog(null)} />
+      </Suspense>
+    )}
     </>
   );
 }

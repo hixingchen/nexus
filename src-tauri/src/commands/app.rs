@@ -250,6 +250,7 @@ pub async fn pick_save_file(
 fn open_picker_title(purpose: Option<&str>) -> &'static str {
     match purpose {
         Some("importAiRuntime") => "选择 AI 运行时压缩包",
+        Some("importTemplates") => "选择模板文件",
         _ => "选择文件",
     }
 }
@@ -269,8 +270,10 @@ pub async fn pick_open_file(
     let filter = purpose.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
         let mut builder = picker.dialog().file().set_title(title);
-        if filter.as_deref() == Some("importAiRuntime") {
-            builder = builder.add_filter("ZIP", &["zip"]);
+        match filter.as_deref() {
+            Some("importAiRuntime") => builder = builder.add_filter("ZIP", &["zip"]),
+            Some("importTemplates") => builder = builder.add_filter("JSON", &["json"]),
+            _ => {}
         }
         // 同 pick_directory：blocking_* 必须放在 spawn_blocking 里，别卡住 IPC 线程
         builder.blocking_pick_file()

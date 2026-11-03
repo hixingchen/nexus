@@ -303,10 +303,19 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const newDirty = dirtyIds.filter(d => d !== id);
     baselines.delete(id);
     drafts.delete(id);
+    // 编辑代数只用于“读盘期间是否又编辑过”的判定；标签已经关掉，再留着就是无界增长
+    editSeqByTab.delete(id);
 
     if (closedTab && !newTabs.some(t => t.path === closedTab.path)) {
       removeCacheForPath(closedTab.path);
       fileMetaCache.delete(closedTab.path);
+      // 会话序号只对“当前打开的标签”有意义：关闭后清掉，避免按路径的记录无界增长
+      useEditorStore.setState(s => {
+        if (!(closedTab.path in s.fileOpenSeq)) return s;
+        const fileOpenSeq = { ...s.fileOpenSeq };
+        delete fileOpenSeq[closedTab.path];
+        return { fileOpenSeq };
+      });
     }
 
     // 关闭的不是活动标签：无需处理内容
@@ -411,6 +420,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 // ── 异步操作（组件调用） ──────────────────────────────────
 
 let tabSeq = 0;
+/**
+ * 全局单调的“打开/重载会话序号”。
+ *
+ * 原实现按路径递增并永久保留记录：关闭文件后记录不清，长会话里打开过的每个路径
+ * 都会留一条。改成全局计数 + 关闭时删除该路径后，记录只覆盖当前打开的标签；同时
+ * 因为序号永不回退，重开文件不会和旧 stateCache 的 key 撞车（缓存 key 含此序号）。
+ */
+let globalOpenSeq = 0;
+function nextOpenSeq(): number {
+  globalOpenSeq += 1;
+  return globalOpenSeq;
+}
 /** 同一 path 的并发读取去重（双击文件只创建一个标签） */
 const pendingLoads = new Map<string, Promise<void>>();
 
@@ -452,8 +473,7 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
   // 撤销历史清空——输入后 Ctrl+Z 应回到打开时的状态）。标签切换不经过此函数，历史保留
   {
     const st = useEditorStore.getState();
-    const seq = (st.fileOpenSeq[path] ?? 0) + 1;
-    useEditorStore.setState({ fileOpenSeq: { ...st.fileOpenSeq, [path]: seq } });
+    useEditorStore.setState({ fileOpenSeq: { ...st.fileOpenSeq, [path]: nextOpenSeq() } });
   }
   // 本次打开请求的序号：读盘期间用户又点了别的文件时，本请求的结果不再抢活动标签
   const mySeq = ++latestOpenSeq;
@@ -899,10 +919,11 @@ export function commitReloadedContent(id: string, raw: string): void {
   setCacheContent(tab.path, normalized); // 缓存不同步的话，切走再切回会读到旧内容
   // 磁盘内容即新基线 → 立刻是"干净"（不重置的话标签会显示未保存）
   useEditorStore.getState().markClean(id, normalized);
+  const seq = nextOpenSeq();
   useEditorStore.setState(s => ({
     // 只有活动标签才更新内容槽；非活动标签只换会话序号，等切到它时按新内容重建
     ...(s.activeTabId === id ? { fileContent: normalized } : {}),
-    fileOpenSeq: { ...s.fileOpenSeq, [tab.path]: (s.fileOpenSeq[tab.path] ?? 0) + 1 },
+    fileOpenSeq: { ...s.fileOpenSeq, [tab.path]: seq },
   }));
 }
 

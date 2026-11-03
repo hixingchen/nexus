@@ -107,7 +107,7 @@ test('重载后必须是「干净 + 新内容 + 新会话」（用户实测抓�
   const st = useEditorStore.getState();
   assert.deepEqual(st.dirtyIds, [], '重载后不能还挂着未保存标记（那正是用户看到圆点的原因）');
   assert.equal(st.fileContent, 'V2', '内容槽要换成磁盘上的新内容');
-  assert.equal(st.fileOpenSeq[tab.path], seqBefore + 1, '要换会话序号：编辑器据此重建并清撤销历史');
+  assert.ok(st.fileOpenSeq[tab.path] > seqBefore, '要换会话序号：编辑器据此重建并清撤销历史');
 
   // 编辑器随后的"回声"（重建/同步那一拍会把同样的内容再报一次）不该把它重新标脏
   useEditorStore.getState().updateDraft('V2');
@@ -335,4 +335,13 @@ test('非 Markdown 标签的判据恒为 false（预览按钮不显示，切换�
 test('没有活动标签时判据为 false（不抛错）', () => {
   resetStore();
   assert.equal(selectMdPreviewOnActiveTab(useEditorStore.getState()), false);
+});
+
+test('关闭标签后清理 fileOpenSeq（按路径的记录不能随历史无界增长）', () => {
+  resetStore();
+  const tab = openTab('/p/closed.ts', 'x');
+  // 直接构造“已打开过”的序号（openTab 是同步测试入口，不走 loadAndOpenFile 的递增）
+  useEditorStore.setState({ fileOpenSeq: { [tab.path]: 42 } });
+  useEditorStore.getState().closeTab(tab.id);
+  assert.equal(useEditorStore.getState().fileOpenSeq[tab.path], undefined, '关闭后必须删除该路径的记录');
 });

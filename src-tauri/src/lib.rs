@@ -410,7 +410,7 @@ pub fn run() {
     // 2 秒 < 前端的 3 秒轮询：心跳负责推进状态，前端只负责显示。
     {
         let handle = app.handle().clone();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("nexus-lifecycle-tick".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -418,8 +418,14 @@ pub fn run() {
                 let Some(state) = handle.try_state::<AppState>() else { break };
                 state.process_mgr.tick();
             })
-            .map_err(|e| log::warn!("[nexus] 生命周期心跳线程启动失败（失败态/认领将只靠前端轮询）: {}", e))
-            .ok();
+        {
+            Ok(_) => crate::core::process::LIFECYCLE_TICKER_ALIVE
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+            Err(e) => log::warn!(
+                "[nexus] 生命周期心跳线程启动失败（失败态/认领将退回前端轮询）: {}",
+                e
+            ),
+        }
     }
 
     // Exit 是最后的安全网：确保所有资源被释放，子进程被终止

@@ -385,24 +385,24 @@ pub fn sync_manifest_to(
 
 /// 原子写：先写同目录临时文件，再 rename 覆盖。
 ///
-/// Windows 上 `rename` 覆盖已存在文件的行为随实现/文件系统而异；失败时删掉目标再试一次。
+/// 临时名必须唯一：同一进程里的 `add_service` / `sync_all_manifests` 等可并发写同一份
+/// manifest，固定 `.<name>.<pid>.tmp` 会让两路写同一个临时文件，rename 结果取决于谁先。
+/// rename 失败时**不能删目标再试**——另一路可能刚把目标换好，删掉目标会让它凭空消失。
+/// Windows 上 `std::fs::rename` 走 `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`，单次即可。
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| format!("路径没有父目录: {}", path.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败 {}: {}", parent.display(), e))?;
     let tmp = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("write"),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
     std::fs::write(&tmp, bytes).map_err(|e| format!("写临时文件失败 {}: {}", tmp.display(), e))?;
-    if std::fs::rename(&tmp, path).is_ok() {
-        return Ok(());
-    }
-    let _ = std::fs::remove_file(path);
-    std::fs::rename(&tmp, path).map_err(|e| {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        format!("替换文件失败 {}: {}", path.display(), e)
-    })
+        return Err(format!("替换文件失败 {}: {}", path.display(), e));
+    }
+    Ok(())
 }
 
 // ─── Runner 状态 ────────────────────────────────────────────
@@ -703,6 +703,35 @@ mod tests {
         assert_eq!(written.services.len(), 2);
         assert_eq!(written.version, MANIFEST_VERSION);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并发写同一路径不能互相截断/删目标：manifest 与 state 都会被不同命令并发写。
+    #[test]
+    fn test_write_atomic_concurrent_writers_never_corrupt() {
+        let dir = std::env::temp_dir().join(format!("nexus-boot-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("state.json");
+        let payloads = [br#"{"a":1}"#.to_vec(), br#"{"b":2}"#.to_vec()];
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let p = path.clone();
+            let data = payloads[i % payloads.len()].clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    write_atomic(&p, &data).expect("原子写");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("写线程不应 panic");
+        }
+        let bytes = std::fs::read(&path).expect("读最终文件");
+        assert!(
+            payloads.iter().any(|p| p.as_slice() == bytes.as_slice()),
+            "最终文件必须是某一次完整写入，实际 {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

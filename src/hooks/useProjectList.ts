@@ -4,6 +4,7 @@ import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
 import { useProjectActions } from './useProjectActions';
 import { reportError } from '../utils/error';
+import { pruneProjectDrafts } from '../stores/modalDraftStore';
 
 /**
  * 最近一次成功拉到的项目列表（模块级，跨卸载保留）。
@@ -60,19 +61,45 @@ export function useProjectList() {
 
   // ── 数据加载 ──────────────────────────────────────────────
 
+  /** 加载请求代际：较早发出的响应不能覆盖较新的列表（新建/删除/收藏会连续触发 load） */
+  const loadSeqRef = useRef(0);
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     try {
-      setProjects(await fetchProjects());   // 顺带刷新共享缓存（见 cachedProjects）
+      const data = await fetchProjects(); // 顺带刷新共享缓存（见 cachedProjects）
+      if (seq === loadSeqRef.current) {
+        setProjects(data);
+        // 已删除项目的编辑草稿没有复活入口，留着只会让内存慢慢涨
+        pruneProjectDrafts(data.map(p => p.id));
+      }
     } catch (e) {
-      reportError('加载项目列表失败', e);
+      if (seq === loadSeqRef.current) reportError('加载项目列表失败', e);
     }
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
+  // 项目/服务删除后，展开集合里的旧 key 没有复苏入口；顺手剪掉，避免随历史缓慢增长。
+  useEffect(() => {
+    const projectIds = new Set(projects.map(p => p.id));
+    setExpandedSvc(prev => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const key of prev) {
+        const [pid, sid] = key.split(':');
+        if (!projectIds.has(pid)) { changed = true; continue; }
+        const list = svcCache[pid];
+        // 服务列表已加载且不含该服务 → 已删除；未加载时保留，避免折叠期间误删用户的展开态
+        if (list && !list.some(s => s.id === sid)) { changed = true; continue; }
+        next.add(key);
+      }
+      return changed ? next : prev;
+    });
+  }, [projects, svcCache]);
+
   // 项目动作（启动/停止/收藏）与窄轨共用一份实现（见 useProjectActions 的说明）。
   // 收藏会改变排序（后端 ORDER BY pinned DESC），所以动作完成后要重新拉列表
-  const { actingId, start, stop, togglePin } = useProjectActions(load);
+  const { actingIds, start, stop, togglePin } = useProjectActions(load);
 
   // 右键菜单关闭逻辑在 ProjectList 组件内处理（mousedown + 菜单内部不关闭）
 
@@ -160,7 +187,7 @@ export function useProjectList() {
   return {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
-    running, actingId,
+    running, actingIds,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,
     deleteTarget, setDeleteTarget,

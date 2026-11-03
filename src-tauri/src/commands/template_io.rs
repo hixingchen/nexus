@@ -112,6 +112,18 @@ pub fn export_service_templates(
         }
     };
 
+    // 写之前持有父目录句柄（不共享 DELETE）到写入结束：期间目录不能被重命名/删除，
+    // 校验后的路径不会被换成白名单外的联接点。
+    let _parent_guard = if let Some(parent) = resolved.parent() {
+        let (guard, real) = state.paths.open_verified_dir(&state.db, &parent.to_string_lossy())?;
+        if real.as_path() != parent {
+            return Err("目标目录在导出期间发生变化，已取消写入".into());
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     let picked = state.db.with_conn(|conn| collect_export_templates(conn, &ids))?;
     if picked.is_empty() { return Err("没有可导出的模板".into()); }
     let count = picked.len();
@@ -180,6 +192,10 @@ pub fn import_service_templates(
 ) -> Result<ImportTemplatesResult, String> {
     let source = path.trim();
     if source.is_empty() { return Err("导入路径不能为空".into()); }
+    // 路径必须来自用户经原生对话框确认过的目录（pick_open_file 会登记父目录）。
+    // 原先直接 read_to_string：被攻陷的 webview 可以传任意路径，后端至少能做文件存在性
+    // 探测与读取（大文件 DoS），与本模块导出、编辑器读文件的口径不一致。
+    state.paths.check_path_allowed(&state.db, source)?;
     let raw = std::fs::read_to_string(source).map_err(|e| format!("读取文件失败: {}", e))?;
     let file: TemplateExportFile = serde_json::from_str(&raw)
         .map_err(|e| format!("不是有效的模板导出文件: {}", e))?;
@@ -207,7 +223,11 @@ fn import_templates_into(
     // 用户看到的是一堆残缺数据，还不如重来
     for t in &file.templates {
         let name = t.name.trim().to_string();
-        if name.is_empty() { continue; } // 没名字的行没法用，跳过（计数里也不含）
+        if name.is_empty() {
+            // 没名字的行没法用；至少留痕，避免“导入了 N 个”与文件里的条数对不上却无从解释
+            log::warn!("[nexus] 导入模板跳过空名字条目（文件里的条目不完整）");
+            continue;
+        }
         // 同名照收，名字保持原样（见 ImportTemplatesResult.duplicated 的说明）。
         // 只统计一下，好让界面能如实告诉用户"有 N 个与现有的同名"
         let taken: i64 = tx
@@ -247,6 +267,23 @@ fn import_templates_into(
                     .map_err(|e| format!("模板「{}」的工作目录无法导入：{}", name, e))?;
             }
         }
+
+        // 与模板新建/编辑同一套校验：导入是外部文件，不能成为绕过校验的后门。
+        if !t.watch_paths.trim().is_empty() && t.watch_paths.trim() != "[]" {
+            let dirs: Vec<String> = serde_json::from_str(&t.watch_paths)
+                .map_err(|e| format!("模板「{}」的监听路径不是合法 JSON 数组: {}", name, e))?;
+            for dir in dirs {
+                if dir.trim().is_empty() { continue; }
+                // 与 cwd 同口径：本机不存在的路径不进入白名单根，保留模板跨机器可用；
+                // 只有“本机确实存在、且将成为可访问根”的路径才需要收口。
+                if !std::path::Path::new(&dir).is_dir() { continue; }
+                paths
+                    .ensure_config_dir_allowed_with_conn(&tx, &dir, "监听路径")
+                    .map_err(|e| format!("模板「{}」的监听路径无法导入：{}", name, e))?;
+            }
+        }
+        crate::commands::service::validate_tool_commands(&t.tool_commands)
+            .map_err(|e| format!("模板「{}」的工具命令无法导入：{}", name, e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let en = if t.enabled { 1 } else { 0 };

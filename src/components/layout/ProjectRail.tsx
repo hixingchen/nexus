@@ -48,7 +48,7 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
   const reload = useCallback(() => setReloadKey(k => k + 1), []);
   // 动作与完整列表共用一份实现（见 useProjectActions 的说明）：窄轨上漏开项目级文件监听、
   // 停止时漏清日志这类**只在收起态复现**的错，靠共用而不是靠"记得两处都改"来避免
-  const { actingId, start, stop, togglePin } = useProjectActions(reload);
+  const { actingIds, start, stop, togglePin } = useProjectActions(reload);
 
   useEffect(() => {
     let alive = true;
@@ -140,7 +140,7 @@ Enter：选中该项目；→ 或双击：展开项目列表并展开该项目�
           y={menu.y}
           pinned={menuProject.pinned}
           running={isRunning(menuProject.id)}
-          busy={actingId === menuProject.id}
+          busy={actingIds.has(menuProject.id)}
           onClose={() => setMenu(null)}
           onStart={() => void start(menuProject.id, menuProject.name)}
           onStop={() => void stop(menuProject.id, menuProject.name)}

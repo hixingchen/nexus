@@ -536,11 +536,22 @@ fn test_request_params_are_camel_case() {
         "envVars": "",
         "restartMode": 0,
         "toolCommands": "[]",
+        // 这五个都是 #[serde(default)]：键名写错会静默回落到默认值（开机配置丢失）
+        "bootEnabled": true,
+        "bootOrder": 7,
+        "bootCheck": "{\"type\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":8080}",
+        "bootRequired": true,
+        "bootCredentialMode": "password",
     });
     let params: AddServiceParams = serde_json::from_value(json).expect("应能按驼峰反序列化");
     assert_eq!(params.project_id, "p1");
     assert_eq!(params.restart_mode, 0);
     assert_eq!(params.tool_commands, "[]");
+    assert_eq!(params.boot_enabled, Some(true), "bootEnabled 被静默忽略");
+    assert_eq!(params.boot_order, Some(7), "bootOrder 被静默忽略");
+    assert!(params.boot_check.as_deref().unwrap_or("").contains("8080"), "bootCheck 被静默忽略");
+    assert_eq!(params.boot_required, Some(true), "bootRequired 被静默忽略");
+    assert_eq!(params.boot_credential_mode.as_deref(), Some("password"), "bootCredentialMode 被静默忽略");
 
     // ARCH-12：`SearchParams` 的这三个字段都带 `#[serde(default)]`——这里丢了
     // `rename_all = "camelCase"` 不会报 `missing field`，而是**静默取默认值**：
@@ -570,6 +581,9 @@ fn test_request_params_are_camel_case() {
         "watchPaths": "[\"C:/p\"]", "watchInclude": "*.ts", "watchExclude": "dist",
         "envVars": "K=V", "restartMode": 2, "enabled": false, "showFileTree": true,
         "toolCommands": "[{\"id\":\"c1\"}]",
+        "bootEnabled": true, "bootOrder": 9,
+        "bootCheck": "{\"type\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":8080}",
+        "bootRequired": true, "bootCredentialMode": "s4u",
     })).expect("UpdateServiceParams 应能按驼峰反序列化");
     assert_eq!(upd.id, "s1");
     assert_eq!(upd.watch_paths, "[\"C:/p\"]", "watchPaths 被静默忽略");
@@ -577,6 +591,10 @@ fn test_request_params_are_camel_case() {
     assert_eq!(upd.restart_mode, 2, "restartMode 被静默忽略");
     assert!(!upd.enabled && upd.show_file_tree, "两个展示开关被静默忽略");
     assert_eq!(upd.tool_commands, "[{\"id\":\"c1\"}]", "toolCommands 被静默忽略");
+    assert!(upd.boot_enabled && upd.boot_required, "开机开关被静默忽略");
+    assert_eq!(upd.boot_order, 9, "bootOrder 被静默忽略");
+    assert!(upd.boot_check.contains("8080"), "bootCheck 被静默忽略");
+    assert_eq!(upd.boot_credential_mode, "s4u", "bootCredentialMode 被静默忽略");
 
     let tpl: UpdateServiceTemplateParams = serde_json::from_value(serde_json::json!({
         "id": "t1", "name": "tpl", "command": "c", "cwd": "C:/p",
@@ -692,15 +710,21 @@ fn scan_ipc_structs() -> IpcStructs {
             // 会变成一次显式决定，实际只管得住响应侧。这里分开记两个方向。
             let (mut saw_serialize, mut saw_deserialize) = (false, false);
             // 测试段之后的类型不是 IPC 载荷（守卫只关心生产代码）。
-            // 约定：文件里的测试一律在 `#[cfg(test)]` 之后
-            let mut in_tests = false;
+            // **只在 `#[cfg(test)]` 紧跟 `mod …` 时停止**：文件中部还有 `#[cfg(test)]`
+            // 的测试辅助函数（core/process.rs、core/ai.rs），按“见到 cfg(test) 就停”
+            // 会让扫描器从那里开始失明，后面新增的 DTO 静默不被守卫看见。
+            let mut pending_cfg_test = false;
             for line in text.lines() {
                 let t = line.trim();
                 if t.starts_with("#[cfg(test)]") {
-                    in_tests = true;
-                }
-                if in_tests {
+                    pending_cfg_test = true;
                     continue;
+                }
+                if pending_cfg_test {
+                    if t.starts_with("mod ") {
+                        break; // 测试模块之后才是真正的非生产代码
+                    }
+                    pending_cfg_test = false;
                 }
                 if t.starts_with("#[") {
                     if let Some(rest) = t.split("derive(").nth(1) {

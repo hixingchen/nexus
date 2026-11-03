@@ -13,7 +13,7 @@ export interface ReadFileResponse {
   /** 原始换行风格（保存时按此写回，避免编辑器规范化换行导致 git 误报变更） */
   line_ending: 'lf' | 'crlf' | 'cr';
   /** 原始编码（'gb18030' 时保存按原编码写回，GBK 文件编辑后字节不变） */
-  encoding: 'utf8' | 'gb18030';
+  encoding: 'utf8' | 'gb18030' | 'lossy';
   /** 读取时的修改时间（距 UNIX 纪元毫秒）。保存时原样回传，用于检测外部改动 */
   modified: number | null;
 }

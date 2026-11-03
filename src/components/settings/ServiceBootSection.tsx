@@ -14,8 +14,12 @@ const MODES: { key: Mode; label: string; short: string }[] = [
   { key: 'password', label: '保存密码', short: '保存密码' },
 ];
 
-/** 状态轮询间隔：runner 可能被系统/计划任务/其他窗口停止，界面要能自己追上 */
-const POLL_MS = 5000;
+/**
+ * 状态轮询间隔：runner 可能被系统/计划任务/其他窗口停止，界面要能自己追上。
+ * 15 秒而不是 5 秒：每次轮询后端要跑两次 schtasks 查询；动作后的刷新走 load(true)
+ * 立即执行，所以这里放宽只影响“外部把 runner 停掉”的发现延迟，不影响用户操作反馈。
+ */
+const POLL_MS = 15000;
 
 /**
  * 设置 > 服务开机启动。
@@ -73,11 +77,23 @@ export function ServiceBootSection() {
     }
   }, []);
 
+  /** 5 秒轮询在途保护：schtasks/哈希慢时上一拍未回不再叠下一发 */
+  const pollInFlightRef = useRef(false);
+  const loadPoll = useCallback(async () => {
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
+    try {
+      await load();
+    } finally {
+      pollInFlightRef.current = false;
+    }
+  }, [load]);
+
   useEffect(() => {
     void load();
-    const timer = setInterval(() => { void load(); }, POLL_MS);
+    const timer = setInterval(() => { void loadPoll(); }, POLL_MS);
     return () => clearInterval(timer);
-  }, [load]);
+  }, [load, loadPoll]);
 
   const run = async (label: string, fn: () => Promise<unknown>, okText: string) => {
     setBusy(label);

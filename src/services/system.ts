@@ -37,7 +37,7 @@ export function pickDirectory(opts?: { purpose?: PickPurpose; defaultPath?: stri
 export type SavePurpose = 'exportTemplates' | 'exportAiRuntime';
 
 /** 打开对话框的用途键（标题与扩展名过滤同样由后端决定） */
-export type OpenPurpose = 'importAiRuntime';
+export type OpenPurpose = 'importAiRuntime' | 'importTemplates';
 
 /**
  * 原生文件保存对话框（由 Rust 侧弹框）。

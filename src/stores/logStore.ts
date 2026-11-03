@@ -11,8 +11,12 @@ interface LogStore {
   /** 累计新增行数（只增不减，\r 刷新帧不计）。暂停时显示"新增 N 行"的依据 */
   totalAdded: Record<string, number>;
   bulkAppend: (items: Array<{ serviceKey: string; stream: LogStream; data: string; timestamp?: string; seq?: number }>) => void;
-  /** 同步设置跟随数据源（由组件调用 service 后传入；不影响暂停视图） */
-  setLogs: (serviceKey: string, lines: ServiceLogLine[]) => void;
+  /**
+   * 同步设置跟随数据源（由组件调用 service 后传入；不影响暂停视图）。
+   * `resetAdded=false` 用于 1 秒轮询：轮询不是“新会话的初始快照”，不能把暂停期间的
+   * “新增 N 行”计数每秒清零。
+   */
+  setLogs: (serviceKey: string, lines: ServiceLogLine[], opts?: { resetAdded?: boolean }) => void;
   clearLogs: (serviceKey: string) => void;
   pruneInactive: (activeKeys: Set<string>) => void;
   /** 暂停：快照当前跟随数据源作为暂停视图（之后最多涨到 2000 行，满后冻结） */
@@ -101,6 +105,31 @@ function mergeRefreshFrame(target: ServiceLogLine[], line: ServiceLogLine): Serv
   return tail;
 }
 
+/**
+ * 当前打开着日志面板的 serviceKey 引用计数。
+ *
+ * 后端按服务持续 emit，但前端只有打开的面板才需要实时流入；未打开的服务在 Redis
+ * 打开时用 `get_service_logs` 快照补齐即可。没有这个过滤时，10 个忙碌服务只开 1 个面板，
+ * 其余 9 个仍在做 JS 解析、对象分配、2000 行数组复制——面板没开也全额付 CPU/内存。
+ * 引用计数是因为同一服务可能同时被详情页和设置页的 boot 日志各开一个面板。
+ */
+const logViewerRefs = new Map<string, number>();
+
+/** LogViewer 挂载时登记；返回的清理函数在卸载时调用 */
+export function retainLogViewer(serviceKey: string): () => void {
+  logViewerRefs.set(serviceKey, (logViewerRefs.get(serviceKey) ?? 0) + 1);
+  return () => {
+    const next = (logViewerRefs.get(serviceKey) ?? 1) - 1;
+    if (next <= 0) logViewerRefs.delete(serviceKey);
+    else logViewerRefs.set(serviceKey, next);
+  };
+}
+
+/** 该服务是否有打开的日志面板（供全局 service-log-batch 过滤） */
+export function isLogViewerOpen(serviceKey: string): boolean {
+  return (logViewerRefs.get(serviceKey) ?? 0) > 0;
+}
+
 export const useLogStore = create<LogStore>((set) => ({
   logs: {},
   pausedLogs: {},
@@ -181,7 +210,7 @@ export const useLogStore = create<LogStore>((set) => ({
     });
   },
 
-  setLogs: (serviceKey, lines) => {
+  setLogs: (serviceKey, lines, opts) => {
     // 快照 ≠ 覆盖：快照到达前已合并的实时行（seq 比快照里任何一行都大）必须保留，
     // 否则"打开日志面板瞬间已经刷出来的几行"会永久消失（原实现直接整表覆盖）。
     const snapMax = lines.reduce((m, l) => Math.max(m, l.seq ?? 0), 0);
@@ -195,8 +224,10 @@ export const useLogStore = create<LogStore>((set) => ({
       return {
         logs: { ...state.logs, [serviceKey]: merged },
         version: { ...state.version, [serviceKey]: (state.version[serviceKey] ?? 0) + 1 },
-        // 快照是初始状态，不是"新"日志——重置累计器
-        totalAdded: { ...state.totalAdded, [serviceKey]: 0 },
+        // 快照是初始状态，不是"新"日志——重置累计器；1 秒轮询传 false，保留暂停计数
+        totalAdded: opts?.resetAdded === false
+          ? state.totalAdded
+          : { ...state.totalAdded, [serviceKey]: 0 },
       };
     });
     // 去重窗口取两者较大值：快照里的行不应再被后续事件重复插入

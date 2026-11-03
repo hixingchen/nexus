@@ -434,8 +434,14 @@ pub(crate) fn final_path_of_handle(file: &std::fs::File) -> Result<PathBuf, Stri
 fn open_dir_for_handle(path: &str) -> Result<std::fs::File, String> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    // 不共享 DELETE：只要这个句柄还活着，目录本身就不能被重命名/删除。调用方把它
+    // 持有到“写入/删除真正完成”之后，就堵住了“校验后把父目录换成指向白名单外的
+    // 联接点”的 TOCTOU 窗口。目录内文件的读写不受影响（共享 READ|WRITE）。
     std::fs::OpenOptions::new()
         .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|e| format!("无法打开目录: {}", e))
@@ -714,6 +720,32 @@ mod tests {
         assert!(paths.ensure_config_dir_allowed(&db, &temp.to_string_lossy(), "工作目录").is_err(),
             "临时目录即使作为根也必须拒绝");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod anchored_dir_tests {
+    use super::open_dir_for_handle;
+
+    /// 持有目录句柄（不共享 DELETE）时：目录不能被重命名/删除，但目录内文件读写仍正常。
+    /// 这是 write_file/paste/delete 用来锚定父目录、堵 TOCTOU 的前提。
+    #[test]
+    fn test_anchored_dir_blocks_rename_but_allows_child_writes() {
+        let base = std::env::temp_dir().join(format!("nexus-anchor-{}", uuid::Uuid::new_v4()));
+        let inside = base.join("inside");
+        std::fs::create_dir_all(&inside).expect("建临时目录");
+        let guard = open_dir_for_handle(&inside.to_string_lossy()).expect("打开目录句柄");
+
+        std::fs::write(inside.join("child.txt"), b"x").expect("锚定期间目录内写入应允许");
+        let moved = base.join("moved");
+        assert!(
+            std::fs::rename(&inside, &moved).is_err(),
+            "持有不共享 DELETE 的目录句柄时，目录不应能被重命名"
+        );
+
+        drop(guard);
+        assert!(std::fs::rename(&inside, &moved).is_ok(), "释放句柄后应可重命名");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

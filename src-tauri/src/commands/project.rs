@@ -24,6 +24,18 @@ pub fn get_projects(state: State<AppState>) -> Result<Vec<Project>, String> {
     })
 }
 
+/// 项目查询失败 → 对界面说的话。
+///
+/// 只有“确实没有这一行”才是项目不存在；IO/锁/损坏等瞬时错误必须保留原文。
+/// 前端曾用 `msg.includes('项目不存在')` 判断“项目已删除”并落库清空选中项目，
+/// 把所有 DB 错误都映射成这句话等于让一次瞬时故障永久改配置。
+fn project_lookup_error(e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::QueryReturnedNoRows => "项目不存在".into(),
+        other => format!("读取项目失败: {}", other),
+    }
+}
+
 /// 获取项目详情（含所有服务）
 #[tauri::command]
 pub fn get_project_detail(state: State<AppState>, project_id: String) -> Result<ProjectDetail, String> {
@@ -37,7 +49,7 @@ pub fn get_project_detail(state: State<AppState>, project_id: String) -> Result<
                 pinned: row.get::<_, i32>("pinned")? != 0,
                 sort_index: row.get("sort_index")?,
             })
-        ).map_err(|e| format!("项目不存在: {}", e))?;
+        ).map_err(project_lookup_error)?;
 
         let services = query_services_by_project(conn, &project_id)?;
         Ok(ProjectDetail { project, services })
@@ -197,7 +209,7 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
                 pinned: row.get::<_, i32>("pinned")? != 0,
                 sort_index: row.get("sort_index")?,
             })
-        ).map_err(|e| format!("项目不存在: {}", e))?;
+        ).map_err(project_lookup_error)?;
 
         let services = query_services_by_project(&tx, id)?;
 
@@ -277,7 +289,7 @@ pub fn toggle_pin_project(state: State<AppState>, id: String) -> Result<bool, St
     state.db.with_conn(|conn| {
         let current: bool = conn.query_row(
             "SELECT pinned FROM projects WHERE id=?1", [&id], |r| r.get::<_,i32>(0)
-        ).map_err(|e| format!("项目不存在: {}", e))? != 0;
+        ).map_err(project_lookup_error)? != 0;
         let new_val = if current { 0 } else { 1 };
         conn.execute("UPDATE projects SET pinned=?1 WHERE id=?2", rusqlite::params![new_val, id])
             .map_err(|e| format!("更新项目收藏状态失败: {}", e))?;
@@ -292,6 +304,15 @@ mod tests {
     use super::*;
     use crate::database::{init_schema, Database};
     use std::collections::BTreeMap;
+
+    /// 只有 QueryReturnedNoRows 才是“项目不存在”；其它 DB 错误不能伪装成删除。
+    /// 前端拿这句话决定是否把选中项目落库清空。
+    #[test]
+    fn test_project_lookup_error_only_maps_no_rows() {
+        assert_eq!(project_lookup_error(rusqlite::Error::QueryReturnedNoRows), "项目不存在");
+        let msg = project_lookup_error(rusqlite::Error::InvalidQuery);
+        assert!(msg.starts_with("读取项目失败"), "瞬时 DB 错误必须保留原文: {}", msg);
+    }
 
     /// 某表在 schema 里的列名（**运行时枚举**，不写死）
     fn columns_of(conn: &rusqlite::Connection, table: &str) -> Vec<String> {

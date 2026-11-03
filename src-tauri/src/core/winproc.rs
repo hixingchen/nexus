@@ -21,8 +21,12 @@ const MAX_PATH: usize = 260;
 /// 只申请查询权限：认领后用它判存活 / 取退出码。**不含**终止权限——
 /// 杀进程仍统一走 `taskkill /T`（借助系统工具就能连整棵树一起收，不必自己实现遍历）。
 const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x1000;
+/// `WaitForSingleObject` 需要 SYNCHRONIZE；只有 QUERY_LIMITED 时等待会直接 WAIT_FAILED。
+const SYNCHRONIZE: Dword = 0x0010_0000;
 /// `GetExitCodeProcess` 的"仍在运行"哨兵值（Win32 文档：值 259）
 const STILL_ACTIVE: Dword = 259;
+/// `WaitForSingleObject` 的返回值：对象已终止
+const WAIT_OBJECT_0: Dword = 0;
 
 #[repr(C)]
 struct ProcessEntry32 {
@@ -44,6 +48,7 @@ extern "system" {
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32) -> Bool;
     fn OpenProcess(access: Dword, inherit: Bool, pid: Dword) -> Handle;
     fn GetExitCodeProcess(handle: Handle, code: *mut Dword) -> Bool;
+    fn WaitForSingleObject(handle: Handle, milliseconds: Dword) -> Dword;
     fn CloseHandle(handle: Handle) -> Bool;
 }
 
@@ -145,6 +150,7 @@ pub(crate) fn name_of(pid: u32, snapshot: &[ProcEntry]) -> String {
 /// 句柄是稀缺资源：只对认领到的游离进程开，服务停止时随 `Drop` 关闭。
 pub(crate) struct OwnedProcess {
     handle: Handle,
+    pid: u32,
 }
 
 impl OwnedProcess {
@@ -155,7 +161,7 @@ impl OwnedProcess {
             if handle == 0 {
                 None
             } else {
-                Some(OwnedProcess { handle })
+                Some(OwnedProcess { handle, pid })
             }
         }
     }
@@ -173,7 +179,18 @@ impl OwnedProcess {
                 return None; // 查不到：按"仍在运行"处理，比误报退出安全
             }
             if code == STILL_ACTIVE {
-                None
+                // 259 有歧义：既可能是“仍在运行”，也可能是进程**恰好以 259 退出**。
+                // 只看退出码会把后者永远当成活的（服务永远显示运行中、停止一直报未退出）。
+                // 零超时等待需要 SYNCHRONIZE；主句柄只申请了 QUERY_LIMITED，这里按需再开
+                // 一个等待句柄——不能把它并进主 open，否则受保护进程会连“查询存活”都失败。
+                let syn = OpenProcess(SYNCHRONIZE, 0, self.pid);
+                if syn == 0 {
+                    return None; // 无法复核：按“可能还活着”的保守方向
+                }
+                let wait = WaitForSingleObject(syn, 0);
+                CloseHandle(syn);
+                // WAIT_TIMEOUT = 仍在运行；其它（WAIT_FAILED 等）也按“存活”的保守方向
+                if wait == WAIT_OBJECT_0 { Some(code as i32) } else { None }
             } else {
                 Some(code as i32)
             }
@@ -278,6 +295,30 @@ mod tests {
         }
         assert_eq!(code, Some(7), "应当读到退出码 7");
         assert!(!owned.is_alive(), "进程已退出，不该报告存活");
+    }
+
+    /// 回归：259 也是合法退出码，不能因为等于 `STILL_ACTIVE` 就永远报“存活”。
+    #[test]
+    fn test_exit_code_259_is_not_forever_alive() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit /b 259"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("应当能起 cmd");
+        let pid = child.id();
+        let owned = OwnedProcess::open(pid).expect("刚起的进程应当能打开句柄");
+        let _ = child.wait();
+        let mut code = None;
+        for _ in 0..40 {
+            code = owned.exit_code();
+            if code.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(code, Some(259), "退出码 259 必须能读出来");
+        assert!(!owned.is_alive(), "已退出（退出码 259）的进程不该报告存活");
     }
 
     fn kill_and_wait(mut child: std::process::Child) {

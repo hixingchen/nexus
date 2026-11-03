@@ -29,6 +29,18 @@ const EMPTY_SERVICES: Service[] = [];
  * 数据仍以库里的为准（它是显示来源，不是事实来源）。
  */
 const detailCache = new Map<string, ProjectDetailView>();
+/** 详情缓存上限：项目被删除/长期切换时也不能无限增长 */
+const MAX_DETAIL_CACHE = 100;
+function rememberDetail(projectId: string, view: ProjectDetailView) {
+  if (!detailCache.has(projectId)) {
+    while (detailCache.size >= MAX_DETAIL_CACHE) {
+      const oldest = detailCache.keys().next().value;
+      if (oldest === undefined) break;
+      detailCache.delete(oldest);
+    }
+  }
+  detailCache.set(projectId, view);
+}
 
 /**
  * ProjectDetail 组件的业务逻辑 hook
@@ -80,7 +92,7 @@ export function useProjectDetail(projectId: string) {
 
   // ── 数据加载 ──────────────────────────────────────────────
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (refreshStatus = true) => {
     const seq = ++loadSeqRef.current;
     try {
       const d = await projectApi.getDetail(projectId);
@@ -94,13 +106,14 @@ export function useProjectDetail(projectId: string) {
       // 交给组件的只有 project：services 已写进共享缓存，再留一份就是第二份真相（ARCH-29）
       const view: ProjectDetailView = { project: d.project };
       setDetailState({ projectId, detail: view });
-      detailCache.set(projectId, view); // 供下次切回本项目时首帧直接命中（见 detailCache 说明）
+      rememberDetail(projectId, view); // 供下次切回本项目时首帧直接命中（见 detailCache 说明）
       setLoadError(null);
       // 运行状态**不在这里单独拉**（ARCH-28）：`runningStore` 自己每 3 秒轮询，而
       // `get_running` 是全项目最重的命令（逐服务 try_wait + 一次全系统进程快照 +
       // 未认领服务各扫 7 个日志目录）——「启动全部」原先要付两遍。
       // 这里只让它刷新，数据从订阅进来；与 `setRunning` 一样走同一套代际判定。
-      void useRunningStore.getState().refresh();
+      // 「启动/停止全部」的动作层已经 refresh 过一次，调用方传 false 避免同一命令连付两遍。
+      if (refreshStatus) void useRunningStore.getState().refresh();
       // "运行态已就绪"只在 store 真有数据时才置位：否则 `pruneInactive` 会拿一份空表
       // 判"哪些服务不在运行"，把正在跑的服务的日志缓冲清掉（这就是这个 ref 存在的理由）
       if (useRunningStore.getState().loaded) runningLoadedRef.current = true;
@@ -271,7 +284,7 @@ export function useProjectDetail(projectId: string) {
       if (errors.length > 0) {
         showNotification({ variant: 'error', title: '部分服务启动失败', description: errors.join(', ') });
       }
-      await load();
+      await load(false); // 动作层已 refresh，避免 get_running 连跑两遍
     } catch (e: unknown) {
       reportError('启动服务失败', e);
     }
@@ -290,7 +303,7 @@ export function useProjectDetail(projectId: string) {
       if (errors.length > 0) {
         showNotification({ variant: 'error', title: '部分服务停止失败', description: errors.join(', ') });
       }
-      await load();
+      await load(false); // 动作层已 refresh，避免 get_running 连跑两遍
     } catch (e: unknown) {
       reportError('停止服务失败', e);
     }

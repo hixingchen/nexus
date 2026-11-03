@@ -32,6 +32,30 @@ const AI_ON_KEY_PREFIX = 'ai_on_';
 const aiOnCache = new Map<string, boolean>();
 const aiPanelCache = new Map<string, boolean>();
 
+/**
+ * 启动/停止意图序号（仅本次运行）。
+ *
+ * 后端 epoch 解决“进程该不该活着”，但前端仍需要一个“哪个请求是最后意图”的判据：
+ * `ensureRunning` 的 await 可能晚于用户点停止返回，旧代码会无条件把 running 写回 true，
+ * 表现为“点了停止，图标又亮起来”。两个计数器分开是因为两种响应要做的收尾不同：
+ * - 被新 start 取代：不要动会话（新 start 可能正在复用它）；
+ * - 被 stop 取代：如果 start 还是把会话起来了，补一次 stop。
+ */
+let aiStartSeq = 0;
+let aiStopSeq = 0;
+
+/** 项目记忆上限：长时间使用会创建/删除很多项目，缓存必须封顶 */
+const MAX_AI_PROJECT_MEMORY = 200;
+
+/** 同步记缓存前淘汰最旧项（Map 保持插入顺序） */
+function capMap(map: Map<string, unknown>, max: number) {
+  while (map.size >= max) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
 /** 同步读某项目记忆（本次运行内未启用过 → false） */
 function aiOnOf(cwd: string): boolean {
   return aiOnCache.get(cwd) ?? false;
@@ -40,6 +64,7 @@ function aiOnOf(cwd: string): boolean {
 /** 同步记缓存（仅内存，不持久化） */
 function rememberAiOn(cwd: string | null, on: boolean) {
   if (!cwd) return;
+  if (!aiOnCache.has(cwd)) capMap(aiOnCache, MAX_AI_PROJECT_MEMORY);
   aiOnCache.set(cwd, on);
 }
 
@@ -51,6 +76,7 @@ function aiPanelWasOpen(cwd: string): boolean {
 /** 同步记面板显隐记忆（仅内存，不持久化；当前项目以 cwd 为键） */
 function rememberPanelOpen(cwd: string | null, open: boolean) {
   if (!cwd) return;
+  if (!aiPanelCache.has(cwd)) capMap(aiPanelCache, MAX_AI_PROJECT_MEMORY);
   aiPanelCache.set(cwd, open);
 }
 
@@ -245,6 +271,8 @@ export const useAiStore = create<AiState>((set, get) => ({
 
   stop: async () => {
     const { currentCwd } = get();
+    const myStop = ++aiStopSeq;
+    const startSeqAtStop = aiStartSeq;
     // 不设 starting 守卫：启动在途时停止 = 取消启动（后端 epoch 自杀，Err「已取消」当正常路径）
     // 先 await 后端停止、成功才落状态：乐观清空会让 UI 显示"会话已停止"而 dsh 进程其实还在跑
     try {
@@ -254,9 +282,17 @@ export const useAiStore = create<AiState>((set, get) => ({
       reportError('停止 AI 会话失败', e);
       return;
     }
+    if (myStop !== aiStopSeq) return; // 期间又点了一次停止/新的 stop 负责收尾
+    if (aiStartSeq !== startSeqAtStop) return; // 期间已发起新的启动：不要清掉它的状态
     // 记忆标记也只在成功后写：失败时保持"本项目启用过 AI"，避免下次切回来不再自动启动
     rememberAiOn(currentCwd, false);
-    set({ panelOpen: false, running: false, url: null, sessionCwd: null, lastError: null });
+    set({
+      panelOpen: false, running: false, url: null, sessionCwd: null, lastError: null,
+      // 在途启动若被 stop 取代，它的 finally 可能已经不再写 state；这里兜底收掉 spinner
+      starting: false,
+      // 明确停止后，不再保留“启动期间记下的待切换目标”，否则下一次启动会误收敛
+      pendingTarget: null,
+    });
   },
 
   setPanelWidth: (width) => {
@@ -276,10 +312,22 @@ export const useAiStore = create<AiState>((set, get) => ({
       if (!p || p.cwd !== cwd || p.name !== name) set({ pendingTarget: { cwd, name } });
       return;
     }
+    const stopSeqAtStart = aiStopSeq;
+    const myStart = ++aiStartSeq;
     set({ starting: true, lastError: null });
     const wantName = projectName?.trim() || null;
     try {
       const s = await aiService.start(cwd, projectName);
+      if (aiStopSeq !== stopSeqAtStart) {
+        // 启动在途时用户点了停止：只有“没有更新的启动接手”时才补杀，避免误杀新请求
+        if (aiStartSeq === myStart) {
+          if (s.running) void aiService.stop().catch((e) => reportError('停止 AI 会话失败', e));
+          // stop 失败时它不会清 spinner；这里兜底
+          set({ starting: false });
+        }
+        return;
+      }
+      if (aiStartSeq !== myStart) return; // 已有更新的启动/切换接手，不覆盖它的状态
       set({
         running: s.running,
         url: s.url,
@@ -291,11 +339,14 @@ export const useAiStore = create<AiState>((set, get) => ({
         // （sessionCwd 还是老项目 → runningHere=false，且没有自愈路径）
       });
     } catch (e) {
+      if (aiStartSeq !== myStart) return; // 已被更新的启动接手
+      if (aiStopSeq !== stopSeqAtStart) { set({ starting: false }); return; } // 已被 stop 取代
       const err = toAiError(e);
       // 「已取消」= 启动被 stop 打断（后端 epoch 自杀）：当正常路径，不展示错误
       if (!err.summary.startsWith('已取消')) set({ lastError: err });
       set({ starting: false, running: false, url: null, sessionCwd: null });
     }
+    if (aiStartSeq !== myStart || aiStopSeq !== stopSeqAtStart) return;
     // 收敛：请求期间目标又变了 → 补一次最新目标的启动。cwd 与项目名都要比：
     // 同一个项目目录换显示名同样需要重启会话（workspace 标题不同）
     const pending = get().pendingTarget;

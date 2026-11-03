@@ -9,7 +9,6 @@
 //! 对顶层导航无功能影响，保留以免 127.0.0.1 双栈怪癖。
 
 use std::cmp::Ordering;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -134,20 +133,52 @@ fn ensure_workspace_registered_at(storage: &Path, dir: &str, title: Option<&str>
     Ok(())
 }
 
+/// 同目录随机临时文件名：固定 `.tmp` 会让并发写互相截断。
+fn temp_sibling(file: &Path) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    file.with_file_name(format!(".{}.{}.tmp", name, uuid::Uuid::new_v4()))
+}
+
+/// Windows 上两个线程同时 `rename` 到同一目标时，后一个会短暂拿到“拒绝访问/共享冲突”。
+/// 生产路径已被 `AI_STORAGE_LOCK` 串行化；这里加有限重试是为了让原子写本身也稳健，
+/// 不把偶发共享冲突直接暴露成失败。
+fn atomic_replace(tmp: &Path, file: &Path) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..10 {
+        match std::fs::rename(tmp, file) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retryable = matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock)
+                    || e.raw_os_error() == Some(32); // ERROR_SHARING_VIOLATION
+                if !retryable || attempt == 9 {
+                    return Err(e);
+                }
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename 失败")))
+}
+
 /// 原子写（临时文件 + rename，避免半写文件被 dsh 读到）
 fn atomic_write(file: &Path, content: &str) -> Result<(), String> {
-    let tmp = file.with_extension("json.tmp");
+    let tmp = temp_sibling(file);
     std::fs::write(&tmp, content).map_err(|e| format!("写临时文件失败: {}", e))?;
-    std::fs::rename(&tmp, file).map_err(|e| format!("替换 workspace.json 失败: {}", e))
+    if let Err(e) = atomic_replace(&tmp, file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换 workspace.json 失败: {}", e));
+    }
+    Ok(())
 }
 
 /// 原子写二进制内容（同目录临时文件 + rename）。
 /// 用于会话文件（`session.jsonl.zstd`）这类用户数据：直接整份 `fs::write` 在写入中途
 /// 崩溃/断电/磁盘满时会留下截断文件，历史会话就此损坏。
 fn atomic_write_bytes(file: &Path, content: &[u8]) -> Result<(), String> {
-    let tmp = file.with_extension("tmp");
+    let tmp = temp_sibling(file);
     std::fs::write(&tmp, content).map_err(|e| format!("写临时文件失败: {}", e))?;
-    if let Err(e) = std::fs::rename(&tmp, file) {
+    if let Err(e) = atomic_replace(&tmp, file) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("替换会话文件失败 {}: {}", file.display(), e));
     }
@@ -514,28 +545,42 @@ pub(crate) fn ensure_workspace_active_at(
     title: Option<&str>,
     restarting_same_project: bool,
 ) {
+    // workspace.json 与会话 header 都是“读-改-写”。两次 ai_start（双开面板/快速切项目）
+    // 并发到这里时，没有互斥会各自读到旧文档、写回时互相覆盖；固定临时名还会让两路
+    // 写同一个 .tmp。锁只覆盖本进程内的写入，跨进程仍由 dsh 自己的单实例约束兜底。
+    static AI_STORAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write_guard = AI_STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // 1. 注册/刷新 workspace 记录（含 path 缺失时重建）
     if let Err(e) = ensure_workspace_registered_at(storage, dir, title) {
         log::warn!("[ai] workspace 注册失败（忽略）: {}", e);
     }
-    // 2. bump 本项目会话的活动时间 → recentWorkspace 必选中本项目
+    // 2. bump 本项目**最新**会话的活动时间 → recentWorkspace 必选中本项目。
+    //
+    // dsh 的工作区最近活动取该项目最新一条会话的时间；把“最新那一条”顶到当前时刻
+    // 就足以改变 workspace 排序。原实现把所有匹配会话都整读/解压/重压/写回一遍——
+    // 会话多的项目在切换时是几十 MB 的顺序读写 + zstd CPU，而结果没有区别。
     let dir_norm = norm_path(dir);
-    for file in find_project_sessions(storage, &dir_norm) {
-        if restarting_same_project {
-            // 同一个项目的重启：上一次 bump 的就是它，跳过"已经够新鲜"的那些
-            // （bump 一次 = 整读 + 解压 + 重压 + 整份写盘，见常量的说明）
-            let created_at = probe_session_header(&file)
-                .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()));
-            if let Some(ts) = created_at {
-                if epoch_ms() - ts < BUMP_SKIP_WINDOW_MS {
-                    log::debug!("[ai] 会话活动时间已新鲜，跳过重写: {}", file.display());
-                    continue;
-                }
+    let mut files = find_project_sessions(storage, &dir_norm);
+    files.sort_by(|a, b| {
+        let ma = std::fs::metadata(a).and_then(|m| m.modified()).ok();
+        let mb = std::fs::metadata(b).and_then(|m| m.modified()).ok();
+        mb.cmp(&ma) // 新 → 旧
+    });
+    let Some(newest) = files.first() else { return };
+    if restarting_same_project {
+        // 同一个项目的重启：上一次 bump 的就是它，够新鲜就跳过
+        let created_at = probe_session_header(newest)
+            .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()));
+        if let Some(ts) = created_at {
+            if epoch_ms() - ts < BUMP_SKIP_WINDOW_MS {
+                log::debug!("[ai] 最新会话活动时间已新鲜，跳过重写: {}", newest.display());
+                return;
             }
         }
-        if let Err(e) = bump_session_activity(&file) {
-            log::warn!("[ai] 会话活动时间 bump 失败（忽略）: {}", e);
-        }
+    }
+    if let Err(e) = bump_session_activity(newest) {
+        log::warn!("[ai] 会话活动时间 bump 失败（忽略）: {}", e);
     }
 }
 
@@ -931,13 +976,9 @@ fn spawn_web_command(
         std::thread::Builder::new()
             .name(format!("nexus-ai-{}-stderr", pid))
             .spawn(move || {
-                let reader = std::io::BufReader::new(stderr);
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
-                        Err(_) => break,
-                    };
+                // 有界行读取：外部进程可以打一条无换行的 GB 级 stderr，`lines()` 会先把
+                // 整行读进 String 再截断，等于把内存交给对方控制。
+                for line in crate::core::logtext::read_log_lines(std::io::BufReader::new(stderr)) {
                     // 凭据红线（SEC-23）：这一行既进日志（落盘 ~/.nexus/logs/nexus.log）
                     // 也进 stderr 尾部摘要（启动失败时原样回给界面），而 dsh 的启动横幅
                     // 里可能带 `?token=…` 的会话 URL——两处都先过一遍脱敏（与命令脱敏同一
@@ -966,14 +1007,8 @@ fn spawn_web_command(
         std::thread::Builder::new()
             .name(format!("nexus-ai-{}-stdout", pid))
             .spawn(move || {
-                let reader = std::io::BufReader::new(stdout);
                 let mut found = false;
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
-                        Err(_) => break,
-                    };
+                for line in crate::core::logtext::read_log_lines(std::io::BufReader::new(stdout)) {
                     if !found {
                         if let Some(url) = parse_web_url(&line) {
                             log::info!("[ai#{}] 解析到 dsh web URL", pid);
@@ -1618,6 +1653,31 @@ mod tests {
         std::fs::remove_dir_all(&storage).ok();
     }
 
+    /// 切换项目只 bump **最新**会话：旧会话文件的 header 不能被整份重写。
+    #[test]
+    fn test_workspace_active_bumps_only_newest_session() {
+        let storage = std::env::temp_dir().join(format!("ai-newest-test-{}", uuid::Uuid::new_v4()));
+        let cwd = r"D:\work\GitProject\proj";
+        let older = make_session_file_named(&storage, cwd, "session.v3.jsonl.zstd");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = make_session_file_named(&storage, cwd, "session.v4.jsonl.zstd");
+        let created_at = |f: &std::path::Path| -> i64 {
+            probe_session_header(f)
+                .and_then(|h| h.get("createdAt").and_then(|c| c.as_i64()))
+                .expect("会话 header 里有 createdAt")
+        };
+        let older_before = created_at(&older);
+
+        ensure_workspace_active_at(&storage, cwd, Some("proj"), false);
+
+        assert!(
+            epoch_ms() - created_at(&newer) < BUMP_SKIP_WINDOW_MS,
+            "最新会话必须被 bump 到当前时间"
+        );
+        assert_eq!(created_at(&older), older_before, "旧会话不应被整份重写");
+        std::fs::remove_dir_all(&storage).ok();
+    }
+
     // ── 插件就绪探测 ─────────────────────────────────────
 
     /// 回归：插件 bundle 是好几 MB 的 JS，探测**必须只看状态行**。
@@ -1811,7 +1871,9 @@ mod tests {
     /// 探针跑的时长（秒）。8 ≈ 7 秒：比任何等待窗口都长，才分得清"超时后立刻返回"与
     /// "等命令自己跑完"（并行跑整套测试时 taskkill 本身可能耗到 ~2 秒）
     #[cfg(windows)]
-    const PROBE_PINGS: &str = "8";
+    // 20 次 ping ≈ 19 秒：给“杀进程树 + 收尸”留出足够区分度。并行跑整套测试时
+    // taskkill 实测可到 4~5 秒，8 秒断言仍是“远早于自然结束”，不会把慢机器判成漏杀。
+    const PROBE_PINGS: &str = "20";
 
     /// 探针进程：把 `ping.exe` 复制成一个**唯一映像名**再跑。
     ///
@@ -1845,7 +1907,7 @@ mod tests {
     /// 等探针从进程表消失（杀进程树是异步生效的：taskkill 之后系统回收需要一点时间）
     #[cfg(windows)]
     fn wait_probe_gone(name: &str, why: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while probe_running(name) {
             assert!(Instant::now() < deadline, "{}：探针进程仍在运行", why);
             std::thread::sleep(Duration::from_millis(50));
@@ -1854,11 +1916,11 @@ mod tests {
 
     /// 超时路径（③）：进程迟迟不退出 → 杀进程树 + 返回**可读**错误。
     ///
-    /// 探针跑约 7 秒（`ping -n 8`）、超时 300ms：若实现退回"等进程自然结束"，
+    /// 探针跑约 19 秒（`ping -n 20`）、超时 300ms：若实现退回"等进程自然结束"，
     /// 耗时断言与"进程已消失"断言都会红。错误文本三件套（是哪条命令 / 为什么失败 /
     /// 已终止）缺一不可——用户看到的只有这一行。
-    /// 耗时上限给到 4 秒：杀进程树是 `taskkill` 子进程 + 最多 2 秒的收尸宽限，
-    /// 并行跑整套测试时实测能到 2.2 秒（不是"等命令跑完"——那是 7 秒级）。
+    /// 耗时上限给到 8 秒：杀进程树是 `taskkill` 子进程 + 最多 2 秒的收尸宽限；
+    /// 并行跑整套测试时 taskkill 可到 4~5 秒，但仍远早于 19 秒的自然结束。
     #[cfg(windows)]
     #[test]
     fn test_run_captured_timeout_kills_process_tree() {
@@ -1872,7 +1934,7 @@ mod tests {
         assert!(err.contains(&cmd), "错误要带原命令（否则排障不知道卡在哪条）: {}", err);
         assert!(err.contains("已终止"), "错误要说清进程已被终止: {}", err);
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(8),
             "超时后应立刻返回，不该等命令自然跑完（{:?}）",
             elapsed
         );
@@ -1950,11 +2012,40 @@ mod tests {
         };
         assert!(err.contains("等待 dsh web 启动超时"), "错误要说清是启动超时: {}", err);
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < Duration::from_secs(8),
             "超时应立刻返回，而不是等 60 秒的启动窗口（{:?}）",
             started.elapsed()
         );
         wait_probe_gone(&name, "启动超时路径没有把进程树杀干净");
         let _ = std::fs::remove_file(&abs);
+    }
+
+    /// 并发写同一份 workspace/会话文件不能互相截断：固定临时名会让两路写同一个 .tmp。
+    #[test]
+    fn test_atomic_write_concurrent_writers_never_corrupt() {
+        let dir = std::env::temp_dir().join(format!("nexus-ai-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let file = dir.join("workspace.json");
+        let payloads = [r#"{"version":1,"a":1}"#.to_string(), r#"{"version":1,"b":2}"#.to_string()];
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let p = file.clone();
+            let data = payloads[i % payloads.len()].clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..30 {
+                    atomic_write(&p, &data).expect("原子写");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("写线程不应 panic");
+        }
+        let text = std::fs::read_to_string(&file).expect("读最终文件");
+        assert!(
+            payloads.iter().any(|p| p == &text),
+            "最终文件必须是某一次完整写入，实际 {}",
+            text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -27,7 +27,10 @@ fn project_name(db: &crate::database::Database, project_id: &str) -> Result<Stri
     db.with_conn(|conn| {
         conn.query_row("SELECT name FROM projects WHERE id=?1", [project_id],
             |row| row.get("name")
-        ).map_err(|e| format!("项目不存在: {}", e))
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "项目不存在".to_string(),
+            other => format!("读取项目失败: {}", other),
+        })
     })
 }
 

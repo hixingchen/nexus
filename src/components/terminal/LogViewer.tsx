@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useLogStore } from '../../stores/logStore';
+import { retainLogViewer, useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -8,7 +8,7 @@ import { useCtrlWheelFontSize } from '../../hooks/useCtrlWheelFontSize';
 import { parseEditorFontSize } from '../../utils/editorFont';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
-import { includesIgnoreCase } from '../../utils/search';
+import { createLogSearchCache, filterLogLinesIncremental } from '../../utils/logSearch';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { isStickToBottom } from '../../utils/logFollow';
 import { failureDetail, failureLabel } from '../../utils/serviceFailure';
@@ -34,6 +34,9 @@ interface LogViewerProps {
 
 /** 空数组常量（避免选择器每次返回新引用导致无谓重渲染） */
 const EMPTY_LINES: ServiceLogLine[] = [];
+
+/** 当前缓冲里的最大行号（空快照是否过期的判据） */
+const maxLogSeq = (lines: ServiceLogLine[]) => lines.reduce((m, l) => Math.max(m, l.seq ?? 0), 0);
 
 /**
  * 日志正文相对「文本字号」的偏移（px）：正文比代码视图小 1px。
@@ -91,6 +94,8 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   const [paused, setPaused] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [searchIdx, setSearchIdx] = useState(0);
+  /** 1 秒轮询在途保护：慢盘/大文件时上一发未回不再叠下一发 */
+  const pollInFlightRef = useRef(false);
 
   // 双数据源：跟随显示最新 2000 行；暂停显示暂停视图（快照，满 2000 后冻结）
   const followLines = useLogStore((s) => s.logs[serviceKey]) ?? EMPTY_LINES;
@@ -122,19 +127,27 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // 以后端缓冲为权威同步日志：
   // - 空快照（正常停止已清空）→ 清本地缓存，避免展示已清空的旧日志（含失败日志）
   // - 非空快照（崩溃保留 / 运行中）→ 覆盖本地缓存（后端保证先写缓冲再 emit，快照不丢行）
-  const syncLogsFromBackend = useCallback(() => {
-    logService.getServiceLogs(serviceKey).then(
-      (snapshot) => {
-        if (snapshot.length === 0) {
-          useLogStore.getState().clearLogs(serviceKey);
-        } else {
-          useLogStore.getState().setLogs(serviceKey, snapshot);
-        }
-      },
+  /** 快照请求代际：卸载/切服务后晚到的空快照不能把新日志清掉 */
+  const syncSeqRef = useRef(0);
+  const syncLogsFromBackend = useCallback(async (resetAdded = true) => {
+    const reqSeq = ++syncSeqRef.current;
+    // 请求发出时的本地最大 seq：空快照返回时若本地已有更新的行，说明期间来了实时日志，
+    // 这份空快照已经过期（典型：停止服务时恰好有一批行还在路上）。
+    const seqAtStart = maxLogSeq(useLogStore.getState().logs[serviceKey] ?? EMPTY_LINES);
+    try {
+      const snapshot = await logService.getServiceLogs(serviceKey);
+      if (reqSeq !== syncSeqRef.current) return;
+      if (snapshot.length === 0) {
+        if (maxLogSeq(useLogStore.getState().logs[serviceKey] ?? EMPTY_LINES) > seqAtStart) return;
+        useLogStore.getState().clearLogs(serviceKey);
+      } else {
+        useLogStore.getState().setLogs(serviceKey, snapshot, { resetAdded });
+      }
+    } catch (e) {
       // 只留控制台：同步在轮询/状态切换时反复发生，弹 toast 会刷屏；
       // 失败只影响这一次快照合并，下一次同步会自愈
-      (e) => { console.error('同步服务日志失败:', serviceKey, e); }
-    );
+      console.error('同步服务日志失败:', serviceKey, e);
+    }
   }, [serviceKey]);
 
   // 运行中 → 已停止（崩溃/秒退/手动停止）：同步后端日志——
@@ -152,7 +165,12 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   // 面板打开期间按 1 秒轮询日志文件尾部；setLogs 按快照整份替换，不会重复。
   useEffect(() => {
     if (!forcePoll && (!isRunning || !isBootRunning)) return;
-    const timer = setInterval(syncLogsFromBackend, 1000);
+    const timer = setInterval(() => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
+      // 轮询不是“新会话初始快照”：不重置暂停期间的“新增 N 行”计数
+      void syncLogsFromBackend(false).finally(() => { pollInFlightRef.current = false; });
+    }, 1000);
     return () => clearInterval(timer);
   }, [isRunning, isBootRunning, forcePoll, syncLogsFromBackend]);
 
@@ -167,12 +185,11 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   // 搜索态渲染匹配行（虚拟滚动下无需再截断尾部：任意匹配都可达、可定位）
   const searchActive = debouncedTerm.trim().length > 0;
+  /** 增量匹配缓存：只测新行，搜索词不变时不再每 50ms 重扫 2000 行文本 */
+  const searchCacheRef = useRef(createLogSearchCache());
   const rows = useMemo(() => {
     if (!searchActive) return lines;
-    // 大小写不敏感匹配用无分配实现：`l.text.toLowerCase()` 每个刷新周期要为最多 2000 行
-    // 各分配一个临时字符串（20 次/秒 → 4 万次分配/秒），纯属给 GC 添活
-    const term = debouncedTerm;
-    return lines.filter(l => includesIgnoreCase(l.text, term));
+    return filterLogLinesIncremental(lines, debouncedTerm, searchCacheRef.current);
   }, [lines, searchActive, debouncedTerm]);
   const searchMatches = searchActive ? rows.length : 0;
   /** 传给行组件的搜索词：非搜索态为空串（与旧的整块渲染同口径） */
@@ -193,6 +210,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => estimateRowHeight(textSize),
+    // 用日志行号而不是数组下标做 key：2000 行滑窗满后每来一批，所有下标对应的行对象都会
+    // 前移；index key 会让每一行都被当成新行，memo 失效、可见行全部重新 renderLine。
+    // 本地服务日志的 seq 单调且稳定；boot 日志快照会重编号，退化回下标行为，但不会更差。
+    getItemKey: (index) => rows[index]?.seq ?? index,
     overscan: OVERSCAN,
     // 贴底语义：行高实测值变化（长行换行 / 拖拽改宽）时按总高差补偿滚动位置，
     // 保证「始终看着最新一行」不被重排或窗口滑动打断
@@ -201,6 +222,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
     paddingEnd: PAD_Y,
   });
   const virtualItems = virtualizer.getVirtualItems();
+
+  // 登记“本服务有打开着的日志面板”：MainLayout 的全局监听只把已打开服务的行写入 store。
+  // 未打开的服务靠打开时的 get_service_logs 快照补齐；引用计数支持同一服务多面板。
+  useEffect(() => retainLogViewer(serviceKey), [serviceKey]);
 
   // 切换服务：清空行高实测缓存（缓存以索引为键，会被新服务的行错误复用）并回到顶部；
   // 声明在贴底 effect 之前——layout effect 按声明顺序执行，先归零再贴底，最终落在最新一行
@@ -217,9 +242,10 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
     // 依赖即触发源：只列真正需要重跑的项（syncLogsFromBackend 是 store 的稳定动作，不入依赖）
   }, [serviceKey, syncLogsFromBackend]);
 
-  // 卸载时清理暂停视图（释放暂停期间保留的数据）
+  // 卸载/切服务时清理暂停视图，并让在途快照响应失效（否则晚到的空快照会清掉新日志）
   useEffect(() => () => {
     useLogStore.getState().resumeLogs(serviceKey);
+    syncSeqRef.current++;
   }, [serviceKey]);
 
   /**

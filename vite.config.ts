@@ -35,6 +35,9 @@ const VENDOR_CHUNKS: Array<[chunk: string, packages: string[]]> = [
   ],
   ["dnd", ["@dnd-kit/core", "@dnd-kit/sortable", "@dnd-kit/utilities"]],
   ["virtual", ["@tanstack/react-virtual"]],
+  // sonner 是启动即用的 toast 运行时，但变更频率低、体积不小；单独成 chunk 让主 chunk
+  // 保持在 500KB 警告阈值以下，同时不改任何加载时序（它仍在首屏静态依赖里）。
+  ["sonner", ["sonner"]],
 ];
 
 /**

@@ -172,10 +172,6 @@ export interface ToolCommandLogBatchPayload {
 // ─── Service API (scoped to project) ────────────────────────
 
 export const serviceApi = {
-  /** 获取某项目下所有服务 */
-  getByProject: (projectId: string) =>
-    invoke<Service[]>('get_services', { projectId }),
-
   /**
    * 给项目添加服务。
    *

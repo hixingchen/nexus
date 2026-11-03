@@ -155,9 +155,20 @@ pub async fn paste_files(
 
     #[cfg(windows)]
     {
+        // 校验与复制之间仍有时间窗：进入阻塞线程后重新按**规范化后的目标**复核白名单，
+        // 并持有目标目录句柄（不共享 DELETE）直到复制完成——复制期间该目录不能被
+        // 重命名/删除，也就无法被换成指向白名单外的联接点。
+        let roots = state.paths.allowed_roots(&state.db);
+        let (target_guard, _real_target) = state.paths.open_verified_dir(&state.db, &target_dir)?;
         // 剪贴板读取 + 递归复制都在阻塞线程池执行（大目录复制耗时，不占异步 worker）
         tokio::task::spawn_blocking(move || {
-            paste_files_windows(&target, conflict_policy, expected_sources.as_deref())
+            let _anchor = target_guard; // 持有到复制结束
+            let canonical = std::fs::canonicalize(&target)
+                .map_err(|_| "目标目录已不存在".to_string())?;
+            if !roots.iter().any(|root| canonical.starts_with(root)) {
+                return Err("访问被拒绝".into());
+            }
+            paste_files_windows(&canonical, conflict_policy, expected_sources.as_deref())
         })
         .await
         .map_err(|e| format!("粘贴任务执行失败: {}", e))?
@@ -534,14 +545,18 @@ fn unique_dest_path(target: &Path, name: &str) -> Option<PathBuf> {
 ///
 /// 两条检查的**顺序不能反**：范围在前。反过来先查存在性的话，调用方（被攻陷的 webview）
 /// 就能拿它当"这个路径存不存在"的探针。
-fn ensure_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<PathBuf, String> {
-    let target = resolve_deletable(paths, db, path)?;
+fn ensure_deletable(
+    paths: &PathAllowlist,
+    db: &Database,
+    path: &str,
+) -> Result<(PathBuf, Option<std::fs::File>), String> {
+    let (target, guard) = resolve_deletable(paths, db, path)?;
     // symlink_metadata：不跟随链接（与 copy_recursive 同口径）。删除动作删的是链接本身、
     // 不是它的目标（`trash` 只 canonicalize 父目录），所以判存在也该按链接判
     std::fs::symlink_metadata(&target)
         .map(|_| ())
         .map_err(|e| format!("无法访问（可能已被外部删除）: {}（{}）", path, e))?;
-    Ok(target)
+    Ok((target, guard))
 }
 
 /// 校验删除目标，并返回**交给 `trash` 的那条真实路径**（SEC-22 / SEC-31）。
@@ -558,7 +573,11 @@ fn ensure_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<
 /// 修法两条一起收窄：① 父目录用**句柄复核**（SEC-4 的 `open_verified_dir`，拿内核真实路径
 /// 比根），末段只做纯名字检查（非空、不含分隔符、非 `.`/`..`）；② 把复核得到的**真实父目录**
 /// 拼回末段交给 `trash`——删除落在我们刚验过的那条路径上，而不是原始字符串。
-fn resolve_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result<PathBuf, String> {
+fn resolve_deletable(
+    paths: &PathAllowlist,
+    db: &Database,
+    path: &str,
+) -> Result<(PathBuf, Option<std::fs::File>), String> {
     let p = Path::new(path);
     let name = p
         .file_name()
@@ -571,15 +590,16 @@ fn resolve_deletable(paths: &PathAllowlist, db: &Database, path: &str) -> Result
     let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) else {
         return Err("访问被拒绝".into());
     };
-    // 句柄级复核父目录：拿到的 real 是内核视角的真实路径（联接点/`..`/8.3 短名都已解析）
+    // 句柄级复核父目录：拿到的 real 是内核视角的真实路径（联接点/`..`/8.3 短名都已解析）。
+    // 把句柄一并交出去：调用方持有到 `trash::delete` 返回，期间父目录不能被重命名/删除。
     match paths.open_verified_dir(db, &parent.to_string_lossy()) {
-        Ok((_handle, real_parent)) => Ok(real_parent.join(&name)),
+        Ok((handle, real_parent)) => Ok((real_parent.join(&name), Some(handle))),
         Err(e) => {
             // 父目录不在白名单里，但**目标自己**可能就是白名单的一个根（删整个项目根是
             // 允许的既有行为）。这一支退回整条路径校验：它跟随最后一段，对"根本身"
             // 恰好是对的，而上面那条已把"联接点"的语义管住
             paths.check_write_path_allowed(db, path).map_err(|_| e)?;
-            Ok(p.to_path_buf())
+            Ok((p.to_path_buf(), None))
         }
     }
 }
@@ -619,9 +639,11 @@ fn describe_trash_error(e: &trash::Error) -> String {
 #[tauri::command]
 pub async fn delete_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
     // 删除用的是**校验过的真实路径**（见 resolve_deletable），不是原始字符串
-    let target = ensure_deletable(&state.paths, &state.db, &path)?;
-    // 同步阻塞调用（COM 操作），放阻塞线程池；校验已在上一步返回，闭包里不持任何锁
+    let (target, guard) = ensure_deletable(&state.paths, &state.db, &path)?;
+    // 同步阻塞调用（COM 操作），放阻塞线程池；校验已在上一步返回，闭包里不持任何锁。
+    // 父目录句柄（不共享 DELETE）持有到删除返回：期间父目录不能被换成白名单外路径。
     tokio::task::spawn_blocking(move || {
+        let _anchor = guard;
         trash::delete(&target).map_err(|e| format!("删除失败: {}", describe_trash_error(&e)))
     })
     .await
@@ -730,7 +752,7 @@ mod tests {
         let (db, paths, root) = scoped_allowlist("del_ok");
         let f = root.join("a.txt");
         std::fs::write(&f, "x").unwrap();
-        let got = resolve_deletable(&paths, &db, &f.to_string_lossy()).expect("白名单内的文件可删");
+        let (got, _guard) = resolve_deletable(&paths, &db, &f.to_string_lossy()).expect("白名单内的文件可删");
         // 返回的是句柄复核得到的真实路径（Windows 上带 \?\ 前缀，与 fs::canonicalize 同形）
         assert_eq!(got, std::fs::canonicalize(&f).unwrap(), "应是同一份真实路径");
         let _ = std::fs::remove_dir_all(&root);
@@ -1303,6 +1325,34 @@ mod tests {
         let msg = describe_trash_error(&e);
         assert!(msg.contains("Access is denied."), "实际: {}", msg);
         assert!(msg.contains("0x80070005"), "错误码不能丢，实际: {}", msg);
+    }
+
+    /// 删除时持有父目录句柄（不共享 DELETE）不应妨碍删除子项——这是锚定方案的前提。
+    /// 默认忽略（同回收站测试）：本机手动跑
+    /// `cargo test --lib -- --ignored trash_child_with_anchored_parent`。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "会往用户回收站里塞测试文件"]
+    fn test_trash_child_with_anchored_parent() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let base = tmp_dir("trash_anchor");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("anchored.txt");
+        std::fs::write(&file, "x").unwrap();
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&base)
+            .expect("锚定父目录");
+        trash::delete(&file).expect("持有父目录句柄时删除子项应成功");
+        assert!(!file.exists(), "子项应被删除");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **真跑一次回收站**——默认忽略：它需要真实的回收站，GitHub runner 上不保证有。

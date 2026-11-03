@@ -5,8 +5,28 @@ import './index.css';
 import { logToBackend } from './utils/logSink';
 import { isEditorContentTarget } from './utils/keyboard';
 
-// 全局禁止右键菜单
-document.addEventListener('contextmenu', (e) => e.preventDefault());
+// 全局禁止页面级右键菜单；输入框/可编辑区放行。
+//
+// 此前无差别 preventDefault 把日志搜索框、项目搜索框、路径/命令输入框和 CodeMirror
+// 里的原生「复制 / 粘贴 / 拼写」菜单一并禁掉了——用户在这些位置右键得不到任何菜单，
+// Ctrl+V 成了唯一入口。应用自己的右键菜单由各组件在 onContextMenu 里处理，不依赖
+// 这个全局监听；这里只拦住“页面空白处”的浏览器默认菜单。
+document.addEventListener('contextmenu', (e) => {
+  const target = e.target;
+  if (target instanceof HTMLElement) {
+    const tag = target.tagName;
+    if (
+      target.isContentEditable
+      || tag === 'INPUT'
+      || tag === 'TEXTAREA'
+      || tag === 'SELECT'
+      || target.closest('.cm-editor')
+    ) {
+      return;
+    }
+  }
+  e.preventDefault();
+});
 
 /**
  * 全局压住 Ctrl+F / Cmd+F 的**默认行为**（浏览器/WebView2 右上角自带的查找条）。

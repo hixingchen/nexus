@@ -13,8 +13,8 @@ interface DshProbe {
   source: RuntimeSource | null;
   /** 自带 Node 的版本（如 `v24.21.0`） */
   node_version: string | null;
-  /** 实测到的 dsh 版本（跑得起来时才有） */
-  dsh_version?: string | null;
+  /** 实测到的 dsh 版本（跑得起来时才有；后端字段名是 `version`） */
+  version?: string | null;
   /** 跑不起来时的原因（人话 + 原话） */
   problem: string | null;
 }

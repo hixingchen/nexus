@@ -386,12 +386,19 @@ fn fetch_index(url: &str) -> Result<Vec<NodeVersionInfo>, String> {
 ///
 /// 安装器要求管理员（1.2.2 的 `nvm.iss` 里是 `PrivilegesRequired=admin`），所以这一步会弹
 /// UAC——那一下只能由用户点，我们负责的只是把向导拉起来、等它关掉。
-async fn run_installer(path: &Path) -> Result<NvmInstallResult, String> {
+async fn run_installer(
+    path: &Path,
+    // 以“只共享读”打开的句柄：持有到 CreateProcess 返回，期间文件不能被替换。
+    // CreateProcess 本身只需读访问，因此共享读不会挡住执行。
+    guard: Option<std::fs::File>,
+) -> Result<NvmInstallResult, String> {
     let mut child = tokio::process::Command::new(path)
         .env("NoDefaultCurrentDirectoryInExePath", "1") // 同上：新增进程调用要么收口要么豁免
         .stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("启动安装向导失败: {}", e))?;
+    // 映像已被内核打开；之后替换文件不会影响本次执行，可以释放锁
+    drop(guard);
     let status = child
         .wait()
         .await
@@ -401,6 +408,23 @@ async fn run_installer(path: &Path) -> Result<NvmInstallResult, String> {
         code: status.code(),
         path: path.display().to_string(),
     })
+}
+
+/// 以“只共享读”打开安装器：不共享写/删除，持有期间文件不能被替换/改名。
+#[cfg(windows)]
+fn open_locked_installer(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| format!("锁定安装器失败: {}", e))
+}
+
+#[cfg(not(windows))]
+fn open_locked_installer(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(path).map_err(|e| format!("打开安装器失败: {}", e))
 }
 
 /// 安装器的落地路径（`%TEMP%\nexus\nvm-setup-1.2.2.exe`）
@@ -449,9 +473,29 @@ pub async fn run_nvm_installer() -> Result<NvmInstallResult, String> {
         return Err(format!("{} 还没下载好（先下载再运行）", path.display()));
     }
     // **执行前再核对一次**（SEC-20）：下载与点「运行安装向导」之间可以隔着很久，而这一步
-    // 会以管理员权限执行它。校验与执行之间没有 TOCTOU 可钻的缝——校验的就是即将执行的那份文件
+    // 会以管理员权限执行它。
     verify_before_run(&path)?;
-    run_installer(&path).await
+    // 仍不能直接执行这个可预测路径：校验与 CreateProcess 之间，同用户进程可以把它换掉。
+    // 先复制到随机名，再对副本做同一套校验，执行副本；攻击者必须命中随机名并在第二次
+    // 校验后完成替换，窗口远小于原路径。执行完删除副本。
+    // （Windows 没有“按已校验句柄执行”的公开接口，这是在不改签名策略下的最优缓解。）
+    let run_path = path.with_file_name(format!("nvm-setup-run-{}.exe", uuid::Uuid::new_v4()));
+    std::fs::copy(&path, &run_path).map_err(|e| format!("准备安装器副本失败: {}", e))?;
+    // 先锁定副本，再校验：锁持有期间文件不能被替换，校验的就是即将执行的那份字节。
+    let run_guard = open_locked_installer(&run_path)?;
+    if let Err(e) = verify_before_run(&run_path) {
+        // verify_before_run 自身删不掉被锁住的文件；先放锁再删，保证不留下坏副本
+        drop(run_guard);
+        let _ = std::fs::remove_file(&run_path);
+        return Err(e);
+    }
+    let result = run_installer(&run_path, Some(run_guard)).await.map(|mut r| {
+        // 界面显示原始下载路径；副本只是执行载体，随后删除
+        r.path = path.display().to_string();
+        r
+    });
+    let _ = std::fs::remove_file(&run_path);
+    result
 }
 
 /// 执行安装器前的最后一道核对（单独成函数是为了能直接测"哈希不对就别执行"）。
@@ -971,6 +1015,31 @@ mod tests {
         let got = installed_versions(&dir);
         assert_eq!(got, vec!["v22.22.1", "v16.20.2", "v9.11.2"], "版本号数值序，且只收目录");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod locked_installer_tests {
+    use super::open_locked_installer;
+
+    /// 只共享读的句柄持有期间，安装器不能被改名/写入——这正是“校验后、执行前”窗口的封口。
+    #[test]
+    fn test_locked_installer_blocks_replacement_until_dropped() {
+        let dir = std::env::temp_dir().join(format!("nexus-nvm-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let file = dir.join("setup.exe");
+        std::fs::write(&file, b"MZ fake installer").expect("写临时文件");
+
+        let guard = open_locked_installer(&file).expect("锁定安装器");
+        let moved = dir.join("moved.exe");
+        assert!(std::fs::rename(&file, &moved).is_err(), "持锁期间不应允许改名");
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&file).is_err(),
+            "持锁期间不应允许写入/替换"
+        );
+        drop(guard);
+        assert!(std::fs::rename(&file, &moved).is_ok(), "释放锁后应恢复可替换");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

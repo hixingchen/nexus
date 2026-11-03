@@ -74,3 +74,14 @@ export const useModalDraftStore = create<ModalDraftState>((set) => ({
 export function readModalDraft<T>(key: string): T | undefined {
   return useModalDraftStore.getState().drafts[key] as T | undefined;
 }
+
+/** 项目列表刷新后清掉已删除项目的编辑草稿（键按项目 id 分开存，删除项目时不会自动消失）。 */
+export function pruneProjectDrafts(validIds: readonly string[]): void {
+  const valid = new Set(validIds.map(MODAL_DRAFT_KEYS.projectEdit));
+  useModalDraftStore.setState((s) => {
+    const entries = Object.entries(s.drafts);
+    const kept = entries.filter(([k]) => !k.startsWith('modal:project:edit:') || valid.has(k));
+    if (kept.length === entries.length) return s;
+    return { drafts: Object.fromEntries(kept) };
+  });
+}

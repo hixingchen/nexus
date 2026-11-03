@@ -909,8 +909,26 @@ fn newarray_type_name(atype: u8) -> &'static str {
     }
 }
 
-fn push_line(lines: &mut Vec<String>, pc: i64, line: String) {
-    lines.push(format!("{:>8}: {}", pc, line));
+/// 追加一行反汇编，并维护**字节**预算。
+///
+/// 行数上限只管“条数”：一条指令可以引用最长 65535 字节的常量池字符串，20 万行仍是
+/// GB 级输出。预算必须在**每次追加前**累计，而不是等整个方法生成完再看。
+/// 返回 false = 已达上限，调用方应立即停止。
+fn push_line(
+    lines: &mut Vec<String>,
+    pc: i64,
+    line: String,
+    bytes: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    let formatted = format!("{:>8}: {}", pc, line);
+    if bytes.saturating_add(formatted.len()) > max_bytes {
+        lines.push("... 字节上限，其余省略".into());
+        return false;
+    }
+    *bytes += formatted.len();
+    lines.push(formatted);
+    true
 }
 
 /// 反汇编一段 Code 字节码（pc 即 Reader 位置，读取器推进即指令结束）
@@ -930,8 +948,10 @@ fn disassemble_code(
     pool: &[Option<CpEntry>],
     lines: &mut Vec<String>,
     max_lines: usize,
+    max_bytes: usize,
 ) -> Result<(), String> {
     let mut r = Reader::new(code);
+    let mut bytes = 0usize;
     while r.pos < code.len() {
         if lines.len() >= max_lines {
             lines.push("... 输出已达上限，其余指令省略".into());
@@ -965,7 +985,9 @@ fn disassemble_code(
                     lines.push("... 输出已达上限，其余指令省略".into());
                     return Ok(());
                 }
-                push_line(lines, pc, format!("tableswitch {{ // {} to {}", low, high));
+                if !push_line(lines, pc, format!("tableswitch {{ // {} to {}", low, high), &mut bytes, max_bytes) {
+                    return Ok(());
+                }
                 for k in 0..n {
                     let target = r.i4()?;
                     // JVMS：目标 = opcode 地址 + offset（不能用指令结束地址 total）
@@ -996,7 +1018,9 @@ fn disassemble_code(
                     lines.push("... 输出已达上限，其余指令省略".into());
                     return Ok(());
                 }
-                push_line(lines, pc, format!("lookupswitch {{ // {} keys", n));
+                if !push_line(lines, pc, format!("lookupswitch {{ // {} keys", n), &mut bytes, max_bytes) {
+                    return Ok(());
+                }
                 for _ in 0..n {
                     let key = r.i4()?;
                     let target = r.i4()?;
@@ -1012,10 +1036,14 @@ fn disassemble_code(
                 if next_mn == "iinc" {
                     let idx = r.u2()?;
                     let c = r.i2()?;
-                    push_line(lines, pc, format!("wide {} {}, {}", next_mn, idx, c));
+                    if !push_line(lines, pc, format!("wide {} {}, {}", next_mn, idx, c), &mut bytes, max_bytes) {
+                        return Ok(());
+                    }
                 } else {
                     let idx = r.u2()?;
-                    push_line(lines, pc, format!("wide {} {}", next_mn, idx));
+                    if !push_line(lines, pc, format!("wide {} {}", next_mn, idx), &mut bytes, max_bytes) {
+                        return Ok(());
+                    }
                 }
                 continue;
             }
@@ -1097,7 +1125,9 @@ fn disassemble_code(
             }
             _ => unreachable!("switch/wide 已在上方处理"),
         }
-        push_line(lines, pc, line);
+        if !push_line(lines, pc, line, &mut bytes, max_bytes) {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -1318,6 +1348,7 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
     for (f_access, name_idx, desc_idx, const_val, annos) in &fields {
         if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
         for a in annos {
+            if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
             writeln!(out, "  {}", render_annotation(&reg, a)).unwrap();
         }
         let flags_str = field_flags(*f_access).join(" ").to_lowercase().replace("acc_", "");
@@ -1342,6 +1373,7 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
         if is_annotation {
             // 注解成员：Java 风格一行（public abstract 是默认修饰，省略对齐 IDE）
             for a in &info.annotations {
+                if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
                 writeln!(out, "  {}", render_annotation(&reg, a)).unwrap();
             }
             let default_str = info.default_value.as_ref().map(|d| format!(" default {}", render_element_value(&reg, d))).unwrap_or_default();
@@ -1351,6 +1383,7 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
 
         writeln!(out).unwrap();
         for a in &info.annotations {
+            if out.len() >= MAX_OUTPUT_BYTES { out_truncated = true; break; }
             writeln!(out, "  {}", render_annotation(&reg, a)).unwrap();
         }
         let flags_str = method_flags(*m_access).join(" ").to_lowercase().replace("acc_", "");
@@ -1373,7 +1406,8 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
                 continue;
             }
             let mut lines = vec![];
-            disassemble_code(code, &pool, &mut lines, remaining)?;
+            let remaining_bytes = MAX_OUTPUT_BYTES.saturating_sub(out.len());
+            disassemble_code(code, &pool, &mut lines, remaining, remaining_bytes)?;
             emitted_lines += lines.len();
             for l in &lines {
                 writeln!(out, "      {}", l).unwrap();
@@ -1381,6 +1415,10 @@ pub fn disassemble_class(bytes: &[u8]) -> Result<String, String> {
             if !line_table.is_empty() {
                 writeln!(out, "      LineNumberTable:").unwrap();
                 for (pc, line) in line_table {
+                    if out.len() >= MAX_OUTPUT_BYTES {
+                        out_truncated = true;
+                        break;
+                    }
                     writeln!(out, "        line {}: {}", line, pc).unwrap();
                 }
             }
@@ -1650,6 +1688,18 @@ mod tests {
         assert!(out.contains("java/lang/Object.\"<init>\":()V"), "成员引用注释错误:\n{}", out);
         assert!(out.contains("LineNumberTable"), "缺少行号表:\n{}", out);
         assert!(out.contains("line 3: 0"), "行号映射错误:\n{}", out);
+    }
+
+    /// 字节预算必须在生成过程中生效，而不是等整段代码生成完再看——否则超长常量
+    /// 被大量指令引用时，内存已经在判定之前被放大到 GB 级。
+    #[test]
+    fn test_disassemble_code_respects_byte_budget() {
+        let mut lines = Vec::new();
+        // 10 条 nop；每行约 14 字节，40 字节预算只够两行左右
+        disassemble_code(&[0x00; 10], &[], &mut lines, 100, 40).expect("nop 不应解析失败");
+        let text = lines.join("\n");
+        assert!(text.len() <= 80, "输出必须被字节预算截住，实际 {} 字节", text.len());
+        assert!(text.contains("字节上限"), "截断必须留痕，实际输出: {}", text);
     }
 
     /// 回归：分支目标必须相对**该指令 opcode 的地址**（JVMS §6.5：goto/if* 等

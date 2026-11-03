@@ -35,7 +35,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
   const {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
-    actingId,
+    actingIds,
     showNewModal, setShowNewModal,
     ctxMenu, setCtxMenu,
     deleteTarget, setDeleteTarget,
@@ -106,7 +106,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
               expanding={expandingId === p.id}
               services={svcCache[p.id] || []}
               isRunning={isProjectRunning(p.id)}
-              actingId={actingId}
+              acting={actingIds.has(p.id)}
               expandedSvc={expandedSvc}
               onSelect={() => { onSelect(p.id); onProjectName?.(p.name); onProjectPath?.(p.path); }}
               onToggleExpand={e => toggleExpand(e, p.id)}
@@ -128,7 +128,7 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
           y={ctxMenu.y}
           pinned={ctxProject?.pinned ?? false}
           running={ctxRunning}
-          busy={actingId === ctxMenu.id}
+          busy={actingIds.has(ctxMenu.id)}
           onClose={() => setCtxMenu(null)}
           onStart={() => void start(ctxMenu.id, ctxMenu.name)}
           onStop={() => void stop(ctxMenu.id, ctxMenu.name)}
@@ -154,7 +154,9 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
         project={editTarget}
         onClose={() => setEditTarget(null)}
         onUpdated={load}
-        onProjectName={onProjectName}
+        // 编辑的不是当前选中项目时，不能把它的名字/路径写到当前项目头上
+        onProjectName={(n) => { if (editTarget?.id === selectedId) onProjectName?.(n); }}
+        onProjectPath={(p) => { if (editTarget?.id === selectedId) onProjectPath?.(p); }}
       />
 
       <DuplicateProjectModal

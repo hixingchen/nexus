@@ -161,7 +161,12 @@ impl FileWatcher {
             .name(format!("nexus-watch-{}", project_id))
             .spawn(move || {
             let debounce = Duration::from_millis(500);
-            let mut pending: HashMap<String, String> = HashMap::new();
+            // 值里带上“命中的服务下标”：预过滤已经算过一遍，flush 时不再重新做
+            // 路径规范化/split/逐服务匹配（洪泛时这是最大的重复工作）。
+            let mut pending: HashMap<String, PendingChange> = HashMap::new();
+            // 所有服务都排除的目录名（node_modules/.git/dist…）：在 OS 事件进来时就用
+            // 原始路径分量跳过，省掉 is_dir + 字符串规范化 + 逐服务匹配。
+            let always_excluded = always_excluded_dirs(&svc_map);
             let mut last_flush = Instant::now();
             // 因 pending 达上限而未入队的路径数（flush 时汇总告警）
             let mut overflowed: usize = 0;
@@ -175,9 +180,12 @@ impl FileWatcher {
                         if stop_rx.try_recv().is_ok() { break; }
                         let kind = event_kind_str(&event.kind);
                         for path in &event.paths {
+                            if has_any_component(path, &always_excluded) { continue; }
                             if path.is_dir() { continue; }
-                            // 预过滤：有服务需要该路径才入队（防 node_modules 等全员排除目录洪泛）
-                            if !should_queue_event(path, &svc_map) { continue; }
+                            // 预过滤：有服务需要该路径才入队（防 node_modules 等全员排除目录洪泛）。
+                            // 命中的服务下标一并记下，flush 时不再重算。
+                            let services = matching_service_indices(path, &svc_map);
+                            if services.is_empty() { continue; }
                             if pending.len() >= MAX_PENDING_PATHS {
                                 // 上限保护：一次 flush 的载荷大小由 pending 决定，洪泛时
                                 // （大型 checkout / 构建产物目录）不设限会撑出巨大的 IPC 消息
@@ -185,7 +193,7 @@ impl FileWatcher {
                                 continue;
                             }
                             let p = path.to_string_lossy().replace('\\', "/");
-                            pending.insert(p, kind.to_string());
+                            pending.insert(p, PendingChange { kind: kind.to_string(), services });
                         }
                         // 持续事件流下（recv 从不超时）也要在去抖间隔后及时 flush，
                         // 否则 pending 永不发送且无限累积
@@ -210,7 +218,13 @@ impl FileWatcher {
                         );
                         overflowed = 0;
                     }
-                    let changes = match_changes(&svc_map, &pending);
+                    let (changes, suppressed) = match_changes_cached(&svc_map, &pending);
+                    if suppressed > 0 {
+                        log::warn!(
+                            "[nexus] 文件变更事件过多：本次合并 {} 条，丢弃 {} 条（按服务上限）",
+                            changes.len(), suppressed
+                        );
+                    }
                     if !changes.is_empty() {
                         for c in &changes {
                             log::trace!("文件变更 [{}] {}: {}", c.kind, c.service_name, c.path);
@@ -380,30 +394,115 @@ fn service_accepts(svc: &ServiceWatchConfig, path_str: &str, components: &[&str]
     true
 }
 
+/// 单次 flush 的变更上限：单一服务最多 50 条、整批最多 1000 条。
+///
+/// 一个路径可以被 N 个服务同时接收，`MAX_PENDING_PATHS=5000` 只限路径数，不限
+/// change 数（最坏 5000×N 个对象 + IPC 载荷）。自动重启只需要“该服务有变化”，
+/// 同一服务一轮里收到 50 个路径已经足够；超出部分计数告警，不静默吞掉。
+const MAX_CHANGES_PER_SERVICE: usize = 50;
+const MAX_CHANGES_PER_FLUSH: usize = 1000;
+
+/// 所有服务都排除的目录名（只取“无 glob 的字面目录名”）。
+///
+/// `service_accepts` 对字面目录名是 components 精确匹配，且排除优先于包含；因此
+/// 当每个服务都排除 `node_modules` 时，该目录下的任何路径都不可能被接收，可以
+/// 在 OS 事件入口直接丢弃。只用于预过滤，不改变最终归属判定。
+fn always_excluded_dirs(services: &[ServiceWatchConfig]) -> Vec<String> {
+    let literal = |svc: &ServiceWatchConfig| -> Vec<String> {
+        svc.exclude.iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty() && !e.contains('*') && !e.contains('/') && !e.contains('\\'))
+            .map(|e| e.to_string())
+            .collect()
+    };
+    let Some(first) = services.first() else { return Vec::new() };
+    let mut out = literal(first);
+    for svc in &services[1..] {
+        let others = literal(svc);
+        out.retain(|name| others.contains(name));
+    }
+    out
+}
+
+/// 原始路径分量里是否含任一目录名（不分配字符串、不规范化）。
+fn has_any_component(path: &Path, names: &[String]) -> bool {
+    if names.is_empty() { return false; }
+    path.components().any(|c| {
+        let std::path::Component::Normal(part) = c else { return false };
+        names.iter().any(|n| part == std::ffi::OsStr::new(n))
+    })
+}
+
+/// 待发送的一条路径：事件类型 + 预过滤命中的服务下标。
+struct PendingChange {
+    kind: String,
+    services: Vec<usize>,
+}
+
+/// 路径命中的服务下标（预过滤与 flush 共用同一判据）。
+fn matching_service_indices(path: &Path, services: &[ServiceWatchConfig]) -> Vec<usize> {
+    let path_str = normalize(&path.to_string_lossy());
+    let components: Vec<&str> = path_str.split('/').collect();
+    services.iter().enumerate()
+        .filter(|(_, svc)| {
+            let in_watch = svc.paths_norm.iter().any(|wp| path_str.starts_with(wp));
+            in_watch && service_accepts(svc, &path_str, &components)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// flush：使用预过滤缓存的服务下标，不再重新规范化/匹配；同时按服务与整批封顶。
+fn match_changes_cached(
+    services: &[ServiceWatchConfig],
+    paths: &HashMap<String, PendingChange>,
+) -> (Vec<FileChange>, usize) {
+    let mut changes = Vec::new();
+    let mut per_service = vec![0usize; services.len()];
+    let mut suppressed = 0usize;
+    for (path_str, pending) in paths {
+        for &idx in &pending.services {
+            let Some(svc) = services.get(idx) else { continue };
+            if changes.len() >= MAX_CHANGES_PER_FLUSH
+                || per_service[idx] >= MAX_CHANGES_PER_SERVICE
+            {
+                suppressed += 1;
+                continue;
+            }
+            changes.push(FileChange {
+                path: path_str.clone(),
+                service_name: svc.name.clone(),
+                service_id: svc.id.clone(),
+                kind: pending.kind.clone(),
+                restart_mode: svc.restart_mode,
+            });
+            per_service[idx] += 1;
+        }
+    }
+    (changes, suppressed)
+}
+
 /// 预过滤方向判定：路径是否值得进入待发送队列
 ///
 /// true = 至少一个归属服务接收该路径（需要事件）；false = 无人需要（丢弃）。
 /// 入队条件直接用本函数本身（`if should_queue_event(...)`），**不要取反**——取反会让
 /// 有服务需要的文件全部被丢弃、被全员排除的目录反而入队，表现为"改文件永远不触发"。
+#[cfg(test)]
 fn should_queue_event(path: &Path, services: &[ServiceWatchConfig]) -> bool {
     path_needed_by_any(path, services)
 }
 
 /// 路径是否至少被一个归属服务接收（粗过滤：全部归属服务都拒绝或无人归属才丢弃）
+#[cfg(test)]
 fn path_needed_by_any(path: &Path, services: &[ServiceWatchConfig]) -> bool {
-    let path_str = normalize(&path.to_string_lossy());
-    // 提取路径各组件用于目录名匹配
-    let components: Vec<&str> = path_str.split('/').collect();
-    services.iter().any(|svc| {
-        let in_watch = svc.paths_norm.iter().any(|wp| path_str.starts_with(wp));
-        in_watch && service_accepts(svc, &path_str, &components)
-    })
+    !matching_service_indices(path, services).is_empty()
 }
 
 /// 将变更路径归属到对应服务
 ///
 /// 归属判定 per-service：路径须在该服务监听范围内**且**被其规则接收
 /// （接收由 service_accepts 判定——服务 A 的排除不得压制服务 B 的事件）。
+#[cfg(test)]
 fn match_changes(
     services: &[ServiceWatchConfig],
     paths: &HashMap<String, String>,
@@ -654,6 +753,44 @@ mod tests {
 
         fw.stop_all();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 所有服务都排除的目录名可在 OS 事件入口直接丢弃；只要有一个服务不排除就不能丢。
+    #[test]
+    fn test_always_excluded_dirs_requires_all_services_to_exclude() {
+        let both = vec![
+            make_svc("A", vec!["/project"], vec!["node_modules", "*.log"], vec!["*"]),
+            make_svc("B", vec!["/project"], vec!["node_modules", "dist"], vec!["*"]),
+        ];
+        let names = always_excluded_dirs(&both);
+        assert_eq!(names, vec!["node_modules"], "只有两边都排除的字面目录名");
+        assert!(has_any_component(
+            Path::new("/project/node_modules/pkg/index.js"), &names
+        ));
+        assert!(!has_any_component(Path::new("/project/src/index.ts"), &names));
+
+        let only_a = vec![
+            make_svc("A", vec!["/project"], vec!["node_modules"], vec!["*"]),
+            make_svc("B", vec!["/project"], vec![], vec!["*"]),
+        ];
+        assert!(always_excluded_dirs(&only_a).is_empty(), "B 没排除就不能在入口丢弃");
+    }
+
+    /// 预过滤缓存：flush 直接使用命中的服务下标，且同一服务一轮最多 50 条。
+    #[test]
+    fn test_match_changes_cached_uses_prefilter_and_caps_per_service() {
+        let svcs = vec![make_svc("A", vec!["/project"], vec![], vec!["*"])];
+        let mut paths = HashMap::new();
+        for i in 0..60 {
+            paths.insert(
+                format!("/project/f{i}.ts"),
+                PendingChange { kind: "modify".into(), services: vec![0] },
+            );
+        }
+        let (changes, suppressed) = match_changes_cached(&svcs, &paths);
+        assert_eq!(changes.len(), MAX_CHANGES_PER_SERVICE, "单服务一轮最多 50 条");
+        assert_eq!(suppressed, 10, "被上限挡下的数量要如实统计");
+        assert!(changes.iter().all(|c| c.service_id == "A"));
     }
 
     #[test]

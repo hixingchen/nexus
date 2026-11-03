@@ -135,9 +135,11 @@ interface EditModalProps {
   onClose: () => void;
   onUpdated: () => void;
   onProjectName?: (name: string) => void;
+  /** 保存成功后回报新路径：MainLayout 的当前项目路径/AI cwd 必须跟着变 */
+  onProjectPath?: (path: string) => void;
 }
 
-export function EditProjectModal({ project, onClose, onUpdated, onProjectName }: EditModalProps) {
+export function EditProjectModal({ project, onClose, onUpdated, onProjectName, onProjectPath }: EditModalProps) {
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
   const [saving, setSaving] = useState(false);
@@ -209,6 +211,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName }:
       useModalDraftStore.getState().setDraft(MODAL_DRAFT_KEYS.projectEdit(project.id), null);
       setName(n); setPath(p);
       onProjectName?.(n);
+      onProjectPath?.(p);
       showNotification({ title: `已更新「${n}」` });
       onUpdated();
       onClose();

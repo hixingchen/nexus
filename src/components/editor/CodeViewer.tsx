@@ -96,6 +96,22 @@ function cacheKey(filePath: string, editable: boolean, openSeq: number): string 
 const scrollByPath = new Map<string, ReturnType<EditorView['scrollSnapshot']>>();
 
 /**
+ * 选区匹配扫描的防抖计时器（按 EditorView 记）。
+ *
+ * 计时器原先是 `createEditorState` 里的局部变量：编辑器销毁时没人清它，120ms 后仍会
+ * 回调 `onMatchMarks`（卸载后 setState）并短暂持有大文档。用 WeakMap 按 view 记，
+ * 组件 cleanup 能统一清掉；缓存复用的 state 在新 view 上也会重新登记，不会串。
+ */
+const markScanTimers = new WeakMap<EditorView, ReturnType<typeof setTimeout>>();
+function clearMarkScanTimer(view: EditorView): void {
+  const timer = markScanTimers.get(view);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    markScanTimers.delete(view);
+  }
+}
+
+/**
  * 开始跟踪这个 view 的滚动位置，返回停止跟踪的函数。
  *
  * 为什么是**持续跟踪**而不是"销毁前读一把"：读一把在 React 里根本没有安全的时机。
@@ -789,8 +805,6 @@ function createEditorState(
 ) {
   // 上次扫描的选中文本：updateListener 据此跳过重复全文档扫描
   let lastMarkText: string | null = null;
-  /** 扫描防抖计时器：选区/文档连续变化时只在停下来之后扫一次 */
-  let markScanTimer: ReturnType<typeof setTimeout> | null = null;
 
   const extensions = [
     lineNumbers(),
@@ -833,15 +847,16 @@ function createEditorState(
       lastMarkText = text;
       // 扫描防抖：有选区时每次按键/每次指针移动都会到这里，全文档逐行 includes（数千行文件
       // 即数千次行物化）不该每秒跑十几遍。滚动条标记本来就不是瞬时反馈，120ms 后扫一次即可。
-      if (markScanTimer !== null) clearTimeout(markScanTimer);
-      markScanTimer = setTimeout(() => {
-        markScanTimer = null;
+      clearMarkScanTimer(update.view);
+      const timer = setTimeout(() => {
+        markScanTimers.delete(update.view);
         const lines = new Set<number>();
         for (let n = 1; n <= doc.lines && lines.size < 500; n++) {
           if (doc.line(n).text.includes(text)) lines.add(n);
         }
         onMatchMarks({ lines, total: doc.lines });
       }, MARK_SCAN_DEBOUNCE_MS);
+      markScanTimers.set(update.view, timer);
     }),
     searchHitField,
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
@@ -1178,6 +1193,8 @@ export function CodeViewer({ filePath, editable = true, onChange }: CodeViewerPr
       // 存进去只会把 trackScroll 记下的真实位置覆盖掉（见 trackScroll 的说明）
       untrackScroll();
       if (activeEditorView === viewRef.current) activeEditorView = null;
+      // 先清选区扫描计时器：否则销毁后 120ms 仍会回调 setState
+      if (viewRef.current) clearMarkScanTimer(viewRef.current);
       viewRef.current?.destroy();
     };
   }, [filePath, editable, openSeq]);

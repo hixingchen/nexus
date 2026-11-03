@@ -35,14 +35,12 @@ import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../sto
 import { RobotIcon } from '../ai/RobotIcon';
 import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type Service, type ServiceTemplate } from '../../services/service';
 import { failureLabel } from '../../utils/serviceFailure';
-import { openInExplorer, openTerminal, pickSaveFile } from '../../services/system';
+import { openInExplorer, openTerminal, pickOpenFile, pickSaveFile } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
 import { useServiceActions } from '../../hooks/useServiceActions';
 import { LAYOUT_KEYS, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { useRunToolCommand } from '../../hooks/useToolCommandRunner';
 import { showNotification } from '../ui/Toast';
-// 模板导入导出用系统文件对话框选路径：后端按"用户显式选择的路径"处理（与打开工具选 exe 同口径）
-import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { reportError } from '../../utils/error';
 import { pruneServiceDrafts } from '../../stores/serviceDraftStore';
 
@@ -296,12 +294,10 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   /** 从 JSON 文件导入模板：重名自动改名、工具按名字匹配本机工具库 */
   const handleImportTemplates = useCallback(async () => {
     try {
-      const selected = await openFileDialog({
-        title: '选择模板导出文件',
-        multiple: false,
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      });
-      if (typeof selected !== 'string') return; // 用户取消
+      // 必须走后端原生对话框：选中的目录会被记为“用户已确认”，导入命令才能过白名单；
+      // 前端自己弹框拿到的路径经 IPC 回传，服务端分辨不出它是不是用户刚选的（SEC-19）。
+      const selected = await pickOpenFile({ purpose: 'importTemplates' });
+      if (!selected) return; // 用户取消
       const res = await serviceApi.importServiceTemplates(selected);
       loadTemplates();
       // 如实说明发生了什么。尤其后两类——不说清楚，用户只会看到"导入了但用不了"

@@ -679,6 +679,8 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
   kind?: 'project' | 'service';
 }) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
+  /** 根节点同样先渲染前 200 项：后端允许单目录 2 万条，一次性挂载会让树卡死 */
+  const [showAllRoot, setShowAllRoot] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   /** 选中态放 store（PERF-18）：见 stores/fileTreeStore.ts——作为 prop 下发会重渲染整棵子树 */
   const setSelectedPath = useFileTreeStore(s => s.setSelectedPath);
@@ -740,6 +742,7 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
   }, [rootPath]);
 
   useEffect(() => {
+    setShowAllRoot(false);
     if (!rootPath) { setEntries([]); setErr(null); return; }
     loadRoot();
   }, [loadRoot, rootPath]);
@@ -793,9 +796,18 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
         {rootPath && !err && entries.length === 0 && (
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">空目录</div>
         )}
-        {!err && entries.map(ent => (
+        {!err && (showAllRoot ? entries : entries.slice(0, INITIAL_RENDER_LIMIT)).map(ent => (
           <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} level={1} reloadParent={loadRoot} />
         ))}
+        {!err && !showAllRoot && entries.length > INITIAL_RENDER_LIMIT && (
+          <div
+            className="text-[11px] text-nexus-muted py-0.5 cursor-pointer hover:text-nexus-text relative z-10"
+            style={{ paddingLeft: `${basePadding + 20}px` }}
+            onClick={(ev) => { ev.stopPropagation(); setShowAllRoot(true); }}
+          >
+            还有 {entries.length - INITIAL_RENDER_LIMIT} 项…
+          </div>
+        )}
 
         {/* 空白区域右键菜单：搜索整个树根 / 粘贴到项目根目录 */}
         {rootMenu && rootPath && (

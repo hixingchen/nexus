@@ -46,6 +46,16 @@ let wvSeq = 0;
 const nextWvLabel = () => `ai-panel-${PAGE_TAG}-${++wvSeq}`;
 
 /**
+ * 正在创建中的子 WebView label。
+ *
+ * 挂载时清理“上一份页面遗留的 ai-panel-*”是异步的：StrictMode 双挂载 / HMR 重挂时，
+ * 旧清理的 `getAllWebviews()` 可能在新实例“原生已创建、`wvRef` 尚未赋值”的窗口内返回。
+ * 不排除这个 label，就会把新实例当成遗留物关掉，而 effect 之后仍把已关闭实例赋给
+ * `wvRef`，面板永久空白。单实例组件，模块级变量安全。
+ */
+let creatingLabel: string | null = null;
+
+/**
  * 全局弹窗打开期间子 WebView 的暂停标志（模块级：guardedRelayout 等模块函数共用）。
  * true 时一切重贴短路——WebView 应停留在屏外，防止窗口 resize/moved/focus 事件
  * 在弹窗打开期间把它贴回可见区（原生层不受 DOM 遮罩约束）。
@@ -204,6 +214,8 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const createLockRef = useRef<Promise<void> | null>(null);
   /** 窗口事件监听集合（resize/moved/focus）：恢复最小化/移动/缩放后都触发重贴 */
   const unlistenWinRef = useRef<UnlistenFn[]>([]);
+  /** 拖拽调宽的清理函数：组件在拖拽途中卸载时恢复 body 样式并拆 window 监听 */
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
   /** 内容区 DOM 槽：WebView 以它的真实矩形定位铺位（与头部无错位、随布局变化） */
   const slotRef = useRef<HTMLDivElement | null>(null);
   const [wvReady, setWvReady] = useState(false);
@@ -275,12 +287,19 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
      *
      * 跳过本实例已持有的那个：StrictMode 双挂载时第一次创建可能已经完成，不能误杀。
      */
+    let alive = true;
     void getAllWebviews()
       .then((list) => {
+        // 卸载后才返回：这次清理已经没有意义，继续执行只会误伤下一个实例
+        if (!alive) return;
         const current = wvRef.current?.label;
         return Promise.all(
           list
-            .filter((w) => w.label.startsWith('ai-panel-') && w.label !== current)
+            .filter((w) =>
+              w.label.startsWith('ai-panel-')
+              && w.label !== current
+              // 正在创建中的实例不属于“遗留物”：原生控件可能已经存在，而 wvRef 还没赋值
+              && w.label !== creatingLabel)
             .map((w) => closeQuietly(w)),
         );
       })
@@ -292,9 +311,12 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
     const onParentFocusIn = () => { lastParentFocusAt = Date.now(); };
     document.addEventListener('focusin', onParentFocusIn);
     return () => {
+      alive = false; // 让在途的遗留 WebView 清理失效，避免误杀下一个实例
       document.removeEventListener('focusin', onParentFocusIn);
       // 卸载后不得再触发重建（在途创建的 finally 会读这个键）
       desiredKeyRef.current = '';
+      // 拖拽途中卸载：恢复 body 的 cursor/user-select 并拆 window 监听
+      resizeCleanupRef.current?.();
       destroyWv();
     };
     // 挂载/卸载各一次：bootstrap 与 destroyWv 都是幂等命令，不依赖任何 props/state
@@ -305,6 +327,26 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   useEffect(() => {
     void useAiStore.getState().switchProject(cwd, projectName);
   }, [cwd, projectName]);
+
+  // 进程状态轮询：`running/url` 只在 start/stop 时更新，dsh 在面板打开期间崩溃/被杀时
+  // store 仍显示“会话中”，崩溃自愈判据永远不触发。面板可见期间每 5 秒向后端对一次账，
+  // 发现进程没了就把 url 清空，让下面的自愈 effect 接手。
+  useEffect(() => {
+    if (!panelOpen || (!runningHere && !url)) return;
+    let alive = true;
+    const timer = setInterval(() => {
+      void aiService.status().then((s) => {
+        if (!alive) return;
+        const nextUrl = s.running ? s.url : null;
+        const st = useAiStore.getState();
+        if (st.running === s.running && st.url === nextUrl && st.sessionCwd === s.cwd) return;
+        useAiStore.setState({ running: s.running, url: nextUrl, sessionCwd: s.cwd });
+      }).catch(() => {
+        // 对账失败只是少一次刷新：下一次轮询会自愈，不打扰用户
+      });
+    }, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [panelOpen, runningHere, url]);
 
   // 崩溃自愈：面板开着、本项目应运行（无 error）但进程不在了 → 自动重启
   // （覆盖 dsh 崩溃/被杀后无项目切换动作的场景，避免卡在假 spinner）
@@ -391,9 +433,11 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
         createLockRef.current = null;
         // 键在创建在途时又变了（用户切项目/刷新/收起再打开）：本次实例已自毁或已过期，
         // 这里补发一次创建，否则没人再发起，面板会永久停在"没有 WebView"的状态（CQ-7）。
-        // desiredKeyRef 由 lifecycle effect 维护，卸载/面板收起时为空 → 不会重建。
+        // **只比较本次尝试的 key**：创建本身失败时 createdForRef 仍是旧值，若拿它比较会
+        // 把每一次失败都当成"键变了"再试一次——WebView2 初始化/窗口已销毁等持久故障会
+        // 变成无退避的忙循环。失败交给错误卡上的刷新/重试入口。
         const want = desiredKeyRef.current;
-        if (want !== '' && want !== createdForRef.current) setCreateNonce(n => n + 1);
+        if (want !== '' && want !== key) setCreateNonce(n => n + 1);
       }
     })();
     // 依赖即触发源：只有"该不该有 WebView / 该载哪个内容键"变化才重跑
@@ -439,12 +483,52 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   // WebView 走同步器尾随合并，最新宽度必达且不堆积
   const onResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
+    // 上一轮拖拽若因异常没收到 mouseup，先收掉它的监听与 body 样式
+    resizeCleanupRef.current?.();
     dragStartRef.current = { x: e.clientX, w: useAiStore.getState().panelWidth };
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
     /** 结束标记：mouseup / blur / 卸载 任一先到即拆监听，重复调用安全 */
     let finished = false;
+
+    const removeListeners = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onUp);
+    };
+
+    /** 单出口：恢复 body 样式、取消排队帧、拆监听。卸载时也走这里。 */
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      manualWRef.current = null;
+      dragStartRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      removeListeners();
+      if (resizeCleanupRef.current === cleanup) resizeCleanupRef.current = null;
+    };
+    resizeCleanupRef.current = cleanup;
+
+    const onUp = () => {
+      if (finished) return;
+      try {
+        const d = dragStartRef.current;
+        // 松手：以最终鼠标位置落 store 并清除手动宽度（渲染回归 store 事实源）
+        if (d && dockRef.current) {
+          const finalW = clampWidth(d.x, d.w, pendingXRef.current);
+          dockRef.current.style.width = finalW + 'px';
+          useAiStore.getState().setPanelWidth(finalW);
+        }
+      } finally {
+        cleanup();
+      }
+    };
 
     const onMove = (ev: MouseEvent) => {
       // 无按键的移动 = 松手事件丢失（在窗口外或原生子 WebView 上松手收不到 mouseup），
@@ -468,37 +552,6 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           if (b) sync.apply(b);
         }
       });
-    };
-
-    const onUp = () => {
-      if (finished) return;
-      finished = true;
-      try {
-        const d = dragStartRef.current;
-        dragStartRef.current = null;
-        if (rafRef.current !== null) {
-          cancelAnimationFrame(rafRef.current);
-          rafRef.current = null;
-        }
-        // 松手：以最终鼠标位置落 store 并清除手动宽度（渲染回归 store 事实源）
-        if (d && dockRef.current) {
-          const finalW = clampWidth(d.x, d.w, pendingXRef.current);
-          manualWRef.current = null;
-          dockRef.current.style.width = finalW + 'px';
-          useAiStore.getState().setPanelWidth(finalW);
-        }
-      } finally {
-        // 单出口：无论正常松手还是兜底结束，都恢复 body 样式并拆监听
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-        removeListeners();
-      }
-    };
-
-    const removeListeners = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      window.removeEventListener('blur', onUp);
     };
 
     window.addEventListener('mousemove', onMove);
@@ -916,56 +969,87 @@ async function createEmbeddedWebview(
   // 经 Rust 命令创建（带 initialization_script：dsh 页面焦点记忆/恢复脚本安装——
   // JS 侧 new Webview() 无注入脚本入口，原因与实现见 src-tauri/src/commands/ai.rs）
   const label = nextWvLabel();
-  await aiService.createPanelWebview({
-    windowLabel: appWindow.label,
-    label,
-    url,
-    x: b?.x ?? 0,
-    y: b?.y ?? 0,
-    width: b?.width ?? 1,
-    height: b?.height ?? 1,
-    projectCwd,
-    resumeSession,
-  });
-  const all = await getAllWebviews();
-  const wv = all.find((w) => w.label === label);
-  if (!wv) throw new Error('AI 面板 WebView 创建后未找到实例');
-  const sync = createBoundsSync(wv);
-  // 三路事件都触发重贴：resize 覆盖窗口缩放/最小化恢复，moved 覆盖跨屏移动，
-  // focus 兜底最小化恢复（部分 Windows 组合下恢复不派发 resize，仅焦点回归）。
-  // 每路先等两帧让 DOM 布局跟随窗口变化；守卫版 relayout 无效矩形不写入
-  const relayoutNow = () => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        // 收起/弹窗期间窗口恢复（睡眠唤醒、最小化恢复、切回）时，Windows/WebView2 可能
-        // 把原生子 WebView 按旧矩形重新露出来；这里补一次移屏（幂等）。可见态才走正常重贴。
-        if (wvHidden || modalPause) { parkOffscreen(wv); return; }
-        void guardedRelayout(sync, slot);
-      });
-    });
-  };
+  creatingLabel = label;
+  let sync: BoundsSync | null = null;
   const unlistens: UnlistenFn[] = [];
-  unlistens.push(await appWindow.onResized(relayoutNow));
-  unlistens.push(await appWindow.onMoved(relayoutNow));
-  // focus 恢复（true）与失去（false）都进来，guardedRelayout 内部守卫过滤无效写入。
-  // 切回窗口时条件恢复 dsh 输入焦点（延迟等窗口焦点流转完成）：
-  // - 保护：父页面最近 2 秒内有交互（用户正在主界面输入）→ 不抢焦点；
-  // - 否则：调 Rust 命令对子 WebView 的 WebView2 控件窗口 SetFocus（正确语义的
-  //   系统焦点交接，见 commands/ai.rs::ai_panel_focus——wry 的 set_focus 底层是
-  //   MoveFocus，语义错误会破坏输入，刻意不用）+ 页面内 DOM 恢复脚本自动兜底
-  unlistens.push(await appWindow.onFocusChanged(({ payload: focused }) => {
-    relayoutNow();
-    if (!focused) return;
-    setTimeout(() => {
-      if (Date.now() - lastFocusCmdAt < 500) return; // 节流：防焦点流转链重复触发
-      lastFocusCmdAt = Date.now();
-      if (Date.now() - lastParentFocusAt < 2000) return; // 主界面刚被操作，不抢
-      // 只留控制台：焦点流转触发的自动行为（已节流 + 防抢），失败时面板只是没抢到焦点，
-      // 弹 toast 会在切换窗口时反复打扰
-      void aiService.focusPanel(appWindow.label, label).catch((e) => console.error('恢复 dsh 焦点失败:', e));
-    }, 150);
-  }));
-  return { wv, sync, unlistens };
+  let focusTimer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await aiService.createPanelWebview({
+      windowLabel: appWindow.label,
+      label,
+      url,
+      x: b?.x ?? 0,
+      y: b?.y ?? 0,
+      width: b?.width ?? 1,
+      height: b?.height ?? 1,
+      projectCwd,
+      resumeSession,
+    });
+    const wv = await Webview.getByLabel(label);
+    if (!wv) throw new Error('AI 面板 WebView 创建后未找到实例');
+    const createdSync = createBoundsSync(wv);
+    sync = createdSync;
+    // 三路事件都触发重贴：resize 覆盖窗口缩放/最小化恢复，moved 覆盖跨屏移动，
+    // focus 兜底最小化恢复（部分 Windows 组合下恢复不派发 resize，仅焦点回归）。
+    // 每路先等两帧让 DOM 布局跟随窗口变化；守卫版 relayout 无效矩形不写入
+    const relayoutNow = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          // 收起/弹窗期间窗口恢复（睡眠唤醒、最小化恢复、切回）时，Windows/WebView2 可能
+          // 把原生子 WebView 按旧矩形重新露出来；这里补一次移屏（幂等）。可见态才走正常重贴。
+          if (wvHidden || modalPause) { parkOffscreen(wv); return; }
+          void guardedRelayout(createdSync, slot);
+        });
+      });
+    };
+    unlistens.push(await appWindow.onResized(relayoutNow));
+    unlistens.push(await appWindow.onMoved(relayoutNow));
+    // focus 恢复（true）与失去（false）都进来，guardedRelayout 内部守卫过滤无效写入。
+    // 切回窗口时条件恢复 dsh 输入焦点（延迟等窗口焦点流转完成）：
+    // - 保护：父页面最近 2 秒内有交互（用户正在主界面输入）→ 不抢焦点；
+    // - 收起/弹窗期间 WebView 在屏外，抢焦点会把键盘交给不可见页面；
+    // - 否则：调 Rust 命令对子 WebView 的 WebView2 控件窗口 SetFocus（正确语义的
+    //   系统焦点交接，见 commands/ai.rs::ai_panel_focus——wry 的 set_focus 底层是
+    //   MoveFocus，语义错误会破坏输入，刻意不用）+ 页面内 DOM 恢复脚本自动兜底
+    const unFocus = await appWindow.onFocusChanged(({ payload: focused }) => {
+      relayoutNow();
+      if (!focused) return;
+      if (focusTimer !== null) clearTimeout(focusTimer);
+      focusTimer = setTimeout(() => {
+        focusTimer = null;
+        if (Date.now() - lastFocusCmdAt < 500) return; // 节流：防焦点流转链重复触发
+        if (Date.now() - lastParentFocusAt < 2000) return; // 主界面刚被操作，不抢
+        if (wvHidden || modalPause || createdSync.disposed || !useAiStore.getState().panelOpen) return;
+        lastFocusCmdAt = Date.now();
+        // 只留控制台：焦点流转触发的自动行为（已节流 + 防抢），失败时面板只是没抢到焦点，
+        // 弹 toast 会在切换窗口时反复打扰
+        void aiService.focusPanel(appWindow.label, label).catch((e) => console.error('恢复 dsh 焦点失败:', e));
+      }, 150);
+    });
+    // 定时器必须随监听一起释放：否则卸载/重建后它仍可能把焦点交给已销毁的 WebView
+    unlistens.push(() => {
+      if (focusTimer !== null) clearTimeout(focusTimer);
+      focusTimer = null;
+      unFocus();
+    });
+    return { wv, sync: createdSync, unlistens };
+  } catch (e) {
+    // 半成功：原生 WebView 可能已经 add_child，但后续 getAllWebviews/窗口监听失败。
+    // 不清理会留在界面上盖住错误卡，且每次重试再叠一个。
+    sync?.dispose();
+    for (const un of unlistens) {
+      try { un(); } catch { /* 监听已失效：清理阶段不抛 */ }
+    }
+    try {
+      const created = await Webview.getByLabel(label);
+      if (created) await closeQuietly(created);
+    } catch (cleanupErr) {
+      console.warn(`AI 面板 WebView(${label}) 创建失败后清理失败（可能残留原生控件）:`, cleanupErr);
+    }
+    throw e;
+  } finally {
+    if (creatingLabel === label) creatingLabel = null;
+  }
 }
 
 /**

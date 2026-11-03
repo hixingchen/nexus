@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use super::logfile;
 use super::logpipe::{
-    push_log_line, spawn_log_flush_thread, LogBuffers, LogKey, LogLine, LogSignal,
+    now_rfc3339_cached, push_log_line, spawn_log_flush_thread, LogBuffers, LogKey, LogLine, LogSignal,
     ServiceLogBatchPayload,
 };
 use super::logtext::{decode_lossy, prepare_log_text, MAX_READ_LINE_BYTES};
@@ -186,9 +186,13 @@ fn spawn_log_tailer(
             let mut skip_partial = offset > 0;
             // 上一段因超长被丢弃：先把该行剩余字节丢到行尾，别再重复输出
             let mut overflowing = false;
-            // 与进程 stdout 走同一条落库路径：上限、序号、刷新帧合并全部继承
+            let stopped = || follow_stop.load(Ordering::Relaxed) || service_stop.load(Ordering::Relaxed);
+            // 与进程 stdout 走同一条落库路径：上限、序号、刷新帧合并全部继承。
+            // emit 内部也要看停止标志：内层读到 EOF 的循环可能一次处理大量积压行，
+            // 只在 250ms 外层检查的话，stop 之后仍会把缓冲重新建出来（幽灵日志）。
             let emit = |text: String| {
-                let line = push_log_line(&log_buffers, &key, "file", text, chrono::Utc::now().to_rfc3339(), false);
+                if stopped() { return; }
+                let line = push_log_line(&log_buffers, &key, "file", text, now_rfc3339_cached(), false);
                 {
                     if let Ok(mut p) = pending.lock() {
                         p.push(line);
@@ -197,7 +201,6 @@ fn spawn_log_tailer(
                     signal.notify();
                 }
             };
-            let stopped = || follow_stop.load(Ordering::Relaxed) || service_stop.load(Ordering::Relaxed);
             // 读缓冲在轮询循环外分配一次（PERF-23）：原先每轮新建 64KB 零缓冲，
             // 每 250ms 一次 = 每个跟随中的服务每秒白白清零 256KB
             let mut read_buf = vec![0u8; 64 * 1024];
@@ -261,6 +264,7 @@ fn spawn_log_tailer(
                     // 而日志洪泛时正是"一块里几万行"的场景。游标版是 O(n)
                     let mut consumed = 0usize;
                     while let Some(rel) = partial[consumed..].iter().position(|&b| b == b'\n') {
+                        if stopped() { break; }
                         let end = consumed + rel; // '\n' 的下标
                         let mut line = partial[consumed..end].to_vec();
                         consumed = end + 1;
@@ -280,6 +284,7 @@ fn spawn_log_tailer(
                     if consumed > 0 {
                         partial.drain(..consumed);
                     }
+                    if stopped() { break; }
                     // 残行超长：输出截断版并进入"丢到行尾"状态
                     if partial.len() > MAX_READ_LINE_BYTES {
                         let text = prepare_log_text(decode_lossy(std::mem::take(&mut partial)), false);

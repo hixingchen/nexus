@@ -170,6 +170,12 @@ fn search_in_dir(
         };
         let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
         for entry in entries.flatten() {
+            // 结果已满：当前目录的剩余文件一个都不用再 open/读盘/解码。
+            // 原实现只在下一次目录循环检查，结果早满时仍会把当前大目录扫完。
+            if results.len() >= max_results {
+                truncated = true;
+                break;
+            }
             // file_type() 取自目录项本身（不额外 stat），并据此跳过符号链接/junction：
             // 它们可能指向项目外（既泄漏白名单外内容，也让同一份内容被重复遍历）
             let Ok(file_type) = entry.file_type() else { continue };

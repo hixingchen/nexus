@@ -372,6 +372,19 @@ pub async fn write_file(
         uuid::Uuid::new_v4()
     ));
     tokio::fs::write(&tmp, &data).await.map_err(|e| format!("无法写入文件: {}", e))?;
+    // 持有父目录句柄（不共享 DELETE）直到 rename 完成：期间该目录不能被重命名/删除，
+    // 也就不能在校验后把父目录换成指向白名单外的联接点。这比“再校验一次”更强——
+    // 窗口不再是“校验到使用之间”，而是整个写入期间都被锁住。
+    let _parent_guard = if let Some(parent) = p.parent() {
+        let (guard, real) = state.paths.open_verified_dir(&state.db, &parent.to_string_lossy())?;
+        if real.as_path() != parent {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err("目标目录在保存期间发生变化，已取消写入".into());
+        }
+        Some(guard)
+    } else {
+        None
+    };
     if let Err(e) = tokio::fs::rename(&tmp, p).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!("无法写入文件: {}", e));
@@ -396,13 +409,13 @@ fn file_modified_millis(t: std::time::SystemTime) -> u64 {
 /// 键含 `(真实路径, 长度, mtime)`：**路径来自句柄复核**（每次仍照常校验，SEC-4 不放水），
 /// 只有"读+解析"这一步被省掉；文件一变（构建产物重写）戳记就不匹配，自然回落到重新读。
 ///
-/// 上限刻意保守：只缓存 ≤32MB 且只留 1 份——大包留在内存里的代价（几十 MB RSS）比
-/// 省下的几百毫秒更贵。
+/// 上限：缓存 ≤64MB 且只留 1 份。常见的 Spring Boot fat jar 在 40–60MB，32MB 会让它们
+/// **每次点条目都重新整包读 + 建 ZIP 索引**；64MB 覆盖绝大多数，仍只有一份常驻内存。
 /// 缓存项：(句柄复核得到的真实路径, 长度, mtime 毫秒, 字节)。
 /// 起别名是为了压住 `clippy::type_complexity`——顺带让上面那句"键是什么"一眼可读
 type JarCacheEntry = (String, u64, i64, std::sync::Arc<Vec<u8>>);
 static JAR_CACHE: std::sync::Mutex<Option<JarCacheEntry>> = std::sync::Mutex::new(None);
-const JAR_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const JAR_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 async fn read_file_cached(
     state: &AppState,
@@ -473,8 +486,10 @@ async fn read_file_limited(
     Ok(bytes)
 }
 
-/// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）
-const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024;
+/// 图片预览大小上限（base64 放大 1/3，避免 IPC 传输爆内存）。
+/// 20MB 图片编码后约 26.7MB，再经 Tauri 序列化/JS 字符串复制，峰值可能到原文件数倍；
+/// 8MB 覆盖正常截图/图标，超出时明确报错而不是让进程冒 OOM 风险。
+const MAX_IMAGE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// 读取图片为 base64（内建预览，前端拼 data URL）
 #[tauri::command]
@@ -565,8 +580,9 @@ pub async fn read_jar_entry(
     name: String,
 ) -> Result<JarEntryContent, String> {
     let bytes = read_file_cached(&state, &path, "jar").await?;
-    // 先判类型：`name` 下面要 move 进闭包
+    // 先判类型：`name` 下面要 move 进闭包，报错文案留一份副本
     let is_class = name.to_ascii_lowercase().ends_with(".class");
+    let name_for_err = name.clone();
     // 解压指定条目是同步 CPU 工作（fat jar 上可达数十 ms），放进 spawn_blocking 不占 tokio worker。
     // 与 list_jar 同一口径——那里已改，这里原先漏了。
     let (entry, size) = tokio::task::spawn_blocking(move || {
@@ -576,6 +592,18 @@ pub async fn read_jar_entry(
     })
     .await
     .map_err(|e| format!("读取 jar 条目任务失败: {}", e))??;
+
+    // jar 条目内嵌返回上限：text/binary/class 全部走 IPC，必须在这里封顶。
+    // 大条目（尤其二进制 base64）会让峰值内存到原文件数倍；超限明确报错，不静默截断。
+    const MAX_INLINE_JAR_ENTRY: u64 = 8 * 1024 * 1024;
+    if size > MAX_INLINE_JAR_ENTRY {
+        return Err(format!(
+            "jar 条目「{}」过大（{:.1} MB），超过 {} MB 内嵌预览上限",
+            name_for_err,
+            size as f64 / (1024.0 * 1024.0),
+            MAX_INLINE_JAR_ENTRY / (1024 * 1024)
+        ));
+    }
 
     if is_class {
         // class：CFR 反编译，失败回退字节码视图（与 readClassFile 前端回退同策略）。

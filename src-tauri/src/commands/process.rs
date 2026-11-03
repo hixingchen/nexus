@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::io::BufRead;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use serde::Serialize;
@@ -18,6 +17,9 @@ const TOOL_CMD_OUTPUT_MAX_LINES: usize = 2000;
 /// 16MB 字符串会在序列化、传输、渲染三处各付一次。与服务日志缓冲同口径（2MB）——
 /// 两条上限量纲不同，缺一条就漏一种形状。
 const TOOL_CMD_OUTPUT_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// 工具命令待发行队列上限：消费端卡顿时 reader 仍会持续 push，必须有界。
+/// 允许涨到 2× 再一次性丢旧的一半，避免每行都从队首删。
+const TOOL_CMD_PENDING_MAX_LINES: usize = 4000;
 
 /// 运行中的工具命令表项：pid + 进程启动时间。
 ///
@@ -201,8 +203,10 @@ fn spawn_stream_reader(
             let mut collected: VecDeque<(u64, String)> = VecDeque::with_capacity(TOOL_CMD_OUTPUT_MAX_LINES);
             // 已驻留字节数：增量维护，别每行重算（服务日志缓冲那边同样处理）
             let mut collected_bytes = 0usize;
-            for line in reader.lines() {
-                let Ok(line) = line else { continue };
+            let mut pending_trimmed = false;
+            // 有界行读取：`BufRead::lines()` 会把整行先读进 String，单行 GB 级
+            // （base64 / 单行 JSON）足以打满内存；`read_log_lines` 与文件日志同一口径。
+            for line in crate::core::logtext::read_log_lines(reader) {
                 let line = crate::core::process::truncate_line(line, 8192);
                 let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // 只入队不 emit：由发射线程按 50ms 批量发（锁中毒也继续发，
@@ -212,6 +216,17 @@ fn spawn_stream_reader(
                     Err(e) => e.into_inner(),
                 };
                 p.push(ToolCommandLogLine { stream: stream.into(), data: line.clone() });
+                if p.len() > TOOL_CMD_PENDING_MAX_LINES * 2 {
+                    let drop = p.len() - TOOL_CMD_PENDING_MAX_LINES;
+                    p.drain(..drop);
+                    if !pending_trimmed {
+                        pending_trimmed = true;
+                        log::warn!(
+                            "[nexus] 工具命令 {} 输出待发队列积压，丢弃最旧 {} 行",
+                            stream, drop
+                        );
+                    }
+                }
                 drop(p);
                 // 与 ServiceLog 的 reader 同口径：**释放缓冲锁之后**再唤醒（锁序见 LogSignal）
                 signal.notify();
@@ -289,6 +304,12 @@ pub struct ToolCommandLogLine {
     pub data: String,
 }
 
+// 切批 trait 定义在 core（批量发射器不认识 IPC DTO）；实现放在这里，
+// 避免 `core` 反向依赖 `commands`。trait 本身是 crate 可见。
+impl crate::core::logpipe::LogChunkItem for ToolCommandLogLine {
+    fn byte_len(&self) -> usize { self.data.len() }
+}
+
 /// 工具命令实时输出事件 payload（run_id 用于前端区分并发执行）
 ///
 /// **批量而非逐行**（PERF-11）：一次 `emit` 的完整链路是 serde_json 序列化 → 拼 JS 脚本串
@@ -335,6 +356,41 @@ pub struct DeleteResult {
 
 // ─── Tauri Commands ───────────────────────────────────────────
 
+/// 启动路由：本地进程 / 开机启动器 / 两者冲突时该拒绝哪一边。
+///
+/// 抽成纯函数是为了把最容易回归的“所有权判定”变成真值表测试：同一份逻辑原先散落在
+/// 多层 if 里，改一处分支就可能让“本地 + runner 双开”或“明明在跑却再起一份”回归。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartRoute {
+    AlreadyLocal,
+    BootAlreadyLive,
+    BootStart,
+    BootUnreachableLive,
+    BootUnreachable,
+    LocalBlockedByLiveBoot,
+    Local,
+}
+
+fn decide_start_route(
+    local_running: bool,
+    boot_active: bool,
+    runner_reachable: bool,
+    live_boot: bool,
+) -> StartRoute {
+    if local_running {
+        return StartRoute::AlreadyLocal;
+    }
+    if boot_active {
+        return match (runner_reachable, live_boot) {
+            (true, true) => StartRoute::BootAlreadyLive,
+            (true, false) => StartRoute::BootStart,
+            (false, true) => StartRoute::BootUnreachableLive,
+            (false, false) => StartRoute::BootUnreachable,
+        };
+    }
+    if live_boot { StartRoute::LocalBlockedByLiveBoot } else { StartRoute::Local }
+}
+
 /// 启动单个服务。
 ///
 /// 异步 + spawn_blocking：spawn 进程、绑定 Job Object、建 2 个 reader 线程都是阻塞操作，
@@ -346,53 +402,59 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let info = get_service_info(&state.db, &service_id)?;
-        // 本地进程表已有它：无论开机启动配置如何，都不能再交给 runner 起第二份。
         // 先推进一拍（崩溃/秒退的服务可能还没从表里摘掉）
         state.process_mgr.tick();
-        if state.process_mgr.is_running(&service_id) {
-            return Err(format!("服务「{}」已在本地运行中", info.name));
-        }
         let configured = crate::core::boot::BootMode::parse(&info.boot_credential_mode)
             .unwrap_or(crate::core::boot::BootMode::S4u);
         // manifest 只收 `boot_enabled=1 AND enabled=1`。取消任一项后，启动器就不再负责
         // 它的未来启停；此时不能再把 start 发给 runner（manifest 里没有它，必然失败）。
         let boot_active = info.boot_enabled && info.enabled;
         let live = crate::commands::boot::live_boot_service(&service_id);
-        if boot_active {
+        let route = decide_start_route(
+            state.process_mgr.is_running(&service_id),
+            boot_active,
             // 启动按**配置的模式**路由：manifest 是按它生成的，不能被旧模式里的残留条目带偏
-            if crate::commands::boot::runner_reachable_now(configured) {
-                // 已在跑时给明确结论（PID + 下一步动作），而不是把 runner 的
-                // “服务已在运行中”原样抛成一次失败提示
-                if let Some((_, st)) = &live {
-                    return Err(format!(
-                        "服务「{}」已在开机启动器中运行（PID {}）；需要重启请点「重启」，停止请点「停止」。",
-                        info.name, st.pid.unwrap_or(0)
-                    ));
-                }
+            boot_active && crate::commands::boot::runner_reachable_now(configured),
+            live.is_some(),
+        );
+        match route {
+            StartRoute::AlreadyLocal => return Err(format!("服务「{}」已在本地运行中", info.name)),
+            StartRoute::BootAlreadyLive => {
+                let pid = live.as_ref().and_then(|(_, st)| st.pid).unwrap_or(0);
+                return Err(format!(
+                    "服务「{}」已在开机启动器中运行（PID {}）；需要重启请点「重启」，停止请点「停止」。",
+                    info.name, pid
+                ));
+            }
+            StartRoute::BootStart => {
                 return crate::commands::boot::send_service_command(configured, "start", &service_id)
                     .map_err(|e| format!("服务「{}」{}", info.name, e));
             }
-            // 启动器不可达：绝不落回本地启动，否则会出现同名服务的第二个进程
-            if let Some((source, st)) = &live {
+            StartRoute::BootUnreachableLive => {
+                let (source, pid) = live.as_ref()
+                    .map(|(source, st)| (*source, st.pid.unwrap_or(0)))
+                    .unwrap_or(("", 0));
                 return Err(format!(
                     "服务「{}」正在由{}启动器运行（PID {}），但启动器当前不可达；已阻止本地重复启动。可在「设置 > 服务开机启动」强制停止，或重新启动启动器。",
                     info.name,
-                    if *source == "legacy" { "旧版" } else { "开机" },
-                    st.pid.unwrap_or(0)
+                    if source == "legacy" { "旧版" } else { "开机" },
+                    pid
                 ));
             }
-            return Err(format!(
-                "服务「{}」配置为开机启动，但对应启动器未运行；已阻止本地重复启动。请到「设置 > 服务开机启动」启动/修复启动器，或先关闭该服务的开机启动再本地运行。",
-                info.name
-            ));
-        }
-        // 已取消开机启动（或服务被禁用），但启动器里的实例还在跑：不能启动第二份。
-        // 先把实例停掉，下一次「启动」就会走本地进程管理器。
-        if let Some((_, st)) = &live {
-            return Err(format!(
-                "服务「{}」仍由开机启动器运行（PID {}）；已阻止本地重复启动。请先点服务卡片上的「停止」，停止后即可本地启动。",
-                info.name, st.pid.unwrap_or(0)
-            ));
+            StartRoute::BootUnreachable => {
+                return Err(format!(
+                    "服务「{}」配置为开机启动，但对应启动器未运行；已阻止本地重复启动。请到「设置 > 服务开机启动」启动/修复启动器，或先关闭该服务的开机启动再本地运行。",
+                    info.name
+                ));
+            }
+            StartRoute::LocalBlockedByLiveBoot => {
+                let pid = live.as_ref().and_then(|(_, st)| st.pid).unwrap_or(0);
+                return Err(format!(
+                    "服务「{}」仍由开机启动器运行（PID {}）；已阻止本地重复启动。请先点服务卡片上的「停止」，停止后即可本地启动。",
+                    info.name, pid
+                ));
+            }
+            StartRoute::Local => {}
         }
         let envs = crate::core::process::parse_env_vars(&info.env_vars)?;
         state.process_mgr.start(crate::core::process::ServiceSpawn {
@@ -664,15 +726,24 @@ pub async fn stop_project_services(app: tauri::AppHandle, project_id: String) ->
 
 /// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
 ///
-/// 异步 + spawn_blocking：`running()` 会为已退出的服务收尸（taskkill + 超时等待，
-/// 最坏每进程约 4s），而前端每 3 秒轮询本命令；同步执行会冻结 IPC/事件循环线程。
+/// 只读快照：生命周期推进（崩溃判定/游离进程认领/日志文件发现）由 `lib.rs` 的 2 秒
+/// 后台心跳负责。这里不再 `running()`（那会再 tick 一次），否则 20 次/分钟的前端轮询
+/// 会把同一套 `try_wait`/快照工作重复付一遍。
 #[tauri::command]
 pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         // 本地进程 + runner 状态合并。外部服务**不收养进 ProcessManager**：
         // 这里只是把 runner 的快照并进展示层，Nexus 退出时 stop_all 仍然只碰本地进程。
-        let mut running: Vec<RunningService> = state.process_mgr.running().into_iter()
+        // 心跳线程在时读快照；它创建失败时退回 running()（先 tick），否则崩溃判定/认领无人推进。
+        let snapshot = if crate::core::process::LIFECYCLE_TICKER_ALIVE
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state.process_mgr.snapshot_running()
+        } else {
+            state.process_mgr.running()
+        };
+        let mut running: Vec<RunningService> = snapshot.into_iter()
             .map(|(project_id, service_id, followed_log)| RunningService {
                 service_id, project_id, followed_log, source: "local".into(),
             })
@@ -969,13 +1040,55 @@ fn run_tool_child(
     }
 
     let status = child.wait().map_err(|e| format!("等待命令退出失败: {}", e))?;
-    let mut all: Vec<_> = stdout_handle.join().map_err(|_| "stdout 读取线程异常".to_string())?
+    // 先给正常命令一个短窗口把管道读干净（绝大多数命令这里就 EOF 了）。
+    // 若 reader 仍未结束，说明有后代进程继承了 stdout/stderr 写端——结束这些后代，
+    // 管道关闭后 reader 才能退出；否则线程会永久阻塞（调用方已不再被 join 卡死，
+    // 但线程/句柄仍会持续累积）。
+    #[cfg(windows)]
+    {
+        let grace = std::time::Instant::now() + Duration::from_millis(500);
+        while (!stdout_handle.is_finished() || !stderr_handle.is_finished())
+            && std::time::Instant::now() < grace
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !stdout_handle.is_finished() || !stderr_handle.is_finished() {
+            let killed = crate::core::process::kill_descendants_of(child.id());
+            log::warn!(
+                "[nexus] 工具命令 {} 已退出，但输出管道仍被占用；已清理 {} 个后代进程",
+                run_id, killed
+            );
+        }
+    }
+    // 不能无条件 join：若清理后仍有别的进程持有管道，reader 仍可能阻塞。
+    // 限时等待，超时就放弃这次输出并如实报错，线程自行退出/被丢弃。
+    let mut all: Vec<_> = join_reader_with_timeout(stdout_handle, "stdout")?
         .into_iter()
-        .chain(stderr_handle.join().map_err(|_| "stderr 读取线程异常".to_string())?)
+        .chain(join_reader_with_timeout(stderr_handle, "stderr")?)
         .collect();
     all.sort_by_key(|(n, _)| *n);
     let output = all.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n");
     Ok((status, output))
+}
+
+/// 有界等待 reader 线程结束（最多 2 秒）。
+///
+/// `JoinHandle::join` 没有超时；子进程把管道继承给后台进程时 reader 永远等不到 EOF。
+/// 超时后放弃等待（Drop 句柄即 detach），至少不把阻塞池线程一起拖死；输出可能不完整，
+/// 由调用方以明确错误告知用户。
+fn join_reader_with_timeout<T: Send + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    what: &str,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!("[nexus] {} 读取线程未在 2s 内退出（子进程可能仍持有管道），放弃等待", what);
+            return Err(format!("{} 读取线程超时（子进程可能未释放管道）", what));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.join().map_err(|_| format!("{} 读取线程异常", what))
 }
 
 /// 停止正在执行的工具命令（按 run_id 终止其进程树）。
@@ -1018,6 +1131,28 @@ fn stop_tool_command_inner(table: &ToolCmdTable, run_id: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 启停所有权路由的真值表：本地/开机启动器同时存在时，任何组合都不能起第二份。
+    #[test]
+    fn test_decide_start_route_truth_table() {
+        use StartRoute::*;
+        // 本地已在跑：无论开机配置如何，一律 AlreadyLocal
+        assert_eq!(decide_start_route(true, false, false, false), AlreadyLocal);
+        assert_eq!(decide_start_route(true, true, true, false), AlreadyLocal);
+        assert_eq!(decide_start_route(true, true, true, true), AlreadyLocal);
+
+        // 开机启动 + 启动器可达：已跑则拒绝重复启动，否则交给 runner
+        assert_eq!(decide_start_route(false, true, true, true), BootAlreadyLive);
+        assert_eq!(decide_start_route(false, true, true, false), BootStart);
+
+        // 开机启动 + 启动器不可达：绝不落回本地
+        assert_eq!(decide_start_route(false, true, false, true), BootUnreachableLive);
+        assert_eq!(decide_start_route(false, true, false, false), BootUnreachable);
+
+        // 非开机启动：runner 里仍有实例则阻止本地启动，否则本地启动
+        assert_eq!(decide_start_route(false, false, false, true), LocalBlockedByLiveBoot);
+        assert_eq!(decide_start_route(false, false, false, false), Local);
+    }
 
     // ── 工具命令执行路径（ARCH-25 / NEW-24④）─────────────────────────────
     //

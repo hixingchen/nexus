@@ -1,10 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { TitleBar } from './TitleBar';
 import { StatusBar } from './StatusBar';
 import { ResizablePanel } from './ResizablePanel';
 import { ProjectList } from './ProjectList';
-import { ProjectDetail } from './ProjectDetail';
+
+// 详情页（编辑器/文件树/服务列）只在选中项目后才需要：按需加载，首屏不解析它。
+const ProjectDetail = lazy(() =>
+  import('./ProjectDetail').then(m => ({ default: m.ProjectDetail })));
 import { RestartConfirm } from './RestartConfirm';
 import { PasteConflictModal } from '../file-tree/PasteConflictModal';
 import { AiPanel } from '../ai/AiPanel';
@@ -16,7 +19,7 @@ import { useToolCommandDialog } from '../../hooks/useToolCommandRunner';
 import { securityApi, projectApi } from '../../services/service';
 import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../stores/layoutStore';
 import { parseEditorFontSize } from '../../utils/editorFont';
-import { useLogStore } from '../../stores/logStore';
+import { isLogViewerOpen, useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
 import type { LogStream, ServiceLogBatchEvent } from '../../services/logService';
 import { reportError } from '../../utils/error';
@@ -47,6 +50,16 @@ export function MainLayout() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
   const [ready, setReady] = useState(false);
+  /**
+   * 已落库的值。持久化 effect 只在“当前值 ≠ 已落库值”时写。
+   *
+   * 只靠 `ready` 会在布局读取失败时立刻用默认值（null/false）覆盖数据库里的真实选择：
+   * 一次瞬时读失败就把“上次选中项目/折叠态”永久清掉。用已落库值做基线后，初始渲染与
+   * 读取失败都不会触发写入；只有用户真的改了值才写。
+   */
+  const persistedSelectedRef = useRef<string | null>(null);
+  const persistedServiceCollapsedRef = useRef(false);
+  const persistedLeftCollapsedRef = useRef(false);
   // 工具命令弹窗挂在这里而不是 ProjectDetail：关掉弹窗/切换项目后命令仍在后台跑，
   // 弹窗与"运行中"指示器必须活得比详情页久（状态在 stores/toolCommandStore）
   const toolCommandDialog = useToolCommandDialog();
@@ -74,6 +87,9 @@ export function MainLayout() {
     // 这里保留一层 50ms 合帧：多个服务同时刷屏时把它们的批次再合并成一次 store 写入。
     listen<ServiceLogBatchEvent>('service-log-batch', (event) => {
       if (disposed) return;
+      // 只为打开着日志面板的服务维护前端缓冲；未打开的服务在打开时用后端快照补齐。
+      // 不这样过滤的话，所有服务的输出都会进 JS 对象与 2000 行数组复制（面板没开也付费）。
+      if (!isLogViewerOpen(event.payload.service_key)) return;
       for (const line of event.payload.lines) {
         batch.push({
           serviceKey: event.payload.service_key,
@@ -124,6 +140,7 @@ export function MainLayout() {
         try {
           const detail = await projectApi.getDetail(layout[LAYOUT_KEYS.selectedProjectId]);
           setSelectedProjectId(layout[LAYOUT_KEYS.selectedProjectId]);
+          persistedSelectedRef.current = layout[LAYOUT_KEYS.selectedProjectId];
           setSelectedProjectName(detail.project.name);
           setSelectedProjectPath(detail.project.path);
         } catch (e: unknown) {
@@ -141,6 +158,9 @@ export function MainLayout() {
             description: '读取项目详情失败，本次未自动选中（配置里记的项目没有被改动）',
           });
           setSelectedProjectId(null);
+          // 不论瞬时故障还是项目已删除，本次渲染都不该触发持久化覆盖：
+          // 瞬时故障保留库里原值；确认删除时下面的 saveLayout 才是唯一的写入。
+          persistedSelectedRef.current = null;
           setSelectedProjectName(null);
           setSelectedProjectPath(null);
           // 后端在项目不存在时给的是"项目不存在"（commands/project.rs）；其余错误
@@ -153,6 +173,8 @@ export function MainLayout() {
       if (layout[LAYOUT_KEYS.leftPanelWidth]) setLeftPanelWidth(Number(layout[LAYOUT_KEYS.leftPanelWidth]));
       if (layout[LAYOUT_KEYS.leftPanelCollapsed] === '1') setLeftPanelCollapsed(true);
       if (layout[LAYOUT_KEYS.servicePanelCollapsed] === '1') setServicePanelCollapsed(true);
+      persistedLeftCollapsedRef.current = layout[LAYOUT_KEYS.leftPanelCollapsed] === '1';
+      persistedServiceCollapsedRef.current = layout[LAYOUT_KEYS.servicePanelCollapsed] === '1';
       setReady(true);
     }).catch((e: unknown) => {
       // 兜底（正常到不了）：`ensureLoaded` 内部已 catch，所以这里只可能接住**上面这段回调
@@ -199,19 +221,22 @@ export function MainLayout() {
     document.documentElement.style.setProperty('--nexus-text-size', `${textSize}px`);
   }, [textSize]);
 
-  // 选中项目变化时保存
+  // 选中项目变化时保存（只有真正偏离已落库值才写，见 persistedSelectedRef）
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || selectedProjectId === persistedSelectedRef.current) return;
+    persistedSelectedRef.current = selectedProjectId;
     saveLayout({ [LAYOUT_KEYS.selectedProjectId]: selectedProjectId ?? '' });
   }, [selectedProjectId, ready, saveLayout]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || servicePanelCollapsed === persistedServiceCollapsedRef.current) return;
+    persistedServiceCollapsedRef.current = servicePanelCollapsed;
     saveLayout({ [LAYOUT_KEYS.servicePanelCollapsed]: servicePanelCollapsed ? '1' : '0' });
   }, [servicePanelCollapsed, ready, saveLayout]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || leftPanelCollapsed === persistedLeftCollapsedRef.current) return;
+    persistedLeftCollapsedRef.current = leftPanelCollapsed;
     saveLayout({ [LAYOUT_KEYS.leftPanelCollapsed]: leftPanelCollapsed ? '1' : '0' });
   }, [leftPanelCollapsed, ready, saveLayout]);
 
@@ -256,11 +281,13 @@ export function MainLayout() {
   );
 
   const detailPanel = selectedProjectId ? (
-    <ProjectDetail
-      projectId={selectedProjectId}
-      servicePanelCollapsed={servicePanelCollapsed}
-      onToggleServicePanel={() => setServicePanelCollapsed(p => !p)}
-    />
+    <Suspense fallback={<div className="h-full bg-nexus-editor" />}>
+      <ProjectDetail
+        projectId={selectedProjectId}
+        servicePanelCollapsed={servicePanelCollapsed}
+        onToggleServicePanel={() => setServicePanelCollapsed(p => !p)}
+      />
+    </Suspense>
   ) : (
     <div className="h-full bg-nexus-editor flex items-center justify-center">
       <div className="text-center space-y-3">
@@ -291,7 +318,7 @@ export function MainLayout() {
       minWidth={150}
       maxWidth={500}
       direction="horizontal"
-      onResize={(w) => { setLeftPanelWidth(w); saveLayout({ left_panel_width: String(w) }); }}
+      onResize={(w) => { setLeftPanelWidth(w); saveLayout({ [LAYOUT_KEYS.leftPanelWidth]: String(w) }); }}
     />
   );
 

@@ -4,17 +4,27 @@
 //! 把行写进缓冲并推进待发行队列；③ 批量发射线程按窗口把队列整批交给 `LogSink`，
 //! 并用 `LogSignal` 唤醒（空闲时不空转）。文本层面的解码/裁剪见 `logtext`。
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::logtext::{prepare_log_text, read_log_lines};
 
 /// 日志缓冲区 key 类型，使用 Arc<str> 避免热路径 String clone
 pub(crate) type LogKey = Arc<str>;
+
+/// `Arc<str>` 的 JSON 表示仍是普通字符串（前端契约不变）。
+fn serialize_timestamp<S: serde::Serializer>(ts: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(ts)
+}
+fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+    let s = <String as serde::Deserialize>::deserialize(d)?;
+    Ok(Arc::from(s))
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct LogLine {
@@ -24,7 +34,10 @@ pub struct LogLine {
     /// "已追加但尚未被前端合并"的实时行（跟随视图里那几行永久消失）；有了序号，
     /// 前端可以按"只应用 seq 大于已合并最大值的行"做幂等合并，两条路径任意交错都收敛。
     pub seq: u64,
-    pub timestamp: String,
+    /// 时间戳在**同一次刷新窗口内**是同一份字符串：用 `Arc<str>` 让每行只做一次引用计数，
+    /// 而不是逐行克隆 String。它的 JSON 表示仍是普通字符串（见下面的 serde 函数）。
+    #[serde(serialize_with = "serialize_timestamp", deserialize_with = "deserialize_timestamp")]
+    pub timestamp: Arc<str>,
     pub stream: String,
     pub text: String,
 }
@@ -44,6 +57,12 @@ pub(crate) const LOG_FLUSH_MS: u64 = 50;
 
 /// 每服务日志缓冲行数上限（IDEA Console 式：只保留最新 2000 行）
 pub(crate) const MAX_LOG_LINES: usize = 2000;
+/// 待发行队列的行数上限（发射线程每 50ms 取走一次）。
+///
+/// 日志缓冲本身有 2MB 上限，但“已写入缓冲、尚未 emit”的旁路没有——前端/事件循环卡顿时
+/// reader 仍会持续 push，队列可无界增长。允许涨到 2× 再一次性丢掉较旧的一半，避免每条
+/// 都从队首 drain（O(n²)）；每行最长 8KB 时内存上界约 64MB。
+const MAX_PENDING_LINES: usize = 4000;
 /// 每服务日志缓冲**字节**上限（与前端 `stores/logStore.ts` 的 `MAX_BYTES` 同值同口径）。
 /// 行数上限挡不住"2000 行 × 8KB 长行 = 16MB/服务"这种形状，两条上限量纲不同、都必须有。
 pub(crate) const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
@@ -91,10 +110,6 @@ impl LogChunkItem for String {
 
 impl LogChunkItem for Arc<LogLine> {
     fn byte_len(&self) -> usize { self.text.len() }
-}
-
-impl LogChunkItem for crate::commands::process::ToolCommandLogLine {
-    fn byte_len(&self) -> usize { self.data.len() }
 }
 
 /// 日志发射的**唤醒通道**（PERF-25）。
@@ -191,7 +206,22 @@ where
 /// 直接克隆结构体等于在锁内做 2000 次字符串深拷贝（单行最长 8KB → 最坏十几 MB），
 /// 期间所有服务的 reader 线程都阻塞在同一把锁上。改成 Arc 后锁内只拷指针，
 /// 字符串拷贝推迟到锁外（序列化时自然发生）。
-pub(crate) type LogBuffers = Arc<Mutex<HashMap<LogKey, LogBuffer>>>;
+/// 外层只负责查找/插入服务，**每个服务一把内层锁**：原先所有服务共用一把全局 Mutex，
+/// 任一服务刷屏时，其他服务的写入与快照都要排队。外层锁只在“取/建 Arc”时短暂持有，
+/// 真正的队列操作在内层锁内完成。
+pub(crate) type LogBuffers = Arc<Mutex<HashMap<LogKey, Arc<Mutex<LogBuffer>>>>>;
+
+/// 取某服务的缓冲；不存在时创建。外层锁在返回前释放，调用方只持内层锁。
+fn buffer_for(buffers: &LogBuffers, key: &LogKey) -> Option<Arc<Mutex<LogBuffer>>> {
+    let mut map = match buffers.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            log::error!("[nexus] log_buffers 外层锁已中毒: {}", e);
+            e.into_inner()
+        }
+    };
+    Some(Arc::clone(map.entry(Arc::clone(key)).or_insert_with(|| Arc::new(Mutex::new(LogBuffer::default())))))
+}
 
 /// 每条服务的日志缓冲：行队列 + **累计字节数**（PERF-17）。
 ///
@@ -244,15 +274,36 @@ impl LogBuffer {
 /// 日志行序号源：全局单调，保证"同一服务内递增"（跨服务不要求可比）
 static LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+// 每行日志都要一个 RFC3339 时间戳；`chrono` 的格式化在高行速率下是纯额外 CPU。
+// 同一线程 10ms 内复用同一个字符串（日志显示精度是秒，这个误差不可见）。
+// 只缓存“格式化结果”，每行仍克隆一次 String——比每行做一次时区/格式计算便宜得多。
+thread_local! {
+    static TS_CACHE: RefCell<(Instant, Arc<str>)> = RefCell::new((
+        Instant::now() - Duration::from_secs(1),
+        Arc::from(""),
+    ));
+}
+
+pub(crate) fn now_rfc3339_cached() -> Arc<str> {
+    TS_CACHE.with(|cell| {
+        let mut c = cell.borrow_mut();
+        if c.0.elapsed() >= Duration::from_millis(10) || c.1.is_empty() {
+            c.0 = Instant::now();
+            c.1 = Arc::from(chrono::Utc::now().to_rfc3339());
+        }
+        Arc::clone(&c.1)
+    })
+}
+
 /// 写入某服务的日志缓冲：刷新帧原地替换队尾，普通行追加并按行数上限滑窗。
 ///
 /// 刷新帧只在**队尾同属一条流**时才合并：stdout 的进度条不得覆盖 stderr 队尾的错误行。
 /// 返回写进缓冲的那一行（含 seq），调用方据此发实时事件——事件与快照因此可以按 seq 对齐。
-pub(crate) fn push_log_line(buffers: &LogBuffers, key: &LogKey, stream: &str, text: String, timestamp: String, is_refresh: bool) -> Arc<LogLine> {
+pub(crate) fn push_log_line(buffers: &LogBuffers, key: &LogKey, stream: &str, text: String, timestamp: Arc<str>, is_refresh: bool) -> Arc<LogLine> {
     let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
     let line = Arc::new(LogLine { seq, timestamp, stream: stream.to_string(), text });
-    let Ok(mut b) = buffers.lock() else { return line };
-    let e = b.entry(Arc::clone(key)).or_default();
+    let Some(buf) = buffer_for(buffers, key) else { return line };
+    let Ok(mut e) = buf.lock() else { return line };
     if is_refresh {
         let mergeable = e.lines.back().map(|l| l.stream == stream).unwrap_or(false);
         if mergeable {
@@ -290,11 +341,13 @@ pub(crate) fn spawn_log_reader(
         .name(format!("nexus-log-{}-{}", key, stream))
         .spawn(move || {
             let reader = BufReader::new(pipe);
+            // 队列裁剪只告警一次，避免背压期间刷屏
+            let mut pending_trimmed = false;
             for line in read_log_lines(reader) {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                let now = chrono::Utc::now().to_rfc3339();
+                let now = now_rfc3339_cached();
                 // 刷新行识别：\r、\x1b[s（保存光标）、\x1b[2K/\x1b[K（清行）开头的行
                 // 都是单行刷新（webpack 进度条等），应合并而非逐帧追加
                 let is_refresh = line.starts_with('\r')
@@ -307,6 +360,17 @@ pub(crate) fn spawn_log_reader(
                 {
                     if let Ok(mut p) = pending.lock() {
                         p.push(logged);
+                        if p.len() > MAX_PENDING_LINES * 2 {
+                            let drop = p.len() - MAX_PENDING_LINES;
+                            p.drain(..drop);
+                            if !pending_trimmed {
+                                pending_trimmed = true;
+                                log::warn!(
+                                    "[nexus] 日志待发行队列积压，丢弃最旧 {} 行（消费端可能被阻塞）: {}",
+                                    drop, key
+                                );
+                            }
+                        }
                     }
                     // push 之后、**释放 pending 锁之后**再叫醒（锁序见 LogSignal 说明）
                     signal.notify();
@@ -325,10 +389,15 @@ pub(crate) fn spawn_log_reader(
 /// 语义：进程生命周期事件（启动失败/退出码/停止）写入日志流，用户可从日志面板查因。
 /// 缓冲为空时自动创建；锁失败或超限时静默处理（系统行丢失不影响主流程）。
 pub(crate) fn append_system_line(buffers: &LogBuffers, key: &str, text: String) {
-    if let Ok(mut b) = buffers.lock() {
-        let e = b.entry(Arc::from(key)).or_default();
-        e.push(Arc::new(LogLine { seq: LOG_SEQ.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), stream: "system".into(), text }));
-    }
+    let Some(buf) = buffer_for(buffers, &Arc::from(key)) else { return };
+    if let Ok(mut e) = buf.lock() {
+        e.push(Arc::new(LogLine {
+            seq: LOG_SEQ.fetch_add(1, Ordering::Relaxed),
+            timestamp: now_rfc3339_cached(),
+            stream: "system".into(),
+            text,
+        }));
+    };
 }
 
 #[cfg(test)]

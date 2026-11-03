@@ -158,7 +158,7 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
 
     // 显式 spawn（而非 cmd.output()）：需要在进程跑起来后按 pid 纳入共享 Job Object——
     // kill_on_drop 只在"本进程还活着"时有效，Nexus 被强杀时靠 KILL_ON_JOB_CLOSE 兜底
-    let child = cmd.spawn().map_err(|e| format!("启动 java 失败（需要 JRE）: {}", e))?;
+    let mut child = cmd.spawn().map_err(|e| format!("启动 java 失败（需要 JRE）: {}", e))?;
     #[cfg(windows)]
     if let Some(job) = crate::core::job_object::shared() {
         if let Some(pid) = child.id() {
@@ -169,31 +169,81 @@ pub async fn decompile_class_bytes(bytes: &[u8]) -> Result<String, String> {
         }
     }
 
-    let output = tokio::time::timeout(DECOMPILE_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "反编译超时（>15s），已终止 java 进程".to_string());
+    // `wait_with_output()` 会无上限地把 CFR 的 stdout/stderr 读进内存。CFR 对构造/
+    // 超大类可能输出数百 MB 源码，-Xmx256m 只限制 JVM 堆、不限制它往管道写。
+    // 两条流各用 take(上限 + 1) 有界读取；并发读避免一条流写满管道把另一条堵死。
+    const MAX_DECOMPILE_OUTPUT: usize = 64 * 1024 * 1024;
+    const MAX_DECOMPILE_STDERR: usize = 4 * 1024 * 1024;
+    use tokio::io::AsyncReadExt;
+    let stdout = child.stdout.take().ok_or_else(|| "无法读取 CFR stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "无法读取 CFR stderr".to_string())?;
+
+    async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
+        reader: R,
+        max: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        // 两个 reader 并发跑（tokio::spawn），避免一条流写满管道把另一条堵死
+        let mut limited = reader.take(max as u64 + 1);
+        limited.read_to_end(&mut buf).await?;
+        Ok(buf)
+    }
+
+    let result = tokio::time::timeout(DECOMPILE_TIMEOUT, async {
+        let out_task = tokio::spawn(read_limited(stdout, MAX_DECOMPILE_OUTPUT));
+        let err_task = tokio::spawn(read_limited(stderr, MAX_DECOMPILE_STDERR));
+        let status = child.wait().await.map_err(|e| format!("等待 CFR 退出失败: {}", e))?;
+        let out = out_task
+            .await
+            .map_err(|e| format!("读取 CFR 输出任务失败: {}", e))?
+            .map_err(|e| format!("读取 CFR 输出失败: {}", e))?;
+        let err = err_task
+            .await
+            .map_err(|e| format!("读取 CFR 错误输出任务失败: {}", e))?
+            .map_err(|e| format!("读取 CFR 错误输出失败: {}", e))?;
+        if out.len() > MAX_DECOMPILE_OUTPUT {
+            return Err(format!(
+                "反编译输出超过 {} MB 上限（class 可能被构造或异常巨大）",
+                MAX_DECOMPILE_OUTPUT / 1024 / 1024
+            ));
+        }
+        if err.len() > MAX_DECOMPILE_STDERR {
+            return Err("CFR 错误输出超过上限".into());
+        }
+        Ok((status, out, err))
+    })
+    .await;
 
     // 无论成败都清理临时文件
     let _ = tokio::fs::remove_file(&class_path).await;
 
-    match output {
-        Ok(Ok(output)) if output.status.success() => {
+    match result {
+        Ok(Ok((status, out, _err))) if status.success() => {
             // 成功退出但输出为空 = 没有反编译结果（CFR 对个别类会这样）。
             // 不能把空串当成功返回：上层会显示一个空标签，而不是回退到字节码视图。
-            let raw = String::from_utf8_lossy(&output.stdout);
+            let raw = String::from_utf8_lossy(&out);
             let text = strip_cfr_banner(&raw);
             if text.trim().is_empty() {
                 return Err("CFR 未输出反编译结果（结果为空）".into());
             }
             Ok(text.to_string())
         }
-        Ok(Ok(output)) => Err(format!(
+        Ok(Ok((status, _out, err))) => Err(format!(
             "CFR 退出码 {}: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr)
+            status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&err)
         )),
-        Ok(Err(e)) => Err(format!("启动 java 失败（需要 JRE）: {}", e)),
-        Err(e) => Err(e),
+        Ok(Err(e)) => {
+            // 读取失败/超上限时进程可能还活着：主动收掉，别留一个占内存的 JVM
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err("反编译超时（>15s），已终止 java 进程".to_string())
+        }
     }
 }
 
@@ -228,5 +278,39 @@ mod tests {
         let input = "/** 类 javadoc */\npublic class A {}\n";
         let out = strip_cfr_banner(input);
         assert!(out.starts_with("/** 类 javadoc */"), "无 banner 内容不应被改:\n{}", out);
+    }
+
+    /// 真机冒烟：用本机 javac 编一个 class，再走完整 CFR 反编译链路（含有界输出读取）。
+    /// 默认忽略：需要本机有 JDK/JRE。手动跑 `cargo test --lib -- --ignored decompile_real`。
+    #[test]
+    #[ignore = "需要本机 JDK/JRE 与内嵌 CFR"]
+    fn test_decompile_real_class_smoke() {
+        let dir = std::env::temp_dir().join(format!("nexus-decompile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let src = dir.join("Hello.java");
+        std::fs::write(&src, "public class Hello { public static String hi() { return \"hi\"; } }")
+            .expect("写 Java 源文件");
+        let status = std::process::Command::new("javac")
+            .arg("-d").arg(&dir).arg(&src)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("跳过：本机没有 javac");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        if !status.success() {
+            eprintln!("跳过：javac 编译失败");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let class = dir.join("Hello.class");
+        let bytes = std::fs::read(&class).expect("读 class");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建测试运行时");
+        let text = rt.block_on(decompile_class_bytes(&bytes)).expect("CFR 应能反编译");
+        assert!(text.contains("class Hello"), "反编译结果应包含类声明:\n{}", text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

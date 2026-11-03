@@ -328,6 +328,11 @@ mod imp {
         }
     }
 
+    /// 停止超时后是否仍有进程活着。只有“直接子进程与认领进程都确认退出”才能写 stopped。
+    pub(super) fn stop_has_survivors(child_running: bool, adopted_running: bool) -> bool {
+        child_running || adopted_running
+    }
+
     impl Runner {
         /// 把 runner 亲自观测到的存活状态与代表 pid 写进 state。
         ///
@@ -692,12 +697,42 @@ mod imp {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // 超时后**复核存活**：taskkill 返回成功不等于进程真的死了（安全软件拦截、
+            // 不可终止状态）。仍活着就说“未停掉”，并把它留在 running 表里，下一次停止
+            // 还能重试；不能写一个假的 stopped——那会让后续 start 再起一份。
+            let (child_running, child_status) = match run.child.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => (false, Some(status)),
+                    Ok(None) => (true, None),
+                    Err(_) => (true, None), // 查不了按“可能还活着”处理，方向偏保守
+                },
+                None => (false, None),
+            };
+            let adopted_running = run.adopted.iter().any(|a| a.handle.is_alive());
+            if stop_has_survivors(child_running, adopted_running) {
+                let pid = run.child.as_ref().map(|c| c.id())
+                    .or_else(|| run.adopted.iter().find(|a| a.handle.is_alive()).map(|a| a.pid))
+                    .unwrap_or(0);
+                let msg = format!(
+                    "停止未完成：仍有进程在运行（pid {}）{}",
+                    pid,
+                    if kill_error.is_empty() { String::new() } else { format!("；{}", kill_error) }
+                );
+                self.set_state(id, |s| {
+                    s.phase = "ready".into(); // 仍在运行：保持可被下一次停止操作
+                    s.pid = Some(pid);
+                    s.process_alive = Some(true);
+                    s.error = msg.clone();
+                });
+                self.running.insert(id.to_string(), run);
+                self.log.info(&format!("⚠ {}", msg));
+                self.write_state();
+                return Err(msg);
+            }
             let pid_log = run.child.as_ref().map(|c| c.id())
                 .or_else(|| run.adopted.first().map(|a| a.pid))
                 .unwrap_or(0);
-            let code = run.child.as_mut()
-                .and_then(|c| c.try_wait().ok().flatten())
-                .and_then(|s| s.code())
+            let code = child_status.and_then(|s| s.code())
                 .or_else(|| run.adopted.iter().find_map(|a| a.handle.exit_code()));
             self.set_state(id, |s| {
                 s.phase = "stopped".into();
@@ -1113,4 +1148,19 @@ pub use imp::run;
 pub fn run() {
     eprintln!("[nexus-boot-runner] 仅 Windows 支持");
     std::process::exit(1);
+}
+
+#[cfg(all(test, windows))]
+mod stop_survivor_tests {
+    use super::imp::stop_has_survivors;
+
+    /// 停止超时后只有“子进程与认领进程都确认退出”才允许写 stopped；
+    /// 任一仍活着都必须走“未停掉”分支（保留 running 表项）。
+    #[test]
+    fn test_stop_requires_both_child_and_adopted_dead() {
+        assert!(!stop_has_survivors(false, false));
+        assert!(stop_has_survivors(true, false));
+        assert!(stop_has_survivors(false, true));
+        assert!(stop_has_survivors(true, true));
+    }
 }

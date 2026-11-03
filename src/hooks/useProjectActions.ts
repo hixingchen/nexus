@@ -21,22 +21,48 @@ import { reportError } from '../utils/error';
  * （后端 `ORDER BY pinned DESC`），所以刷新是必须的。
  */
 export function useProjectActions(onProjectsChanged?: () => void) {
-  /** 正在启停的项目 id：调用方据此禁用按钮/菜单项，避免第二次启动 */
-  const [actingId, setActingId] = useState<string | null>(null);
+  /**
+   * 正在启停的项目 id 集合。
+   *
+   * 不能只存单个 id：列表/窄轨上可以先后对 A、B 发起启动，A 先返回时若 `set(null)` 会把
+   * B 的忙碌态一并清掉，B 的按钮重新可点，能再次发起启动/停止（CQ-40 在服务动作层的同类问题）。
+   */
+  const [actingIds, setActingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const begin = useCallback((id: string) => {
+    setActingIds(prev => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+  const end = useCallback((id: string) => {
+    setActingIds(prev => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
 
   const start = useCallback(async (id: string, name: string) => {
-    setActingId(id);
-    // 共享动作层：启动 + 项目级监听 + 运行状态刷新 + 逐服务失败汇总
-    await startProjectWithFeedback(id, name);
-    setActingId(null);
-  }, []);
+    begin(id);
+    try {
+      // 共享动作层：启动 + 项目级监听 + 运行状态刷新 + 逐服务失败汇总
+      await startProjectWithFeedback(id, name);
+    } finally {
+      end(id);
+    }
+  }, [begin, end]);
 
   const stop = useCallback(async (id: string, name: string) => {
-    setActingId(id);
-    // 停止的日志清单取自共享服务缓存（与详情页同一口径：缓存里就是这个项目的服务数组）
-    await stopProjectWithFeedback(id, name, useSvcCacheStore.getState().cache[id] ?? []);
-    setActingId(null);
-  }, []);
+    begin(id);
+    try {
+      // 停止的日志清单取自共享服务缓存（与详情页同一口径：缓存里就是这个项目的服务数组）
+      await stopProjectWithFeedback(id, name, useSvcCacheStore.getState().cache[id] ?? []);
+    } finally {
+      end(id);
+    }
+  }, [begin, end]);
 
   const togglePin = useCallback(async (id: string) => {
     try {
@@ -47,5 +73,5 @@ export function useProjectActions(onProjectsChanged?: () => void) {
     }
   }, [onProjectsChanged]);
 
-  return { actingId, start, stop, togglePin };
+  return { actingIds, start, stop, togglePin };
 }

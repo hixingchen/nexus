@@ -99,6 +99,12 @@ function flush(): Promise<void> {
   // 返回 Promise 而不是 fire-and-forget：退出路径必须在 `app.exit(0)` 之前确定写库完成，
   // 否则这条 IPC 与退出流程竞争，挂起的布局改动会随进程一起消失
   return layoutApi.save(patch).catch((e) => {
+    // 失败不能丢这批改动：并回 pending 并重排一次防抖，下一次保存/退出前 flush 会重试。
+    // 不覆盖期间用户新写的值（新值更新）。
+    for (const [k, v] of Object.entries(patch)) {
+      if (!(k in pending)) pending[k] = v;
+    }
+    if (flushTimer === null) flushTimer = setTimeout(flush, SAVE_DEBOUNCE_MS);
     reportError('保存布局失败', e, { silent: true });
   });
 }

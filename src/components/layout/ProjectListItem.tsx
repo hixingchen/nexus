@@ -16,7 +16,8 @@ interface Props {
   expanding: boolean;
   services: Service[];
   isRunning: boolean;
-  actingId: string | null;
+  /** 本项目正在启停（按钮禁用并显示 spinner） */
+  acting: boolean;
   expandedSvc: Set<string>;
   onSelect: () => void;
   /**
@@ -54,7 +55,7 @@ function activateOnEnter(run: () => void) {
 }
 
 export function ProjectListItem({
-  project, selected, isExpanded, expanding, services, isRunning, actingId, expandedSvc,
+  project, selected, isExpanded, expanding, services, isRunning, acting, expandedSvc,
   onSelect, onToggleExpand, onContextMenu, onStart, onStop, onTogglePin, onToggleSvcExpand,
 }: Props) {
   // useMemo（PERF-38）：本组件没有 memo，而父级的每次 running / svcCache / 搜索输入变化
@@ -167,7 +168,7 @@ export function ProjectListItem({
           {isRunning ? (
             <button
               className="flex-shrink-0 w-[22px] h-[22px] flex items-center justify-center rounded bg-nexus-error/15 text-nexus-error hover:bg-nexus-error/25 active:bg-nexus-error/30 disabled:opacity-30 transition-colors"
-              disabled={actingId === project.id}
+              disabled={acting}
               onClick={onStop}
               title="停止"
             >
@@ -177,11 +178,11 @@ export function ProjectListItem({
             <button
               /* 不带 disabled:opacity-30：启动中要显示 spinner，压暗会让它看不清 */
               className="flex-shrink-0 w-[22px] h-[22px] flex items-center justify-center rounded text-nexus-success/70 hover:text-nexus-success hover:bg-nexus-success/10 active:bg-nexus-success/20 transition-colors"
-              disabled={actingId === project.id}
+              disabled={acting}
               onClick={onStart}
               title="启动"
             >
-              {actingId === project.id ? (
+              {acting ? (
                 /* 启动中：真转的 spinner（原来是个静态圆环，看着像"停止"） */
                 <span className="w-[13px] h-[13px] border-[1.5px] border-nexus-success/30 border-t-nexus-success rounded-full animate-spin" />
               ) : (

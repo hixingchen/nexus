@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCommandResult } from '../../services/service';
-import { useUiStore } from '../../stores/uiStore';
+import { newModalId, useUiStore } from '../../stores/uiStore';
 import { EMPTY_LOGS, useToolLogStore } from '../../stores/toolLogStore';
 
 // 常见退出码 → 中文含义（Unix 约定），未识别返回 null
@@ -77,12 +77,19 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
     }
   }, [output]);
 
+  /** 弹窗栈 id：与 Modal 共用同一套“Esc 只关最上层”语义 */
+  const [modalId] = useState(() => newModalId());
+
   // 全屏遮罩弹窗：打开期间通知全局（AI 面板子 WebView 移出屏幕，防弹窗期间仍可点击）
   useEffect(() => {
     if (!open) return;
     useUiStore.getState().pushModal();
-    return () => useUiStore.getState().popModal();
-  }, [open]);
+    useUiStore.getState().pushModalId(modalId);
+    return () => {
+      useUiStore.getState().popModal();
+      useUiStore.getState().popModalId(modalId);
+    };
+  }, [open, modalId]);
 
   /** 所有关闭入口（X / 关闭 / Esc / 点遮罩）都走这里：执行中先让用户选怎么关 */
   const requestClose = useCallback(() => {
@@ -90,13 +97,18 @@ export function ToolCommandResultDialog({ open, commandName, runId, result, load
     else onClose();
   }, [loading, onStop, onClose]);
 
-  // Esc 关闭（与 Modal 行为一致）：执行中先弹确认条，不把命令悄悄丢到后台
+  // Esc 关闭（与 Modal 行为一致）：只关栈顶；执行中先弹确认条，不把命令悄悄丢到后台
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose(); };
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const stack = useUiStore.getState().modalStack;
+      if (stack[stack.length - 1] !== modalId) return;
+      requestClose();
+    };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [open, requestClose]);
+  }, [open, modalId, requestClose]);
 
   if (!open) return null;
 

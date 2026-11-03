@@ -10,10 +10,10 @@
 //! - 安装/卸载要提权：用 `ShellExecuteExW runas` 拉起 `cmd.exe`/`schtasks.exe`，
 //!   只传固定参数，不接受前端指定的路径或任务 XML。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -418,6 +418,37 @@ fn query_task_xml(name: &str) -> Result<Option<String>, String> {
     if ok { Ok(Some(text)) } else { Ok(None) }
 }
 
+/// 任务 XML 的短 TTL 缓存：设置页轮询只需要“任务还在不在/登录类型”，
+/// 不必每 15 秒起两次 schtasks。安装/卸载会显式失效，外部改动最多延迟 20 秒发现。
+const TASK_XML_TTL: Duration = Duration::from_secs(20);
+type TaskXmlCache = HashMap<String, (Instant, Option<String>)>;
+static TASK_XML_CACHE: Mutex<Option<TaskXmlCache>> = Mutex::new(None);
+
+fn query_task_xml_cached(name: &str) -> Result<Option<String>, String> {
+    {
+        let guard = TASK_XML_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_ref() {
+            if let Some((at, xml)) = map.get(name) {
+                if at.elapsed() < TASK_XML_TTL {
+                    return Ok(xml.clone());
+                }
+            }
+        }
+    }
+    let xml = query_task_xml(name)?;
+    let mut guard = TASK_XML_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(name.to_string(), (Instant::now(), xml.clone()));
+    Ok(xml)
+}
+
+fn invalidate_task_xml_cache(name: &str) {
+    let mut guard = TASK_XML_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(name);
+    }
+}
+
 fn tag_text(xml: &str, tag: &str) -> String {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -582,6 +613,31 @@ fn files_identical(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn bundled_runner_hash() -> Option<[u8; 32]> {
     static CACHE: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| bundled_runner_path().ok().and_then(|p| sha256_file(&p)))
+}
+
+/// 已安装 runner 的哈希（按长度 + mtime 缓存）。
+/// 设置页轮询会反复问“安装包与 ProgramData 里的 runner 是否一致”，2.7MB 的哈希
+/// 不应每 15 秒重算一次；文件被替换后 mtime/长度会变，自然失效。
+fn installed_runner_hash(path: &std::path::Path) -> Option<[u8; 32]> {
+    static CACHE: std::sync::Mutex<Option<(u64, i64, [u8; 32])>> = std::sync::Mutex::new(None);
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let stamp = (meta.len(), mtime);
+    if let Ok(g) = CACHE.lock() {
+        if let Some((len, m, hash)) = g.as_ref() {
+            if (*len, *m) == stamp {
+                return Some(*hash);
+            }
+        }
+    }
+    let hash = sha256_file(path)?;
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((stamp.0, stamp.1, hash));
+    }
+    Some(hash)
 }
 
 /// runner 目录的安装期 ACL 加固：只留 SYSTEM / Administrators 可写，Users 只读+执行。
@@ -773,15 +829,16 @@ fn classify_runner_state(
 
 fn build_status(state: &AppState, mode: BootMode) -> Result<BootRunnerStatus, String> {
     let name = task_name(mode);
-    let xml = query_task_xml(&name)?;
+    let xml = query_task_xml_cached(&name)?;
     let installed = xml.is_some();
     let logon_type = xml.as_deref().map(|x| tag_text(x, "LogonType")).unwrap_or_default();
     let runner_path = runner_install_path();
     let runner_installed = runner_path.is_file();
     // 安装包里的 runner 与 ProgramData 里的版本是否一致（SHA-256）：
     // GUI 更新后 sidecar 会变，但 ProgramData 的稳定 runner 不会自动更新；提示修复。
-    // sidecar 哈希缓存（每 5 秒轮询不必重读 4MB），只重算已安装文件。
-    let runner_current = match (bundled_runner_hash(), sha256_file(&runner_path)) {
+    // sidecar 哈希缓存（每轮询不必重读 4MB）；已安装文件也按 (长度, mtime) 缓存，
+    // 只有 runner 被替换/更新时才重算 2.7MB 的 SHA-256。
+    let runner_current = match (bundled_runner_hash(), installed_runner_hash(&runner_path)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
@@ -1332,25 +1389,22 @@ pub fn read_boot_log_tail(
     } else {
         &decoded
     };
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut lines: Vec<Arc<LogLine>> = text
-        .lines()
-        .map(|line| Arc::new(LogLine {
-            seq: 0,
-            timestamp: now.clone(),
+    // 先裁到最新 2000 行再建对象：原实现先为文本里的**所有**行创建 Arc/String
+    // （2MB 短行可达数十万行），最后才 drain 到 2000——轮询每秒一次，等于每秒白造
+    // 几十万个短命对象。seq 在裁剪后重新编号（快照轮询按整份替换，不做跨快照合并）。
+    let mut tail: Vec<&str> = text.lines().rev().take(2000).collect();
+    tail.reverse();
+    let now: Arc<str> = Arc::from(chrono::Utc::now().to_rfc3339());
+    let lines: Vec<Arc<LogLine>> = tail
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| Arc::new(LogLine {
+            seq: (i + 1) as u64,
+            timestamp: Arc::clone(&now),
             stream: "file".into(),
             text: line.to_string(),
         }))
         .collect();
-    // 只保留最新 2000 行；seq 在裁剪后重新编号（快照轮询按整份替换，不做跨快照合并）
-    if lines.len() > 2000 {
-        lines.drain(..lines.len() - 2000);
-    }
-    for (i, line) in lines.iter_mut().enumerate() {
-        if let Some(l) = Arc::get_mut(line) {
-            l.seq = (i + 1) as u64;
-        }
-    }
     Some(lines)
 }
 
@@ -1600,6 +1654,7 @@ pub async fn install_boot_runner(
             // 已有同一模式的 runner 在跑时，让它重新读一次 manifest（不重启服务）
             reload_if_running(boot_mode);
         }
+        invalidate_task_xml_cache(&name);
         build_status(&state, boot_mode)
     }).await.map_err(|e| format!("安装开机启动器任务失败: {}", e))?
 }
@@ -1626,6 +1681,7 @@ pub async fn uninstall_boot_runner(
             }
         }
         mark_runner_stopped(boot_mode);
+        invalidate_task_xml_cache(&name);
         build_status(&state, boot_mode)
     }).await.map_err(|e| format!("卸载开机启动器任务失败: {}", e))?
 }

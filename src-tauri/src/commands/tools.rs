@@ -127,12 +127,15 @@ pub(crate) fn open_tool_usage(db: &crate::database::Database, id: &str) -> Resul
 #[tauri::command]
 pub fn delete_open_tool(state: State<AppState>, id: String) -> Result<(), String> {
     if id.trim().is_empty() { return Err("工具ID不能为空".into()); }
-    state.db.with_conn(|conn| {
-        conn.execute("DELETE FROM open_tools WHERE id=?1", [&id])
+    state.db.with_conn_mut(|conn| {
+        // 两条语句必须原子：工具已删、模板引用清理失败会留下指向不存在 id 的悬空引用，
+        // 而 service_templates.open_tool_id 没有外键兜底。
+        let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
+        tx.execute("DELETE FROM open_tools WHERE id=?1", [&id])
             .map_err(|e| format!("删除打开工具失败: {}", e))?;
-        conn.execute("UPDATE service_templates SET open_tool_id='' WHERE open_tool_id=?1", [&id])
+        tx.execute("UPDATE service_templates SET open_tool_id='' WHERE open_tool_id=?1", [&id])
             .map_err(|e| format!("清理模板工具引用失败: {}", e))?;
-        Ok(())
+        tx.commit().map_err(|e| format!("提交事务失败: {}", e))
     })
 }
 

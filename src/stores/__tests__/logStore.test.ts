@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { useLogStore } from '../logStore.ts';
+import { isLogViewerOpen, retainLogViewer, useLogStore } from '../logStore.ts';
 import type { LogStream } from '../../services/logService.ts';
 
 /**
@@ -96,4 +96,16 @@ test('clearLogs 之后行号从新会话重新计数（去重窗口不能把新�
   useLogStore.getState().clearLogs(k);
   useLogStore.getState().bulkAppend([line(k, '新会话第 1 行', 1)]);
   assert.deepEqual(texts(k), ['新会话第 1 行'], '清空后 seq 从头开始，属于同一会话的新行必须显示');
+});
+
+test('日志面板引用计数：只有打开着的服务才接收实时行', () => {
+  const k = 'svc-viewer-ref';
+  assert.equal(isLogViewerOpen(k), false, '未打开面板时不应接收');
+  const release1 = retainLogViewer(k);
+  const release2 = retainLogViewer(k);
+  assert.equal(isLogViewerOpen(k), true, '同一服务两个面板（详情 + 设置）都要保留');
+  release1();
+  assert.equal(isLogViewerOpen(k), true, '仍有一个面板打开');
+  release2();
+  assert.equal(isLogViewerOpen(k), false, '全部关闭后停止接收');
 });

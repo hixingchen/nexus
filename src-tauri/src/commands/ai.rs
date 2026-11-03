@@ -110,6 +110,11 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             state.paths.ensure_project_dir_allowed(&state.db, dir, "AI 会话工作目录")?;
         }
 
+        // 代数必须在**慢操作之前**取：runtime.probe / workspace bump / spawn 都可能耗时
+        // 数秒，期间用户完全可能点停止。原实现把 fetch_add 放在这些操作之后，停止先递增
+        // 的 epoch 会被本次启动的更高 epoch 覆盖，于是“点了停止，会话又起来了”。
+        let gen = state.ai_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
         // Job Object 句柄取一次，供本函数里所有 `core::ai` 调用共用（ARCH-19）
         let job = state.process_mgr.job_arc();
 
@@ -134,6 +139,11 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             if let Some(s) = h.as_mut() {
                 if s.cwd == cwd_norm {
                     if s.alive() {
+                        // 等待锁/探测期间可能已被 stop 或更新的 start 取代：不要返回一个
+                        // 马上就要被杀掉的会话状态。
+                        if state.ai_epoch.load(Ordering::SeqCst) != gen {
+                            return Err("已取消：会话被更新的请求取代".into());
+                        }
                         return Ok(AiStatus {
                             running: true,
                             url: Some(s.url.clone()),
@@ -173,9 +183,6 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         if let Some(dir) = cwd_norm.as_deref() {
             crate::core::ai::ensure_workspace_active(dir, name_norm.as_deref(), restarting_same_project);
         }
-
-        // 代数递增：使任何进行中的旧启动自动放弃
-        let gen = state.ai_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
         let session = match crate::core::ai::spawn_dsh_web(&runtime, job.as_deref(), cwd_norm.as_deref(), START_TIMEOUT) {
             Ok(s) => s,
