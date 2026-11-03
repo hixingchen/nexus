@@ -541,8 +541,12 @@ export const openToolsApi = {
   /** 全部工具（全局共享，按添加顺序） */
   list: () => invoke<OpenTool[]>('list_open_tools'),
 
-  /** 扫描本机已安装的编辑器/IDE/终端，自动添加工具库里还没有的项 */
-  detectAndAdd: () => invoke<DetectedToolsResult>('detect_and_add_open_tools'),
+  /**
+   * 扫描本机已安装的编辑器/IDE/终端，自动添加工具库里还没有的项。
+   * `scanDir` 非空时额外扫描该目录（便携版/自定义安装目录，如 HBuilderX）。
+   */
+  detectAndAdd: (scanDir?: string | null) =>
+    invoke<DetectedToolsResult>('detect_and_add_open_tools', { scanDir: scanDir ?? null }),
 
   /** 新增（id 空）或更新工具 */
   save: (tool: { id?: string | null; name: string; executable: string; args: string }) =>

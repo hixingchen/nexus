@@ -5,6 +5,7 @@ import { openToolsApi, type OpenTool } from '../../services/service';
 import { useToolStore } from '../../stores/toolStore';
 import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
+import { pickDirectory } from '../../services/system';
 import {
   MODAL_DRAFT_KEYS, readModalDraft, useModalDraftStore, type ToolFormDraft,
 } from '../../stores/modalDraftStore';
@@ -31,7 +32,7 @@ export function ToolsManagerModal({ open, onClose }: Props) {
   const [formArgs, setFormArgs] = useState('');
   /** 保存中（防连点，UX-16） */
   const [saving, setSaving] = useState(false);
-  /** 本机工具识别中（扫描注册表/PATH/安装目录，不执行程序） */
+  /** 本机工具识别中（扫描卸载注册表/开始菜单/PATH/安装目录，不启动被检测程序） */
   const [detecting, setDetecting] = useState(false);
   /** 待删除的工具（非 null = 确认框开着） */
   const [deleting, setDeleting] = useState<OpenTool | null>(null);
@@ -107,12 +108,12 @@ export function ToolsManagerModal({ open, onClose }: Props) {
     setSaving(false);
   };
 
-  /** 扫描本机已安装的编辑器/IDE/终端，自动补齐未添加的项 */
-  const handleDetect = async () => {
+  /** 扫描本机已安装的编辑器/IDE/终端，自动补齐未添加的项；可额外扫描一个目录 */
+  const handleDetect = async (scanDir?: string) => {
     if (detecting) return;
     setDetecting(true);
     try {
-      const res = await openToolsApi.detectAndAdd();
+      const res = await openToolsApi.detectAndAdd(scanDir);
       await refreshTools();
       if (res.added.length > 0) {
         showNotification({
@@ -126,14 +127,23 @@ export function ToolsManagerModal({ open, onClose }: Props) {
           title: '未发现新工具',
           description: res.skipped > 0
             ? `已存在的 ${res.skipped} 个工具已跳过`
-            : '未检测到常见编辑器/IDE，仍可手动添加',
+            : scanDir
+              ? '所选目录中未发现已知工具；可换个更具体的安装目录，或手动添加'
+              : '未检测到常见编辑器/IDE，仍可手动添加',
         });
       }
     } catch (e) {
-      reportError('识别本机工具失败', e);
+      reportError(scanDir ? '扫描安装目录失败' : '识别本机工具失败', e);
     } finally {
       setDetecting(false);
     }
+  };
+
+  /** 便携版/自定义目录兜底：让用户选一个安装目录，额外扫描（如 HBuilderX） */
+  const handleDetectInDir = async () => {
+    if (detecting) return;
+    const dir = await pickDirectory({ purpose: 'toolDir' });
+    if (dir) await handleDetect(dir);
   };
 
   /** 弹出文件选择器挑选可执行程序（也可手动输入：编辑/Path 命令场景） */
@@ -243,18 +253,26 @@ export function ToolsManagerModal({ open, onClose }: Props) {
 
         {/* ── 工具列表 ── */}
         <div className="space-y-1.5">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <span className="text-[11px] font-semibold text-nexus-muted uppercase tracking-wider">工具列表</span>
-            <button
-              className="px-2 py-1 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 disabled:opacity-40 transition-colors"
-              disabled={detecting}
-              onClick={() => void handleDetect()}
-              title="扫描注册表 App Paths、PATH 与常见安装目录，自动添加未添加的编辑器/IDE/终端；不会启动任何程序"
-            >{detecting ? '识别中…' : '识别本机工具'}</button>
+            <div className="flex items-center gap-1.5">
+              <button
+                className="px-2 py-1 text-[11px] text-nexus-accent border border-nexus-accent/40 rounded-md hover:bg-nexus-accent/10 disabled:opacity-40 transition-colors"
+                disabled={detecting}
+                onClick={() => void handleDetect()}
+                title="扫描卸载注册表、开始菜单快捷方式、PATH 与常见安装目录，自动添加未添加的编辑器/IDE/终端；不会启动被检测的程序"
+              >{detecting ? '识别中…' : '识别本机工具'}</button>
+              <button
+                className="px-2 py-1 text-[11px] text-nexus-muted border border-nexus-border rounded-md hover:border-nexus-accent hover:text-nexus-accent disabled:opacity-40 transition-colors"
+                disabled={detecting}
+                onClick={() => void handleDetectInDir()}
+                title="选择一个便携版/自定义安装目录（如 HBuilderX），额外扫描其中的已知工具"
+              >扫描安装目录</button>
+            </div>
           </div>
           <div className="max-h-[240px] overflow-auto space-y-1.5">
           {openTools.length === 0 ? (
-            <p className="text-center text-[12px] text-nexus-muted/40 py-4">暂无工具；点右上「识别本机工具」自动发现，或在上方手动添加</p>
+            <p className="text-center text-[12px] text-nexus-muted/40 py-4">暂无工具；点右上「识别本机工具」自动发现，便携版可点「扫描安装目录」，或在上方手动添加</p>
           ) : openTools.map(t => {
             const legacy = !t.executable && !!t.command;
             return (

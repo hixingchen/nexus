@@ -146,6 +146,7 @@ fn picker_title(purpose: Option<&str>) -> &'static str {
     match purpose {
         Some("projectDir") => "选择项目目录",
         Some("serviceCwd") => "选择工作目录",
+        Some("toolDir") => "选择工具安装目录",
         _ => "选择目录",
     }
 }

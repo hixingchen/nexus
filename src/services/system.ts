@@ -24,7 +24,7 @@ import type { FileEntry } from '../types/file';
  * 信任天然更高，所以标题不能被 IPC 指定——否则被攻陷的 webview 能弹出标题写着
  * 「Nexus 需要访问 …\.ssh 才能继续」的系统级选择框。这里只传用途，不传文案。
  */
-export type PickPurpose = 'projectDir' | 'serviceCwd';
+export type PickPurpose = 'projectDir' | 'serviceCwd' | 'toolDir';
 
 export function pickDirectory(opts?: { purpose?: PickPurpose; defaultPath?: string }): Promise<string | null> {
   return invoke<string | null>('pick_directory', {

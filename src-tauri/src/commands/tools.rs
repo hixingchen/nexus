@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
@@ -405,22 +407,169 @@ struct ToolCandidate {
     path: PathBuf,
 }
 
+/// 可识别的产品表：显示名、主可执行文件名、卸载注册表 DisplayName 的匹配串。
+///
+/// 新增一个常用工具只需要加一行；注册表、开始菜单、PATH、指定目录四种发现方式共用它。
+/// `uninstall_match` 用**最长匹配**决定归属，避免 "Visual Studio Code" 抢走
+/// "Visual Studio Code - Insiders" 的卸载项。
+struct ToolProduct {
+    name: &'static str,
+    exe: &'static str,
+    uninstall_match: &'static str,
+}
+
+const TOOL_PRODUCTS: &[ToolProduct] = &[
+    ToolProduct { name: "VS Code", exe: "Code.exe", uninstall_match: "Visual Studio Code" },
+    ToolProduct { name: "VS Code Insiders", exe: "Code - Insiders.exe", uninstall_match: "Visual Studio Code - Insiders" },
+    ToolProduct { name: "Cursor", exe: "Cursor.exe", uninstall_match: "Cursor" },
+    ToolProduct { name: "Sublime Text", exe: "sublime_text.exe", uninstall_match: "Sublime Text" },
+    ToolProduct { name: "IntelliJ IDEA", exe: "idea64.exe", uninstall_match: "IntelliJ IDEA" },
+    ToolProduct { name: "PyCharm", exe: "pycharm64.exe", uninstall_match: "PyCharm" },
+    ToolProduct { name: "WebStorm", exe: "webstorm64.exe", uninstall_match: "WebStorm" },
+    ToolProduct { name: "GoLand", exe: "goland64.exe", uninstall_match: "GoLand" },
+    ToolProduct { name: "CLion", exe: "clion64.exe", uninstall_match: "CLion" },
+    ToolProduct { name: "PhpStorm", exe: "phpstorm64.exe", uninstall_match: "PhpStorm" },
+    ToolProduct { name: "RubyMine", exe: "rubymine64.exe", uninstall_match: "RubyMine" },
+    ToolProduct { name: "Rider", exe: "rider64.exe", uninstall_match: "Rider" },
+    ToolProduct { name: "DataGrip", exe: "datagrip64.exe", uninstall_match: "DataGrip" },
+    ToolProduct { name: "Android Studio", exe: "studio64.exe", uninstall_match: "Android Studio" },
+    ToolProduct { name: "HBuilderX", exe: "HBuilderX.exe", uninstall_match: "HBuilderX" },
+    ToolProduct { name: "Trae CN", exe: "Trae CN.exe", uninstall_match: "Trae CN" },
+];
+
+fn product_by_exe(exe_name: &str) -> Option<&'static ToolProduct> {
+    TOOL_PRODUCTS.iter().find(|p| p.exe.eq_ignore_ascii_case(exe_name))
+}
+
+/// 卸载项 DisplayName → 产品；取最长匹配，Insiders 不会被普通 VS Code 抢走。
+fn product_for_uninstall_name(display_name: &str) -> Option<&'static ToolProduct> {
+    let lower = display_name.to_lowercase();
+    TOOL_PRODUCTS
+        .iter()
+        .filter(|p| lower.contains(&p.uninstall_match.to_lowercase()))
+        .max_by_key(|p| p.uninstall_match.len())
+}
+
+/// DisplayIcon 可能是 `"C:\path\exe.exe",0` 或 `C:\path\exe.exe,0`。
+fn parse_display_icon(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    let path = if let Some(rest) = raw.strip_prefix('"') {
+        let end = rest.find('"')?;
+        &rest[..end]
+    } else {
+        raw.split(',').next()?.trim()
+    };
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// 只接受“确实是产品主程序”的路径：DisplayIcon 有时是 uninstall.exe/图标。
+fn exe_if_matches(path: &Path, exe: &str) -> Option<PathBuf> {
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    (path.is_file() && name.eq_ignore_ascii_case(exe)).then(|| path.to_path_buf())
+}
+
+/// 从字符串里抽数字段做版本比较：`2022.2.3` → `[2022, 2, 3]`。
+fn version_key(raw: &str) -> Vec<u64> {
+    raw.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| (!part.is_empty()).then(|| part.parse::<u64>().ok()).flatten())
+        .collect()
+}
+
+/// 从路径的目录名里取版本（JetBrains 的 `WebStorm 2022.2.3` 这种布局）。
+fn version_key_from_path(path: &Path) -> Vec<u64> {
+    path.ancestors()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy()))
+        .map(|s| version_key(&s))
+        .find(|v| v.len() >= 2)
+        .unwrap_or_default()
+}
+
+/// 同一产品多个候选时保留版本最高的；版本相同保留先到的（来源优先级）。
+fn consider_candidate(
+    best: &mut HashMap<&'static str, (Vec<u64>, PathBuf)>,
+    product: &'static ToolProduct,
+    path: PathBuf,
+    version: Vec<u64>,
+) {
+    if !path.is_file() {
+        return;
+    }
+    match best.get(product.name) {
+        Some((current, _)) if *current >= version => {}
+        _ => {
+            best.insert(product.name, (version, path));
+        }
+    }
+}
+
+/// 按产品表顺序输出，保证每次识别的插入顺序稳定。
+fn best_to_candidates(mut best: HashMap<&'static str, (Vec<u64>, PathBuf)>) -> Vec<ToolCandidate> {
+    TOOL_PRODUCTS
+        .iter()
+        .filter_map(|p| best.remove(p.name).map(|(_, path)| ToolCandidate { name: p.name, path }))
+        .collect()
+}
+
+/// 去掉同名/同路径的候选；先到的优先（系统元数据来源排在硬编码根之前）。
+fn dedupe_candidates(candidates: Vec<ToolCandidate>) -> Vec<ToolCandidate> {
+    let mut names: HashSet<String> = HashSet::new();
+    let mut paths: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if !candidate.path.is_file() {
+            continue;
+        }
+        let name_key = candidate.name.to_lowercase();
+        let path_key = normalize_tool_path(&candidate.path.to_string_lossy());
+        if names.contains(&name_key) || paths.contains(&path_key) {
+            continue;
+        }
+        names.insert(name_key);
+        paths.insert(path_key);
+        out.push(candidate);
+    }
+    out
+}
+
 /// 一键识别本机已安装的编辑器/IDE/终端，把工具库里还没有的加进去。
 ///
-/// 只做注册表 App Paths / PATH / 已知安装目录的**存在性探测**，不执行任何被检测程序；
-/// 已有同名或同路径工具的跳过，不产生重复条目。
+/// 发现来源（按优先级）：卸载注册表（HKLM/HKCU、64 位与 WOW6432Node）→
+/// 开始菜单快捷方式 → PATH → 硬编码常见安装根；`scanDir` 非空时再额外扫描指定目录
+/// （便携版/自定义目录，如 HBuilderX）。
 ///
-/// 扫描会启动若干 `where.exe` 并读注册表，约几百毫秒到一两秒——放进
-/// `spawn_blocking`，不占 Tauri 的主线程（否则弹窗会卡住不响应）。
+/// **不启动任何被检测的工具**：只做存在性探测；开始菜单那一路会运行一个固定脚本的
+/// PowerShell 解析 `.lnk` 目标，但不执行目标程序。已有同名或同路径工具的跳过。
+/// 注册表/PATH 扫描约几百毫秒，PowerShell 增加约半秒——放进 `spawn_blocking`，
+/// 不占 Tauri 主线程（否则弹窗会卡住不响应）。
 #[tauri::command]
-pub async fn detect_and_add_open_tools(app: tauri::AppHandle) -> Result<DetectedToolsResult, String> {
+pub async fn detect_and_add_open_tools(
+    app: tauri::AppHandle,
+    scan_dir: Option<String>,
+) -> Result<DetectedToolsResult, String> {
+    let scan_root = scan_dir
+        .map(|dir| dir.trim().to_string())
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    if let Some(root) = &scan_root {
+        if !root.is_dir() {
+            return Err(format!("扫描目录不存在或不是目录: {}", root.display()));
+        }
+        // 网络共享的 read_dir 可能长时间阻塞；扫描只针对本地安装目录
+        if root.to_string_lossy().starts_with(r"\\") {
+            return Err("暂不支持扫描网络共享目录".into());
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        detect_and_add_open_tools_inner(&state)
+        detect_and_add_open_tools_inner(&state, scan_root.as_deref())
     }).await.map_err(|e| format!("识别本机工具任务失败: {}", e))?
 }
 
-fn detect_and_add_open_tools_inner(state: &AppState) -> Result<DetectedToolsResult, String> {
+fn detect_and_add_open_tools_inner(
+    state: &AppState,
+    scan_root: Option<&Path>,
+) -> Result<DetectedToolsResult, String> {
     let existing: Vec<(String, String)> = state.db.with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT name, executable FROM open_tools")
             .map_err(|e| format!("查询打开工具失败: {}", e))?;
@@ -441,7 +590,15 @@ fn detect_and_add_open_tools_inner(state: &AppState) -> Result<DetectedToolsResu
 
     let mut inserts: Vec<(String, &'static str, String)> = Vec::new();
     let mut skipped = 0usize;
-    for candidate in detect_tool_candidates() {
+    // 系统元数据（注册表/快捷方式/PATH/指定目录）在前，硬编码安装根在后；
+    // 同名工具保留先到的那个（dedupe 按名称去重）。
+    let candidates = dedupe_candidates(
+        detect_system_candidates(scan_root)
+            .into_iter()
+            .chain(detect_tool_candidates())
+            .collect(),
+    );
+    for candidate in candidates {
         if !candidate.path.is_file() {
             continue;
         }
@@ -544,6 +701,283 @@ fn where_exe(name: &str) -> Option<PathBuf> {
     let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
     let path = PathBuf::from(line);
     path.is_file().then_some(path)
+}
+
+/// 枚举注册表某个键下的子键名（Uninstall 用）。失败/无权限返回空表。
+#[cfg(windows)]
+fn reg_subkeys(root: windows_sys::Win32::System::Registry::HKEY, base: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, KEY_READ,
+    };
+
+    let base_w: Vec<u16> = base.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let rc = unsafe { RegOpenKeyExW(root, base_w.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if rc != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut index = 0u32;
+    loop {
+        if out.len() >= 5000 {
+            break;
+        }
+        let mut name = vec![0u16; 512];
+        let mut len = name.len() as u32;
+        let rc = unsafe {
+            RegEnumKeyExW(
+                hkey,
+                index,
+                name.as_mut_ptr(),
+                &mut len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            break;
+        }
+        out.push(String::from_utf16_lossy(&name[..len as usize]));
+        index += 1;
+    }
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    out
+}
+
+/// 卸载注册表：覆盖 HKLM/HKCU 的 64 位与 WOW6432Node 两个视图。
+///
+/// 这是“装在自定义目录”的常规安装版最可靠的发现方式：JetBrains 的 DisplayIcon /
+/// InstallLocation 都直接指向安装位置，不依赖 Program Files。
+#[cfg(windows)]
+fn uninstall_candidates() -> Vec<ToolCandidate> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+
+    let roots = [
+        (HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (HKEY_CURRENT_USER, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ];
+    let mut best = HashMap::new();
+    let started = Instant::now();
+    'roots: for (root, base) in roots {
+        for sub in reg_subkeys(root, base) {
+            if started.elapsed() > Duration::from_secs(3) {
+                break 'roots;
+            }
+            let key = format!("{}\\{}", base, sub);
+            let Some(display_name) = crate::core::winenv::reg_value(root, &key, "DisplayName") else {
+                continue;
+            };
+            let Some(product) = product_for_uninstall_name(&display_name) else {
+                continue;
+            };
+            let version_text = crate::core::winenv::reg_value(root, &key, "DisplayVersion")
+                .unwrap_or_default();
+
+            let mut path = crate::core::winenv::reg_value(root, &key, "DisplayIcon")
+                .and_then(|v| parse_display_icon(&v))
+                .and_then(|p| exe_if_matches(&p, product.exe));
+            if path.is_none() {
+                if let Some(loc) = crate::core::winenv::reg_value(root, &key, "InstallLocation") {
+                    let loc = PathBuf::from(loc.trim());
+                    path = exe_if_matches(&loc.join(product.exe), product.exe)
+                        .or_else(|| exe_if_matches(&loc.join("bin").join(product.exe), product.exe));
+                }
+            }
+            let Some(path) = path else { continue };
+            let version = if version_text.is_empty() {
+                version_key_from_path(&path)
+            } else {
+                version_key(&version_text)
+            };
+            consider_candidate(&mut best, product, path, version);
+        }
+    }
+    best_to_candidates(best)
+}
+
+/// PATH 上按产品 exe 名找一次；不再为每个产品各起一个 `where.exe`。
+#[cfg(windows)]
+fn path_candidates() -> Vec<ToolCandidate> {
+    let raw = crate::core::winenv::merged_path()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let dirs: Vec<PathBuf> = raw
+        .split(';')
+        .filter_map(|raw| {
+            let dir = raw.trim().trim_matches('"').trim();
+            (!dir.is_empty()).then(|| PathBuf::from(dir))
+        })
+        .collect();
+    let mut best = HashMap::new();
+    for product in TOOL_PRODUCTS {
+        for dir in &dirs {
+            let path = dir.join(product.exe);
+            if path.is_file() {
+                consider_candidate(&mut best, product, path, version_key_from_path(dir));
+                break;
+            }
+        }
+    }
+    best_to_candidates(best)
+}
+
+/// 解析 PowerShell 输出的快捷方式目标（每行一个路径）。
+///
+/// 单独拆出来便于测试：启动 PowerShell 的那部分在 CI/无快捷方式的机器上不可控。
+#[cfg(windows)]
+fn shortcut_candidates_from_text(text: &str) -> Vec<ToolCandidate> {
+    let mut best = HashMap::new();
+    for line in text.lines() {
+        let target = PathBuf::from(line.trim());
+        let Some(name) = target.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(product) = product_by_exe(name) else { continue };
+        consider_candidate(
+            &mut best,
+            product,
+            target.clone(),
+            version_key_from_path(&target),
+        );
+    }
+    best_to_candidates(best)
+}
+
+#[cfg(windows)]
+fn encode_powershell(script: &str) -> String {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+/// 开始菜单快捷方式：解析 `.lnk` 的目标，覆盖便携版/自定义目录但有快捷方式的工具。
+///
+/// 只启动一个固定脚本的 PowerShell（不执行任何被检测程序）；脚本把目标列表用
+/// Base64 输出，避开控制台代码页问题。失败（PowerShell 被禁用/超时）静默跳过，
+/// 不影响注册表/PATH/已知目录那几路。
+#[cfg(windows)]
+fn shortcut_candidates() -> Vec<ToolCandidate> {
+    use std::os::windows::process::CommandExt;
+
+    let Some(root) = system_root_dir() else { return Vec::new() };
+    let powershell = root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        return Vec::new();
+    }
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$sh = New-Object -ComObject WScript.Shell
+$targets = New-Object System.Collections.Generic.List[string]
+foreach ($root in @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs")) {
+  Get-ChildItem -LiteralPath $root -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $t = $sh.CreateShortcut($_.FullName).TargetPath
+      if ($t -and (Test-Path -LiteralPath $t -PathType Leaf)) { $targets.Add($t) }
+    } catch {}
+  }
+}
+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($targets -join "`n")))
+"#;
+    let mut cmd = std::process::Command::new(powershell);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        &encode_powershell(script),
+    ])
+    .env("NoDefaultCurrentDirectoryInExePath", "1")
+    .creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let Ok(text) = crate::core::process::run_captured_command(
+        None,
+        &mut cmd,
+        "读取开始菜单快捷方式",
+        Duration::from_secs(4),
+    ) else {
+        return Vec::new();
+    };
+    use base64::Engine as _;
+    let encoded = text.trim().trim_start_matches('\u{feff}');
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return Vec::new();
+    };
+    shortcut_candidates_from_text(&String::from_utf8_lossy(&bytes))
+}
+
+/// 指定目录扫描：只认产品表里的 exe 名，深度/条目/时间都有上限。
+///
+/// 用于 zip 解压/便携版（比如 HBuilderX）——它们没有卸载注册表、没有开始菜单快捷方式、
+/// 也不在 PATH 上，只能由用户指一个安装目录。
+#[cfg(windows)]
+fn scan_dir_candidates(root: &Path) -> Vec<ToolCandidate> {
+    const MAX_DEPTH: usize = 3;
+    const MAX_ENTRIES: usize = 5000;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut best = HashMap::new();
+    // 广度优先：工具通常装在 `<根>\<产品>\bin\exe` 这种浅层目录。DFS 会先扎进
+    // 根下第一个大目录（node_modules/缓存/旧版本），在 5000 条上限内可能一次都
+    // 到不了 HBuilderX 这种同级目录——实测 D:\software 扫描返回空。
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > MAX_DEPTH || seen >= MAX_ENTRIES || Instant::now() > deadline {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES || Instant::now() > deadline {
+                break;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if is_reparse_point(&meta) {
+                continue; // 不跟随联接点/符号链接，避免环
+            }
+            if meta.is_dir() {
+                queue.push_back((path, depth + 1));
+            } else if meta.is_file() {
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(product) = product_by_exe(name) else { continue };
+                consider_candidate(&mut best, product, path.clone(), version_key_from_path(&path));
+            }
+        }
+    }
+    best_to_candidates(best)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn detect_system_candidates(extra_root: Option<&Path>) -> Vec<ToolCandidate> {
+    let mut out = uninstall_candidates();
+    out.extend(shortcut_candidates());
+    out.extend(path_candidates());
+    if let Some(root) = extra_root {
+        out.extend(scan_dir_candidates(root));
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn detect_system_candidates(_extra_root: Option<&Path>) -> Vec<ToolCandidate> {
+    Vec::new()
 }
 
 /// 在 JetBrains 安装根下按产品名前缀找 `bin/<exe>`。
@@ -861,6 +1295,133 @@ mod tests {
                 candidate.path.display()
             );
         }
+    }
+
+    #[test]
+    fn test_product_matching_prefers_specific_uninstall_name() {
+        assert_eq!(
+            product_for_uninstall_name("Microsoft Visual Studio Code - Insiders (User)").unwrap().name,
+            "VS Code Insiders"
+        );
+        assert_eq!(
+            product_for_uninstall_name("IntelliJ IDEA Community Edition 2021.1.2").unwrap().name,
+            "IntelliJ IDEA"
+        );
+        assert_eq!(product_for_uninstall_name("Trae CN (User)").unwrap().name, "Trae CN");
+        assert!(product_for_uninstall_name("Google Chrome").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_display_icon() {
+        assert_eq!(
+            parse_display_icon(r#""C:\Program Files\JetBrains\IntelliJ IDEA\bin\idea64.exe",0"#),
+            Some(PathBuf::from(r"C:\Program Files\JetBrains\IntelliJ IDEA\bin\idea64.exe"))
+        );
+        assert_eq!(
+            parse_display_icon(r"D:\software\idea\bin\idea64.exe,0"),
+            Some(PathBuf::from(r"D:\software\idea\bin\idea64.exe"))
+        );
+        assert_eq!(parse_display_icon(""), None);
+        assert_eq!(parse_display_icon("   "), None);
+    }
+
+    #[test]
+    fn test_version_key_orders_versions() {
+        assert_eq!(version_key("WebStorm 2022.2.3"), vec![2022, 2, 3]);
+        assert_eq!(version_key("IntelliJ IDEA 2021.1.2"), vec![2021, 1, 2]);
+        assert!(version_key("2022.3") > version_key("2021.1.2"));
+        assert!(version_key("no version").is_empty());
+    }
+
+    /// 便携版目录扫描：只认产品表里的 exe，多版本取最高，未知 exe 忽略。
+    #[cfg(windows)]
+    #[test]
+    fn test_scan_dir_finds_known_tools_and_picks_newest() {
+        let root = std::env::temp_dir().join(format!("nexus_tool_scan_{}", uuid::Uuid::new_v4()));
+        let write = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("有父目录")).expect("建目录");
+            std::fs::write(&path, b"x").expect("写文件");
+        };
+        write("HBuilderX/HBuilderX.exe");
+        write("IntelliJ IDEA 2021.1.2/bin/idea64.exe");
+        write("IntelliJ IDEA 2022.3/bin/idea64.exe");
+        write("unknown/foo.exe");
+
+        let found = scan_dir_candidates(&root);
+        let hbuilder = found.iter().find(|c| c.name == "HBuilderX").expect("应识别 HBuilderX");
+        assert!(hbuilder.path.ends_with("HBuilderX/HBuilderX.exe"));
+        let idea = found.iter().find(|c| c.name == "IntelliJ IDEA").expect("应识别 IDEA");
+        assert!(
+            idea.path.to_string_lossy().contains("2022.3"),
+            "多版本应取最高版本，实际 {}",
+            idea.path.display()
+        );
+        assert!(found.iter().all(|c| c.name != "unknown"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 开始菜单快捷方式目标解析：按目标 exe 名映射到产品。
+    #[cfg(windows)]
+    #[test]
+    fn test_shortcut_candidates_map_by_exe_name() {
+        let root = std::env::temp_dir().join(format!("nexus_tool_shortcut_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("建目录");
+        let idea = root.join("idea64.exe");
+        let webstorm = root.join("webstorm64.exe");
+        let unknown = root.join("chrome.exe");
+        for path in [&idea, &webstorm, &unknown] {
+            std::fs::write(path, b"x").expect("写文件");
+        }
+        let text = format!(
+            "{}\n{}\n{}",
+            idea.display(),
+            webstorm.display(),
+            unknown.display()
+        );
+        let found = shortcut_candidates_from_text(&text);
+        assert!(found.iter().any(|c| c.name == "IntelliJ IDEA"));
+        assert!(found.iter().any(|c| c.name == "WebStorm"));
+        assert!(found.iter().all(|c| c.name != "unknown"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 注册表/PATH 这两路只做结构性检查：可能为空（机器上没装），
+    /// 但只要返回了候选，路径必须真实存在。
+    #[cfg(windows)]
+    #[test]
+    fn test_system_sources_only_return_existing_paths() {
+        for candidate in uninstall_candidates().into_iter().chain(path_candidates()) {
+            assert!(
+                candidate.path.is_file(),
+                "{} 的候选路径不存在: {}",
+                candidate.name,
+                candidate.path.display()
+            );
+        }
+    }
+
+    /// 同一个产品可能同时被注册表和快捷方式命中（实测 WebStorm 会重复一次）；
+    /// 去重按“先到优先”保留系统元数据那一份。
+    #[cfg(windows)]
+    #[test]
+    fn test_dedupe_candidates_keeps_first_name_and_path() {
+        let root = std::env::temp_dir().join(format!("nexus_tool_dedupe_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("建目录");
+        let a = root.join("a.exe");
+        let b = root.join("b.exe");
+        std::fs::write(&a, b"x").expect("写文件");
+        std::fs::write(&b, b"x").expect("写文件");
+        let out = dedupe_candidates(vec![
+            ToolCandidate { name: "WebStorm", path: a.clone() },
+            ToolCandidate { name: "WebStorm", path: b.clone() },
+            ToolCandidate { name: "IntelliJ IDEA", path: a.clone() },
+        ]);
+        assert_eq!(out.len(), 1, "同名/同路径只保留第一条");
+        assert_eq!(out[0].path, a);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
