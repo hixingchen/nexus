@@ -65,9 +65,13 @@ export interface Service {
   restart_mode: number;  // 0=关闭监听, 1=确认重启, 2=自动重启
   enabled: boolean;
   show_file_tree: boolean;
+  /** 是否显示卡片上的「打开」按钮（默认关；旧后端缺省按 false 处理） */
+  open_enabled?: boolean;
+  /** 指定打开端口；0 = 自动（唯一监听端口时直接用它） */
+  open_port?: number;
   sort_index: number;
   tool_commands: string;  // JSON array of ToolCommand
-  /** 是否由开机启动器在登录前启动（enabled=false 时被抑制） */
+  /** 是否由开机启动器在登录前启动（与 enabled「跟随项目启动」独立） */
   boot_enabled: boolean;
   /** 开机启动顺序（独立于展示排序 sort_index） */
   boot_order: number;
@@ -146,6 +150,9 @@ export interface ServiceTemplate {
   restart_mode: number;
   enabled: boolean;
   show_file_tree: boolean;
+  /** 从模板添加服务时一并复制的「打开」配置 */
+  open_enabled?: boolean;
+  open_port?: number;
   tool_commands: string;
   /** 模板携带的默认打开工具（从模板添加服务时复制为新服务绑定） */
   open_tool_id: string;
@@ -191,6 +198,8 @@ export const serviceApi = {
     watchExclude?: string;
     enabled?: boolean;
     showFileTree?: boolean;
+    openEnabled?: boolean;
+    openPort?: number;
     bootEnabled?: boolean;
     bootOrder?: number;
     bootCheck?: string;
@@ -210,6 +219,8 @@ export const serviceApi = {
       watchExclude: params.watchExclude,
       enabled: params.enabled,
       showFileTree: params.showFileTree,
+      openEnabled: params.openEnabled,
+      openPort: params.openPort,
       bootEnabled: params.bootEnabled,
       bootOrder: params.bootOrder,
       bootCheck: params.bootCheck,
@@ -237,6 +248,8 @@ export const serviceApi = {
     restartMode: number;
     enabled: boolean;
     showFileTree: boolean;
+    openEnabled: boolean;
+    openPort: number;
     toolCommands: string;
     bootEnabled: boolean;
     bootOrder: number;
@@ -256,6 +269,8 @@ export const serviceApi = {
       restartMode: params.restartMode,
       enabled: params.enabled,
       showFileTree: params.showFileTree,
+      openEnabled: params.openEnabled,
+      openPort: params.openPort,
       toolCommands: params.toolCommands,
       bootEnabled: params.bootEnabled,
       bootOrder: params.bootOrder,
@@ -295,6 +310,8 @@ export const serviceApi = {
     restartMode: number;
     enabled: boolean;
     showFileTree: boolean;
+    openEnabled: boolean;
+    openPort: number;
     toolCommands: string;
     openToolId: string;
   }) => invoke<void>('update_service_template', {
@@ -310,6 +327,8 @@ export const serviceApi = {
       restartMode: params.restartMode,
       enabled: params.enabled,
       showFileTree: params.showFileTree,
+      openEnabled: params.openEnabled,
+      openPort: params.openPort,
       toolCommands: params.toolCommands,
       openToolId: params.openToolId,
     }
@@ -330,6 +349,8 @@ export const serviceApi = {
     restartMode: number;
     enabled: boolean;
     showFileTree: boolean;
+    openEnabled: boolean;
+    openPort: number;
     toolCommands: string;
     openToolId: string;
   }) => invoke<ServiceTemplate>('create_service_template', { params }),
@@ -402,6 +423,10 @@ export interface RunningService {
   followed_log?: string | null;
   /** 进程来源：local = Nexus 自己拉起，boot = 开机启动器（旧后端缺省时按 local 处理） */
   source?: 'local' | 'boot';
+  /** 就绪阶段：starting = 刚拉起（宽限期内），ready = 已过宽限期；boot 服务取自启动器 */
+  phase?: 'starting' | 'ready' | 'unready';
+  /** 自动发现的监听端口（去重升序；一个服务可能有多个） */
+  listening_ports?: number[];
 }
 
 /** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */

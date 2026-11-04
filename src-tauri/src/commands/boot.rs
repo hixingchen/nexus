@@ -50,7 +50,7 @@ pub struct BootRunnerStatus {
     pub running_mode: String,
     pub runner_pid: Option<u32>,
     pub heartbeat_at: String,
-    /// DB 里 boot_enabled=1 且 enabled=1 的服务数
+    /// DB 里 boot_enabled=1 的服务数（与 enabled 无关）
     pub boot_service_count: usize,
     /// not_installed / installed_stopped / stopped / running / stale / exited
     pub state: String,
@@ -84,8 +84,6 @@ pub struct BootServiceStatus {
     pub runner_alive: bool,
     /// 当前 DB 是否仍配置为开机启动
     pub configured: bool,
-    /// DB 里服务的「跟随项目启动」开关；false 时 manifest 会排除它（开机不会启动）
-    pub service_enabled: bool,
     /// 服务本身是否还在 DB 里（false = 服务已删除；若进程还活着，列表只保留停止/日志入口）
     pub service_exists: bool,
     /// 服务所属项目是否还在 DB 里（false = 项目已删除）
@@ -788,7 +786,7 @@ fn delete_params(name: &str) -> String {
 fn boot_service_count(state: &AppState, mode: BootMode) -> usize {
     state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT COUNT(*) FROM services WHERE boot_enabled=1 AND enabled=1 AND boot_credential_mode=?1",
+            "SELECT COUNT(*) FROM services WHERE boot_enabled=1 AND boot_credential_mode=?1",
             [mode.as_str()],
             |r| r.get::<_, i64>(0),
         ).map(|n| n as usize).map_err(|e| format!("统计开机启动服务失败: {}", e))
@@ -983,7 +981,17 @@ pub fn boot_running_ids() -> HashSet<String> {
 ///
 /// `get_running` 用它把 runner 拉起的服务并进运行列表：进程活着就该显示运行中，
 /// 哪怕管理它的启动器已经退出/卡住。
-pub fn boot_running_services() -> Vec<(String, String)> {
+/// 开机启动器拉起的、当前活着的服务（供 `get_running` 合并展示）。
+pub struct BootRunningService {
+    pub service_id: String,
+    pub project_id: String,
+    /// 启动器记录的阶段：starting / ready（直接用它的，不与本地状态各算一套）
+    pub phase: String,
+    /// 直接子进程 pid；None = 启动器还没记录到
+    pub pid: Option<u32>,
+}
+
+pub fn boot_running_services() -> Vec<BootRunningService> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (_, state) in state_sources() {
@@ -992,7 +1000,12 @@ pub fn boot_running_services() -> Vec<(String, String)> {
                 && boot::service_alive_in(&state, s)
                 && seen.insert(id.clone())
             {
-                out.push((id.clone(), s.project_id.clone()));
+                out.push(BootRunningService {
+                    service_id: id.clone(),
+                    project_id: s.project_id.clone(),
+                    phase: s.phase.clone(),
+                    pid: s.pid,
+                });
             }
         }
     }
@@ -1498,7 +1511,6 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
                     runner_reachable,
                     runner_alive,
                     configured: false,
-                    service_enabled: true,
                     service_exists,
                     project_exists,
                 };
@@ -1511,24 +1523,23 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
             }
         }
 
-        let configured: Vec<(String, String, String, bool, String)> = state.db.with_conn(|conn| {
+        let configured: Vec<(String, String, String, String)> = state.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, project_id, enabled, boot_credential_mode \
+                "SELECT id, name, project_id, boot_credential_mode \
                  FROM services WHERE boot_enabled=1"
             ).map_err(|e| format!("查询开机启动服务失败: {}", e))?;
             let rows = stmt.query_map([], |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?, r.get::<_, i32>(3)? != 0,
-                r.get::<_, String>(4)?,
+                r.get::<_, String>(2)?, r.get::<_, String>(3)?,
             ))).map_err(|e| format!("读取开机启动服务失败: {}", e))?;
             let mut v = Vec::new();
             for row in rows { v.push(row.map_err(|e| format!("解析开机启动服务失败: {}", e))?); }
             Ok::<_, String>(v)
         })?;
 
-        let configured_map: std::collections::HashMap<String, bool> =
-            configured.iter().map(|(id, _, _, enabled, _)| (id.clone(), *enabled)).collect();
-        for (id, name, project_id, enabled, mode) in &configured {
+        let configured_ids: HashSet<String> =
+            configured.iter().map(|(id, _, _, _)| id.clone()).collect();
+        for (id, name, project_id, mode) in &configured {
             if index.contains_key(id) { continue; }
             let boot_mode = BootMode::parse(mode).unwrap_or(BootMode::S4u);
             index.insert(id.clone(), out.len());
@@ -1549,16 +1560,12 @@ pub async fn get_boot_services_status(app: tauri::AppHandle) -> Result<Vec<BootS
                 runner_reachable: false,
                 runner_alive: false,
                 configured: true,
-                service_enabled: *enabled,
                 service_exists: true,
                 project_exists: project_ids.contains(project_id),
             });
         }
         for item in &mut out {
-            item.configured = configured_map.contains_key(&item.service_id);
-            if let Some(enabled) = configured_map.get(&item.service_id) {
-                item.service_enabled = *enabled;
-            }
+            item.configured = configured_ids.contains(&item.service_id);
         }
         // 只保留：仍配置为开机启动（且服务/项目都在）的，或仍有存活进程的。
         // 删除服务/项目后残留的死记录、取消开机自启后已停止的记录，都不再显示。
@@ -2037,7 +2044,6 @@ mod tests {
             runner_reachable: true,
             runner_alive: true,
             configured,
-            service_enabled: true,
             service_exists,
             project_exists,
         }

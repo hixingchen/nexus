@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { projectApi, serviceApi, type FailedService, type ProjectDetailView, type Service } from '../services/service';
+import { projectApi, serviceApi, type FailedService, type ProjectDetailView, type RunningService, type Service } from '../services/service';
 import { useLogStore } from '../stores/logStore';
 import { useEditorStore } from '../stores/editor';
 import { useRunningStore } from '../stores/runningStore';
@@ -275,6 +275,11 @@ export function useProjectDetail(projectId: string) {
     return running.find(r => r.service_id === svc.id)?.followed_log ?? null;
   }, [running]);
 
+  /** 该服务的运行详情（阶段 / 监听端口）；null = 未运行 */
+  const runningInfoOf = useCallback((svc: Service): RunningService | null => {
+    return running.find(r => r.service_id === svc.id) ?? null;
+  }, [running]);
+
   const handleStartAll = useCallback(async () => {
     if (!detail) return;
     setLoading(p => ({ ...p, __all__: true }));
@@ -369,6 +374,7 @@ export function useProjectDetail(projectId: string) {
     isServiceRunning,
     failedInfoOf,
     followedLogOf,
+    runningInfoOf,
     handleStartAll,
     handleStopAll,
     handleDeleteService,

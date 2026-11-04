@@ -67,4 +67,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     # ShellExecuteW 的 nShowCmd 常量（SW_SHOWNORMAL）——不硬编码 1
     "Win32_UI_WindowsAndMessaging",
+    # 端口自动发现：GetExtendedTcpTable + IPv4/IPv6 地址族
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
 ] }

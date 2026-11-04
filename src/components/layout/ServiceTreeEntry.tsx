@@ -1,14 +1,25 @@
-import { useState, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { openInExplorer, openTerminal } from '../../services/system';
 import { useDndMonitor } from '@dnd-kit/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, parseToolCommands, type Service, type ToolCommand } from '../../services/service';
+import { openToolsApi, parseToolCommands, type RunningService, type Service, type ToolCommand } from '../../services/service';
 import { useServiceActions, type ServiceActionName } from '../../hooks/useServiceActions';
+import { useClickOutside } from '../../hooks/useClickOutside';
 import { useToolStore } from '../../stores/toolStore';
 import { reportError } from '../../utils/error';
+import { resolveOpenPort } from '../../utils/serviceOpen';
 import { ServiceContextMenu } from './ServiceContextMenu';
+
+/** 开机启动图标（不区分 S4U/密码；模式与是否已装启动器放 tooltip 与设置页） */
+const POWER_ICON = (
+  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+    <path d="M6 1.2v4" />
+    <path d="M3.2 2.8a4.2 4.2 0 106.6 0" />
+  </svg>
+);
 
 interface Props {
   service: Service;
@@ -22,6 +33,8 @@ interface Props {
   failed: boolean;
   /** 正在跟随的日志文件（null = 没在跟随）：菜单据此给「取消跟随」入口 */
   followedLog: string | null;
+  /** 运行详情：阶段（启动中/已就绪）与自动发现的监听端口；null = 未运行 */
+  runningInfo: RunningService | null;
   isEditing: boolean;
   onEdit: () => void;
   onRefresh: () => void;
@@ -31,7 +44,7 @@ interface Props {
 }
 
 export function ServiceTreeEntry({
-  service, running, failed, followedLog, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
+  service, running, failed, followedLog, runningInfo, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
 }: Props) {
   // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板）
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id });
@@ -85,6 +98,63 @@ export function ServiceTreeEntry({
     listeners?.onKeyDown?.(e);
   };
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+  // ── 服务健康：状态徽章 + 详情弹层 ─────────────────────────
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [healthPos, setHealthPos] = useState<{ left: number; top: number; width: number } | null>(null);
+  const healthAnchorRef = useRef<HTMLButtonElement | null>(null);
+  const healthPopoverRef = useRef<HTMLDivElement | null>(null);
+  useClickOutside(healthPopoverRef, () => setHealthOpen(false), {
+    refs: [healthAnchorRef],
+    escape: true,
+    captureScroll: true,
+  });
+
+  const ports = runningInfo?.listening_ports ?? [];
+  const openResolution = resolveOpenPort(
+    { enabled: service.open_enabled, specifiedPort: service.open_port },
+    ports,
+  );
+  const phase = runningInfo?.phase;
+  const phaseLabel = phase === 'starting' ? '启动中'
+    : phase === 'unready' ? '启动超时'
+    : phase === 'ready' ? '已就绪'
+    : '运行中';
+  const phaseHint = phase === 'starting'
+    ? '进程已启动，尚在就绪宽限期内'
+    : phase === 'unready'
+      ? '进程仍在运行，但就绪检查超时'
+      : '进程存活超过就绪宽限期';
+  const phaseWarn = phase === 'starting' || phase === 'unready';
+
+  // 开机启动：徽章只留一个电源图标，凭据模式与“启动器是否已安装”放 tooltip（细节在设置页）。
+  // 「跟随项目启动」是独立开关，不再影响这里。
+  const bootModeLabel = (service.boot_credential_mode ?? 's4u') === 'password' ? '保存密码' : 'S4U';
+  const bootTooltip = `已配置开机启动（${bootModeLabel}）；需在「设置 > 服务开机启动」确认已安装对应启动器后才生效`;
+
+  const openPort = (port: number) => {
+    void openUrl(`http://localhost:${port}`).catch(err => reportError('打开服务地址失败', err));
+  };
+
+  const toggleHealth = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const anchor = healthAnchorRef.current;
+    if (!anchor) return;
+    if (healthOpen) { setHealthOpen(false); return; }
+    const rect = anchor.getBoundingClientRect();
+    const width = 264;
+    setHealthPos({
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
+      top: rect.bottom + 6,
+      width,
+    });
+    setHealthOpen(true);
+  };
+
+  // 服务停止/重启后详情不再成立：收起，避免下次启动时旧弹层自己冒出来
+  useEffect(() => {
+    if (!runningInfo) setHealthOpen(false);
+  }, [runningInfo]);
 
   // 绑定的打开工具（服务设置中选择，全局工具库共享）
   const boundToolId = useToolStore(s => s.bindings[service.id]);
@@ -145,29 +215,49 @@ export function ServiceTreeEntry({
         title={isDragging ? '拖拽排序' : undefined}
       >
         <div className="flex items-center gap-2">
-          {/* 运行状态：绿=运行中，红=意外失败，灰=未运行 */}
-          <span className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${
-            running ? 'bg-nexus-success' : failed ? 'bg-nexus-error' : 'bg-nexus-muted/40'
-          }`} />
+          {/* 状态圆点：唯一常驻状态指示。运行中时点击打开健康弹层。
+              常态不显示「已就绪/启动中」文字，避免和时有时无的「打开」按钮一起把行撑得参差。 */}
+          {running ? (
+            <button
+              ref={healthAnchorRef}
+              type="button"
+              onPointerDown={e => e.stopPropagation()}
+              onClick={toggleHealth}
+              aria-haspopup="dialog"
+              aria-expanded={healthOpen}
+              aria-label={`${service.name}：${phaseLabel}，查看服务健康`}
+              title={`${phaseLabel} · ${phaseHint}（点击查看详情）`}
+              className={`w-5 h-5 -ml-1 flex items-center justify-center rounded-full flex-shrink-0 transition-colors hover:bg-nexus-hover/50 ${
+                phaseWarn ? 'text-nexus-warning' : 'text-nexus-success'
+              }`}
+            >
+              <span className={`w-[7px] h-[7px] rounded-full ${
+                phaseWarn ? 'bg-nexus-warning' : 'bg-nexus-success'
+              } ${phase === 'starting' ? 'animate-pulse' : ''}`} />
+            </button>
+          ) : (
+            <span className="w-5 h-5 -ml-1 flex items-center justify-center flex-shrink-0">
+              <span className={`w-[7px] h-[7px] rounded-full ${
+                failed ? 'bg-nexus-error' : 'bg-nexus-muted/40'
+              }`} />
+            </span>
+          )}
+
+          {/* 开机启动：只在配置了开机启动时显示电源图标，未配置不留空位。
+              不写文字、不区分凭据模式（详见 tooltip 与设置页） */}
+          {service.boot_enabled && (
+            <span
+              role="img"
+              aria-label={bootTooltip}
+              title={bootTooltip}
+              className="w-4 h-4 flex items-center justify-center flex-shrink-0 text-nexus-accent"
+            >
+              {POWER_ICON}
+            </span>
+          )}
 
           {/* 名称 */}
           <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{service.name}</span>
-
-          {/* 开机启动标志：与“运行中”是两件事——它表示下次开机是否由启动器在登录前拉起 */}
-          {service.boot_enabled && (
-            <span
-              className={`text-[10px] leading-[15px] px-1.5 rounded-full flex-shrink-0 ${
-                !service.enabled
-                  ? 'bg-nexus-hover/40 text-nexus-muted'
-                  : service.boot_credential_mode === 'password'
-                    ? 'bg-nexus-warning/12 text-nexus-warning'
-                    : 'bg-nexus-accent/12 text-nexus-accent'
-              }`}
-              title={service.enabled
-                ? `已设置开机启动（${service.boot_credential_mode === 'password' ? '保存密码' : 'S4U'}）；需在「设置 > 服务开机启动」安装对应启动器后生效`
-                : '已设置开机启动，但服务被禁用，实际不会启动'}
-            >{service.boot_credential_mode === 'password' ? '开机·密码' : '开机'}</span>
-          )}
 
           {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
               用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动。
@@ -182,6 +272,21 @@ export function ServiceTreeEntry({
           >
             {running || failed ? (
               <>
+                {running && (openResolution.kind === 'open' || openResolution.kind === 'choose') && (
+                  <button
+                    className="px-2 py-1 text-[11px] bg-nexus-accent/15 text-nexus-accent rounded hover:bg-nexus-accent/25"
+                    onPointerDown={e => e.stopPropagation()}
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (openResolution.kind === 'open') openPort(openResolution.port);
+                      // 多端口无法唯一确定：打开弹层让用户选，不替用户猜
+                      else toggleHealth(e);
+                    }}
+                    title={openResolution.kind === 'open'
+                      ? `在浏览器中打开 http://localhost:${openResolution.port}`
+                      : `有 ${openResolution.ports.length} 个监听端口，点击选择要打开的那个`}
+                  >打开</button>
+                )}
                 <button
                   className="px-2 py-1 text-[11px] bg-nexus-info/15 text-nexus-info rounded hover:bg-nexus-info/25 disabled:opacity-40"
                   disabled={busy}
@@ -212,6 +317,64 @@ export function ServiceTreeEntry({
           </div>
         </div>
       </div>
+
+      {/* 健康详情弹层：portal 到 body，避免被服务列/滚动容器裁剪 */}
+      {healthOpen && healthPos && runningInfo && createPortal(
+        <div
+          ref={healthPopoverRef}
+          role="dialog"
+          aria-label={`${service.name} 服务健康`}
+          className="fixed z-[70] bg-nexus-surface border border-nexus-border/60 rounded-lg shadow-2xl p-3"
+          style={{ left: healthPos.left, top: healthPos.top, width: healthPos.width }}
+        >
+          <p className="text-[12px] font-medium text-nexus-text truncate" title={service.name}>
+            {service.name} · 服务健康
+          </p>
+          <dl className="mt-2 space-y-1 text-[11px] text-nexus-muted">
+            <div className="flex gap-2">
+              <dt className="w-[52px] flex-shrink-0">状态</dt>
+              <dd className={phaseWarn ? 'text-nexus-warning' : 'text-nexus-success'}>{phaseLabel}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="w-[52px] flex-shrink-0">监听端口</dt>
+              <dd className="min-w-0 break-words">{ports.length > 0 ? ports.join('、') : '未发现'}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="w-[52px] flex-shrink-0">来源</dt>
+              <dd>{runningInfo.source === 'boot' ? '开机启动器' : 'Nexus 启动'}</dd>
+            </div>
+          </dl>
+          {service.open_enabled && (service.open_port ?? 0) > 0 && ports.length > 0
+            && !ports.includes(service.open_port!) && (
+            <p className="mt-2 text-[10.5px] text-nexus-warning leading-relaxed">
+              指定端口 {service.open_port} 未监听，当前监听 {ports.join('、')}。
+            </p>
+          )}
+          <p className="mt-2 text-[10px] text-nexus-muted/70 leading-relaxed">
+            {runningInfo.source === 'boot'
+              ? '就绪阶段采自开机启动器的状态记录。'
+              : '未配置健康检查：进程存活超过 1 秒即视为已就绪；端口为自动发现（仅 TCP）。'}
+          </p>
+          {service.open_enabled && ports.length > 0 && (
+            <div className="mt-2 space-y-1">
+              {ports.map(port => (
+                <button
+                  key={port}
+                  className="w-full flex items-center justify-between gap-2 px-2 py-1.5 text-[11px] bg-nexus-accent/10 text-nexus-text rounded hover:bg-nexus-accent/20 transition-colors"
+                  onClick={() => { openPort(port); setHealthOpen(false); }}
+                >
+                  <span className="truncate">http://localhost:{port}</span>
+                  <span className="text-nexus-accent flex-shrink-0">打开</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {service.open_enabled && ports.length === 0 && (
+            <p className="mt-2 text-[10.5px] text-nexus-muted/60">未发现监听端口，暂时无法打开。</p>
+          )}
+        </div>,
+        document.body,
+      )}
 
       {/* 右键菜单（与"服务列收起后的圆点条"共用同一份，见 ServiceContextMenu）。
           Portal 到 body：服务面板有 transform 容器（折叠动画），fixed 定位的菜单

@@ -55,6 +55,10 @@ pub struct Service {
     pub restart_mode: i32,  // 0=关闭监听, 1=确认重启, 2=自动重启
     pub enabled: bool,
     pub show_file_tree: bool,
+    /// 是否在服务卡片上显示「打开」按钮。默认关：后端/数据库等服务不需要浏览器打开。
+    pub open_enabled: bool,
+    /// 指定打开端口；0 = 自动（唯一监听端口时直接用它）
+    pub open_port: i32,
     pub sort_index: i32,
     pub tool_commands: String,  // JSON array of ToolCommand
     /// 是否由开机启动器在登录前启动（`enabled=false` 时被抑制）
@@ -83,6 +87,9 @@ pub struct ServiceTemplate {
     pub restart_mode: i32,
     pub enabled: bool,
     pub show_file_tree: bool,
+    /// 从模板添加服务时一并复制的「打开」配置
+    pub open_enabled: bool,
+    pub open_port: i32,
     pub tool_commands: String,
     /// 模板携带的默认打开工具（从模板添加服务时复制为新服务的绑定）
     pub open_tool_id: String,

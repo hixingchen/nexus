@@ -120,6 +120,10 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   const [restartMode, setRestartMode] = useState(initialDraft?.restartMode ?? service.restart_mode);
   const [enabled, setEnabled] = useState(initialDraft?.enabled ?? service.enabled);
   const [showFileTree, setShowFileTree] = useState(initialDraft?.showFileTree ?? service.show_file_tree);
+  /** 卡片「打开」按钮：默认关；端口 0 = 自动（唯一监听端口时直接用它） */
+  const [openEnabled, setOpenEnabled] = useState(initialDraft?.openEnabled ?? service.open_enabled ?? false);
+  const [openPort, setOpenPort] = useState(String(initialDraft?.openPort ?? service.open_port ?? 0));
+  const openPortNum = openPort.trim() === '' ? 0 : Number(openPort);
 
   // 开机启动：模板不携带这组字段，service 上可能没有（模板编辑时统统按关闭处理）
   const [originalBoot] = useState(() => parseBootCheck(service.boot_check));
@@ -187,6 +191,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     || watchExclude !== service.watch_exclude || envVars !== service.env_vars
     || restartMode !== service.restart_mode || enabled !== service.enabled
     || showFileTree !== service.show_file_tree
+    || openEnabled !== (service.open_enabled ?? false)
+    || openPortNum !== (service.open_port ?? 0)
     || bootEnabled !== (service.boot_enabled ?? false)
     || bootOrder !== (service.boot_order ?? 0)
     || bootRequired !== (service.boot_required ?? false)
@@ -201,11 +207,12 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
   useEffect(() => {
     useServiceDraftStore.getState().setDraft(draftKey, formDirty ? {
       name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
-      restartMode, enabled, showFileTree, toolCommands, tplToolId,
+      restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
+      toolCommands, tplToolId,
       bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
     } : null);
   }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
-      restartMode, enabled, showFileTree, toolCommands, tplToolId,
+      restartMode, enabled, showFileTree, openEnabled, openPortNum, toolCommands, tplToolId,
       bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode]);
 
   /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
@@ -222,6 +229,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
     setRestartMode(service.restart_mode);
     setEnabled(service.enabled);
     setShowFileTree(service.show_file_tree);
+    setOpenEnabled(service.open_enabled ?? false);
+    setOpenPort(String(service.open_port ?? 0));
     setBootEnabled(service.boot_enabled ?? false);
     setBootOrder(service.boot_order ?? 0);
     setBootCheckKind(originalBoot.kind);
@@ -310,10 +319,15 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
         setSaving(false);
         return;
       }
+      if (!Number.isInteger(openPortNum) || openPortNum < 0 || openPortNum > 65535) {
+        reportError('打开端口无效', new Error('端口必须在 0-65535 之间（0 = 自动）'));
+        setSaving(false);
+        return;
+      }
       const basePayload = {
         id: service.id, name: name.trim() || service.name,
         command, cwd, watchPaths, watchInclude, watchExclude, envVars, restartMode, enabled,
-        showFileTree,
+        showFileTree, openEnabled, openPort: openPortNum,
         toolCommands: JSON.stringify(toolCommands),
       };
       if (mode === 'template') {
@@ -324,7 +338,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           // id 为空 = 模板库里刚点「新建」出来的空壳，走 create（id 由后端生成）
           await serviceApi.createServiceTemplate({
             name: name.trim(), command, cwd, watchPaths, watchInclude, watchExclude,
-            envVars, restartMode, enabled, showFileTree,
+            envVars, restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
             toolCommands: JSON.stringify(toolCommands),
             openToolId: tplToolId,
           });
@@ -341,7 +355,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
           // 已经不一致了——正好说明不该抄）
           watchInclude: watchInclude || undefined,
           watchExclude: watchExclude || undefined,
-          envVars, restartMode, enabled, showFileTree,
+          envVars, restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
           toolCommands: JSON.stringify(toolCommands),
           bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
         });
@@ -603,6 +617,38 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
                 <Switch checked={item.checked} onChange={item.onChange} label={item.label} />
               </div>
             ))}
+
+            {/* 打开按钮：默认关闭。后端/数据库等服务只需要看监听端口，不需要浏览器打开。
+                模板也带这项：从模板添加服务时复制给新服务。 */}
+            <div
+              className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+              onClick={() => setOpenEnabled(v => !v)}
+            >
+              <span className="flex-1 text-[13px] text-nexus-text">允许在浏览器中打开</span>
+              <Switch checked={openEnabled} onChange={setOpenEnabled} label="允许在浏览器中打开" />
+            </div>
+            {openEnabled && (
+              <div className="px-2 pt-1 pb-1.5">
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`${uid}-open-port`} className="text-[12px] text-nexus-muted w-[92px] flex-shrink-0">指定端口</label>
+                  <input
+                    id={`${uid}-open-port`}
+                    type="number"
+                    min={0}
+                    max={65535}
+                    className={`${INPUT_CLS} flex-1 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none`}
+                    value={openPort}
+                    onChange={e => setOpenPort(e.target.value)}
+                    placeholder="0 = 自动"
+                  />
+                </div>
+                <p className="mt-1 text-[10.5px] text-nexus-muted/60 leading-relaxed">
+                  优先打开指定端口；端口漂移且只有一个监听端口时自动跟随。多个监听端口且无法唯一确定时，点击「打开」会让你选择。
+                  {mode === 'template' && ' 从该模板添加服务后生效。'}
+                </p>
+              </div>
+            )}
+
           </div>
         </div>
 
@@ -657,12 +703,6 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
 
                 {bootEnabled && (
               <div className="mt-3 pt-3 border-t border-nexus-border/30 space-y-3">
-                {!enabled && (
-                  <p className="text-[11px] text-nexus-warning leading-relaxed">
-                    服务已关闭“跟随项目启动”，开机启动会被抑制；需要同时打开上一个开关。
-                    当前已运行的实例不会被自动停止。
-                  </p>
-                )}
                 <div>
                   <label htmlFor={`${uid}-boot-order`} className={labelCls}>启动顺序</label>
                   <div className="mt-1.5">

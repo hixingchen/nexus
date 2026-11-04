@@ -427,11 +427,6 @@ export function ServiceBootSection() {
                         已关闭开机启动
                       </span>
                     ) : null}
-                    {svc.configured && svc.service_exists && svc.project_exists && !svc.service_enabled && (
-                      <span className="text-[9px] leading-[14px] px-1.5 rounded-full flex-shrink-0 bg-nexus-hover/40 text-nexus-muted">
-                        服务已禁用 · 开机不启动
-                      </span>
-                    )}
                     <span className={`ml-auto text-[10px] flex-shrink-0 ${phase.textCls}`}>{phase.text}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-nexus-muted/60">
@@ -526,9 +521,6 @@ function servicePhase(s: BootServiceStatus): {
   dot: string;
 } {
   if (!s.phase) {
-    if (s.configured && !s.service_enabled) {
-      return { text: '开机不会启动（服务已禁用）', textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
-    }
     return { text: '未由启动器管理', textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
   }
   if (s.alive) {

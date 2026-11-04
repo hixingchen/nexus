@@ -137,7 +137,7 @@ impl Database {
 /// 历史教训：版本号不匹配曾触发删表重建——用户升级即清空全部项目/服务配置。
 /// 表结构变更一律走下方 MIGRATION_COLUMNS 增量 ALTER（幂等加列），
 /// 任何旧版本数据库都能原地升级，禁止再引入 DROP 任何用户表。
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 13;
 
 /// 建表 + 迁移（`pub(crate)`：命令层的 SQL 路径测试要自己搭一个内存库，见 commands/service.rs 的 tests）
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -188,9 +188,12 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
             restart_mode INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             show_file_tree INTEGER NOT NULL DEFAULT 1,
+            -- 服务卡片的「打开」按钮：默认关；open_port=0 表示自动取唯一监听端口
+            open_enabled INTEGER NOT NULL DEFAULT 0,
+            open_port INTEGER NOT NULL DEFAULT 0,
             sort_index INTEGER NOT NULL DEFAULT 0,
             tool_commands TEXT NOT NULL DEFAULT '[]',
-            -- 开机启动：独立于 enabled/sort_index。enabled=0 时 boot_enabled 被抑制
+            -- 开机启动：独立于 enabled/sort_index，仅由 boot_enabled 决定
             boot_enabled INTEGER NOT NULL DEFAULT 0,
             boot_order INTEGER NOT NULL DEFAULT 0,
             boot_check TEXT NOT NULL DEFAULT '',
@@ -210,6 +213,9 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
             restart_mode INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             show_file_tree INTEGER NOT NULL DEFAULT 1,
+            -- 从模板添加服务时一并复制的「打开」配置
+            open_enabled INTEGER NOT NULL DEFAULT 0,
+            open_port INTEGER NOT NULL DEFAULT 0,
             sort_index INTEGER NOT NULL DEFAULT 0,
             tool_commands TEXT NOT NULL DEFAULT '[]',
             -- 模板携带的默认打开工具（从模板添加服务时复制为服务绑定；工具被删时由命令清空）
@@ -271,7 +277,11 @@ const MIGRATION_COLUMNS: &[(&str, &str, &str)] = &[
     ("services", "restart_mode", "INTEGER NOT NULL DEFAULT 0"),
     ("services", "enabled", "INTEGER NOT NULL DEFAULT 1"),
     ("services", "show_file_tree", "INTEGER NOT NULL DEFAULT 1"),
+    ("services", "open_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("services", "open_port", "INTEGER NOT NULL DEFAULT 0"),
     ("services", "sort_index", "INTEGER NOT NULL DEFAULT 0"),
+    ("service_templates", "open_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("service_templates", "open_port", "INTEGER NOT NULL DEFAULT 0"),
     ("services", "tool_commands", "TEXT NOT NULL DEFAULT '[]'"),
     ("services", "boot_enabled", "INTEGER NOT NULL DEFAULT 0"),
     ("services", "boot_order", "INTEGER NOT NULL DEFAULT 0"),
@@ -308,14 +318,14 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
 /// 共用常量后这份清单只剩一处，配套的绑定方式见 `named_placeholders`。
 pub const SERVICE_COLUMNS: &str =
     "id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
-     restart_mode, enabled, show_file_tree, sort_index, tool_commands, \
+     restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, \
      boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode";
 
 /// `UPDATE services` 允许改动的列（`id`/`project_id`/`sort_index` 不由更新命令改）。
 pub const SERVICE_UPDATABLE_COLUMNS: &str =
     "name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, \
-     enabled, show_file_tree, tool_commands, boot_enabled, boot_order, boot_check, boot_required, \
-     boot_credential_mode";
+     enabled, show_file_tree, open_enabled, open_port, tool_commands, boot_enabled, boot_order, \
+     boot_check, boot_required, boot_credential_mode";
 
 /// `service_templates` 的列清单——**唯一来源**（ARCH-20）。
 ///
@@ -325,7 +335,8 @@ pub const SERVICE_UPDATABLE_COLUMNS: &str =
 /// 读侧的 SELECT 也各写各的（`collect_export_templates` / `get_service_templates` 等）。
 pub const SERVICE_TEMPLATE_COLUMNS: &str =
     "id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
-     restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id";
+     restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, \
+     tool_commands, open_tool_id";
 
 /// 由列清单生成 `VALUES` 用的命名占位符（`:列名`，顺序与列清单一致）。
 ///
@@ -360,6 +371,8 @@ pub fn query_services_by_project(conn: &Connection, project_id: &str) -> Result<
             restart_mode: row.get("restart_mode")?,
             enabled: row.get::<_, i32>("enabled")? != 0,
             show_file_tree: row.get::<_, i32>("show_file_tree")? != 0,
+            open_enabled: row.get::<_, i32>("open_enabled")? != 0,
+            open_port: row.get("open_port")?,
             sort_index: row.get("sort_index")?,
             tool_commands: row.get("tool_commands")?,
             boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,

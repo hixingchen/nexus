@@ -6,7 +6,7 @@
 //! - 启动顺序用独立的 `boot_order`，不复用展示排序 `sort_index`。
 //! - manifest / 日志 / 状态都放在 Nexus 自己的数据目录下（`<data_dir>/boot`），
 //!   runner 拿到的是绝对路径，不依赖登录后才有的用户环境。
-//! - `enabled=0` 的服务**不进入 manifest**（开机启动被抑制）。
+//! - manifest 只看 `boot_enabled`；`enabled`（跟随项目启动）是独立范围，不影响开机启动。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -322,7 +322,7 @@ pub fn sync_manifest_to(
     let rows = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, name, command, cwd, env_vars, boot_check, boot_required, boot_order \
-             FROM services WHERE boot_enabled=1 AND enabled=1 AND boot_credential_mode=?1 \
+             FROM services WHERE boot_enabled=1 AND boot_credential_mode=?1 \
              ORDER BY boot_order, sort_index, name",
         ).map_err(|e| format!("查询开机启动服务失败: {}", e))?;
         let rows = stmt.query_map([mode.as_str()], |row| {
@@ -648,8 +648,9 @@ mod tests {
         assert!(normalize_check(r#"{"type":"unknown"}"#).is_err());
     }
 
-    /// manifest 只看 `boot_enabled=1 AND enabled=1` 且模式匹配的服务，
-    /// 顺序按 boot_order，服务 env 覆盖快照；两个模式的 manifest 互不混入。
+    /// manifest 只看 `boot_enabled=1` 且模式匹配的服务（**不再看 enabled**：
+    /// 「跟随项目启动」与「开机启动」是两个独立范围），顺序按 boot_order，
+    /// 服务 env 覆盖快照；两个模式的 manifest 互不混入。
     #[test]
     fn test_sync_manifest_filters_orders_and_merges_env() {
         let conn = rusqlite::Connection::open_in_memory().expect("内存库");
@@ -668,7 +669,7 @@ mod tests {
         };
         insert("s2", 1, 1, 2, "", "B=2", "s4u");
         insert("s1", 1, 1, 1, r#"{"type":"tcp","host":"127.0.0.1","port":3306,"timeoutSecs":60}"#, "A=1", "s4u");
-        insert("s3", 0, 1, 0, "", "", "s4u"); // enabled=0：必须被过滤
+        insert("s3", 0, 1, 0, "", "", "s4u"); // enabled=0：仍应进入 manifest（两个开关独立）
         insert("s4", 1, 0, 0, "", "", "s4u"); // boot_enabled=0：必须被过滤
         insert("s5", 1, 1, 0, "", "", "password"); // 密码模式：只进 password manifest
 
@@ -679,18 +680,19 @@ mod tests {
         let manifest = sync_manifest_to(&db, &s4u_dir, BootMode::S4u).expect("生成 S4U manifest");
         let pwd = sync_manifest_to(&db, &pwd_dir, BootMode::Password).expect("生成密码 manifest");
 
-        assert_eq!(manifest.services.len(), 2);
-        assert_eq!(manifest.services[0].id, "s1", "boot_order 小的先出现");
-        assert_eq!(manifest.services[1].id, "s2");
+        assert_eq!(manifest.services.len(), 3);
+        assert_eq!(manifest.services[0].id, "s3", "boot_order 小的先出现（enabled=0 不排除）");
+        assert_eq!(manifest.services[1].id, "s1");
+        assert_eq!(manifest.services[2].id, "s2");
         assert!(manifest.services.iter().all(|s| s.id != "s5"), "密码服务不能进 S4U manifest");
-        assert_eq!(manifest.services[0].env.get("A").map(String::as_str), Some("1"));
-        assert_eq!(manifest.services[0].env.get("B"), None);
+        assert_eq!(manifest.services[1].env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(manifest.services[1].env.get("B"), None);
         assert_eq!(
-            manifest.services[0].check,
+            manifest.services[1].check,
             BootCheck::Tcp { host: "127.0.0.1".into(), port: 3306, timeout_secs: 60 }
         );
-        assert!(manifest.services[0].log_path.contains("s4u"));
-        assert!(manifest.services[0].log_path.ends_with("s1.log"));
+        assert!(manifest.services[1].log_path.contains("s4u"));
+        assert!(manifest.services[1].log_path.ends_with("s1.log"));
 
         assert_eq!(pwd.services.len(), 1);
         assert_eq!(pwd.services[0].id, "s5");
@@ -700,7 +702,7 @@ mod tests {
         let written: BootManifest = serde_json::from_slice(
             &std::fs::read(s4u_dir.join("manifest.json")).expect("读 manifest"),
         ).expect("解析 manifest");
-        assert_eq!(written.services.len(), 2);
+        assert_eq!(written.services.len(), 3);
         assert_eq!(written.version, MANIFEST_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);

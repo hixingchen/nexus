@@ -256,8 +256,6 @@ struct ServiceInfo {
     cwd: String,
     project_id: String,
     env_vars: String,
-    /// 服务本身是否启用（"跟随项目启动"）；manifest 只收 `boot_enabled=1 AND enabled=1`
-    enabled: bool,
     boot_enabled: bool,
     boot_credential_mode: String,
 }
@@ -268,7 +266,7 @@ fn get_service_info(
 ) -> Result<ServiceInfo, String> {
     db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, project_id, env_vars, enabled, boot_enabled, boot_credential_mode \
+            "SELECT name, command, cwd, project_id, env_vars, boot_enabled, boot_credential_mode \
              FROM services WHERE id=?1",
             [service_id],
             |row| Ok(ServiceInfo {
@@ -277,7 +275,6 @@ fn get_service_info(
                 cwd: row.get("cwd")?,
                 project_id: row.get("project_id")?,
                 env_vars: row.get("env_vars")?,
-                enabled: row.get::<_, i32>("enabled")? != 0,
                 boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
                 boot_credential_mode: row.get("boot_credential_mode")?,
             }),
@@ -335,6 +332,24 @@ pub struct RunningService {
     pub followed_log: Option<String>,
     /// 进程来源：local（Nexus 自己拉起） / boot（开机启动器）
     pub source: String,
+    /// 就绪阶段：starting（刚拉起，宽限期内） / ready（存活满宽限期）
+    pub phase: String,
+    /// 自动发现的监听端口（去重升序；一个服务可能有多个）
+    pub listening_ports: Vec<u16>,
+}
+
+/// 「启动中」宽限期：无健康检查配置时，进程存活超过这个时长即视为 ready。
+///
+/// 目的只是区分"刚 spawn、端口还没起来"与"已经跑了一会儿"，不是真正的就绪判定
+/// （真正的检查在 Phase B；超时也不会标失败）。
+const READY_GRACE_MS: u64 = 1_000;
+
+fn phase_label(started_at_ms: u64, now_ms: u64) -> &'static str {
+    if now_ms.saturating_sub(started_at_ms) < READY_GRACE_MS {
+        "starting"
+    } else {
+        "ready"
+    }
 }
 
 /// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
@@ -406,9 +421,9 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
         state.process_mgr.tick();
         let configured = crate::core::boot::BootMode::parse(&info.boot_credential_mode)
             .unwrap_or(crate::core::boot::BootMode::S4u);
-        // manifest 只收 `boot_enabled=1 AND enabled=1`。取消任一项后，启动器就不再负责
-        // 它的未来启停；此时不能再把 start 发给 runner（manifest 里没有它，必然失败）。
-        let boot_active = info.boot_enabled && info.enabled;
+        // manifest 只收 `boot_enabled=1`（「跟随项目启动」是独立范围，不再影响开机）。
+        // 未配置开机启动时启动器不负责它，此时不能把 start 发给 runner。
+        let boot_active = info.boot_enabled;
         let live = crate::commands::boot::live_boot_service(&service_id);
         let route = decide_start_route(
             state.process_mgr.is_running(&service_id),
@@ -502,7 +517,7 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
         let info = get_service_info(&state.db, &service_id)?;
         let configured = crate::core::boot::BootMode::parse(&info.boot_credential_mode)
             .unwrap_or(crate::core::boot::BootMode::S4u);
-        let boot_active = info.boot_enabled && info.enabled;
+        let boot_active = info.boot_enabled;
         let owned = crate::commands::boot::boot_owned_mode(&service_id);
         state.process_mgr.tick();
         // 本地与启动器同时有实例（历史遗留）时先收掉本地那份；只有本地实例时直接本地重启，
@@ -736,16 +751,38 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
         // 本地进程 + runner 状态合并。外部服务**不收养进 ProcessManager**：
         // 这里只是把 runner 的快照并进展示层，Nexus 退出时 stop_all 仍然只碰本地进程。
         // 心跳线程在时读快照；它创建失败时退回 running()（先 tick），否则崩溃判定/认领无人推进。
-        let snapshot = if crate::core::process::LIFECYCLE_TICKER_ALIVE
+        let details = if crate::core::process::LIFECYCLE_TICKER_ALIVE
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            state.process_mgr.snapshot_running()
+            state.process_mgr.snapshot_running_detail()
         } else {
-            state.process_mgr.running()
+            state.process_mgr.running();
+            state.process_mgr.snapshot_running_detail()
         };
-        let mut running: Vec<RunningService> = snapshot.into_iter()
-            .map(|(project_id, service_id, followed_log)| RunningService {
-                service_id, project_id, followed_log, source: "local".into(),
+        // 一次快照 + 一次端口表，给所有服务一起映射（不要每个服务各查一次）
+        let proc_snapshot = crate::core::winproc::snapshot_processes();
+        let ports_by_pid = crate::core::ports::listening_ports_by_pid();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut running: Vec<RunningService> = details.into_iter()
+            .map(|d| {
+                let mut pids = d.pids.clone();
+                for root in &d.pids {
+                    pids.extend(crate::core::winproc::descendants(*root, &proc_snapshot));
+                }
+                pids.sort_unstable();
+                pids.dedup();
+                RunningService {
+                    service_id: d.service_id,
+                    project_id: d.project_id,
+                    followed_log: d.followed_log,
+                    source: "local".into(),
+                    phase: phase_label(d.started_at, now_ms).to_string(),
+                    listening_ports: crate::core::ports::service_ports(&pids, &ports_by_pid),
+                }
             })
             .collect();
         let local_ids: std::collections::HashSet<String> =
@@ -758,13 +795,20 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
         // 开机服务：只要**进程还活着**就并进运行列表，不以 runner 心跳为门槛。
         // 否则 runner 退出/卡住后，它拉起的服务在界面上会全部“消失”，连带日志入口也没了
         // （用户实际遇到的就是这个）。pid + 启动时刻的校验在 boot::service_alive 里。
-        for (id, project_id) in crate::commands::boot::boot_running_services() {
-            if !local_ids.contains(&id) {
+        for info in crate::commands::boot::boot_running_services() {
+            if !local_ids.contains(&info.service_id) {
+                let mut pids = Vec::new();
+                if let Some(pid) = info.pid {
+                    pids.push(pid);
+                    pids.extend(crate::core::winproc::descendants(pid, &proc_snapshot));
+                }
                 running.push(RunningService {
-                    service_id: id,
-                    project_id,
+                    service_id: info.service_id,
+                    project_id: info.project_id,
                     followed_log: None,
                     source: "boot".into(),
+                    phase: info.phase,
+                    listening_ports: crate::core::ports::service_ports(&pids, &ports_by_pid),
                 });
             }
         }
@@ -1131,6 +1175,18 @@ fn stop_tool_command_inner(table: &ToolCmdTable, run_id: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_phase_label_grace_period() {
+        // 刚拉起：宽限期内是 starting（解决"刚起来就绿灯"）
+        assert_eq!(phase_label(10_000, 10_000), "starting");
+        assert_eq!(phase_label(10_000, 10_999), "starting");
+        // 存活满 1 秒：ready
+        assert_eq!(phase_label(10_000, 11_000), "ready");
+        assert_eq!(phase_label(10_000, 99_999), "ready");
+        // 启动时刻未知（0）：按已就绪处理，不把老进程误标成一直启动中
+        assert_eq!(phase_label(0, 5_000), "ready");
+    }
 
     /// 启停所有权路由的真值表：本地/开机启动器同时存在时，任何组合都不能起第二份。
     #[test]

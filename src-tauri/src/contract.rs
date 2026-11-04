@@ -336,6 +336,8 @@ fn test_response_dtos_are_snake_case() {
         restart_mode: 0,
         enabled: true,
         show_file_tree: false,
+        open_enabled: false,
+        open_port: 0,
         sort_index: 0,
         tool_commands: "[]".into(),
         boot_enabled: false,
@@ -349,8 +351,8 @@ fn test_response_dtos_are_snake_case() {
         sorted(&[
             "id", "project_id", "name", "command", "cwd", "watch_paths", "watch_include",
             "watch_exclude", "env_vars", "restart_mode", "enabled", "show_file_tree",
-            "sort_index", "tool_commands", "boot_enabled", "boot_order", "boot_check",
-            "boot_required", "boot_credential_mode",
+            "open_enabled", "open_port", "sort_index", "tool_commands", "boot_enabled",
+            "boot_order", "boot_check", "boot_required", "boot_credential_mode",
         ])
     );
 
@@ -411,6 +413,8 @@ fn test_response_dtos_are_snake_case() {
         restart_mode: 0,
         enabled: true,
         show_file_tree: false,
+        open_enabled: false,
+        open_port: 0,
         tool_commands: "[]".into(),
         open_tool_id: "".into(),
         created_at: "t".into(),
@@ -419,8 +423,8 @@ fn test_response_dtos_are_snake_case() {
         keys_of(&tpl),
         sorted(&[
             "id", "name", "command", "cwd", "watch_paths", "watch_include", "watch_exclude",
-            "env_vars", "restart_mode", "enabled", "show_file_tree", "tool_commands",
-            "open_tool_id", "created_at",
+            "env_vars", "restart_mode", "enabled", "show_file_tree", "open_enabled",
+            "open_port", "tool_commands", "open_tool_id", "created_at",
         ])
     );
 
@@ -444,8 +448,11 @@ fn test_response_dtos_are_snake_case() {
     // 显示「取消跟随日志（文件名）」）
     let run = RunningService {
         service_id: "s".into(), project_id: "p".into(), followed_log: None, source: "local".into(),
+        phase: "ready".into(), listening_ports: vec![8080],
     };
-    assert_eq!(keys_of(&run), sorted(&["service_id", "project_id", "followed_log", "source"]));
+    assert_eq!(keys_of(&run), sorted(&[
+        "service_id", "project_id", "followed_log", "source", "phase", "listening_ports",
+    ]));
     let failed = FailedService {
         service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
     };
@@ -501,7 +508,6 @@ fn test_response_dtos_are_snake_case() {
         runner_reachable: true,
         runner_alive: true,
         configured: true,
-        service_enabled: true,
         service_exists: true,
         project_exists: true,
     };
@@ -510,7 +516,7 @@ fn test_response_dtos_are_snake_case() {
         sorted(&[
             "service_id", "name", "project_id", "mode", "phase", "alive", "pid",
             "started_at", "ready_at", "exit_code", "error", "log_path",
-            "runner_reachable", "runner_alive", "configured", "service_enabled",
+            "runner_reachable", "runner_alive", "configured",
             "service_exists", "project_exists",
         ])
     );
@@ -896,16 +902,19 @@ fn test_nullable_fields_stay_nullable_and_typed() {
     // 运行中服务：没在跟随日志文件时必须是 null（前端 `?? null` 后判断）
     let running = RunningService {
         service_id: "s1".into(), project_id: "p1".into(), followed_log: None, source: "local".into(),
+        phase: "ready".into(), listening_ports: vec![8080],
     };
     assert_eq!(types_of(&running), vec![
         ("followed_log".to_string(), "null"),
+        ("listening_ports".to_string(), "array"),
+        ("phase".to_string(), "string"),
         ("project_id".to_string(), "string"),
         ("service_id".to_string(), "string"),
         ("source".to_string(), "string"),
     ], "followed_log 为 None 时必须序列化成 null");
     let running2 = RunningService {
         service_id: "s1".into(), project_id: "p1".into(), followed_log: Some("C:/x.log".into()),
-        source: "boot".into(),
+        source: "boot".into(), phase: "starting".into(), listening_ports: vec![],
     };
     assert_eq!(types_of(&running2).iter().find(|(k, _)| k == "followed_log").unwrap().1, "string",
         "有跟随文件时是字符串——前端据它显示文件名");

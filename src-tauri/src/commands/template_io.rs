@@ -37,6 +37,11 @@ pub struct ExportedTemplate {
     pub enabled: bool,
     #[serde(default)]
     pub show_file_tree: bool,
+    /// 旧版导出文件没有这两个字段：默认关闭，导入后不影响既有行为
+    #[serde(default)]
+    pub open_enabled: bool,
+    #[serde(default)]
+    pub open_port: i32,
     #[serde(default)]
     pub tool_commands: String,
     #[serde(default)]
@@ -143,8 +148,8 @@ fn collect_export_templates(
     // LEFT JOIN 取工具名：没绑工具时 tool_name 为空
     let mut stmt = conn.prepare(
         "SELECT t.name, t.command, t.cwd, t.watch_paths, t.watch_include, t.watch_exclude,
-                t.env_vars, t.restart_mode, t.enabled, t.show_file_tree, t.tool_commands,
-                t.id, COALESCE(o.name, '') AS tool_name
+                t.env_vars, t.restart_mode, t.enabled, t.show_file_tree, t.open_enabled, t.open_port,
+                t.tool_commands, t.id, COALESCE(o.name, '') AS tool_name
          FROM service_templates t
          LEFT JOIN open_tools o ON o.id = t.open_tool_id
          ORDER BY t.sort_index, t.name"
@@ -162,6 +167,8 @@ fn collect_export_templates(
             restart_mode: row.get("restart_mode")?,
             enabled: row.get("enabled")?,
             show_file_tree: row.get("show_file_tree")?,
+            open_enabled: row.get::<_, i32>("open_enabled")? != 0,
+            open_port: row.get("open_port")?,
             tool_commands: row.get("tool_commands")?,
             open_tool_name: row.get("tool_name")?,
         },
@@ -284,6 +291,8 @@ fn import_templates_into(
         }
         crate::commands::service::validate_tool_commands(&t.tool_commands)
             .map_err(|e| format!("模板「{}」的工具命令无法导入：{}", name, e))?;
+        crate::commands::service::validate_open_port(t.open_port)
+            .map_err(|e| format!("模板「{}」的打开端口无法导入：{}", name, e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let en = if t.enabled { 1 } else { 0 };
@@ -303,6 +312,7 @@ fn import_templates_into(
                 ":watch_paths": t.watch_paths, ":watch_include": t.watch_include,
                 ":watch_exclude": t.watch_exclude, ":env_vars": t.env_vars,
                 ":restart_mode": t.restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":open_enabled": if t.open_enabled { 1 } else { 0 }, ":open_port": t.open_port,
                 ":sort_index": next_sort, ":tool_commands": tool_commands, ":open_tool_id": tool_id,
             },
         ).map_err(|e| format!("导入模板失败: {}", e))?;
@@ -345,6 +355,8 @@ mod tests {
             restart_mode: 0,
             enabled: true,
             show_file_tree: false,
+            open_enabled: false,
+            open_port: 0,
             tool_commands: "[]".into(),
             open_tool_name: tool.into(),
         }
@@ -357,8 +369,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|c| {
             c.execute(
-                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, sort_index, tool_commands, open_tool_id)
-                 VALUES ('t1','前端 dev','npm run dev','','[]','','','K=V',1,1,0,0,'[]','')",
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, open_tool_id)
+                 VALUES ('t1','前端 dev','npm run dev','','[]','','','K=V',1,1,0,1,3000,0,'[]','')",
                 [],
             ).map_err(|e| e.to_string())?;
             Ok(())
@@ -386,6 +398,14 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM service_templates WHERE name='前端 dev'", [], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
             assert_eq!(n, 2, "两条都该叫原名");
+            // 「打开」配置也要原样往返（旧导出文件没有这两项时按默认关闭处理）
+            let with_open: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM service_templates WHERE name='前端 dev' AND open_enabled=1 AND open_port=3000",
+                    [], |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            assert_eq!(with_open, 2, "源模板与导入副本都该保留打开配置");
             Ok(())
         }).expect("校验名字保持原样");
     }

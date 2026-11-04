@@ -23,6 +23,14 @@ const DEFAULT_WATCH_EXCLUDE: &str = "node_modules\n.git\ndist\ntarget\n__pycache
 /// 工具命令配置（前端提交的 JSON 文本）是否合法。空串 = 未配置（调用方归一为 `[]`）。
 ///
 /// 不在保存入口拦下的话，非法 JSON 只会在运行时解析失败：工具面板空转、报错点离现场很远
+/// 打开端口：0 = 自动；其余必须是合法 TCP 端口。
+pub(crate) fn validate_open_port(port: i32) -> Result<(), String> {
+    if !(0..=65535).contains(&port) {
+        return Err("打开端口必须在 0-65535 之间（0 = 自动）".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_tool_commands(raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Ok(());
@@ -66,6 +74,12 @@ pub struct UpdateServiceParams {
     pub restart_mode: i32,
     pub enabled: bool,
     pub show_file_tree: bool,
+    /// 是否显示卡片上的「打开」按钮；旧前端不传 = 关闭
+    #[serde(default)]
+    pub open_enabled: bool,
+    /// 指定打开端口；0/不传 = 自动（唯一监听端口时直接用它）
+    #[serde(default)]
+    pub open_port: i32,
     pub tool_commands: String,
     /// 开机启动（见 core::boot）：保存前会校验 boot_check 并同步 manifest。
     /// 默认值让旧前端/旧测试的载荷仍能反序列化（不传 = 不开机启动）。
@@ -108,6 +122,10 @@ pub struct AddServiceParams {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub show_file_tree: Option<bool>,
+    #[serde(default)]
+    pub open_enabled: Option<bool>,
+    #[serde(default)]
+    pub open_port: Option<i32>,
     /// 开机启动四项不传时用默认值（关闭 / 顺序 0 / 无就绪检查 / 非必需）
     #[serde(default)]
     pub boot_enabled: Option<bool>,
@@ -190,6 +208,9 @@ pub(crate) fn insert_service_row(
         let wx = params.watch_exclude.clone().unwrap_or_else(|| DEFAULT_WATCH_EXCLUDE.to_string());
         let en = params.enabled.unwrap_or(true);
         let sft = params.show_file_tree.unwrap_or(false);
+        let open_enabled = params.open_enabled.unwrap_or(false);
+        let open_port = params.open_port.unwrap_or(0);
+        validate_open_port(open_port)?;
         // 开机启动：不传 = 关闭；boot_check 必须是受支持的 JSON（空串 = 无检查）
         let boot_enabled = params.boot_enabled.unwrap_or(false);
         let boot_order = params.boot_order.unwrap_or(0);
@@ -211,6 +232,7 @@ pub(crate) fn insert_service_row(
                 ":restart_mode": params.restart_mode,
                 // 两个展示开关：默认"启用 + 不显示文件树"，面板新建时按用户勾的走
                 ":enabled": en, ":show_file_tree": sft,
+                ":open_enabled": if open_enabled { 1 } else { 0 }, ":open_port": open_port,
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
                 ":boot_enabled": boot_enabled, ":boot_order": boot_order,
                 ":boot_check": boot_check, ":boot_required": boot_required,
@@ -221,7 +243,7 @@ pub(crate) fn insert_service_row(
             id, project_id: params.project_id.clone(), name: params.name.trim().to_string(), command: params.command.clone(),
             cwd: cwd.to_string(), watch_paths: wp, watch_include: wi.into(), watch_exclude: wx,
             env_vars: params.env_vars.clone(), restart_mode: params.restart_mode, enabled: en,
-            show_file_tree: sft,
+            show_file_tree: sft, open_enabled, open_port,
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
             boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode,
@@ -310,6 +332,7 @@ pub(crate) fn write_service_update(
     db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
+        validate_open_port(params.open_port)?;
         let old: (String, String, String) = conn.query_row(
             "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
             [&params.id],
@@ -344,7 +367,10 @@ pub(crate) fn write_service_update(
                 ":watch_paths": wp, ":watch_include": params.watch_include,
                 ":watch_exclude": params.watch_exclude, ":env_vars": params.env_vars,
                 ":restart_mode": params.restart_mode, ":enabled": en,
-                ":show_file_tree": sft, ":tool_commands": tool_commands,
+                ":show_file_tree": sft,
+                ":open_enabled": if params.open_enabled { 1 } else { 0 },
+                ":open_port": params.open_port,
+                ":tool_commands": tool_commands,
                 ":boot_enabled": params.boot_enabled, ":boot_order": params.boot_order,
                 ":boot_check": boot_check, ":boot_required": params.boot_required,
                 ":boot_credential_mode": boot_credential_mode,
@@ -469,7 +495,7 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<DeleteR
 pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTemplate>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id, created_at
+            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id, created_at
              FROM service_templates ORDER BY sort_index, name"
         ).map_err(|e| format!("查询模板失败: {}", e))?;
         let rows = stmt.query_map([], |row| Ok(ServiceTemplate {
@@ -485,6 +511,8 @@ pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTempla
             restart_mode: row.get("restart_mode")?,
             enabled: row.get("enabled")?,
             show_file_tree: row.get("show_file_tree")?,
+            open_enabled: row.get::<_, i32>("open_enabled")? != 0,
+            open_port: row.get("open_port")?,
             tool_commands: row.get("tool_commands")?,
             open_tool_id: row.get("open_tool_id")?,
             created_at: row.get("created_at")?,
@@ -499,7 +527,7 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
     state.db.with_conn(|conn| {
         let t = conn.query_row(
-            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands
+            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands
              FROM services WHERE id=?1",
             [&service_id],
             |row| Ok((
@@ -513,10 +541,12 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
                 row.get::<_, i32>("restart_mode")?,
                 row.get::<_, bool>("enabled")?,
                 row.get::<_, bool>("show_file_tree")?,
+                row.get::<_, bool>("open_enabled")?,
+                row.get::<_, i32>("open_port")?,
                 row.get::<_, String>("tool_commands")?,
             )),
         ).map_err(|e| format!("服务不存在: {}", e))?;
-        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands) = t;
+        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands) = t;
         // 模板随服务带走当前绑定的打开工具（从模板添加服务时复制为新服务绑定）
         let open_tool_id: String = conn.query_row(
             "SELECT tool_id FROM service_open_tools WHERE service_id=?1", [&service_id],
@@ -537,6 +567,7 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
                 ":watch_paths": watch_paths, ":watch_include": watch_include,
                 ":watch_exclude": watch_exclude, ":env_vars": env_vars,
                 ":restart_mode": restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":open_enabled": if open_enabled { 1 } else { 0 }, ":open_port": open_port,
                 // 「另存为模板」固定落 0（模板库「新建」接在末尾，见那里的说明）
                 ":sort_index": 0, ":tool_commands": tool_commands, ":open_tool_id": open_tool_id,
             },
@@ -547,8 +578,8 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
             .unwrap_or_default();
         Ok(ServiceTemplate {
             id, name, command, cwd, watch_paths, watch_include, watch_exclude,
-            env_vars, restart_mode, enabled, show_file_tree, tool_commands,
-            open_tool_id,
+            env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port,
+            tool_commands, open_tool_id,
             created_at,
         })
     })
@@ -561,6 +592,16 @@ pub fn add_service_from_template(
     project_id: String,
     template_id: String,
 ) -> Result<Service, String> {
+    add_service_from_template_impl(&state.db, &state.paths, &project_id, &template_id)
+}
+
+/// 核心逻辑（只依赖 `Database` / `PathAllowlist`，命令签名带 State 构造不出来，测试走这里）。
+fn add_service_from_template_impl(
+    db: &Database,
+    paths: &PathAllowlist,
+    project_id: &str,
+    template_id: &str,
+) -> Result<Service, String> {
     // 取模板行 + 白名单收口，**必须在取 DB 锁之前**。
     //
     // 为什么不能放进下面的 `with_conn_mut` 闭包：`ensure_config_dir_allowed` 内部会调
@@ -571,11 +612,11 @@ pub fn add_service_from_template(
     //
     // 模板里的目录同样是"即将进入白名单的根"：套用同一套收口（历史模板值视为已授权，
     // 但驱动器根/系统目录一律拒绝——模板可能是从别处导入或被写坏的）
-    let t = state.db.with_conn(|conn| {
+    let t = db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id
+            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id
              FROM service_templates WHERE id=?1",
-            [&template_id],
+            [template_id],
             |row| Ok((
                 row.get::<_, String>("name")?,
                 row.get::<_, String>("command")?,
@@ -587,27 +628,30 @@ pub fn add_service_from_template(
                 row.get::<_, i32>("restart_mode")?,
                 row.get::<_, bool>("enabled")?,
                 row.get::<_, bool>("show_file_tree")?,
+                row.get::<_, bool>("open_enabled")?,
+                row.get::<_, i32>("open_port")?,
                 row.get::<_, String>("tool_commands")?,
                 row.get::<_, String>("open_tool_id")?,
             )),
         ).map_err(|e| format!("模板不存在: {}", e))
     })?;
-    let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, tool_commands, open_tool_id) = t;
-    validate_config_dirs(&state.db, &state.paths, &cwd, &watch_paths)?;
+    let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id) = t;
+    validate_open_port(open_port)?;
+    validate_config_dirs(db, paths, &cwd, &watch_paths)?;
 
-    state.db.with_conn_mut(|conn| {
+    db.with_conn_mut(|conn| {
         // 事务包裹：服务行 + 打开工具绑定必须原子写入——绑定插入失败（外键等）
         // 若留下已建服务，用户看到的是"服务加进来了但工具绑定丢了"的半成品
         let tx = conn.transaction().map_err(|e| format!("开启事务失败: {}", e))?;
         let project_exists: bool = tx.query_row(
-            "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [&project_id], |r| r.get(0)
+            "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [project_id], |r| r.get(0)
         ).map_err(|e| format!("校验所属项目失败: {}", e))?;
         if !project_exists { return Err("所属项目不存在".into()); }
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = tx.query_row(
             "SELECT COALESCE(MAX(sort_index), -1) FROM services WHERE project_id=?1",
-            [&project_id], |r| r.get(0)
+            [project_id], |r| r.get(0)
         ).map_err(|e| format!("读取服务排序失败: {}", e))?;
         let en = if enabled { 1 } else { 0 };
         let sft = if show_file_tree { 1 } else { 0 };
@@ -622,6 +666,7 @@ pub fn add_service_from_template(
                 ":cwd": cwd, ":watch_paths": watch_paths, ":watch_include": watch_include,
                 ":watch_exclude": watch_exclude, ":env_vars": env_vars,
                 ":restart_mode": restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":open_enabled": if open_enabled { 1 } else { 0 }, ":open_port": open_port,
                 ":sort_index": max_sort + 1, ":tool_commands": tool_commands,
                 // 模板不携带开机启动：从模板添加的服务默认不参与登录前启动
                 ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
@@ -642,8 +687,9 @@ pub fn add_service_from_template(
         }
         tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
         Ok(Service {
-            id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude,
-            env_vars, restart_mode, enabled, show_file_tree, sort_index: max_sort + 1, tool_commands,
+            id, project_id: project_id.to_string(), name, command, cwd, watch_paths, watch_include, watch_exclude,
+            env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port,
+            sort_index: max_sort + 1, tool_commands,
             boot_enabled: false, boot_order: 0, boot_check: String::new(), boot_required: false,
             boot_credential_mode: "s4u".into(),
         })
@@ -698,6 +744,11 @@ pub struct UpdateServiceTemplateParams {
     pub restart_mode: i32,
     pub enabled: bool,
     pub show_file_tree: bool,
+    /// 旧前端不传 = 关闭；从模板添加服务时复制给新服务
+    #[serde(default)]
+    pub open_enabled: bool,
+    #[serde(default)]
+    pub open_port: i32,
     pub tool_commands: String,
     pub open_tool_id: String,
 }
@@ -713,6 +764,7 @@ pub fn update_service_template(
     if params.name.trim().is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
     validate_tool_commands(&params.tool_commands)?;
+    validate_open_port(params.open_port)?;
     // 模板目录同样进入白名单根集合：套用配置目录收口（见 commands/paths.rs 的"配置路径收口"）
     validate_config_dirs(&state.db, &state.paths, &cwd, &params.watch_paths)?;
     let tool_commands = if params.tool_commands.trim().is_empty() { "[]".to_string() } else { params.tool_commands };
@@ -720,8 +772,8 @@ pub fn update_service_template(
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
         let affected = conn.execute(
-            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11, open_tool_id=?13 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id, params.open_tool_id],
+            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11, open_tool_id=?13, open_enabled=?14, open_port=?15 WHERE id=?12",
+            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id, params.open_tool_id, if params.open_enabled { 1 } else { 0 }, params.open_port],
         ).map_err(|e| format!("更新模板失败: {}", e))?;
         if affected == 0 { return Err("模板不存在".into()); }
         Ok(())
@@ -742,6 +794,10 @@ pub struct CreateServiceTemplateParams {
     pub restart_mode: i32,
     pub enabled: bool,
     pub show_file_tree: bool,
+    #[serde(default)]
+    pub open_enabled: bool,
+    #[serde(default)]
+    pub open_port: i32,
     pub tool_commands: String,
     pub open_tool_id: String,
 }
@@ -756,6 +812,7 @@ pub fn create_service_template(
     if name.is_empty() { return Err("名称不能为空".into()); }
     if params.command.trim().is_empty() { return Err("命令不能为空".into()); }
     validate_tool_commands(&params.tool_commands)?;
+    validate_open_port(params.open_port)?;
     let cwd = params.cwd.replace('\\', "/");
     // 与 update_service_template 同一套收口：模板目录同样是"即将进入白名单的根"
     validate_config_dirs(&state.db, &state.paths, &cwd, &params.watch_paths)?;
@@ -793,6 +850,7 @@ pub fn create_service_template(
                 ":watch_paths": params.watch_paths, ":watch_include": watch_include,
                 ":watch_exclude": watch_exclude, ":env_vars": params.env_vars,
                 ":restart_mode": params.restart_mode, ":enabled": en, ":show_file_tree": sft,
+                ":open_enabled": if params.open_enabled { 1 } else { 0 }, ":open_port": params.open_port,
                 ":sort_index": next_sort, ":tool_commands": tool_commands,
                 ":open_tool_id": params.open_tool_id,
             },
@@ -812,6 +870,8 @@ pub fn create_service_template(
             restart_mode: params.restart_mode,
             enabled: params.enabled,
             show_file_tree: params.show_file_tree,
+            open_enabled: params.open_enabled,
+            open_port: params.open_port,
             tool_commands,
             open_tool_id: params.open_tool_id,
             created_at,
@@ -850,6 +910,8 @@ mod tests {
             watch_exclude: None,
             enabled: None,
             show_file_tree: None,
+            open_enabled: None,
+            open_port: None,
             boot_enabled: None,
             boot_order: None,
             boot_check: None,
@@ -871,6 +933,8 @@ mod tests {
         p.watch_exclude = Some("dist".into());
         p.enabled = Some(false);
         p.show_file_tree = Some(true);
+        p.open_enabled = Some(true);
+        p.open_port = Some(3000);
         p.boot_credential_mode = Some("password".into());
 
         let svc = insert_service_row(&db, &p, "C:/s", "[]").expect("插入服务");
@@ -878,7 +942,22 @@ mod tests {
         assert_eq!(svc.watch_exclude, "dist");
         assert!(!svc.enabled, "传了 false 就该是不启用");
         assert!(svc.show_file_tree, "传了 true 就该显示文件树");
+        assert!(svc.open_enabled, "打开按钮开关应按传入值保存");
+        assert_eq!(svc.open_port, 3000, "指定打开端口应按传入值保存");
         assert_eq!(svc.boot_credential_mode, "password", "凭据模式应按传入值保存");
+    }
+
+    #[test]
+    fn test_open_port_bounds() {
+        assert!(validate_open_port(0).is_ok());
+        assert!(validate_open_port(65535).is_ok());
+        assert!(validate_open_port(-1).is_err());
+        assert!(validate_open_port(65536).is_err());
+
+        let db = test_db();
+        let mut p = add_params("bad-port", "C:/s");
+        p.open_port = Some(70000);
+        assert!(insert_service_row(&db, &p, "C:/s", "[]").is_err(), "非法端口不得落库");
     }
 
     #[test]
@@ -917,6 +996,8 @@ mod tests {
             restart_mode: 2,
             enabled: false,
             show_file_tree: true,
+            open_enabled: false,
+            open_port: 0,
             tool_commands: "[]".into(),
             boot_enabled: false,
             boot_order: 0,
@@ -1122,5 +1203,38 @@ mod tests {
             Ok(conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get::<_, i32>(0)).unwrap())
         }).unwrap();
         assert_eq!(left2, 0);
+    }
+
+    /// 从模板添加服务：模板里的「打开」配置必须一起复制（返回结构 + 落库值都要对）
+    #[test]
+    fn test_add_service_from_template_copies_open_config() {
+        let db = test_db();
+        let root = std::env::temp_dir().join(format!("nexus_ut_tpl_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = PathAllowlist::new();
+        paths.set_project_root(Some(root.to_string_lossy().to_string())).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, open_tool_id)
+                 VALUES ('t1','tpl','npm run dev',?1,'[]','*','','',0,1,0,1,3000,0,'[]','')",
+                [root.to_string_lossy().to_string()],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).unwrap();
+
+        let svc = add_service_from_template_impl(&db, &paths, "p1", "t1").expect("从模板添加服务");
+        assert!(svc.open_enabled, "模板的打开开关应复制给新服务");
+        assert_eq!(svc.open_port, 3000, "模板的指定端口应复制给新服务");
+
+        db.with_conn(|conn| {
+            let (oe, op): (i32, i32) = conn.query_row(
+                "SELECT open_enabled, open_port FROM services WHERE id=?1",
+                [&svc.id], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).map_err(|e| e.to_string())?;
+            assert_eq!((oe, op), (1, 3000), "落库值也要与返回结构一致");
+            Ok(())
+        }).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

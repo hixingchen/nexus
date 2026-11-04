@@ -50,7 +50,8 @@ test('服务/模板草稿的清理不会误删弹窗草稿（两套键空间隔�
   reset();
   const serviceDraft: ServiceFormDraft = {
     name: 'svc', command: 'run', cwd: 'C:/x', watchPaths: '', watchInclude: '*', watchExclude: '',
-    envVars: '', restartMode: 0, enabled: true, showFileTree: false, toolCommands: [], tplToolId: '',
+    envVars: '', restartMode: 0, enabled: true, showFileTree: false,
+    openEnabled: false, openPort: 0, toolCommands: [], tplToolId: '',
     bootEnabled: false, bootOrder: 0, bootCheckKind: 'none', bootCheckValue: '', bootRequired: false,
     bootCredentialMode: 's4u',
   };

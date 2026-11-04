@@ -1,5 +1,12 @@
 import type { FailedService, RunningService } from '../services/service';
 
+/** 端口数组逐项比较（后端保证升序去重，这里仍按内容比，不依赖顺序以外的约定） */
+function samePorts(a: number[] | undefined, b: number[] | undefined): boolean {
+  const pa = a ?? [];
+  const pb = b ?? [];
+  return pa.length === pb.length && pa.every((port, i) => port === pb[i]);
+}
+
 /**
  * 比对两组运行/失败列表是否等价（逐字段、按下标）。
  *
@@ -26,6 +33,8 @@ export function sameRunningStatus(
         && x.service_id === y.service_id
         && x.project_id === y.project_id
         && x.source === y.source
+        && x.phase === y.phase
+        && samePorts(x.listening_ports, y.listening_ports)
         && (x.followed_log ?? null) === (y.followed_log ?? null);
     })
     && af.every((x, i) => {

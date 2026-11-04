@@ -51,6 +51,20 @@ test('内容真的没变时判为等价：每 3 秒一次轮询不该让订阅�
   assert.equal(sameRunningStatus(r, [{ ...r[0] }], [], []), true);
 });
 
+test('phase 变化要判为“变了”：启动中 → 已就绪', () => {
+  const before = [{ service_id: 's1', project_id: 'p1', source: 'local' as const, phase: 'starting' as const }];
+  const after = [{ ...before[0], phase: 'ready' as const }];
+  assert.equal(sameRunningStatus(before, after, [], []), false);
+});
+
+test('监听端口变化要判为“变了”；内容相同则等价', () => {
+  const a = [{ service_id: 's1', project_id: 'p1', source: 'local' as const, listening_ports: [8080] }];
+  const b = [{ ...a[0], listening_ports: [8080, 5005] }];
+  assert.equal(sameRunningStatus(a, b, [], []), false);
+  const same = [{ ...a[0], listening_ports: [8080] }];
+  assert.equal(sameRunningStatus(a, same, [], []), true);
+});
+
 test('failed 分支仍是逐字段全比（exit_code / timestamp 变了要判为“变了”）', () => {
   const r = [{ service_id: 's1', project_id: 'p1', followed_log: null, source: 'local' as const }];
   const f1 = [{ service_id: 's1', exit_code: 1, timestamp: 't1', source: 'local' as const }];

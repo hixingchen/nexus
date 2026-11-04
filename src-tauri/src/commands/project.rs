@@ -242,6 +242,7 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
             let svc_id = uuid::Uuid::new_v4().to_string();
             let en = if svc.enabled { 1 } else { 0 };
             let sft = if svc.show_file_tree { 1 } else { 0 };
+            let oe = if svc.open_enabled { 1 } else { 0 };
             tx.execute(
                 &format!(
                     "INSERT INTO services ({}) VALUES ({})",
@@ -254,6 +255,7 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
                     ":watch_include": svc.watch_include, ":watch_exclude": svc.watch_exclude,
                     ":env_vars": svc.env_vars, ":restart_mode": svc.restart_mode,
                     ":enabled": en, ":show_file_tree": sft, ":sort_index": svc.sort_index,
+                    ":open_enabled": oe, ":open_port": svc.open_port,
                     ":tool_commands": svc.tool_commands,
                     // 复制项目**不复制开机启动**：两个项目会启动同一套服务/抢同一个端口。
                     // 这是唯一的例外，见 test_duplicate_project_copies_every_service_column
@@ -371,6 +373,8 @@ mod tests {
             ("restart_mode", "2".to_string()),
             ("enabled", "0".to_string()),
             ("show_file_tree", "0".to_string()),
+            ("open_enabled", "1".to_string()),
+            ("open_port", "3000".to_string()),
             ("sort_index", "7".to_string()),
             ("tool_commands", r#"[{"id":"t1","name":"build","command":"npm run build","timeout_secs":1800}]"#.to_string()),
             ("boot_enabled", "1".to_string()),

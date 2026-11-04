@@ -134,6 +134,17 @@ pub(crate) struct ProcessInfo {
     pub(crate) stop_flag: Arc<AtomicBool>,
 }
 
+/// 运行快照的详细元素（`get_running` 用来算就绪阶段与监听端口）。
+pub(crate) struct RunningDetail {
+    pub project_id: String,
+    pub service_id: String,
+    pub followed_log: Option<String>,
+    /// 直接子进程的创建时刻（epoch ms）：用于「启动中」宽限期
+    pub started_at: u64,
+    /// 进程树根：直接子进程 + 已认领的游离进程（调用方再展开它们各自的后代）
+    pub pids: Vec<u32>,
+}
+
 pub struct ProcessManager {
     pub(crate) processes: Mutex<HashMap<String, ProcessInfo>>,
     pub(crate) log_buffers: LogBuffers,
@@ -806,19 +817,36 @@ impl ProcessManager {
 
     /// 只读的运行表快照（不推进任何生命周期）。后台线程 tick 完之后取它来判定/展示
     pub(crate) fn snapshot_running(&self) -> Vec<(String, String, Option<String>)> {
+        self.snapshot_running_detail()
+            .into_iter()
+            .map(|d| (d.project_id, d.service_id, d.followed_log))
+            .collect()
+    }
+
+    /// 运行快照的详细版：多带启动时刻与进程树根 pid（直接子进程 + 已认领的游离进程），
+    /// 供 `get_running` 做就绪阶段与端口自动发现。
+    pub(crate) fn snapshot_running_detail(&self) -> Vec<RunningDetail> {
         // Phase 4: 重新获取锁，一次取齐 (project_id, service_id, 跟随的日志文件)。
         //
         // `followed_log` 一并在这里取走（PERF-33）：它就在同一张表里，而原实现是
         // 调用方拿着这串 id **每个服务再各取一次锁**（18 服务 = 一轮 18 次加锁，
         // 只为读一个字段）。表是同一张、锁是同一把，没有分两次取的理由。
-        let mut out: Vec<(String, String, Option<String>)> = self.processes.lock()
+        let mut out: Vec<RunningDetail> = self.processes.lock()
             .map(|procs| procs.iter().map(|(k, v)| {
-                (v.project_id.clone(), k.clone(), v.follow.as_ref().map(|f| f.path.clone()))
+                let mut pids = vec![v.pid];
+                pids.extend(v.adopted.iter().map(|a| a.pid));
+                RunningDetail {
+                    project_id: v.project_id.clone(),
+                    service_id: k.clone(),
+                    followed_log: v.follow.as_ref().map(|f| f.path.clone()),
+                    started_at: v.spawn_started_at,
+                    pids,
+                }
             }).collect())
             .unwrap_or_default();
         // HashMap 顺序不稳定：前端 sameStatus 按下标比较，顺序一变就会被判成“内容变了”，
         // 抵消“内容没变不重渲染”的优化。排序后快照与轮询之间才是逐字段稳定的。
-        out.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        out.sort_unstable_by(|a, b| a.service_id.cmp(&b.service_id));
         out
     }
 

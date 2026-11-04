@@ -38,7 +38,7 @@ import { useProjectDetail } from '../../hooks/useProjectDetail';
 import { useEditorStore, selectMdPreviewOnActiveTab } from '../../stores/editor';
 import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
-import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type Service, type ServiceTemplate } from '../../services/service';
+import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type RunningService, type Service, type ServiceTemplate } from '../../services/service';
 import { failureLabel } from '../../utils/serviceFailure';
 import { openInExplorer, openTerminal, pickOpenFile, pickSaveFile } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
@@ -86,7 +86,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
     deleteSvcTarget, setDeleteSvcTarget, deleting,
     viewingLog, setViewingLog,
     activeTab, load, reorderServicesLocal,
-    isServiceRunning, failedInfoOf, followedLogOf, handleStartAll, handleStopAll,
+    isServiceRunning, failedInfoOf, followedLogOf, runningInfoOf, handleStartAll, handleStopAll,
     handleDeleteService, handleViewLog,
   } = useProjectDetail(projectId);
   // 只订阅这个布尔：`fileContent` 由 MarkdownPreview 自己订阅（见该组件说明）。
@@ -509,6 +509,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
         isServiceRunning={isServiceRunning}
         failedInfoOf={failedInfoOf}
         followedLogOf={followedLogOf}
+        runningInfoOf={runningInfoOf}
         setDeleteSvcTarget={setDeleteSvcTarget}
         // 改名自 setShowAddServiceModal：添加服务不再是"开个弹窗"，而是打开右侧编辑面板
         onCreateService={handleCreateService}
@@ -600,6 +601,8 @@ interface ServicePanelProps {
   failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
+  /** 该服务的运行详情（阶段 / 监听端口）；null = 未运行 */
+  runningInfoOf: (svc: Service) => RunningService | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -615,7 +618,7 @@ interface ServicePanelProps {
 
 function ServicePanel({
   services, servicesLoading, collapsed, onToggle, splitPanel, editingService, onEditService,
-  isServiceRunning, failedInfoOf, followedLogOf, setDeleteSvcTarget,
+  isServiceRunning, failedInfoOf, followedLogOf, runningInfoOf, setDeleteSvcTarget,
   onCreateService, handleStartAll, handleStopAll, handleViewLog,
   handleRunToolCommand, handleReorderServices, loading, load,
 }: ServicePanelProps) {
@@ -664,6 +667,7 @@ function ServicePanel({
             isServiceRunning={isServiceRunning}
             failedInfoOf={failedInfoOf}
             followedLogOf={followedLogOf}
+            runningInfoOf={runningInfoOf}
             setDeleteSvcTarget={setDeleteSvcTarget}
             onCreateService={onCreateService}
             handleStartAll={handleStartAll}
@@ -827,6 +831,8 @@ interface ExpandedViewProps {
   failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
+  /** 该服务的运行详情（阶段 / 监听端口）；null = 未运行 */
+  runningInfoOf: (svc: Service) => RunningService | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -843,7 +849,7 @@ interface ExpandedViewProps {
 
 function ExpandedView({
   services, servicesLoading, splitPanel, editingService, onEditService, isServiceRunning, failedInfoOf,
-  followedLogOf, setDeleteSvcTarget, onCreateService,
+  followedLogOf, runningInfoOf, setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices,
   loading, load, onToggle,
@@ -860,6 +866,7 @@ function ExpandedView({
           isServiceRunning={isServiceRunning}
           failedInfoOf={failedInfoOf}
           followedLogOf={followedLogOf}
+          runningInfoOf={runningInfoOf}
           setDeleteSvcTarget={setDeleteSvcTarget}
           onCreateService={onCreateService}
           handleStartAll={handleStartAll}
@@ -892,6 +899,8 @@ interface ServiceSectionProps {
   failedInfoOf: (svc: Service) => FailedService | null;
   /** 该服务正在跟随的日志文件（null = 没在跟随） */
   followedLogOf: (svc: Service) => string | null;
+  /** 该服务的运行详情（阶段 / 监听端口）；null = 未运行 */
+  runningInfoOf: (svc: Service) => RunningService | null;
   setDeleteSvcTarget: (target: { id: string; name: string } | null) => void;
   /** 新建服务（打开右侧编辑面板，空 id 即新建） */
   onCreateService: () => void;
@@ -908,7 +917,7 @@ interface ServiceSectionProps {
 
 function ServiceSection({
   services, servicesLoading, editingService, onEditService,
-  isServiceRunning, failedInfoOf, followedLogOf,
+  isServiceRunning, failedInfoOf, followedLogOf, runningInfoOf,
   setDeleteSvcTarget, onCreateService,
   handleStartAll, handleStopAll, handleViewLog, handleRunToolCommand,
   handleReorderServices, loading, load, onToggle,
@@ -941,11 +950,11 @@ function ServiceSection({
             <rect x="1.5" y="1.5" width="11" height="11" rx="2"/><line x1="5" y1="5" x2="9" y2="5"/><line x1="5" y1="7" x2="9" y2="7"/><line x1="5" y1="9" x2="7" y2="9"/>
           </svg>
           <span className="text-[13px] text-nexus-text font-medium truncate">项目服务</span>
-          {services.some(s => s.boot_enabled && s.enabled) && (
+          {services.some(s => s.boot_enabled) && (
             <span
               className="text-[10px] leading-[15px] px-1.5 rounded-full bg-nexus-accent/10 text-nexus-accent flex-shrink-0"
-              title={`S4U ${services.filter(s => s.boot_enabled && s.enabled && s.boot_credential_mode === 's4u').length} 个 · 保存密码 ${services.filter(s => s.boot_enabled && s.enabled && s.boot_credential_mode === 'password').length} 个（设置 > 服务开机启动）`}
-            >{services.filter(s => s.boot_enabled && s.enabled).length} 个开机启动</span>
+              title={`S4U ${services.filter(s => s.boot_enabled && s.boot_credential_mode === 's4u').length} 个 · 保存密码 ${services.filter(s => s.boot_enabled && s.boot_credential_mode === 'password').length} 个（设置 > 服务开机启动）`}
+            >{services.filter(s => s.boot_enabled).length} 个开机启动</span>
           )}
         </div>
         <div className="flex items-center gap-1">
@@ -1008,6 +1017,7 @@ function ServiceSection({
                 service={svc}
                 running={isServiceRunning(svc)}
                 failed={failedInfoOf(svc) !== null}
+                runningInfo={runningInfoOf(svc)}
                 followedLog={followedLogOf(svc)}
                 isEditing={editingService?.id === svc.id}
                 onEdit={() => onEditService(svc)}

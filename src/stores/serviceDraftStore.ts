@@ -28,6 +28,10 @@ export interface ServiceFormDraft {
   restartMode: number;
   enabled: boolean;
   showFileTree: boolean;
+  /** 卡片「打开」按钮（服务与模板共用） */
+  openEnabled: boolean;
+  /** 指定打开端口；0 = 自动 */
+  openPort: number;
   toolCommands: ToolCommand[];
   /** 模板模式的默认打开工具（服务模式不使用） */
   tplToolId: string;

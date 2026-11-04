@@ -10,6 +10,7 @@ pub mod logfile;
 pub mod logfollow;
 pub mod logpipe;
 pub mod logtext;
+pub mod ports;
 pub mod process;
 pub mod redact;
 pub mod runtime;
