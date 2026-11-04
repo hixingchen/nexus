@@ -88,10 +88,29 @@ function removeStyle(styles: string[], prefix: string) {
 
 type PlaceholderFn = (html: string) => string;
 
-/** 匹配 URL 并替换为带样式的占位符 */
+/** URL 结尾的句读不属于链接。中文标点也收进来：中文日志里 URL 后面常直接跟"。"或"，" */
+const URL_TRAILING_PUNCT_RE = /[.,;:!?)\]}'"`，。；：！？、]+$/;
+
+/**
+ * 匹配 URL 并替换为带样式的占位符。
+ *
+ * 可点击属性 `data-nexus-url` 由 LogViewer 的滚动容器统一做事件委托处理（行是
+ * dangerouslySetInnerHTML 生成的，逐行绑事件在虚拟滚动重挂后会丢）。
+ * 中文标点作为 URL 边界：否则 `见 http://a.com，然后` 会把" ，然后"整段吞成链接。
+ */
 function colorizeUrls(text: string, addPh: PlaceholderFn): string {
-  return text.replace(/(https?:\/\/[^\s<>"]+)/g, match =>
-    addPh(`<span style="color:#7dd3fc;text-decoration:underline">${escapeHtml(match)}</span>`));
+  return text.replace(/https?:\/\/[^\s<>"，。；：！？、（）【】《》「」『』]+/g, (match) => {
+    const clean = match.replace(URL_TRAILING_PUNCT_RE, '');
+    const tail = match.slice(clean.length);
+    // 搜索高亮占位符（\x01N\x01）夹在 URL 中间时，还原后拿不到原字符——保持着色但不做
+    // 可点击，避免把控制字符拼进交给系统浏览器的 URL
+    if (clean.includes('\x00') || clean.includes('\x01')) {
+      return addPh(`<span style="color:#7dd3fc;text-decoration:underline">${escapeHtml(match)}</span>`);
+    }
+    return addPh(
+      `<span data-nexus-url="${escapeHtml(clean)}" style="color:#7dd3fc;text-decoration:underline;cursor:pointer">${escapeHtml(clean)}</span>`,
+    ) + tail;
+  });
 }
 
 /** 匹配 IP 地址并替换为带样式的占位符 */

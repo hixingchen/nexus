@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, type MouseEvent } from 'react';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { retainLogViewer, useLogStore } from '../../stores/logStore';
 import { useRunningStore } from '../../stores/runningStore';
@@ -12,6 +13,7 @@ import { createLogSearchCache, filterLogLinesIncremental } from '../../utils/log
 import { isSubmitEnter } from '../../utils/keyboard';
 import { isStickToBottom } from '../../utils/logFollow';
 import { failureDetail, failureLabel } from '../../utils/serviceFailure';
+import { reportError } from '../../utils/error';
 import type { ServiceLogLine } from '../../services/logService';
 import type { FailedService } from '../../services/service';
 
@@ -290,6 +292,26 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
     });
   }, []);
 
+  /**
+   * 日志里的 URL 点击（事件委托挂在滚动容器上）。
+   *
+   * 行内容是 dangerouslySetInnerHTML 生成的，且虚拟滚动会反复挂载/卸载行——
+   * 给每个链接单独绑 handler 既慢、也会在重渲染后丢，所以统一委托到容器。
+   */
+  const handleLogClick = useCallback((e: MouseEvent<HTMLDivElement>) => {
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    const link = target.closest('[data-nexus-url]');
+    if (!link) return;
+    // 拖选文本后松手也会触发 click：有选区时不打开，避免"本来想复制却弹出浏览器"
+    if (window.getSelection()?.toString()) return;
+    const url = link.getAttribute('data-nexus-url');
+    if (!url) return;
+    e.preventDefault();
+    // 交给系统浏览器（应用内导航守卫也会拦截，这里是同一口径）
+    void openUrl(url).catch((err) => reportError('打开链接失败', err));
+  }, []);
+
   // ── 暂停 ──────────────────────────────────────────────────
   // 暂停 = 快照当前跟随数据源为暂停视图（独立数据源，满 2000 行后冻结，不会再滚动）；
   // 恢复 = 丢弃暂停视图，切回跟随数据源（其始终维护最新 2000 行）
@@ -385,7 +407,7 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
       {/* 文本样式（字体/字号/行高/换行）放在滚动容器上由行继承，与旧 <pre> 的表现一致；
           行高由 `estimateRowHeight` 按同一个字号算（ESTIMATED_ROW_H 那个写死的 21 已随字号
           设置改成派生值），改动这里需同步那里的 LINE_HEIGHT_RATIO */}
-      <div ref={scrollRef} onScroll={handleScroll}
+      <div ref={scrollRef} onScroll={handleScroll} onClick={handleLogClick}
         className={`overflow-auto bg-[#0d1117] font-mono text-[length:calc(var(--nexus-text-size)-1px)] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
         style={fill ? undefined : { maxHeight: '220px' }}>
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>

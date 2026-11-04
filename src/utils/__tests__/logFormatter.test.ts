@@ -117,6 +117,33 @@ test('URL 被着色且文本完整（含 ? 与 = 的查询串不能丢字符）'
   assert.ok(html.includes('https://example.com/a?b=1'));
 });
 
+test('URL 带可点击目标：data-nexus-url 与显示文本一致', () => {
+  const html = renderLine('see https://example.com/a?b=1 now', '');
+  assert.ok(html.includes('data-nexus-url="https://example.com/a?b=1"'), html);
+  assert.ok(html.includes('>https://example.com/a?b=1</span>'), html);
+});
+
+test('URL 尾部句读留在链接外（英文与中文标点）', () => {
+  const en = renderLine('see https://example.com/x). done', '');
+  assert.ok(en.includes('data-nexus-url="https://example.com/x"'), en);
+  assert.ok(en.includes('</span>). '), en);
+
+  const zh = renderLine('见 https://example.com/x，然后继续', '');
+  assert.ok(zh.includes('data-nexus-url="https://example.com/x"'), zh);
+  assert.ok(zh.includes('</span>，然后继续'), zh);
+});
+
+test('搜索高亮夹在 URL 中间时不生成可点击目标（避免控制字符进 URL）', () => {
+  const html = renderLine('see https://example.com/a now', 'example');
+  assert.ok(!html.includes('data-nexus-url'), html);
+  assert.ok(html.includes('<mark'), html);
+});
+
+test('非 http/https 不生成可点击目标', () => {
+  const html = renderLine('ftp://example.com/file file:///D:/x.txt', '');
+  assert.ok(!html.includes('data-nexus-url'), html);
+});
+
 test('IP[:端口] 被着色', () => {
   const html = renderLine('connected 10.0.0.1:8080 ok', '');
   assert.ok(html.includes('#5eead4'));
