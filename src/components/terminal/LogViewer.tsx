@@ -10,6 +10,8 @@ import { parseEditorFontSize } from '../../utils/editorFont';
 import { logService } from '../../services/logService';
 import { renderLine } from '../../utils/logFormatter';
 import { createLogSearchCache, filterLogLinesIncremental } from '../../utils/logSearch';
+import { filterLogsBySeverity, type LogSeverityFilter } from '../../utils/logFilter';
+import { SelectMenu } from '../ui/SelectMenu';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { isStickToBottom } from '../../utils/logFollow';
 import { failureDetail, failureLabel } from '../../utils/serviceFailure';
@@ -70,6 +72,13 @@ const PAD_Y = 12;
 /** 搜索输入防抖间隔 */
 const SEARCH_DEBOUNCE_MS = 200;
 
+/** 级别过滤选项（顺序即下拉展示顺序） */
+const SEVERITY_OPTIONS: ReadonlyArray<{ value: LogSeverityFilter; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'error', label: '只看错误' },
+  { value: 'warn', label: '警告及以上' },
+];
+
 /**
  * 服务日志面板：虚拟滚动渲染（只挂载视口内约 30~50 行）。
  * 数据侧仍是「最多 2000 行」的滑动窗口，DOM 侧不再与之等量——
@@ -96,6 +105,9 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
   const [paused, setPaused] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [searchIdx, setSearchIdx] = useState(0);
+  /** 级别过滤放全局 store：切换服务会重挂载本组件，局部状态会被重置 */
+  const severityFilter = useUiStore(s => s.logSeverityFilter);
+  const setSeverityFilter = useUiStore(s => s.setLogSeverityFilter);
   /** 1 秒轮询在途保护：慢盘/大文件时上一发未回不再叠下一发 */
   const pollInFlightRef = useRef(false);
 
@@ -187,15 +199,30 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
 
   // 搜索态渲染匹配行（虚拟滚动下无需再截断尾部：任意匹配都可达、可定位）
   const searchActive = debouncedTerm.trim().length > 0;
+  /** 先按级别过滤（堆栈续行随所属主行保留），再在结果上做搜索 */
+  const severity = useMemo(
+    () => filterLogsBySeverity(lines, severityFilter),
+    [lines, severityFilter],
+  );
   /** 增量匹配缓存：只测新行，搜索词不变时不再每 50ms 重扫 2000 行文本 */
   const searchCacheRef = useRef(createLogSearchCache());
   const rows = useMemo(() => {
-    if (!searchActive) return lines;
-    return filterLogLinesIncremental(lines, debouncedTerm, searchCacheRef.current);
-  }, [lines, searchActive, debouncedTerm]);
+    if (!searchActive) return severity.rows;
+    return filterLogLinesIncremental(severity.rows, debouncedTerm, searchCacheRef.current);
+  }, [severity, searchActive, debouncedTerm]);
   const searchMatches = searchActive ? rows.length : 0;
   /** 传给行组件的搜索词：非搜索态为空串（与旧的整块渲染同口径） */
   const rowTerm = searchActive ? debouncedTerm : '';
+  /** 过滤/搜索后为空时给明确说明，而不是一块空白 */
+  const emptyHint = rows.length > 0
+    ? null
+    : severityFilter === 'error'
+      ? '没有匹配的错误日志'
+      : severityFilter === 'warn'
+        ? '没有匹配的警告及以上日志'
+        : searchActive
+          ? '没有匹配的日志'
+          : null;
 
   // ── 虚拟列表 ──────────────────────────────────────────────
 
@@ -395,6 +422,14 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
         searchMatches={searchMatches}
         searchIdx={searchIdx}
         onGoMatch={goMatch}
+        severityFilter={severityFilter}
+        onSeverityFilterChange={(mode) => {
+          setSeverityFilter(mode);
+          setSearchIdx(0);
+        }}
+        errorCount={severity.errorCount}
+        warnCount={severity.warnCount}
+        continuationCount={severity.continuationCount}
         paused={paused}
         onPause={handlePause}
         newSincePause={newSincePause}
@@ -410,23 +445,27 @@ export function LogViewer({ serviceKey, serviceName: serviceNameProp, fill, onCl
       <div ref={scrollRef} onScroll={handleScroll} onClick={handleLogClick}
         className={`overflow-auto bg-[#0d1117] font-mono text-[length:calc(var(--nexus-text-size)-1px)] leading-relaxed text-[#c9d1d9]/80 whitespace-pre-wrap break-all px-4 ${fill ? 'flex-1' : ''}`}
         style={fill ? undefined : { maxHeight: '220px' }}>
-        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
-          {virtualItems.map(vi => {
-            const line = rows[vi.index];
-            if (!line) return null;
-            return (
-              <div
-                key={vi.key}
-                data-index={vi.index}
-                ref={virtualizer.measureElement}
-                className="absolute left-0 top-0 w-full"
-                style={{ transform: `translateY(${vi.start}px)` }}
-              >
-                <LogRow line={line} searchTerm={rowTerm} />
-              </div>
-            );
-          })}
-        </div>
+        {emptyHint ? (
+          <div className="px-4 py-6 text-[12px] text-[#8b949e]">{emptyHint}</div>
+        ) : (
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+            {virtualItems.map(vi => {
+              const line = rows[vi.index];
+              if (!line) return null;
+              return (
+                <div
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={virtualizer.measureElement}
+                  className="absolute left-0 top-0 w-full"
+                  style={{ transform: `translateY(${vi.start}px)` }}
+                >
+                  <LogRow line={line} searchTerm={rowTerm} />
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -469,6 +508,7 @@ function LogHeader({
   serviceName, lineCount, isRunning, failure, onClose,
   searchTerm, setSearchTerm, setSearchIdx, searchRef,
   searchActive, searchMatches, searchIdx, onGoMatch,
+  severityFilter, onSeverityFilterChange, errorCount, warnCount, continuationCount,
   paused, onPause, onClear, newSincePause,
 }: {
   serviceName: string;
@@ -485,6 +525,11 @@ function LogHeader({
   searchMatches: number;
   searchIdx: number;
   onGoMatch: (dir: 1 | -1) => void;
+  severityFilter: LogSeverityFilter;
+  onSeverityFilterChange: (mode: LogSeverityFilter) => void;
+  errorCount: number;
+  warnCount: number;
+  continuationCount: number;
   paused: boolean;
   onPause: () => void;
   onClear: () => void;
@@ -532,6 +577,25 @@ function LogHeader({
       {/* 操作组：整体右对齐（ml-auto）；放不下时作为一个整体换到下一行，
           组内再放不下（查找框 + 匹配数 + 三个按钮）时还可以继续换行 */}
       <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1.5 min-w-0">
+        <SelectMenu
+          ariaLabel="按日志级别过滤"
+          title="只看错误 / 警告及以上（堆栈续行会跟着保留）"
+          value={severityFilter}
+          options={SEVERITY_OPTIONS}
+          onChange={onSeverityFilterChange}
+          className="h-[30px] px-2.5 rounded-lg text-[11px] bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] outline-none hover:border-[#58a6ff]/60 focus:border-[#58a6ff] aria-expanded:border-[#58a6ff] flex-shrink-0"
+        />
+        {severityFilter !== 'all' && (
+          <span
+            className="text-[11px] text-[#8b949e] tabular-nums flex-shrink-0"
+            title="按级别过滤后的行数（搜索前）；续行是随主行保留的堆栈/多行消息"
+          >
+            {severityFilter === 'error'
+              ? `错误 ${errorCount}`
+              : `错误 ${errorCount} · 警告 ${warnCount}`}
+            {continuationCount > 0 ? ` · 续行 ${continuationCount}` : ''}
+          </span>
+        )}
         <div className="flex items-center gap-1.5 bg-[#0d1117] rounded-lg px-2.5 h-[30px] border border-[#30363d] focus-within:border-[#58a6ff] transition-colors">
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#8b949e" strokeWidth="1.5"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4 4"/></svg>
           <input ref={searchRef as React.Ref<HTMLInputElement>}

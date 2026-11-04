@@ -1,10 +1,17 @@
 import { create } from 'zustand';
+import type { LogSeverityFilter } from '../utils/logFilter';
 
 interface UiState {
   /** 当前打开的全局弹窗数量（可叠加；>0 表示有全屏遮罩弹窗打开） */
   modalCount: number;
   pushModal: () => void;
   popModal: () => void;
+  /**
+   * 日志面板的级别过滤。放全局而不是组件内：切换服务时 LogViewer 会随
+   * `branchKey` 重挂载，组件内状态会被重置——同一会话内保持用户的选择。
+   */
+  logSeverityFilter: LogSeverityFilter;
+  setLogSeverityFilter: (mode: LogSeverityFilter) => void;
   /**
    * 弹窗栈（后进先出）：每个 Modal 挂载时压入一个自增 id，卸载时移除。
    *
@@ -27,6 +34,8 @@ export const useUiStore = create<UiState>((set) => ({
   modalCount: 0,
   pushModal: () => set((s) => ({ modalCount: s.modalCount + 1 })),
   popModal: () => set((s) => ({ modalCount: Math.max(0, s.modalCount - 1) })),
+  logSeverityFilter: 'all',
+  setLogSeverityFilter: (mode) => set({ logSeverityFilter: mode }),
   modalStack: [],
   pushModalId: (id) => set((s) => ({ modalStack: [...s.modalStack, id] })),
   popModalId: (id) => set((s) => ({ modalStack: s.modalStack.filter(x => x !== id) })),
