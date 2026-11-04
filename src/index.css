@@ -114,3 +114,37 @@ html, body, #root {
 .md-preview a:hover { text-decoration: underline; }
 .md-preview img { max-width: 100%; border-radius: 4px; }
 .md-preview hr { border: none; border-top: 1px solid #464b57; margin: 1.4em 0; }
+
+/* ── PDF 文本层（components/editor/PdfViewer.tsx）─────────────────────────
+   canvas 只有像素；pdf.js 的 TextLayer 在它上面叠一层透明的绝对定位 span，
+   选中 / 复制才是浏览器原生行为。坐标、字号与容器尺寸由 TextLayer 按
+   --scale-factor（viewer 每次渲染时写入）设置，这里的规则只负责
+   “字形透明、选中可见、不撑出页面”。 */
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  text-align: initial;
+  line-height: 1;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+}
+.textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+.textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+.textLayer ::selection {
+  background: rgba(0, 0, 255, 0.25);
+}
+.textLayer br::selection {
+  background: transparent;
+}

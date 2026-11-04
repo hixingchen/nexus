@@ -101,8 +101,19 @@ const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', '
 /** 常见二进制扩展名：直接进 hex 视图，免整文件读入嗅探（jar 有专属浏览器，不在此列） */
 const BINARY_EXTS = new Set([
   'ttf', 'otf', 'woff', 'woff2', 'eot', 'exe', 'dll', 'so', 'dylib', 'zip',
-  'gz', 'tgz', 'tar', '7z', 'rar', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+  'gz', 'tgz', 'tar', '7z', 'rar', 'xls', 'xlsx', 'ppt', 'pptx',
   'mp3', 'mp4', 'wav', 'flac', 'avi', 'mkv', 'mov', 'psd', 'ai', 'bin', 'dat', 'wasm', 'pyc',
+]);
+/**
+ * 文档内嵌预览的扩展名 → 查看器类型。
+ *
+ * 与 BINARY_EXTS 分开：PDF/DOCX 虽然也是二进制，但有专门的只读查看器，
+ * 必须在 hex 分支**之前**分流；`.doc` 是旧版 OLE 格式，只给兜底说明页。
+ */
+const DOCUMENT_VIEWERS = new Map<string, 'pdf' | 'docx' | 'doc-fallback'>([
+  ['pdf', 'pdf'],
+  ['docx', 'docx'],
+  ['doc', 'doc-fallback'],
 ]);
 
 
@@ -511,6 +522,14 @@ export async function loadAndOpenFile(path: string, name: string): Promise<void>
         openLoadedTab(tab, '', mySeq);
         return;
       }
+      const documentViewer = DOCUMENT_VIEWERS.get(ext);
+      if (documentViewer) {
+        // PDF / DOCX 内嵌只读预览；.doc 只给说明页（不引入 Word COM / LibreOffice）
+        tab.readonly = true;
+        tab.viewerType = documentViewer;
+        openLoadedTab(tab, '', mySeq);
+        return;
+      }
       if (BINARY_EXTS.has(ext)) {
         // 已知二进制类型：直接 hex 视图，免整文件读入嗅探
         tab.readonly = true;
@@ -869,7 +888,7 @@ export async function reloadTab(id: string): Promise<boolean> {
   const tab = useEditorStore.getState().tabs.find(t => t.id === id);
   if (!tab) return false;
   if (tab.readonly || tab.viewerType) {
-    // 图片 / hex / jar 的内容由各自查看器管理，而且它们都不可保存——没有"保存冲突"可言
+    // 图片 / hex / jar / PDF / DOCX 的内容由各自查看器管理，而且都不可保存——没有"保存冲突"可言
     notify({ variant: 'info', title: '该标签不支持从磁盘重新加载' });
     return false;
   }
@@ -965,8 +984,10 @@ async function loadContentInto(id: string, knownPath?: string): Promise<void> {
     setFileContent(draft);
     return;
   }
-  // 图片/hex/jar 标签内容由查看器组件自行管理
-  if (tab.viewerType === 'image' || tab.viewerType === 'hex' || tab.viewerType === 'jar') {
+  // 非文本查看器（图片 / hex / jar / PDF / DOCX / .doc 说明页）的内容由各自组件管理。
+  // 判据用「有无 viewerType」而不是逐个枚举：新增查看器时不会因为漏改这里而把二进制
+  // 内容当文本读入（文本标签的 viewerType 是 undefined）。
+  if (tab.viewerType) {
     setFileContent('');
     return;
   }

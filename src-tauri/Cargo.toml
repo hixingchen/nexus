@@ -65,4 +65,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Com",
     "Win32_UI_Shell",
+    # ShellExecuteW 的 nShowCmd 常量（SW_SHOWNORMAL）——不硬编码 1
+    "Win32_UI_WindowsAndMessaging",
 ] }

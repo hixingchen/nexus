@@ -3,12 +3,17 @@ import { createPortal } from 'react-dom';
 import { EditorTabs } from '../editor/EditorTabs';
 // CodeViewer 是首屏最大的一块（CodeMirror 核心 326KB），改为按需加载（PERF-19）：
 // 未打开文件时不该为它付出解析成本（冷启动首屏实测因此少 326KB raw）。
-// 它与下方三个 Viewer 不同：那些各自很小，静态引入无妨。
+// 它与下方那些轻量查看器（图片 / hex / jar / .doc 兜底页）不同：那些各自很小，静态引入无妨。
 const CodeViewer = lazy(() => import('../editor/CodeViewer').then(m => ({ default: m.CodeViewer })));
 const MarkdownPreview = lazy(() => import('../editor/MarkdownPreview').then(m => ({ default: m.MarkdownPreview })));
+// PDF / DOCX 查看器各自含一整套解析库（pdf.js / docx-preview + JSZip），绝不能进首屏：
+// 只有真的打开这两类文件时才去加载对应 chunk。
+const PdfViewer = lazy(() => import('../editor/PdfViewer').then(m => ({ default: m.PdfViewer })));
+const DocxViewer = lazy(() => import('../editor/DocxViewer').then(m => ({ default: m.DocxViewer })));
 import { ImageViewer } from '../editor/ImageViewer';
 import { HexViewer } from '../editor/HexViewer';
 import { JarViewer } from '../editor/JarViewer';
+import { DocFallback } from '../editor/DocFallback';
 import { LogViewer } from '../terminal/LogViewer';
 import { Modal } from '../ui/Modal';
 import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
@@ -393,6 +398,16 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
                     <HexViewer path={activeTab.path} />
                   ) : activeTab.viewerType === 'jar' ? (
                     <JarViewer path={activeTab.path} />
+                  ) : activeTab.viewerType === 'pdf' ? (
+                    <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                      <PdfViewer path={activeTab.path} name={activeTab.name} />
+                    </Suspense>
+                  ) : activeTab.viewerType === 'docx' ? (
+                    <Suspense fallback={<div className="h-full bg-nexus-bg" />}>
+                      <DocxViewer path={activeTab.path} name={activeTab.name} />
+                    </Suspense>
+                  ) : activeTab.viewerType === 'doc-fallback' ? (
+                    <DocFallback path={activeTab.path} name={activeTab.name} />
                   ) : mdPreviewOnThisTab ? (
                     // Markdown 预览：内容取 store 里的当前文本（含未保存的编辑）——
                     // 预览要从正在编辑的内容渲染，而不是磁盘上的旧版本

@@ -111,6 +111,16 @@ export async function openInExplorer(path: string): Promise<void> {
 }
 
 /**
+ * 用系统默认程序打开文件（`.doc` 兜底页用）。
+ *
+ * **不在这里 catch**：调用方要在页面上原地显示「没有关联程序」这类原因，
+ * 提示条一闪而过看不出所以然。路径由后端做白名单 + 句柄级复核，前端传的只是候选。
+ */
+export function openWithDefaultApp(path: string): Promise<void> {
+  return invoke('open_path_with_default_app', { path });
+}
+
+/**
  * Nexus 自己的目录（数据库 + 日志）：设置 > 通用 > 数据与日志 显示与打开用。
  *
  * 字段名与后端 `commands/app.rs::AppPaths` 一一对应（响应侧一律 snake_case，

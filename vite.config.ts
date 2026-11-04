@@ -1,8 +1,21 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { viteStaticCopy } from "vite-plugin-static-copy";
 import path from "path";
 
 const host = process.env.TAURI_DEV_HOST;
+
+/**
+ * pdf.js 的运行时资源目录（CMap / 标准字体）。
+ *
+ * 中文 PDF 缺 CMap 会缺字，非内嵌的标准字体要从 standard_fonts 取。
+ * 这些文件不能打进 JS chunk——pdf.js 按 URL 去 fetch。
+ * 复制到 dist/pdfjs/<目录>/，PdfViewer 里的两个 URL 必须与这里一一对应。
+ *
+ * 用 4.x 而不是最新版：6.x / 5.x 用到 `Map.prototype.getOrInsertComputed`
+ * （Edge/WebView2 142 尚无此方法），打开任何 PDF 都会报 “getOrInsertComputed is not a function”。
+ */
+const PDFJS_ASSET_DIRS = ["cmaps", "standard_fonts"] as const;
 
 /**
  * vendor 分包：把体积大、变更少的依赖拆成独立 chunk。
@@ -38,6 +51,9 @@ const VENDOR_CHUNKS: Array<[chunk: string, packages: string[]]> = [
   // sonner 是启动即用的 toast 运行时，但变更频率低、体积不小；单独成 chunk 让主 chunk
   // 保持在 500KB 警告阈值以下，同时不改任何加载时序（它仍在首屏静态依赖里）。
   ["sonner", ["sonner"]],
+  // pdf.js 主包约 364KB（4.x）：与 PdfViewer 的 React 外壳分开，两者都在 500KB 门禁以下。
+  // 它仍由 PdfViewer 的 dynamic import 触发加载，不会进首屏。
+  ["pdfjs", ["pdfjs-dist"]],
 ];
 
 /**
@@ -57,7 +73,17 @@ function packageNameOf(id: string): string | null {
 }
 
 export default defineConfig(async () => ({
-  plugins: [react()],
+  plugins: [
+    react(),
+    viteStaticCopy({
+      targets: PDFJS_ASSET_DIRS.map(dir => ({
+        src: `node_modules/pdfjs-dist/${dir}/*`,
+        dest: `pdfjs/${dir}`,
+        // 匹配路径带 node_modules/pdfjs-dist/<dir>/ 三段，剥掉后落在 dest 目录下
+        rename: { stripBase: 3 },
+      })),
+    }),
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

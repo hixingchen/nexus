@@ -81,6 +81,29 @@ test('CRLF 归一化后与基线一致 → 不算未保存（Windows 文件撤�
   assert.deepEqual(useEditorStore.getState().dirtyIds, [], `CRLF 与 LF 应视为同一内容：${tab.id}`);
 });
 
+// ── 文档内嵌预览的分流 ──────────────────────────────────────────
+
+test('PDF / DOCX / .doc 在 hex 分支之前分流到各自查看器，且都是只读', async () => {
+  resetStore();
+  await loadAndOpenFile('/p/manual.pdf', 'manual.pdf');
+  await loadAndOpenFile('/p/report.DOCX', 'report.DOCX');
+  await loadAndOpenFile('/p/legacy.doc', 'legacy.doc');
+
+  const tabs = useEditorStore.getState().tabs;
+  const pdf = tabs.find(t => t.path === '/p/manual.pdf');
+  const docx = tabs.find(t => t.path === '/p/report.DOCX');
+  const doc = tabs.find(t => t.path === '/p/legacy.doc');
+
+  assert.equal(pdf?.viewerType, 'pdf', 'PDF 不能落进 hex 分支');
+  assert.equal(docx?.viewerType, 'docx', '扩展名大小写不影响分流');
+  assert.equal(doc?.viewerType, 'doc-fallback', '.doc 只给兜底说明页');
+  for (const tab of [pdf, docx, doc]) {
+    assert.equal(tab?.readonly, true, `${tab?.name} 必须是只读`);
+  }
+  // 内容由查看器自管理：store 里不能是二进制嗅探后的文本/空占位之外的东西
+  assert.equal(useEditorStore.getState().fileContent, '');
+});
+
 // ── 甲-①：无改动时 Ctrl+S 不写盘 ──────────────────────────────
 
 test('没有未保存改动时 Ctrl+S 直接返回，不去写盘（甲-①）', async () => {

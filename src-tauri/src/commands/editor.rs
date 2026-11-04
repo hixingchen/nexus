@@ -155,6 +155,113 @@ pub fn open_in_explorer(state: State<AppState>, path: String) -> Result<(), Stri
     reveal_in_file_manager(&PathBuf::from(&path))
 }
 
+/// 取固定路径前缀（`\\?\`）之外的可变部分。
+///
+/// `GetFinalPathNameByHandleW` 返回的是 verbatim 形式（`\\?\C:\...`），而 ShellExecute
+/// 面向的是普通 Win32 路径：把 verbatim 形式交给它，部分默认程序会找不到文件。
+/// 只剥 **盘符路径** 与 **UNC 路径** 的前缀：`\\?\Volume{...}` 这类卷 GUID 路径剥掉后
+/// 不再合法，原样保留（打不开时由错误提示说清楚，而不是悄悄换成另一个路径）。
+#[cfg(target_os = "windows")]
+fn shell_visible_path(real: &Path) -> String {
+    let s = real.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // 盘符路径形如 `C:\...`：第二个字符必须是冒号，否则是卷 GUID 等形式
+        if rest.as_bytes().get(1) == Some(&b':') {
+            return rest.to_string();
+        }
+    }
+    s.into_owned()
+}
+
+/// `ShellExecuteW` 返回值 ≤32 时的错误说明（微软文档的 SE_ERR_* 表）。
+#[cfg(target_os = "windows")]
+fn shell_execute_error_message(code: isize) -> &'static str {
+    match code {
+        0 => "系统内存不足",
+        2 => "找不到文件",
+        3 => "找不到路径",
+        5 => "访问被拒绝",
+        26 => "文件被其他程序占用",
+        27 => "操作未完成",
+        28 => "等待程序响应超时",
+        29 => "DDE 调用失败",
+        30 => "DDE 忙",
+        31 => "没有与该文件类型关联的程序",
+        32 => "找不到关联的程序 DLL",
+        _ => "系统无法打开该文件",
+    }
+}
+
+/// 用系统默认程序打开文件（`.doc` 兜底页的「用 Word/WPS 打开」）。
+///
+/// 安全口径与 `read_file` 相同：先用 `open_verified_file` 做**句柄级**白名单复核，
+/// 并在 `ShellExecuteW` 返回前一直持有该句柄——校验与拉起之间没有"路径可以被换掉"的窗口。
+/// **不走 `cmd /c start`**：路径里的 `& | ^` 会被 cmd 当元字符解释，形成注入面。
+#[tauri::command]
+pub fn open_path_with_default_app(state: State<AppState>, path: String) -> Result<(), String> {
+    let (guard, real) = state.paths.open_verified_file(&state.db, &path)?;
+    #[cfg(target_os = "windows")]
+    let target = shell_visible_path(&real);
+    #[cfg(not(target_os = "windows"))]
+    let target = real.to_string_lossy().to_string();
+
+    log::info!("[nexus] 用系统默认程序打开: {}", target);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let file: Vec<u16> = std::ffi::OsStr::new(&target)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        // 返回值是指针：≤32 表示失败（HINSTANCE 被复用成错误码）
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        drop(guard); // 拉起后再释放：保持句柄到 ShellExecuteW 返回
+        let code = result as isize;
+        if code <= 32 {
+            return Err(format!(
+                "无法用系统默认程序打开「{}」：{}（ShellExecuteW 错误 {}）",
+                target,
+                shell_execute_error_message(code),
+                code
+            ));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("无法用系统默认程序打开: {}", e))?;
+        drop(guard);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("无法用系统默认程序打开: {}", e))?;
+        drop(guard);
+    }
+    Ok(())
+}
+
 /// 文件信息
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct FileEntry {
@@ -499,6 +606,79 @@ pub async fn read_image_data(state: State<'_, AppState>, path: String) -> Result
     Ok(STANDARD.encode(&bytes))
 }
 
+/// 文档内嵌预览的大小上限（PDF / DOCX）。
+///
+/// base64 会再膨胀 1/3，50MB 文件编码后约 67MB，再经 Tauri IPC 序列化与 JS 字符串复制，
+/// 峰值已是原文件的数倍；再大就该改用流式协议，而不是继续加压。
+const MAX_DOCUMENT_SIZE: u64 = 50 * 1024 * 1024;
+/// DOCX 的 ZIP 条目数与解压后总字节上限（防压缩炸弹）。
+/// 浏览器端 docx-preview 会把条目解压进内存，后端先看中央目录的声明值——
+/// 拦不住"声明很小、实际很大"的恶意包，但能挡住绝大多数畸形/超大文档。
+const MAX_DOCX_ENTRIES: usize = 20_000;
+const MAX_DOCX_UNCOMPRESSED: u64 = 256 * 1024 * 1024;
+
+/// 校验 DOCX 的 ZIP 结构（条目数、声明解压体积、加密标记、必要条目）。
+fn validate_docx_zip(bytes: &[u8]) -> Result<(), String> {
+    use std::io::Cursor;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("不是有效的 DOCX 文件（无法解析 ZIP 结构：{}）", e))?;
+    if archive.len() > MAX_DOCX_ENTRIES {
+        return Err(format!(
+            "DOCX 内条目过多（{} 个），超过 {} 个预览上限",
+            archive.len(),
+            MAX_DOCX_ENTRIES
+        ));
+    }
+    let mut total: u64 = 0;
+    let mut has_document = false;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(i)
+            .map_err(|e| format!("DOCX 条目读取失败: {}", e))?;
+        if entry.encrypted() {
+            return Err("DOCX 已加密，无法内嵌预览；请用 Word/WPS 打开".into());
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_DOCX_UNCOMPRESSED {
+            return Err(format!(
+                "DOCX 解压后体积超过 {} MB，已拒绝内嵌预览",
+                MAX_DOCX_UNCOMPRESSED / (1024 * 1024)
+            ));
+        }
+        if entry.name().map(|n| n == "word/document.xml").unwrap_or(false) {
+            has_document = true;
+        }
+    }
+    if !has_document {
+        return Err("不是有效的 DOCX 文件（缺少 word/document.xml）".into());
+    }
+    Ok(())
+}
+
+/// 读取 PDF / DOCX 字节为 base64（前端交给 pdf.js / docx-preview 渲染）。
+///
+/// 与图片预览同一条受限读取链路：白名单 + 句柄级真实路径复核 + 读入后按实际长度复核。
+/// 编码与 ZIP 校验都是 CPU 工作（50MB 的 base64 约 67MB），放 `spawn_blocking`，
+/// 不占 tokio worker。
+#[tauri::command]
+pub async fn read_file_base64(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let bytes = read_file_limited(&state, &path, MAX_DOCUMENT_SIZE, "文档").await?;
+    let is_docx = Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("docx"))
+        .unwrap_or(false);
+    tokio::task::spawn_blocking(move || {
+        if is_docx {
+            validate_docx_zip(&bytes)?;
+        }
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        Ok::<_, String>(STANDARD.encode(&bytes))
+    })
+    .await
+    .map_err(|e| format!("读取文档任务失败: {}", e))?
+}
+
 /// hex 视图分页读取响应：一页 rows 行 × 16 字节
 /// 字段名保持 snake_case：响应 DTO 与 Rust 字段同名（命名规则见 `crate::contract`），
 /// 前端 `HexPage` 类型按同名读取；只有请求参数结构体才用 camelCase
@@ -784,5 +964,64 @@ mod tests {
         );
         // 无法表达的路径 → None，调用方降级为打开所在目录
         assert!(explorer_select_arg("C:\\a\"b\\c.md").is_none());
+    }
+
+    /// `GetFinalPathNameByHandleW` 的结果带 `\\?\` 前缀，而 ShellExecute 要普通 Win32 路径。
+    /// 只剥盘符与 UNC 两种；卷 GUID 路径剥掉就不合法了，必须原样保留。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_shell_visible_path_strips_only_verbatim_file_paths() {
+        assert_eq!(shell_visible_path(Path::new(r"\\?\C:\work\a.doc")), r"C:\work\a.doc");
+        assert_eq!(
+            shell_visible_path(Path::new(r"\\?\UNC\server\share\a.doc")),
+            r"\\server\share\a.doc"
+        );
+        assert_eq!(shell_visible_path(Path::new(r"C:\work\a.doc")), r"C:\work\a.doc");
+        // 卷 GUID 形式：`\\?\Volume{...}\a.doc` 剥掉前缀后 `Volume{...}` 不是合法路径
+        let volume = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\a.doc";
+        assert_eq!(shell_visible_path(Path::new(volume)), volume);
+    }
+
+    /// DOCX 预检：非 ZIP / 缺 `word/document.xml` 必须给出明确错误，而不是交给前端空转。
+    #[test]
+    fn test_validate_docx_zip_rejects_non_zip() {
+        let err = validate_docx_zip(b"not a zip").expect_err("非 ZIP 应被拒绝");
+        assert!(err.contains("不是有效的 DOCX"), "错误应说清原因，实际: {}", err);
+    }
+
+    #[test]
+    fn test_validate_docx_zip_requires_document_xml() {
+        use std::io::{Cursor, Write};
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut out);
+            writer
+                .start_file("[Content_Types].xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"<Types/>").unwrap();
+            writer.finish().unwrap();
+        }
+        let err = validate_docx_zip(out.get_ref()).expect_err("缺少 word/document.xml 应被拒绝");
+        assert!(err.contains("word/document.xml"), "错误应指出缺哪一项，实际: {}", err);
+    }
+
+    #[test]
+    fn test_validate_docx_zip_accepts_minimal_package() {
+        use std::io::{Cursor, Write};
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut out);
+            for (name, body) in [
+                ("[Content_Types].xml", &b"<Types/>"[..]),
+                ("word/document.xml", &b"<document/>"[..]),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        validate_docx_zip(out.get_ref()).expect("最小 DOCX 包应通过预检");
     }
 }

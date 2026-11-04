@@ -38,6 +38,16 @@ export async function readImageData(path: string): Promise<string> {
   return await invoke('read_image_data', { path });
 }
 
+/**
+ * 读取 PDF / DOCX 为 base64（交给 pdf.js / docx-preview 渲染）。
+ *
+ * 后端与图片同一条受限读取链路（白名单 + 句柄级复核 + 大小上限），
+ * 文档上限 50MB；DOCX 还会先校验 ZIP 结构（加密 / 条目数 / 解压体积）。
+ */
+export async function readFileBase64(path: string): Promise<string> {
+  return await invoke('read_file_base64', { path });
+}
+
 /** hex 视图分页响应：一页 rows 行 × 16 字节 */
 export interface HexPage {
   offset: number;

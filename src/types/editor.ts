@@ -1,5 +1,8 @@
-/** 标签的查看器类型：text（编辑器）/ image（图片预览）/ hex（十六进制）/ jar（jar 包浏览） */
-type FileViewerType = 'text' | 'image' | 'hex' | 'jar';
+/**
+ * 标签的查看器类型：text（编辑器）/ image（图片预览）/ hex（十六进制）/ jar（jar 包浏览）
+ * / pdf（PDF 只读预览）/ docx（DOCX 只读预览）/ doc-fallback（旧版 .doc 说明页）
+ */
+type FileViewerType = 'text' | 'image' | 'hex' | 'jar' | 'pdf' | 'docx' | 'doc-fallback';
 
 /** 打开的文件标签 */
 export interface FileTab {
