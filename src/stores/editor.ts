@@ -4,6 +4,7 @@ import { reportError } from '../utils/error';
 import { getExtension } from '../utils/path';
 import { isMarkdownFile } from '../utils/markdown';
 import { toMessage } from '../utils/message';
+import { remapPath } from '../utils/editorTabs';
 import type { FileTab } from '../types/editor';
 import * as editorService from '../services/editor';
 
@@ -76,6 +77,11 @@ interface EditorStore {
   markRevealConsumed: () => void;
   /** 清除定位标记（用户主动切换文件/选中树节点时调用，避免定位高亮残留） */
   clearReveal: () => void;
+  /**
+   * 文件/目录重命名后，把指向旧路径的标签、内容缓存与定位请求迁到新路径。
+   * 不迁移的话，已打开的标签点回去就是"文件不存在"。
+   */
+  remapPaths: (oldPath: string, newPath: string, isDir: boolean) => void;
 }
 
 /**
@@ -146,6 +152,40 @@ interface FileMeta {
   modified: number | null;
 }
 const fileMetaCache = new Map<string, FileMeta>();
+
+/** 重命名后迁移 Map 的键（值不动）。新键已存在时保留已有值，避免覆盖 */
+function remapCacheKeys<T>(map: Map<string, T>, oldPath: string, newPath: string, isDir: boolean): void {
+  const moves: Array<[string, string, T]> = [];
+  for (const [key, value] of map) {
+    const next = remapPath(key, oldPath, newPath, isDir);
+    if (next && next !== key) moves.push([key, next, value]);
+  }
+  for (const [oldKey, newKey, value] of moves) {
+    map.delete(oldKey);
+    if (!map.has(newKey)) map.set(newKey, value);
+  }
+}
+
+/** Record 键迁移；没有变化返回 null（避免无谓的 store 更新） */
+function remapRecordKeys(
+  record: Record<string, number>,
+  oldPath: string,
+  newPath: string,
+  isDir: boolean,
+): Record<string, number> | null {
+  let changed = false;
+  const next: Record<string, number> = {};
+  for (const [key, value] of Object.entries(record)) {
+    const mapped = remapPath(key, oldPath, newPath, isDir);
+    if (mapped && mapped !== key) {
+      changed = true;
+      next[mapped] = value;
+    } else {
+      next[key] = value;
+    }
+  }
+  return changed ? next : null;
+}
 
 /** 读取文本内容：jar 内条目走 jar 读取，.class 走 CFR/字节码视图，其余走 read_file（二进制抛 BINARY） */
 async function fetchTextContent(path: string): Promise<{ content: string; size: number }> {
@@ -425,6 +465,35 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   clearReveal: () => {
     set({ revealPath: null });
+  },
+
+  remapPaths: (oldPath, newPath, isDir) => {
+    // 模块级缓存不在 store 里：先迁移，再一次性更新订阅状态
+    remapCacheKeys(fileCache, oldPath, newPath, isDir);
+    remapCacheKeys(fileMetaCache, oldPath, newPath, isDir);
+    set((s) => {
+      let tabsChanged = false;
+      const tabs = s.tabs.map((tab) => {
+        const next = remapPath(tab.path, oldPath, newPath, isDir);
+        if (!next || next === tab.path) return tab;
+        tabsChanged = true;
+        // jar 虚拟路径只改最外层 jar 的磁盘路径，条目名不变
+        const name = next.startsWith('jar://')
+          ? tab.name
+          : next.split(/[/\\]/).pop() ?? tab.name;
+        return { ...tab, path: next, name };
+      });
+      const fileOpenSeq = remapRecordKeys(s.fileOpenSeq, oldPath, newPath, isDir);
+      const locatePath = s.locate ? remapPath(s.locate.path, oldPath, newPath, isDir) : null;
+      const reveal = s.revealPath ? remapPath(s.revealPath, oldPath, newPath, isDir) : null;
+      if (!tabsChanged && !fileOpenSeq && !locatePath && !reveal) return s;
+      return {
+        ...(tabsChanged ? { tabs } : {}),
+        ...(fileOpenSeq ? { fileOpenSeq } : {}),
+        ...(locatePath ? { locate: { ...s.locate!, path: locatePath } } : {}),
+        ...(reveal ? { revealPath: reveal } : {}),
+      };
+    });
   },
 }));
 

@@ -215,6 +215,25 @@ export function deletePath(path: string) {
   return invoke<void>('delete_path', { path });
 }
 
+/**
+ * 在 parentDir 下新建空文件 / 文件夹，返回新路径。
+ *
+ * 名称校验与同名冲突都由后端判定（`create_new`/`create_dir`），错误原文可直接展示在
+ * 弹窗里；返回路径与文件树的路径格式一致（原始父路径 + `/` + 名字）。
+ */
+export function createFile(parentDir: string, name: string) {
+  return invoke<string>('create_file', { parentDir, name });
+}
+
+export function createDir(parentDir: string, name: string) {
+  return invoke<string>('create_dir', { parentDir, name });
+}
+
+/** 重命名文件/目录；同名冲突由后端拒绝（不覆盖），返回新路径。 */
+export function renamePath(path: string, newName: string) {
+  return invoke<string>('rename_path', { path, newName });
+}
+
 /** 回传失败只警告一次：它必然是"整条通道不通"，每次上报都再喊一遍只会把控制台刷满 */
 let warnedLogFailure = false;
 

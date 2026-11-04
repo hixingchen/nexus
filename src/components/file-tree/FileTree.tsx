@@ -5,7 +5,10 @@ import { useSearchModalStore } from '../../stores/searchModal';
 import { useFileTreeStore } from '../../stores/fileTreeStore';
 import { pasteInto } from '../../stores/pasteActions';
 import { listJar, type JarEntryInfo } from '../../services/editor';
-import { listDirectory, copyFilesToClipboard, openInExplorer, deletePath } from '../../services/system';
+import {
+  listDirectory, copyFilesToClipboard, openInExplorer, deletePath,
+  createFile, createDir, renamePath,
+} from '../../services/system';
 import { reportError } from '../../utils/error';
 import { FolderClosed, FolderOpen, getIconSvg } from './FileIcons';
 import { Chevron } from '../ui/Chevron';
@@ -14,7 +17,8 @@ import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 import { Modal } from '../ui/Modal';
 import { getDirColorClass } from '../../utils/fileColors';
 import { getExtension, parentDir } from '../../utils/path';
-import { tabsUnderPath } from '../../utils/editorTabs';
+import { remapPath, tabsUnderPath } from '../../utils/editorTabs';
+import { NameEntryModal } from './NameEntryModal';
 import { copyText } from '../../utils/clipboard';
 import { pickRevealTarget, REVEAL_PRIORITY, type RevealTarget } from '../../utils/fileTree';
 import type { FileEntry } from '../../types/file';
@@ -67,6 +71,31 @@ const PASTE_ICON = (
 const TRASH_ICON = (
   <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
     <path d="M2.5 3h5M3.5 3V2a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1M4 4.5v3M6 4.5v3M3 3l.5 6a1 1 0 001 .5h3a1 1 0 001-.5L9 3" />
+  </svg>
+);
+
+/** 新建文件：页面 + 加号 */
+const NEW_FILE_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M2.5 1.2h3.8l1.7 1.7v3.4M2.5 1.2a.5.5 0 00-.5.5v6.6a.5.5 0 00.5.5h2.2"/>
+    <path d="M7.5 6v3M6 7.5h3"/>
+  </svg>
+);
+
+/** 新建文件夹：文件夹 + 加号 */
+const NEW_FOLDER_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M1.3 3h2.2l.9-1.2h4.3a.5.5 0 01.5.5v2"/>
+    <path d="M1.3 3v5a.5.5 0 00.5.5h3.2"/>
+    <path d="M7.5 6v3M6 7.5h3"/>
+  </svg>
+);
+
+/** 重命名：铅笔 */
+const RENAME_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M6.6 1.7l1.7 1.7-4.8 4.8-2.2.5.5-2.2z"/>
+    <path d="M5.8 2.5l1.7 1.7"/>
   </svg>
 );
 /** 目录展开时初始渲染条数，超出后显示"加载更多" */
@@ -174,9 +203,21 @@ interface EntryProps {
    * 刷不了自己。根节点的子级由 `FileTree` 传 `loadRoot`，其余由父 `Entry` 传它的 `reloadDir`。
    */
   reloadParent: () => void;
+  /** 新建/重命名入口（弹窗状态统一由 FileTree 管理；回调引用稳定，不影响 Entry 的 memo） */
+  onCreateFile: (parentDir: string, reload: () => void) => void;
+  onCreateDir: (parentDir: string, reload: () => void) => void;
+  onRename: (path: string, currentName: string, isDir: boolean, reload: () => void) => void;
 }
 
-const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect, childIndentPx, level, reloadParent }: EntryProps) {
+/** 新建/重命名弹窗的待办请求（Entry 与树根共用，弹窗只渲染一次） */
+type NameDialogState =
+  | { mode: 'create-file' | 'create-dir'; parentDir: string; reload: () => void }
+  | { mode: 'rename'; path: string; currentName: string; isDir: boolean; reload: () => void };
+
+const Entry = memo(function Entry({
+  e, indentPx, revealPath, revealSeq, onSelect, childIndentPx, level, reloadParent,
+  onCreateFile, onCreateDir, onRename,
+}: EntryProps) {
   const [open, setOpen] = useState(false);
   const [kids, setKids] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -531,6 +572,30 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             </div>
           )}
 
+          {/* 新建：只有目录行有落点（文件行没有"里面"） */}
+          {!isJarPath && e.is_dir && (
+            <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+              <ContextMenuItem
+                iconBox
+                icon={NEW_FILE_ICON}
+                label="新建文件"
+                onClick={() => {
+                  setContextMenu(null);
+                  onCreateFile(e.path, reloadDir);
+                }}
+              />
+              <ContextMenuItem
+                iconBox
+                icon={NEW_FOLDER_ICON}
+                label="新建文件夹"
+                onClick={() => {
+                  setContextMenu(null);
+                  onCreateDir(e.path, reloadDir);
+                }}
+              />
+            </div>
+          )}
+
           {/* 复制 / 粘贴（磁盘节点；jar 虚拟节点不支持） */}
           {!isJarPath && (
             <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
@@ -598,6 +663,21 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             />
           </div>
 
+          {/* 重命名：磁盘节点；jar 虚拟节点不参与 */}
+          {!isJarPath && (
+            <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
+              <ContextMenuItem
+                iconBox
+                icon={RENAME_ICON}
+                label="重命名"
+                onClick={() => {
+                  setContextMenu(null);
+                  onRename(e.path, e.name, e.is_dir, reloadParent);
+                }}
+              />
+            </div>
+          )}
+
           {/* 删除：单独一组放最后（破坏性动作不与复制类混排，与项目/服务菜单的排法一致）。
               jar 虚拟节点不参与——它们在磁盘上没有对应对象 */}
           {!isJarPath && (
@@ -650,7 +730,7 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
             <div className="text-[11px] text-nexus-muted py-0.5 relative z-10" style={{ paddingLeft: `${childIndentPx + 20}px` }}>…</div>
           )}
           {!loading && (showAll ? kids : kids.slice(0, INITIAL_RENDER_LIMIT)).map(k => (
-            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} level={level + 1} reloadParent={reloadDir} />
+            <Entry key={k.path} e={k} indentPx={childIndentPx} revealPath={revealPath} revealSeq={revealSeq} onSelect={onSelect} childIndentPx={childIndentPx + INDENT_STEP} level={level + 1} reloadParent={reloadDir} onCreateFile={onCreateFile} onCreateDir={onCreateDir} onRename={onRename} />
           ))}
           {!loading && !showAll && kids.length > INITIAL_RENDER_LIMIT && (
             <div
@@ -668,7 +748,7 @@ const Entry = memo(function Entry({ e, indentPx, revealPath, revealSeq, onSelect
 });
 
 /* ---- root ---- */
-export function FileTree({ rootPath, embedded, kind = 'service' }: {
+export function FileTree({ rootPath, embedded, kind = 'service', refreshSeq }: {
   rootPath?: string;
   embedded?: boolean;
   /**
@@ -677,6 +757,11 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
    * 该由服务树响应（它才是"主角"）。
    */
   kind?: 'project' | 'service';
+  /**
+   * 父级（标题行右键）新建文件/文件夹后递增，触发根目录重新加载。
+   * 树根没有可供 `reloadParent` 刷新的父行，只能由外部给一个刷新信号。
+   */
+  refreshSeq?: number;
 }) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   /** 根节点同样先渲染前 200 项：后端允许单目录 2 万条，一次性挂载会让树卡死 */
@@ -741,11 +826,68 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
     }
   }, [rootPath]);
 
+  // ── 新建 / 重命名 ────────────────────────────────────────
+  // 弹窗状态放在树根、只渲染一份：Entry 的行数很多，每行各挂一个 Modal 既浪费也让状态分散。
+  // 三个入口回调的引用必须稳定（Entry 是 memo 的）。
+  const [nameDialog, setNameDialog] = useState<NameDialogState | null>(null);
+
+  const onCreateFile = useCallback((parentDir: string, reload: () => void) => {
+    setNameDialog({ mode: 'create-file', parentDir, reload });
+  }, []);
+
+  const onCreateDir = useCallback((parentDir: string, reload: () => void) => {
+    setNameDialog({ mode: 'create-dir', parentDir, reload });
+  }, []);
+
+  const onRename = useCallback((path: string, currentName: string, isDir: boolean, reload: () => void) => {
+    setNameDialog({ mode: 'rename', path, currentName, isDir, reload });
+  }, []);
+
+  const handleNameSubmit = useCallback(async (name: string) => {
+    const req = nameDialog;
+    if (!req) return;
+    if (req.mode === 'rename') {
+      const newPath = await renamePath(req.path, name);
+      // 标签/缓存/定位请求跟着换路径；否则已打开的文件点回去就是"不存在"
+      useEditorStore.getState().remapPaths(req.path, newPath, req.isDir);
+      const selected = useFileTreeStore.getState().selectedPath;
+      const remappedSelected = selected
+        ? remapPath(selected, req.path, newPath, req.isDir)
+        : null;
+      if (remappedSelected) setSelectedPath(remappedSelected);
+      setNameDialog(null);
+      req.reload();
+      showNotification({ variant: 'success', title: `已重命名为「${name}」` });
+      return;
+    }
+
+    const created = req.mode === 'create-file'
+      ? await createFile(req.parentDir, name)
+      : await createDir(req.parentDir, name);
+    setNameDialog(null);
+    req.reload();
+    if (req.mode === 'create-file') {
+      // 空文件直接打开；打开失败只提示，文件本身已经建成
+      void loadAndOpenFile(created, name).catch(err => reportError('打开新建文件失败', err));
+    } else {
+      setSelectedPath(created);
+    }
+  }, [nameDialog, setSelectedPath]);
+
   useEffect(() => {
     setShowAllRoot(false);
     if (!rootPath) { setEntries([]); setErr(null); return; }
     loadRoot();
   }, [loadRoot, rootPath]);
+
+  // 标题行新建后刷新根目录：只认"序号变化"，挂载时的初值与 ref 相同，不会重复加载
+  const refreshSeqRef = useRef(refreshSeq ?? 0);
+  useEffect(() => {
+    if (refreshSeq === undefined) return;
+    if (refreshSeq === refreshSeqRef.current) return;
+    refreshSeqRef.current = refreshSeq;
+    void loadRoot();
+  }, [refreshSeq, loadRoot]);
 
   /** 空白区域右键菜单（仅根目录存在时）：粘贴系统剪贴板文件到项目根 */
   const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
@@ -797,7 +939,7 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">空目录</div>
         )}
         {!err && (showAllRoot ? entries : entries.slice(0, INITIAL_RENDER_LIMIT)).map(ent => (
-          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} level={1} reloadParent={loadRoot} />
+          <Entry key={ent.path} e={ent} indentPx={basePadding} revealPath={revealForMe} revealSeq={revealSeq} onSelect={handleSelect} childIndentPx={basePadding + INDENT_STEP} level={1} reloadParent={loadRoot} onCreateFile={onCreateFile} onCreateDir={onCreateDir} onRename={onRename} />
         ))}
         {!err && !showAllRoot && entries.length > INITIAL_RENDER_LIMIT && (
           <div
@@ -819,6 +961,26 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           >
             {/* 搜索整个树根：节点右键只能搜"那一个目录/文件"，这里补上"从根搜"——
                 项目树的根节点没有对应的行（embedded 不渲染根），空白区是另一个自然入口 */}
+            <div className="pb-1.5 mb-1 border-b border-nexus-border/30">
+              <ContextMenuItem
+                iconBox
+                icon={NEW_FILE_ICON}
+                label="新建文件"
+                onClick={() => {
+                  setRootMenu(null);
+                  onCreateFile(rootPath, loadRoot);
+                }}
+              />
+              <ContextMenuItem
+                iconBox
+                icon={NEW_FOLDER_ICON}
+                label="新建文件夹"
+                onClick={() => {
+                  setRootMenu(null);
+                  onCreateDir(rootPath, loadRoot);
+                }}
+              />
+            </div>
             <ContextMenuItem
               iconBox
               icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -847,6 +1009,20 @@ export function FileTree({ rootPath, embedded, kind = 'service' }: {
           </ContextMenu>
         )}
       </div>
+
+      <NameEntryModal
+        open={!!nameDialog}
+        title={nameDialog?.mode === 'rename'
+          ? '重命名'
+          : nameDialog?.mode === 'create-dir' ? '新建文件夹' : '新建文件'}
+        submitLabel={nameDialog?.mode === 'rename' ? '重命名' : '创建'}
+        initialValue={nameDialog?.mode === 'rename'
+          ? nameDialog.currentName
+          : nameDialog?.mode === 'create-dir' ? '新建文件夹' : '新建文件'}
+        selectStem={!!nameDialog && nameDialog.mode === 'rename' && !nameDialog.isDir}
+        onClose={() => setNameDialog(null)}
+        onSubmit={handleNameSubmit}
+      />
     </div>
   );
 }

@@ -650,6 +650,188 @@ pub async fn delete_path(state: State<'_, AppState>, path: String) -> Result<(),
     .map_err(|e| format!("删除任务执行失败: {}", e))?
 }
 
+// ─── 新建 / 重命名 ──────────────────────────────────────────
+
+/// 校验用户输入的单段名称。
+///
+/// 这里只做**名字**层面的规则（Windows 非法字符、保留设备名、结尾点/空格），
+/// 路径范围由 `open_verified_dir` 的句柄级复核负责——两层各管一件事，不互相替代。
+fn validate_entry_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("名称不能为空".into());
+    }
+    if name == "." || name == ".." {
+        return Err("名称不能是 . 或 ..".into());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("名称不能包含路径分隔符".into());
+    }
+    if name.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')) {
+        return Err("名称不能包含 Windows 非法字符 < > : \" | ? * 或控制字符".into());
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("名称不能以点或空格结尾".into());
+    }
+    // 保留设备名大小写不敏感，带扩展名也算（CON.txt 与 CON 一样不可用）
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(format!("「{}」是 Windows 保留名称，不能使用", name));
+    }
+    Ok(())
+}
+
+/// 用**用户给的原始父路径**拼新路径（而不是句柄复核得到的 verbatim 路径）。
+///
+/// 与 `list_directory` 的 `display_prefix` 同一口径：文件树里的路径是
+/// `原始前缀 + "/" + 名字`，返回相同形状才能让新标签/选中态与树里的节点对上。
+fn display_child_path(parent: &str, name: &str) -> String {
+    format!("{}/{}", parent.trim_end_matches(['/', '\\']), name)
+}
+
+/// 新建文件或目录。父目录先做句柄级白名单复核，持有句柄直到操作完成。
+fn create_entry(
+    paths: &PathAllowlist,
+    db: &Database,
+    parent_dir: &str,
+    name: &str,
+    is_dir: bool,
+) -> Result<String, String> {
+    validate_entry_name(name)?;
+    let (guard, real_parent) = paths.open_verified_dir(db, parent_dir)?;
+    let target = real_parent.join(name);
+    let result = if is_dir {
+        std::fs::create_dir(&target)
+    } else {
+        // create_new：校验与创建之间没有"先查不存在、再被别的东西占住"的竞态
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map(|_| ())
+    };
+    drop(guard);
+    match result {
+        Ok(()) => Ok(display_child_path(parent_dir, name)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 不区分文件/文件夹：同名对象可能是另一种类型，按实际类型写文案反而会误报
+            Err(format!("已存在同名项「{}」，请换一个名称", name))
+        }
+        Err(e) => Err(format!(
+            "新建{}失败: {}",
+            if is_dir { "文件夹" } else { "文件" },
+            e
+        )),
+    }
+}
+
+/// 仅改大小写时的临时名：同目录下、以 `.nexus-rename-` 开头，避开用户命名空间。
+fn temp_rename_path(parent: &Path, new_name: &str) -> PathBuf {
+    for i in 0..1000u32 {
+        let candidate = parent.join(format!(".nexus-rename-{}-{}-{}", std::process::id(), i, new_name));
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    parent.join(format!(".nexus-rename-{}-{}", std::process::id(), new_name))
+}
+
+/// 重命名文件/目录（同一目录内）。目标已存在时返回冲突错误，绝不覆盖。
+fn rename_entry(
+    paths: &PathAllowlist,
+    db: &Database,
+    path: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    validate_entry_name(new_name)?;
+    let p = Path::new(path);
+    let old_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "访问被拒绝".to_string())?;
+    if old_name == new_name {
+        return Ok(path.to_string());
+    }
+    let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Err("访问被拒绝".into());
+    };
+    // 父目录句柄复核：与删除同一口径，拿到的是内核视角的真实父目录
+    let (guard, real_parent) = paths.open_verified_dir(db, &parent.to_string_lossy())?;
+    let src = real_parent.join(&old_name);
+    let dst = real_parent.join(new_name);
+
+    std::fs::symlink_metadata(&src)
+        .map_err(|e| format!("无法访问（可能已被外部删除）: {}（{}）", path, e))?;
+
+    let target_exists = std::fs::symlink_metadata(&dst).is_ok();
+    let result = if target_exists {
+        // 大小写不敏感的文件系统上，"改大小写"会让 dst 指向同一个对象。
+        // 其它情况一律视为同名冲突——不覆盖。
+        let same = std::fs::canonicalize(&src)
+            .ok()
+            .zip(std::fs::canonicalize(&dst).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        if !same {
+            drop(guard);
+            return Err(format!("已存在同名项「{}」，请换一个名称", new_name));
+        }
+        let tmp = temp_rename_path(&real_parent, new_name);
+        match std::fs::rename(&src, &tmp) {
+            Ok(()) => match std::fs::rename(&tmp, &dst) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::rename(&tmp, &src); // 尽量回滚，失败时原文错误更重要
+                    Err(e)
+                }
+            },
+            Err(e) => Err(e),
+        }
+    } else {
+        std::fs::rename(&src, &dst)
+    };
+    drop(guard);
+    result.map_err(|e| format!("重命名失败: {}", e))?;
+
+    let display_parent = parent.to_string_lossy();
+    Ok(display_child_path(&display_parent, new_name))
+}
+
+/// 新建空文件（文件树右键「新建文件」）。
+#[tauri::command]
+pub fn create_file(
+    state: State<AppState>,
+    parent_dir: String,
+    name: String,
+) -> Result<String, String> {
+    create_entry(&state.paths, &state.db, &parent_dir, &name, false)
+}
+
+/// 新建文件夹（文件树右键「新建文件夹」）。
+#[tauri::command]
+pub fn create_dir(
+    state: State<AppState>,
+    parent_dir: String,
+    name: String,
+) -> Result<String, String> {
+    create_entry(&state.paths, &state.db, &parent_dir, &name, true)
+}
+
+/// 重命名文件/目录（文件树右键「重命名」）。
+#[tauri::command]
+pub fn rename_path(
+    state: State<AppState>,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
+    rename_entry(&state.paths, &state.db, &path, &new_name)
+}
+
 // ─── Tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1415,5 +1597,100 @@ mod tests {
             assert!(target.join("keep.txt").exists(), "联接的目标不得被连带删除");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── 新建 / 重命名 ──────────────────────────────────────
+
+    #[test]
+    fn test_validate_entry_name_rules() {
+        assert!(validate_entry_name("a.txt").is_ok());
+        assert!(validate_entry_name("新建 文件.md").is_ok());
+        for bad in [
+            "", "   ", ".", "..", "a/b", "a\\b", "a:b", "a*b", "a?", "a\"b", "a<b", "a>b", "a|b",
+            "a.", "a ", "CON", "con.txt", "COM1.log", "LPT9",
+        ] {
+            assert!(validate_entry_name(bad).is_err(), "应拒绝: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_create_file_and_dir_reject_duplicates() {
+        let (db, paths, root) = scoped_allowlist("create_dup");
+        let parent = root.to_string_lossy().to_string();
+
+        let file = create_entry(&paths, &db, &parent, "a.txt", false).expect("新建文件");
+        assert!(Path::new(&file).is_file());
+        assert!(file.ends_with("/a.txt"), "返回路径应沿用原始前缀 + /：{file}");
+
+        let err = create_entry(&paths, &db, &parent, "a.txt", false).unwrap_err();
+        assert!(err.contains("已存在同名项"), "{err}");
+
+        let dir = create_entry(&paths, &db, &parent, "sub", true).expect("新建文件夹");
+        assert!(Path::new(&dir).is_dir());
+        let err = create_entry(&paths, &db, &parent, "sub", true).unwrap_err();
+        assert!(err.contains("已存在同名项"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_create_entry_rejects_invalid_name_and_outside_parent() {
+        let (db, paths, root) = scoped_allowlist("create_bad");
+        let parent = root.to_string_lossy().to_string();
+        assert!(create_entry(&paths, &db, &parent, "a/b", false).is_err());
+        assert!(create_entry(&paths, &db, &parent, "CON", true).is_err());
+
+        let outside = tmp_dir("create_outside");
+        let err = create_entry(&paths, &db, &outside.to_string_lossy(), "x.txt", false).unwrap_err();
+        assert!(err.contains("访问被拒绝"), "{err}");
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_rename_file_and_conflict_blocks_overwrite() {
+        let (db, paths, root) = scoped_allowlist("rename_ok");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "A").unwrap();
+        std::fs::write(&b, "B").unwrap();
+
+        let renamed = rename_entry(&paths, &db, &a.to_string_lossy(), "c.txt").expect("重命名");
+        assert!(Path::new(&renamed).is_file());
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "A");
+        assert!(!a.exists(), "旧文件应已消失");
+
+        let err = rename_entry(&paths, &db, &renamed, "b.txt").unwrap_err();
+        assert!(err.contains("已存在同名项"), "{err}");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "B", "冲突时不得覆盖目标");
+        assert!(Path::new(&renamed).exists(), "冲突时源文件应保持原样");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_rename_directory_and_case_only() {
+        let (db, paths, root) = scoped_allowlist("rename_dir_case");
+        let dir = root.join("CaseDir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inner.txt"), "x").unwrap();
+
+        let renamed = rename_entry(&paths, &db, &dir.to_string_lossy(), "Renamed").expect("重命名目录");
+        assert!(Path::new(&renamed).join("inner.txt").is_file());
+
+        // 仅改大小写：Windows 上目标"已存在"但指向同一对象，应走两步重命名
+        let case_renamed = rename_entry(&paths, &db, &renamed, "renamed").expect("仅改大小写");
+        assert!(Path::new(&case_renamed).join("inner.txt").is_file());
+        #[cfg(windows)]
+        {
+            let on_disk = std::fs::read_dir(&root).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            assert!(on_disk.iter().any(|n| n == "renamed"), "磁盘上的名字应已更新: {on_disk:?}");
+            assert!(!on_disk.iter().any(|n| n == "CaseDir" || n == "Renamed"), "旧名字不应残留: {on_disk:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -55,3 +55,45 @@ export function tabsUnderPath<T extends PathHolder>(tabs: readonly T[], path: st
     return jarPath === base || jarPath.startsWith(base + '/');
   });
 }
+
+/**
+ * 把一个路径按「oldPath 重命名为 newPath」映射到新路径；不受影响返回 `null`。
+ *
+ * 与 `tabsUnderPath` 共用同一套归一化（分隔符 + 大小写）与分量边界，但这里要**保留**
+ * 标签原路径的后半段：重命名目录时，其下文件的标签要跟着换前缀，而不是被一并改成一个名字。
+ *
+ * jar 虚拟路径（`jar://<jar>!/<条目>`）只重写最外层 jar 的磁盘路径，条目名不变；
+ * 重命名 jar 文件本身与重命名目录里的 jar 都走这里，否则标签点回去就是"文件不存在"。
+ */
+export function remapPath(
+  path: string,
+  oldPath: string,
+  newPath: string,
+  isDir: boolean,
+): string | null {
+  const p = normalize(path);
+  const base = normalize(oldPath);
+  if (!base) return null;
+  if (p === base) return newPath;
+  // 调用方可能带尾部斜杠（`tabsUnderPath` 允许）；切后缀时必须按去掉尾斜杠的长度，
+  // 否则会把新前缀与后缀粘在一起
+  const oldBase = oldPath.replace(/[/\\]+$/, '');
+  if (isDir && p.startsWith(base + '/')) {
+    // 用原字符串切后缀：标签路径可能混用两种分隔符，新前缀沿用调用方给的写法
+    return newPath + path.slice(oldBase.length);
+  }
+  if (!p.startsWith('jar://')) return null;
+
+  const rest = path.slice('jar://'.length);
+  const sep = rest.indexOf('!/');
+  if (sep < 0) return null;
+  const jarPath = rest.slice(0, sep);
+  const jarNorm = normalize(jarPath);
+  if (jarNorm === base) {
+    return `jar://${newPath}${rest.slice(sep)}`;
+  }
+  if (isDir && jarNorm.startsWith(base + '/')) {
+    return `jar://${newPath}${jarPath.slice(oldBase.length)}${rest.slice(sep)}`;
+  }
+  return null;
+}

@@ -368,3 +368,52 @@ test('关闭标签后清理 fileOpenSeq（按路径的记录不能随历史无�
   useEditorStore.getState().closeTab(tab.id);
   assert.equal(useEditorStore.getState().fileOpenSeq[tab.path], undefined, '关闭后必须删除该路径的记录');
 });
+
+// ── 重命名后的标签/缓存路径迁移 ──────────────────────────────
+
+test('重命名目录：标签、fileOpenSeq、定位请求一起迁到新前缀', () => {
+  resetStore();
+  const fileTab = freshTab('/p/src/a.ts');
+  const jarTab = {
+    ...freshTab('/p/src/app.jar'),
+    path: 'jar:///p/src/app.jar!/com/A.class',
+    name: 'A.class',
+  };
+  useEditorStore.setState({
+    tabs: [fileTab, jarTab],
+    activeTabId: fileTab.id,
+    fileOpenSeq: { '/p/src/a.ts': 7, '/p/src/app.jar': 2, '/p/other.ts': 1 },
+    locate: { path: '/p/src/a.ts', line: 12, query: 'foo' },
+    revealPath: '/p/src/a.ts',
+  });
+
+  useEditorStore.getState().remapPaths('/p/src', '/p/lib', true);
+  const s = useEditorStore.getState();
+
+  assert.deepEqual(s.tabs.map(t => t.path), [
+    '/p/lib/a.ts',
+    'jar:///p/lib/app.jar!/com/A.class',
+  ]);
+  assert.equal(s.tabs[0].id, fileTab.id, 'id 不变：草稿/基线按 id 存');
+  assert.equal(s.tabs[0].name, 'a.ts');
+  assert.equal(s.tabs[1].name, 'A.class', 'jar 条目名不变');
+  assert.deepEqual(s.fileOpenSeq, { '/p/lib/a.ts': 7, '/p/lib/app.jar': 2, '/p/other.ts': 1 });
+  assert.deepEqual(s.locate, { path: '/p/lib/a.ts', line: 12, query: 'foo' });
+  assert.equal(s.revealPath, '/p/lib/a.ts');
+});
+
+test('重命名文件：只迁移命中的标签与序号', () => {
+  resetStore();
+  const tab = freshTab('/p/a.ts');
+  useEditorStore.setState({
+    tabs: [tab],
+    activeTabId: tab.id,
+    fileOpenSeq: { '/p/a.ts': 1 },
+    revealPath: null,
+  });
+  useEditorStore.getState().remapPaths('/p/a.ts', '/p/b.ts', false);
+  const s = useEditorStore.getState();
+  assert.equal(s.tabs[0].path, '/p/b.ts');
+  assert.equal(s.tabs[0].name, 'b.ts');
+  assert.deepEqual(s.fileOpenSeq, { '/p/b.ts': 1 });
+});

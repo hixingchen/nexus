@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { tabsUnderPath } from '../editorTabs.ts';
+import { remapPath, tabsUnderPath } from '../editorTabs.ts';
 
 /**
  * 删除文件/目录后要关掉哪些标签。
@@ -83,4 +83,60 @@ test('空路径 / 无匹配 → 空数组（空路径不得退化成"命中一�
   assert.deepEqual(tabsUnderPath(tabs, ''), []);
   assert.deepEqual(tabsUnderPath([], 'D:/work/proj'), []);
   assert.deepEqual(tabsUnderPath(tabs, 'E:/elsewhere'), []);
+});
+
+// ── 重命名后的路径映射 ────────────────────────────────────────
+
+test('重命名文件：只映射它自己，名称替换、分隔符与大小写不敏感', () => {
+  assert.equal(
+    remapPath('D:/work/proj/a.ts', 'D:/work/proj/a.ts', 'D:/work/proj/b.ts', false),
+    'D:/work/proj/b.ts',
+  );
+  assert.equal(
+    remapPath('d:\\work/Proj/a.ts', 'D:/work/proj/A.TS', 'D:/work/proj/b.ts', false),
+    'D:/work/proj/b.ts',
+  );
+  assert.equal(
+    remapPath('D:/work/proj/ab.ts', 'D:/work/proj/a.ts', 'D:/work/proj/b.ts', false),
+    null,
+  );
+});
+
+test('重命名目录：整棵子树的标签按前缀替换，且按分量判断', () => {
+  assert.equal(
+    remapPath('D:/work/proj/src/a.ts', 'D:/work/proj/src', 'D:/work/proj/lib', true),
+    'D:/work/proj/lib/a.ts',
+  );
+  assert.equal(
+    remapPath('D:/work/proj/src/deep/b.ts', 'D:/work/proj/src/', 'D:\\work\\proj\\lib', true),
+    'D:\\work\\proj\\lib/deep/b.ts',
+  );
+  assert.equal(
+    remapPath('D:/work/proj/src2/a.ts', 'D:/work/proj/src', 'D:/work/proj/lib', true),
+    null,
+  );
+  // 文件重命名不做前缀匹配（文件下面不可能还有子项）
+  assert.equal(
+    remapPath('D:/work/proj/a.ts/x', 'D:/work/proj/a.ts', 'D:/work/proj/b.ts', false),
+    null,
+  );
+});
+
+test('jar 虚拟路径：重命名 jar 或它所在的目录时同步改前缀，条目名不变', () => {
+  assert.equal(
+    remapPath('jar://D:/libs/app.jar!/com/A.class', 'D:/libs/app.jar', 'D:/libs/new.jar', false),
+    'jar://D:/libs/new.jar!/com/A.class',
+  );
+  assert.equal(
+    remapPath('jar://D:/proj/lib/app.jar!/com/A.class', 'D:/proj/lib', 'D:/proj/lib2', true),
+    'jar://D:/proj/lib2/app.jar!/com/A.class',
+  );
+  assert.equal(
+    remapPath('jar://D:/proj/lib/app.jar!/inner.jar!/com/B.class', 'D:/proj/lib', 'D:/proj/lib2', true),
+    'jar://D:/proj/lib2/app.jar!/inner.jar!/com/B.class',
+  );
+  assert.equal(
+    remapPath('jar://D:/proj/other/lib.jar!/x', 'D:/proj/lib', 'D:/proj/lib2', true),
+    null,
+  );
 });

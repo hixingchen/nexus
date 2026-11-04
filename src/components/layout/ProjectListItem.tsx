@@ -1,11 +1,15 @@
 import { useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { openInExplorer, openTerminal } from '../../services/system';
+import { createDir, createFile, openInExplorer, openTerminal } from '../../services/system';
 import { type Project, type Service } from '../../services/service';
 import { FileTree } from '../file-tree/FileTree';
+import { NameEntryModal } from '../file-tree/NameEntryModal';
 import { useSearchModalStore } from '../../stores/searchModal';
+import { loadAndOpenFile } from '../../stores/editor';
 import { copyText } from '../../utils/clipboard';
 import { focusProjectStep } from '../../utils/keyboard';
+import { reportError } from '../../utils/error';
+import { showNotification } from '../ui/Toast';
 import { ContextMenu, ContextMenuItem } from '../ui/ContextMenu';
 
 interface Props {
@@ -54,6 +58,22 @@ function activateOnEnter(run: () => void) {
   };
 }
 
+/** 标题行右键「新建文件 / 新建文件夹」的图标（与文件树内的同一动作保持同形） */
+const NEW_FILE_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M2.5 1.2h3.8l1.7 1.7v3.4M2.5 1.2a.5.5 0 00-.5.5v6.6a.5.5 0 00.5.5h2.2"/>
+    <path d="M7.5 6v3M6 7.5h3"/>
+  </svg>
+);
+
+const NEW_FOLDER_ICON = (
+  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M1.3 3h2.2l.9-1.2h4.3a.5.5 0 01.5.5v2"/>
+    <path d="M1.3 3v5a.5.5 0 00.5.5h3.2"/>
+    <path d="M7.5 6v3M6 7.5h3"/>
+  </svg>
+);
+
 export function ProjectListItem({
   project, selected, isExpanded, expanding, services, isRunning, acting, expandedSvc,
   onSelect, onToggleExpand, onContextMenu, onStart, onStop, onTogglePin, onToggleSvcExpand,
@@ -82,6 +102,39 @@ export function ProjectListItem({
    * 同一性质——只活本次会话，重开应用/收起左栏后回到收起态（默认收起才不打扰）。
    */
   const [projectTreeOpen, setProjectTreeOpen] = useState(false);
+
+  /**
+   * 标题行（项目根 / 服务工作目录）右键「新建」。
+   *
+   * 这两行是 embedded 文件树的根，而树**不渲染根节点那一行**——新建入口只能挂在
+   * 标题行上。`serviceId` 用来通知对应服务树的根目录刷新。
+   */
+  const [nameDialog, setNameDialog] = useState<
+    { mode: 'create-file' | 'create-dir'; parentDir: string; serviceId?: string } | null
+  >(null);
+  const [projectRefresh, setProjectRefresh] = useState(0);
+  const [svcRefresh, setSvcRefresh] = useState<Record<string, number>>({});
+
+  const handleCreate = async (name: string) => {
+    const req = nameDialog;
+    if (!req) return;
+    const created = req.mode === 'create-file'
+      ? await createFile(req.parentDir, name)
+      : await createDir(req.parentDir, name);
+    const serviceId = req.serviceId;
+    if (serviceId) {
+      setSvcRefresh(r => ({ ...r, [serviceId]: (r[serviceId] ?? 0) + 1 }));
+    } else {
+      setProjectRefresh(v => v + 1);
+    }
+    setNameDialog(null);
+    if (req.mode === 'create-file') {
+      // 空文件直接打开；打开失败只提示，文件本身已经建成
+      void loadAndOpenFile(created, name).catch(err => reportError('打开新建文件失败', err));
+    } else {
+      showNotification({ variant: 'success', title: `已新建文件夹「${name}」` });
+    }
+  };
 
   /**
    * 卡片上的键盘操作（UX-7）。
@@ -247,7 +300,7 @@ export function ProjectListItem({
             </div>
             {projectTreeOpen && (
               <div className="ml-[11px] pl-2 border-l border-nexus-border/30">
-                <FileTree rootPath={project.path} embedded kind="project" />
+                <FileTree rootPath={project.path} embedded kind="project" refreshSeq={projectRefresh} />
               </div>
             )}
           </div>
@@ -293,7 +346,7 @@ export function ProjectListItem({
                   </div>
                   {svcExpanded && (
                     <div className="ml-[11px] pl-2 border-l border-nexus-border/30">
-                      <FileTree rootPath={s.cwd} embedded />
+                      <FileTree rootPath={s.cwd} embedded refreshSeq={svcRefresh[s.id] ?? 0} />
                     </div>
                   )}
                 </div>
@@ -307,8 +360,28 @@ export function ProjectListItem({
     {/* 项目目录标题行右键菜单：范围 = 整个项目根。与服务行（范围 = 该服务的工作目录）对称 */}
     {projectMenu && createPortal(
       <ContextMenu x={projectMenu.x} y={projectMenu.y} onClose={() => setProjectMenu(null)}>
-        {/* 搜索文件内容 */}
+        {/* 新建：标题行代表项目根（树里不渲染根节点那一行） */}
         <div className="py-1.5 px-1.5">
+          <ContextMenuItem
+            icon={NEW_FILE_ICON}
+            label="新建文件"
+            onClick={() => {
+              setProjectMenu(null);
+              setNameDialog({ mode: 'create-file', parentDir: project.path });
+            }}
+          />
+          <ContextMenuItem
+            icon={NEW_FOLDER_ICON}
+            label="新建文件夹"
+            onClick={() => {
+              setProjectMenu(null);
+              setNameDialog({ mode: 'create-dir', parentDir: project.path });
+            }}
+          />
+        </div>
+
+        {/* 搜索文件内容 */}
+        <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
           <ContextMenuItem
             icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
               <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
@@ -352,8 +425,30 @@ export function ProjectListItem({
     {/* 服务行右键菜单：搜索文件内容 / 资源管理器 / 终端 / 复制 */}
     {svcMenu && createPortal(
       <ContextMenu x={svcMenu.x} y={svcMenu.y} onClose={() => setSvcMenu(null)}>
-        {/* 搜索文件内容 */}
+        {/* 新建：标题行代表这个服务的工作目录（树里不渲染根节点那一行） */}
         <div className="py-1.5 px-1.5">
+          <ContextMenuItem
+            icon={NEW_FILE_ICON}
+            label="新建文件"
+            onClick={() => {
+              const svc = svcMenu.svc;
+              setSvcMenu(null);
+              setNameDialog({ mode: 'create-file', parentDir: svc.cwd, serviceId: svc.id });
+            }}
+          />
+          <ContextMenuItem
+            icon={NEW_FOLDER_ICON}
+            label="新建文件夹"
+            onClick={() => {
+              const svc = svcMenu.svc;
+              setSvcMenu(null);
+              setNameDialog({ mode: 'create-dir', parentDir: svc.cwd, serviceId: svc.id });
+            }}
+          />
+        </div>
+
+        {/* 搜索文件内容 */}
+        <div className="border-t border-nexus-border/30 py-1.5 px-1.5">
           <ContextMenuItem
             icon={<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
               <circle cx="4.2" cy="4.2" r="3"/><line x1="6.5" y1="6.5" x2="8.8" y2="8.8"/>
@@ -420,6 +515,15 @@ export function ProjectListItem({
       </ContextMenu>,
       document.body,
     )}
+
+    <NameEntryModal
+      open={!!nameDialog}
+      title={nameDialog?.mode === 'create-dir' ? '新建文件夹' : '新建文件'}
+      submitLabel="创建"
+      initialValue={nameDialog?.mode === 'create-dir' ? '新建文件夹' : '新建文件'}
+      onClose={() => setNameDialog(null)}
+      onSubmit={handleCreate}
+    />
     </>
   );
 }
