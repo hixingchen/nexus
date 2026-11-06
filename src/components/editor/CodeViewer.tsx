@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect, useMemo, memo } from 'react';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, type DecorationSet, type Panel } from '@codemirror/view';
 import { EditorState, StateEffect, StateField, Compartment, type Range, type Text } from '@codemirror/state';
-import { defaultKeymap, history, historyKeymap, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
+import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo, toggleBlockCommentByLine, toggleComment } from '@codemirror/commands';
 import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxTree, type Language, LanguageSupport, LRLanguage, StreamLanguage, type StreamParser } from '@codemirror/language';
 import { parseMixed, type SyntaxNode, type Input } from '@lezer/common';
 import { search, openSearchPanel, findNext, findPrevious, closeSearchPanel, setSearchQuery, SearchQuery, highlightSelectionMatches } from '@codemirror/search';
@@ -862,6 +862,10 @@ function createEditorState(
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     oneDark,
     keymap.of([
+      // Tab / Shift+Tab 缩进：CodeMirror 默认不绑 Tab（为让键盘用户能移出编辑器），
+      // 结果是按 Tab 焦点直接跳走、文档一个字都不缩进——与 VS Code / IDEA 等编辑器不一致。
+      // 需要移出焦点时用 CodeMirror 的 tab-focus 模式：Ctrl+M 切换（空光标时 Esc 也可放行 2 秒）。
+      indentWithTab,
       ...defaultKeymap,
       ...historyKeymap,
       ...foldKeymap,
