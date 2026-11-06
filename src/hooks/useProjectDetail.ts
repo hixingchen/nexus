@@ -103,6 +103,11 @@ export function useProjectDetail(projectId: string) {
       useSvcCacheStore.getState().setCache(projectId, d.services);
       // 服务已被删除时其编辑草稿没有意义（还会让关窗确认多算一项）；模板草稿由模板库加载时清理
       pruneServiceDrafts('service', d.services.map(s => s.id));
+      // 正在编辑的服务被外部（AI / 其它入口）删除：面板必须收起，
+      // 否则用户点保存会写一个已经不存在的对象。新建面板（id 为空）不受影响。
+      setEditingService(prev =>
+        prev && prev.id !== '' && !d.services.some(s => s.id === prev.id) ? null : prev,
+      );
       // 交给组件的只有 project：services 已写进共享缓存，再留一份就是第二份真相（ARCH-29）
       const view: ProjectDetailView = { project: d.project };
       setDetailState({ projectId, detail: view });

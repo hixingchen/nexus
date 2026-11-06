@@ -32,8 +32,9 @@ tauri-plugin-dialog = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # 只声明实际用到的 feature：fs（tokio::fs）/ time（超时）/ process（java 反编译）/ io-util（AsyncRead/Seek）
-# / rt-multi-thread（spawn_blocking 的运行时）。此前多列了 sync 与 macros，两者在 src 中零引用。
-tokio = { version = "1.0", features = ["rt-multi-thread", "fs", "time", "process", "io-util"] }
+# / rt-multi-thread（spawn_blocking 的运行时）/ net（MCP 服务的 TcpListener）。
+# 此前多列了 sync 与 macros，两者在 src 中零引用。
+tokio = { version = "1.0", features = ["rt-multi-thread", "fs", "time", "process", "io-util", "net", "sync"] }
 log = "0.4"
 env_logger = "~0.11"
 chrono = { version = "0.4", features = ["serde"] }
@@ -50,6 +51,13 @@ zip = "9"
 # 长路径、权限、跨卷、联接点都归它处理。默认 feature 必需——coinit_apartmentthreaded
 # 负责在调用线程初始化 COM（我们在 spawn_blocking 的工作线程里调它）。
 trash = "5.2"
+# 内嵌 dsh 的 MCP 工具服务（方案 B：主进程内 streamable-http）。
+# 3.9 支持 2026-07-28 协议（dsh 的 MCP 客户端优先协商这一版），
+# 且已在 0.2.1-rc.5 上实测 tools/list 可用（见 docs/feature-analysis-dsh-nexus-control.md）。
+rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server"] }
+axum = "0.8"
+# MCP 服务的取消令牌（与 rmcp 内部同一套 tokio-util 版本）
+tokio-util = "0.7"
 
 [target."cfg(windows)".dependencies]
 # 5.4.1 已被 yanked（cargo audit 报 yanked）；5.4.3 是当前非 yanked 的 5.x 版本

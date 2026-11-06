@@ -9,8 +9,10 @@
 //! `rename_all`）不会有任何编译或类型错误，前端只会在运行时拿到 `undefined`——
 //! 这类故障在界面上表现为"某个字段莫名其妙是空的"，很难定位。这里把字段名钉住。
 
-use crate::commands::ai::{AiRuntimeStatus, AiStatus, DshVersionInfo};
+use crate::commands::ai::{AiMcpStatus, AiRuntimeStatus, AiStatus, DshVersionInfo};
 use crate::core::ai::DshProbe;
+use crate::mcp::ServiceDraftPayload;
+use crate::mcp_commands::NexusDataChanged;
 use crate::core::runtime::{
     RuntimeExportResult, RuntimeFailure, RuntimeProgress, RuntimeSource, RuntimeTransferProgress,
     TransferKind,
@@ -97,12 +99,54 @@ fn test_response_dtos_are_snake_case() {
             version: None,
             problem: None,
         },
+        mcp: AiMcpStatus {
+            enabled: true,
+            error: None,
+        },
     };
-    assert_eq!(keys_of(&status), sorted(&["running", "url", "pid", "cwd", "runtime"]));
+    assert_eq!(keys_of(&status), sorted(&["running", "url", "pid", "cwd", "runtime", "mcp"]));
     // 运行时的子字段也是契约的一部分（面板据此决定给哪个按钮）
     assert_eq!(
         keys_of(&status.runtime),
         sorted(&["ready", "source", "node_version", "version", "problem"])
+    );
+    // MCP 工具服务状态：界面据此显示「AI 操作能力不可用」及原因
+    assert_eq!(keys_of(&status.mcp), sorted(&["enabled", "error"]));
+
+    // AI 预填「添加服务」面板（`mcp-open-service-draft` 事件载荷）
+    let draft = ServiceDraftPayload {
+        project_id: "p1".into(),
+        name: "web".into(),
+        command: "npm run dev".into(),
+        cwd: "C:\\p".into(),
+        watch_paths: "".into(),
+        watch_include: "*".into(),
+        watch_exclude: "".into(),
+        env_vars: "".into(),
+    };
+    assert_eq!(
+        keys_of(&draft),
+        sorted(&[
+            "project_id",
+            "name",
+            "command",
+            "cwd",
+            "watch_paths",
+            "watch_include",
+            "watch_exclude",
+            "env_vars"
+        ])
+    );
+
+    // AI 改数据后的界面刷新事件（`nexus-data-changed`）
+    let changed = NexusDataChanged {
+        kind: "services".into(),
+        project_id: Some("p1".into()),
+        changed_ids: vec!["s1".into()],
+    };
+    assert_eq!(
+        keys_of(&changed),
+        sorted(&["kind", "project_id", "changed_ids"])
     );
 
     // dsh 版本信息（面板「检查更新」）
@@ -771,7 +815,8 @@ fn scan_ipc_structs() -> IpcStructs {
 /// 提到模块级是为了让**请求侧**那条守卫也能看见它（ARCH-21）：同一批结构体（`Service`/
 /// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
 const COVERED_RESPONSE: &[&str] = &[
-        "AiStatus", "DshVersionInfo", "AppPaths",
+        "AiStatus", "AiMcpStatus", "DshVersionInfo", "AppPaths",
+        "ServiceDraftPayload", "NexusDataChanged",
         // AI 私有运行时：状态走 invoke，进度走 `ai-runtime-progress` 事件，失败体是
         // `ai_runtime_install` 的 Err 载荷——三条都出前端，字段名都得钉住
         "DshProbe", "AiRuntimeStatus", "RuntimeProgress", "RuntimeFailure",
@@ -865,7 +910,11 @@ fn test_every_deserializable_struct_is_covered() {
         // - `Entry`（`commands/node.rs::parse_index` 内的局部结构）：反序列化的是**网上拉来的**
         //   nodejs.org 版本索引 JSON——外部文件格式，字段名由对方决定，我们无权改
         // - `RunnerLockInfo`：runner 的单实例锁文件（pid + 启动时刻），只在磁盘上读写
-        "ConflictPolicy", "ToolCommand", "Entry", "RunnerLockInfo",
+        // - `LogsArgs` / `ServiceArgs` / `PrepareAddServiceArgs` / `UpdateServiceArgs` /
+        //   `WaitArgs`：MCP 工具的 JSON-RPC 参数（不经 Tauri IPC，字段名由工具 schema
+        //   定义，不是 Tauri 的 camelCase 请求约定）
+        "ConflictPolicy", "ToolCommand", "Entry", "RunnerLockInfo", "LogsArgs", "ServiceArgs",
+        "PrepareAddServiceArgs", "UpdateServiceArgs", "WaitArgs", "InvokeArgs",
     ];
 
     let found = scan_ipc_structs();

@@ -186,6 +186,9 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
   const installing = useAiStore((s) => s.installing);
   /** 本项目的会话是否活跃（进程 running 且归属本项目；判据见 selectAiRunningHere） */
   const runningHere = useAiStore(selectAiRunningHere);
+  /** MCP 工具服务（AI 操作能力）：不可用时在头部亮黄点并把原因放进 title */
+  const mcpEnabled = useAiStore((s) => s.mcpEnabled);
+  const mcpError = useAiStore((s) => s.mcpError);
   /** 是否有全局弹窗打开（添加服务/工具库/更新等）——打开时子 WebView 移出屏幕 */
   const anyModalOpen = useUiStore((s) => s.modalCount > 0);
 
@@ -339,8 +342,17 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
         if (!alive) return;
         const nextUrl = s.running ? s.url : null;
         const st = useAiStore.getState();
-        if (st.running === s.running && st.url === nextUrl && st.sessionCwd === s.cwd) return;
-        useAiStore.setState({ running: s.running, url: nextUrl, sessionCwd: s.cwd });
+        if (
+          st.running === s.running && st.url === nextUrl && st.sessionCwd === s.cwd
+          && st.mcpEnabled === s.mcp.enabled && st.mcpError === s.mcp.error
+        ) return;
+        useAiStore.setState({
+          running: s.running,
+          url: nextUrl,
+          sessionCwd: s.cwd,
+          mcpEnabled: s.mcp.enabled,
+          mcpError: s.mcp.error,
+        });
       }).catch(() => {
         // 对账失败只是少一次刷新：下一次轮询会自愈，不打扰用户
       });
@@ -771,6 +783,14 @@ export function AiPanel({ cwd, projectName }: AiPanelProps) {
           <span className="flex-1 truncate text-[12px] text-nexus-text-muted" title="AI 助手（DeepSeek Harness）">
             AI 助手
             {runningHere && <span className="ml-2 text-[10.5px] text-emerald-500/90">● 会话中</span>}
+            {runningHere && !mcpEnabled && (
+              <span
+                className="ml-2 text-[10.5px] text-amber-500/90 cursor-help"
+                title={mcpError ?? 'AI 操作能力不可用（MCP 工具服务未启动）'}
+              >
+                ● 工具不可用
+              </span>
+            )}
           </span>
           <button
             className="w-6 h-6 flex items-center justify-center rounded text-nexus-muted hover:text-nexus-text hover:bg-nexus-hover/60"

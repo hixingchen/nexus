@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import type { NexusDataChanged } from '../../services/aiService';
 import {
   getAppPaths,
   getAutostartEnabled,
@@ -63,6 +65,19 @@ export function GeneralSection() {
   }, []);
 
   useEffect(() => { void loadAutostart(); }, [loadAutostart]);
+
+  /** AI 改开机自启后回读真实状态（与手动切换走同一条回读路径） */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      if (ev.payload.kind !== 'autostart') return;
+      void loadAutostart();
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, [loadAutostart]);
 
   /**
    * 切换开机自启：写完后**回读系统实际状态**再更新开关。

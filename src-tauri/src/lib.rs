@@ -2,6 +2,8 @@ mod commands;
 mod core;
 mod database;
 pub mod logger;
+mod mcp;
+mod mcp_commands;
 mod models;
 
 /// 登录前启动器入口（独立 `nexus-boot-runner.exe --manifest <path>`；
@@ -49,6 +51,11 @@ pub struct AppState {
     pub ai: std::sync::Mutex<Option<AiSession>>,
     /// 会话代数：每次 start/stop 递增，启动中的进程据此识别「被取代」并自杀
     pub ai_epoch: std::sync::atomic::AtomicU64,
+    /// 本次 AI 会话的 MCP 工具服务不可用原因（None = 可用或尚未启动）。
+    ///
+    /// 工具服务起不来**不能阻塞 dsh 启动**（仍可正常聊天），但也不能静默：
+    /// 前端按这个原因显示「AI 操作能力不可用」。
+    pub mcp_error: std::sync::Mutex<Option<String>>,
 }
 
 /// 统一的资源清理逻辑
@@ -272,6 +279,7 @@ pub fn run() {
             tool_cmds: crate::commands::process::ToolCmdTable::new(),
             ai: std::sync::Mutex::new(None),
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
+            mcp_error: std::sync::Mutex::new(None),
             search_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
         .invoke_handler(tauri::generate_handler![

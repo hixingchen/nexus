@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { bootApi, type BootRunnerStatus, type BootServiceStatus } from '../../services/boot';
+import type { NexusDataChanged } from '../../services/aiService';
 import { processApi } from '../../services/service';
 import { Modal } from '../ui/Modal';
 import { LogViewer } from '../terminal/LogViewer';
@@ -94,6 +96,19 @@ export function ServiceBootSection() {
     const timer = setInterval(() => { void loadPoll(); }, POLL_MS);
     return () => clearInterval(timer);
   }, [load, loadPoll]);
+
+  /** AI 改开机启动配置后立即刷新（15 秒轮询之外多一条即时通道） */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      if (ev.payload.kind !== 'boot') return;
+      void load(true);
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, [load]);
 
   const run = async (label: string, fn: () => Promise<unknown>, okText: string) => {
     setBusy(label);

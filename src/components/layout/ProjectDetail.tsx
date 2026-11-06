@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
+import { listen } from '@tauri-apps/api/event';
 import { EditorTabs } from '../editor/EditorTabs';
 // CodeViewer 是首屏最大的一块（CodeMirror 核心 326KB），改为按需加载（PERF-19）：
 // 未打开文件时不该为它付出解析成本（冷启动首屏实测因此少 326KB raw）。
@@ -39,6 +40,7 @@ import { useEditorStore, selectMdPreviewOnActiveTab } from '../../stores/editor'
 import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../stores/aiStore';
 import { RobotIcon } from '../ai/RobotIcon';
 import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type RunningService, type Service, type ServiceTemplate } from '../../services/service';
+import type { NexusDataChanged, ServiceDraftPayload } from '../../services/aiService';
 import { failureLabel } from '../../utils/serviceFailure';
 import { openInExplorer, openTerminal, pickOpenFile, pickSaveFile } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
@@ -158,6 +160,64 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
   }, [loadTemplates]);
 
   /**
+   * AI 改数据后的界面刷新。
+   *
+   * AI 走的是后端命令，不经过前端的 load/缓存写入；不监听的话，新增的服务卡片
+   * 要等用户切项目（组件重挂载）才出现。这里按域只刷新相关视图，并做 150ms 防抖
+   * （AI 批量操作时不会每个命令都触发一次全量查询）。
+   *
+   * 不碰 `editingService`：正在编辑面板里的本地表单不会被覆盖；服务被删除时由
+   * `useProjectDetail.load` 负责收起面板。
+   */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    let timer: number | null = null;
+    const schedule = (fn: () => void) => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (alive) fn();
+      }, 150);
+    };
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      const d = ev.payload;
+      const relevantProject = d.project_id === null || d.project_id === projectId;
+      // 用户正开着某个服务的编辑面板，而 AI 改的正是它：列表照常刷新，但**不要**
+      // 悄悄替换面板（面板里是本地表单状态）。提示用户关闭重开，避免他拿旧值保存后
+      // 把 AI 的修改覆盖掉。删除的情况由 load() 负责收起面板。
+      if (
+        d.kind === 'services'
+        && editingService
+        && editingService.id !== ''
+        && (d.changed_ids ?? []).includes(editingService.id)
+      ) {
+        showNotification({
+          variant: 'warning',
+          title: `AI 修改了正在编辑的服务「${editingService.name}」`,
+          description: '面板里是修改前的内容；建议关闭面板后重新打开，避免用旧值覆盖',
+          duration: 8000,
+        });
+      }
+      if ((d.kind === 'services' || d.kind === 'tools' || d.kind === 'boot') && relevantProject) {
+        schedule(() => { void load(); });
+      } else if (d.kind === 'templates') {
+        schedule(loadTemplates);
+      } else if (d.kind === 'projects') {
+        // 当前项目的名称/路径可能被 AI 改了；被删除时 MainLayout 会清掉选择
+        schedule(() => { void load(); });
+      }
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => {
+      alive = false;
+      unlisten?.();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [projectId, load, loadTemplates, editingService]);
+
+  /**
    * 「恢复默认布局」（设置 > 通用）：清库之后由各消费方自己把默认值贴回来。
    *
    * 为什么清了库还要这一步：组件只在挂载时读一次布局，库里那些行没了并不会让已经渲染
@@ -260,6 +320,45 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       boot_credential_mode: 's4u',
     }));
   }, [projectId, setEditingService, setEditingTemplate]);
+
+  /**
+   * AI 预填「添加服务」：后端已校验路径与 env 语法，这里只负责把草稿放进
+   * 现有的 ServiceEditPanel（右侧抽屉），**不写库**——用户点「保存」才创建。
+   *
+   * 为什么监听放在本项目组件里：草稿必须落到它所属的项目上。切走再回来时
+   * dsh 会话可能已经换了项目，事件里带 `project_id`，不匹配就直接忽略
+   * （宁可不弹，也不能把 A 项目的命令预填进 B 项目）。
+   */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<ServiceDraftPayload>('mcp-open-service-draft', (ev) => {
+      const d = ev.payload;
+      if (d.project_id !== projectId) return;
+      // 用户正在编辑一个新服务（id 为空）时不要替换面板：新建面板不读草稿，
+      // 直接覆盖会把用户尚未保存的输入无声丢掉。已有服务的编辑有草稿保护，可安全切换。
+      if (editingService?.id === '') {
+        showNotification({
+          variant: 'warning',
+          title: 'AI 的「添加服务」面板未打开：当前正在编辑新服务，请先保存或关闭',
+        });
+        return;
+      }
+      setEditingTemplate(null);
+      setEditingService({
+        id: '', project_id: d.project_id, name: d.name, command: d.command, cwd: d.cwd,
+        watch_paths: d.watch_paths, watch_include: d.watch_include, watch_exclude: d.watch_exclude,
+        env_vars: d.env_vars, restart_mode: 0, enabled: true, show_file_tree: false,
+        sort_index: 0, tool_commands: '[]',
+        boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
+        boot_credential_mode: 's4u',
+      });
+      showNotification({ variant: 'info', title: 'AI 已预填「添加服务」面板，请检查后保存' });
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 添加服务事件失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, [projectId, setEditingService, setEditingTemplate, editingService?.id]);
 
   /**
    * 新建模板：用空壳打开既有的编辑面板。

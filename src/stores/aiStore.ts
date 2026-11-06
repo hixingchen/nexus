@@ -121,6 +121,15 @@ interface AiState {
    * 界面就静默走错分支（那正是本轮事故里"照着重装一遍还是不行"的成因之一）。
    */
   lastError: AiError | null;
+  /**
+   * MCP 工具服务是否可用（AI 操作能力）。
+   *
+   * 工具服务起不来不阻塞聊天，但界面必须能说出"为什么 AI 不能操作 Nexus"——
+   * 静默不可用会让用户反复问"帮我启动一下"却得不到原因。
+   */
+  mcpEnabled: boolean;
+  /** 工具服务不可用的原因（正常运行时为 null） */
+  mcpError: string | null;
   /** 在途请求期间目标变化：记录最新目标，完成后自动追启 */
   pendingTarget: { cwd: string; name: string | null } | null;
 
@@ -181,6 +190,8 @@ export const useAiStore = create<AiState>((set, get) => ({
   starting: false,
   installing: false,
   lastError: null,
+  mcpEnabled: false,
+  mcpError: null,
   pendingTarget: null,
 
   bootstrap: async () => {
@@ -211,6 +222,8 @@ export const useAiStore = create<AiState>((set, get) => ({
         running: s.running,
         url: s.url,
         sessionCwd: s.cwd,
+        mcpEnabled: s.mcp.enabled,
+        mcpError: s.mcp.error,
       });
     } catch (e) {
       // 查询失败不阻塞启动：只是少一次对账，后续 ensureRunning 仍会按需启动。
@@ -288,6 +301,7 @@ export const useAiStore = create<AiState>((set, get) => ({
     rememberAiOn(currentCwd, false);
     set({
       panelOpen: false, running: false, url: null, sessionCwd: null, lastError: null,
+      mcpEnabled: false, mcpError: null,
       // 在途启动若被 stop 取代，它的 finally 可能已经不再写 state；这里兜底收掉 spinner
       starting: false,
       // 明确停止后，不再保留“启动期间记下的待切换目标”，否则下一次启动会误收敛
@@ -334,6 +348,8 @@ export const useAiStore = create<AiState>((set, get) => ({
         sessionCwd: s.cwd,
         starting: false,
         lastError: null,
+        mcpEnabled: s.mcp.enabled,
+        mcpError: s.mcp.error,
         // 这里**不能**顺手清 pendingTarget：请求期间新记下的目标就存在这个字段里，
         // 清掉会让下面的收敛分支永远读到 null，表现为"切项目后面板停在启动中"
         // （sessionCwd 还是老项目 → runningHere=false，且没有自愈路径）

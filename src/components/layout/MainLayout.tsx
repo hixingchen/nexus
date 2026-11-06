@@ -11,6 +11,7 @@ const ProjectDetail = lazy(() =>
 import { RestartConfirm } from './RestartConfirm';
 import { PasteConflictModal } from '../file-tree/PasteConflictModal';
 import { AiPanel } from '../ai/AiPanel';
+import type { NexusDataChanged } from '../../services/aiService';
 import { CloseGuard } from './CloseGuard';
 import { ProjectRail } from './ProjectRail';
 import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
@@ -132,6 +133,35 @@ export function MainLayout() {
   const saveLayout = useCallback((patch: Parameters<typeof saveLayoutFn>[0]) => {
     saveLayoutFn(patch);
   }, []);
+
+  /**
+   * AI 增删改项目后同步当前选择：
+   * - 改名/改路径 → 更新标题与 AI 会话工作目录（AiPanel 会按新目录重启会话）；
+   * - 被删除 → 清空选择并落库，避免主区域停在一个不存在的项目上报错。
+   */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      if (ev.payload.kind !== 'projects') return;
+      void projectApi.getAll().then((list) => {
+        if (!alive || !selectedProjectId) return;
+        const p = list.find((x) => x.id === selectedProjectId);
+        if (!p) {
+          setSelectedProjectId(null);
+          setSelectedProjectName(null);
+          setSelectedProjectPath(null);
+          saveLayout({ [LAYOUT_KEYS.selectedProjectId]: '' });
+        } else {
+          setSelectedProjectName(p.name);
+          setSelectedProjectPath(p.path);
+        }
+      }).catch((e) => reportError('刷新项目列表失败', e));
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, [selectedProjectId, saveLayout]);
 
   // 启动时从 DB 恢复布局（ensureLoaded 保证整个进程只查库一次，与其他读取方共享）
   useEffect(() => {

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { projectApi, type Project } from '../services/service';
+import type { NexusDataChanged } from '../services/aiService';
 import { useRunningStore } from '../stores/runningStore';
 import { useSvcCacheStore } from '../stores/svcCacheStore';
 import { useProjectActions } from './useProjectActions';
@@ -184,6 +186,45 @@ export function useProjectList() {
     }
     await expandProject(projectId);
   }, [expanded, expandProject]);
+  /**
+   * AI 改数据后的左侧列表刷新：项目列表变了重新拉；当前展开的项目的服务变了，
+   * 只重拉那个项目的服务写回缓存（不折叠、不闪加载态）。
+   */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    let timer: number | null = null;
+    const schedule = (fn: () => void) => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (alive) fn();
+      }, 150);
+    };
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      const d = ev.payload;
+      if (d.kind === 'projects') {
+        schedule(() => { void load(); });
+        return;
+      }
+      const pid = d.project_id;
+      if (d.kind === 'services' && pid && expanded.has(pid)) {
+        schedule(() => {
+          void projectApi.getDetail(pid)
+            .then(detail => useSvcCacheStore.getState().setCache(pid, detail.services))
+            .catch(e => reportError('刷新项目服务列表失败', e));
+        });
+      }
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => {
+      alive = false;
+      unlisten?.();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [load, expanded]);
+
   return {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,

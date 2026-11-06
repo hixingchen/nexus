@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { nodeApi, type NodeRuntimeStatus, type NodeVersionIndex } from '../../services/service';
+import type { NexusDataChanged } from '../../services/aiService';
 import { showNotification } from '../ui/Toast';
 import { reportError, toMessage } from '../../utils/error';
 import { matchNodeVersions, normalizeVersionQuery } from '../../utils/version';
@@ -116,6 +118,19 @@ export function NodeVersionSection({ onChanged }: Props) {
       reportError('读取 Node 运行时状态失败', e);
     }
   }, []);
+
+  /** AI 切换/安装/卸载 Node 后，面板状态立即跟上（不刷新可安装索引：那是一次网络请求，与安装结果无关） */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      if (ev.payload.kind !== 'node') return;
+      void refresh();
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅 AI 数据变更失败', e));
+    return () => { alive = false; unlisten?.(); };
+  }, [refresh]);
 
   /** 拉可安装版本索引（`<node_mirror>index.json`）。失败时把原因原文留下，别只留一句状态 */
   const loadIndex = useCallback(async () => {

@@ -27,6 +27,16 @@ const START_TIMEOUT: Duration = AiTimeouts::WEB_START;
 pub const ERR_RUNTIME_MISSING: &str = "ai_runtime_missing";
 pub const ERR_RUNTIME_BROKEN: &str = "ai_runtime_broken";
 
+/// MCP 工具服务状态（AI 操作能力）。
+///
+/// `enabled=false` 不阻塞聊天（dsh 照常起），但界面必须能说出"为什么没有工具"。
+#[derive(Clone, Serialize)]
+pub struct AiMcpStatus {
+    pub enabled: bool,
+    /// 不可用原因（enabled=false 时展示；正常运行时为 None）
+    pub error: Option<String>,
+}
+
 /// 会话状态快照
 #[derive(Clone, Serialize)]
 pub struct AiStatus {
@@ -37,11 +47,13 @@ pub struct AiStatus {
     pub cwd: Option<String>,
     /// 私有运行时的状态（未运行时现场探测；把"没装"与"装了跑不动"分开）
     pub runtime: crate::core::ai::DshProbe,
+    /// 本次会话的 MCP 工具服务（只读工具/日志；v1 不含写操作）
+    pub mcp: AiMcpStatus,
 }
 
 /// 组装状态快照（不持锁调用 dsh 检测）
 fn snapshot(state: &AppState) -> AiStatus {
-    let (running, url, pid, cwd) = match state.ai.lock() {
+    let (running, url, pid, cwd, mcp_enabled) = match state.ai.lock() {
         Ok(mut h) => match h.as_mut() {
             Some(s) => {
                 // alive() 现场探测子进程（try_wait）：只看槽里有没有会话，
@@ -50,13 +62,13 @@ fn snapshot(state: &AppState) -> AiStatus {
                 if !alive {
                     log::warn!("[ai] 会话进程已退出（pid={}），状态将报告为未运行", s.pid);
                 }
-                (alive, Some(s.url.clone()), Some(s.pid), s.cwd.clone())
+                (alive, Some(s.url.clone()), Some(s.pid), s.cwd.clone(), s.mcp.is_some())
             }
-            None => (false, None, None, None),
+            None => (false, None, None, None, false),
         },
         Err(e) => {
             log::error!("[ai] 状态锁中毒: {}", e);
-            (false, None, None, None)
+            (false, None, None, None, false)
         }
     };
     // Job Object 句柄在这里取一次传给 `core::ai`（ARCH-19）：`core` 不再认识 AppState
@@ -65,7 +77,17 @@ fn snapshot(state: &AppState) -> AiStatus {
     } else {
         crate::core::ai::probe_dsh(state.process_mgr.job_arc().as_deref())
     };
-    AiStatus { running, url, pid, cwd, runtime }
+    let mcp = mcp_status(state, running && mcp_enabled);
+    AiStatus { running, url, pid, cwd, runtime, mcp }
+}
+
+/// MCP 工具服务状态：可用时不带历史错误，不可用时把原因交给界面。
+fn mcp_status(state: &AppState, enabled: bool) -> AiMcpStatus {
+    let error = state.mcp_error.lock().ok().and_then(|e| e.clone());
+    AiMcpStatus {
+        enabled,
+        error: if enabled { None } else { error },
+    }
 }
 
 /// 会话在跑时的运行时状态：**必然就绪**（否则压根起不来），且不去实跑探测——
@@ -150,6 +172,7 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
                             pid: Some(s.pid),
                             cwd: s.cwd.clone(),
                             runtime: running_runtime(),
+                            mcp: mcp_status(&state, s.mcp.is_some()),
                         });
                     }
                     log::info!("[ai] 会话进程已退出 (pid={})，重启", s.pid);
@@ -174,7 +197,27 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
         if let Some(mut old) = prev {
             log::info!("[ai] 会话目录变化或进程已退出，停止旧会话 (pid={})", old.pid);
             old.stop();
+            // old 在此作用域结束时 drop，其 McpHandle 一并取消服务、删除旧 patch
         }
+
+        // MCP 工具服务：先起服务再起 dsh（patch 里要写本会话的端口/token）。
+        // 启动失败**不阻塞**聊天：记录原因给界面，dsh 以无工具形态继续启动。
+        let mcp_handle = match crate::mcp::start_session(&app, cwd_norm.as_deref()) {
+            Ok(h) => {
+                if let Ok(mut slot) = state.mcp_error.lock() {
+                    *slot = None;
+                }
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("[mcp] 本次 AI 会话没有工具能力: {}", e);
+                if let Ok(mut slot) = state.mcp_error.lock() {
+                    *slot = Some(e);
+                }
+                None
+            }
+        };
+        let patch_path = mcp_handle.as_ref().map(|h| h.patch_path().to_path_buf());
 
         // 旧进程已停（无文件竞争）→ 让 dsh GUI 启动时选中本项目：
         // 注册 workspace（title=项目名）+ bump 本项目会话活动时间（recentWorkspace
@@ -184,13 +227,22 @@ pub async fn ai_start(app: AppHandle, cwd: Option<String>, name: Option<String>)
             crate::core::ai::ensure_workspace_active(dir, name_norm.as_deref(), restarting_same_project);
         }
 
-        let session = match crate::core::ai::spawn_dsh_web(&runtime, job.as_deref(), cwd_norm.as_deref(), START_TIMEOUT) {
+        let mut session = match crate::core::ai::spawn_dsh_web(
+            &runtime,
+            job.as_deref(),
+            cwd_norm.as_deref(),
+            START_TIMEOUT,
+            patch_path.as_deref(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("[ai] 启动 dsh web 失败: {}", e);
+                // mcp_handle 随本次 return drop：服务与 patch 文件一起回收
                 return Err(e);
             }
         };
+        // 服务与 dsh 同生命周期（见 AiSession::mcp 的说明）
+        session.mcp = mcp_handle;
 
         // 入库前复查代数：期间有 stop/新 start → 终止本次进程防幽灵
         let mut pending = Some(session);
@@ -237,6 +289,10 @@ fn stop_current_session(app: &AppHandle) -> Result<(), String> {
     if let Some(mut s) = old {
         log::info!("[ai] 停止会话 (pid={})", s.pid);
         s.stop();
+        // s 在此结束生命周期：McpHandle::drop 取消工具服务并删除 patch 文件
+    }
+    if let Ok(mut slot) = state.mcp_error.lock() {
+        *slot = None;
     }
     Ok(())
 }

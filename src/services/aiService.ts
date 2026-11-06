@@ -19,6 +19,35 @@ interface DshProbe {
   problem: string | null;
 }
 
+/**
+ * AI 改完数据后的界面刷新通知（后端 `nexus-data-changed` 事件载荷）。
+ *
+ * AI 走的是后端命令，不会经过前端的 load/缓存写入；没有这个事件，服务卡片、
+ * 项目列表要等用户切项目（组件重挂载）才更新。
+ */
+export interface NexusDataChanged {
+  kind: 'services' | 'templates' | 'projects' | 'tools' | 'boot' | 'node' | 'autostart' | 'layout';
+  /** 服务类变更所属项目；全局域为 null */
+  project_id: string | null;
+  /** 具体变更的服务 id（界面用于判断"是不是正在编辑的那个"） */
+  changed_ids: string[];
+}
+
+/**
+ * AI 预填「添加服务」的草稿（后端 `mcp-open-service-draft` 事件载荷）。
+ * 只打开面板，不写库——用户点「保存」才真正创建。
+ */
+export interface ServiceDraftPayload {
+  project_id: string;
+  name: string;
+  command: string;
+  cwd: string;
+  watch_paths: string;
+  watch_include: string;
+  watch_exclude: string;
+  env_vars: string;
+}
+
 /** 会话状态快照（字段与后端 AiStatus 同名：响应 DTO 一律 snake_case） */
 interface AiStatus {
   running: boolean;
@@ -28,6 +57,8 @@ interface AiStatus {
   /** 会话工作目录 */
   cwd: string | null;
   runtime: DshProbe;
+  /** MCP 工具服务（AI 操作能力）；enabled=false 时 error 给出原因 */
+  mcp: { enabled: boolean; error: string | null };
 }
 
 /** 这一对路径是哪来的（与后端 `RuntimeSource` 的 serde 表示一致） */

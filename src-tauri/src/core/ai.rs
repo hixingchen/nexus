@@ -592,6 +592,11 @@ pub struct AiSession {
     pub url: String,
     /// 会话工作目录（前端据此判断归属项目）
     pub cwd: Option<String>,
+    /// 本会话的 MCP 工具服务（None = 未启用/启动失败）。
+    ///
+    /// 句柄挂在这里而不是全局槽：服务与 dsh 进程同生命周期，会话被停止/替换时
+    /// `McpHandle::drop` 自动取消服务并删除 patch 文件，不存在"忘了停"的独立路径。
+    pub mcp: Option<crate::mcp::McpHandle>,
 }
 
 impl AiSession {
@@ -856,6 +861,7 @@ pub fn spawn_dsh_web(
     job: Option<&JobObject>,
     cwd: Option<&str>,
     timeout: Duration,
+    patch: Option<&Path>,
 ) -> Result<AiSession, String> {
     // 优先用"按项目目录派生"的稳定端口：同一项目每次启动同一 origin，dsh 才能从
     // localStorage 里恢复上次会话（见 stable_port_for_project）。端口被占用等失败时
@@ -864,7 +870,7 @@ pub fn spawn_dsh_web(
     if port == 0 {
         return spawn_web_command(
             job,
-            runtime.command(&["web", "--no-open", "--port", "0"]),
+            runtime.command(&dsh_launch_args(patch, "0")),
             cwd,
             timeout,
         );
@@ -873,7 +879,7 @@ pub fn spawn_dsh_web(
     let started = Instant::now();
     match spawn_web_command(
         job,
-        runtime.command(&["web", "--no-open", "--port", &port_arg]),
+        runtime.command(&dsh_launch_args(patch, &port_arg)),
         cwd,
         timeout,
     ) {
@@ -888,13 +894,28 @@ pub fn spawn_dsh_web(
             );
             spawn_web_command(
                 job,
-                runtime.command(&["web", "--no-open", "--port", "0"]),
+                runtime.command(&dsh_launch_args(patch, "0")),
                 cwd,
                 timeout,
             )
         }
         Err(e) => Err(e),
     }
+}
+
+/// dsh 启动参数：**必须走 launcher**（`--patch` 是 launcher 选项）。
+///
+/// `dsh web --patch …` 会被 web app 当成未知参数报错；正确形态是
+/// `dsh --profile web --patch <file> --no-open --port <p>`（0.2.1-rc.5 实测）。
+/// 无 patch（MCP 启动失败）时退化为原来的 `--profile web --no-open --port <p>`。
+fn dsh_launch_args<'a>(patch: Option<&'a Path>, port: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["--profile", "web"];
+    if let Some(p) = patch.and_then(|p| p.to_str()) {
+        args.push("--patch");
+        args.push(p);
+    }
+    args.extend(["--no-open", "--port", port]);
+    args
 }
 
 /// 稳定端口范围：39000..=39999（1000 个）。
@@ -1058,6 +1079,7 @@ fn spawn_web_command(
         pid,
         url,
         cwd: cwd.map(|c| c.to_string()),
+        mcp: None, // 由 ai_start 在启动成功后挂上（见 McpHandle 的说明）
     })
 }
 
@@ -1223,6 +1245,29 @@ fn wait_plugins_ready(port: u16, token: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--patch` 必须走 launcher：`dsh web --patch` 会被 web app 当成未知参数。
+    /// 这里钉住参数顺序与形态（0.2.1-rc.5 的 bin.js 只认前者）。
+    #[test]
+    fn test_dsh_launch_args_use_launcher_form() {
+        assert_eq!(
+            dsh_launch_args(None, "39000"),
+            vec!["--profile", "web", "--no-open", "--port", "39000"]
+        );
+        let patch = Path::new("C:\\data\\ai\\nexus-mcp-1.yml");
+        assert_eq!(
+            dsh_launch_args(Some(patch), "39000"),
+            vec![
+                "--profile",
+                "web",
+                "--patch",
+                "C:\\data\\ai\\nexus-mcp-1.yml",
+                "--no-open",
+                "--port",
+                "39000"
+            ]
+        );
+    }
 
     /// 构造一个最小假 workspace.json（对齐 dsh 结构）
     fn fixture(dir: &std::path::Path) -> String {
