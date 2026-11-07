@@ -29,9 +29,13 @@ export function RestartConfirm() {
      * 自动重启的决策逻辑在 `utils/autoRestart.ts`（可单测，见它的说明）；这里只把它接到
      * 真实的重启命令、运行状态与提示上。
      *
-     * 两处不能省：
-     * - `probe` 必须先 `refresh()` 拿**权威状态**再判定。`unknown`（还在启动）与
-     *   `failed`（秒退）的处理完全相反，拿 3 秒前的轮询缓存下结论会把两者判反；
+     * 三处不能省：
+     * - `probe` 必须拿**新鲜状态**再判定（`refreshIfStale` 共享 1 秒内的同一次查询）。
+     *   `failed`（失败）、`ready`（监听端口已起来）、`running`（进程活着但还在构建/启动）
+     *   与 `unknown` 四者语义完全不同，拿旧缓存下结论会判反；
+     * - `ready` 必须靠**监听端口**而不是"进程在运行表里"：Maven/NPM 这类先构建再启动的
+     *   服务，在构建失败的几十秒里一直算 running——按 running 判定成功就再也等不到
+     *   那次失败（用户报的"自动重启后起不来、手动重启又好"就是这个时间差）；
      * - `onGiveUp` 是唯一会打扰用户的时刻（中间的重试是静默的，否则改代码时会刷屏）。
      *
      * 这个状态机的定时器活到组件卸载之后（`RestartConfirm` 挂在 `MainLayout` 上，
@@ -40,11 +44,16 @@ export function RestartConfirm() {
     const restarter = createAutoRestarter({
       restart: (sid) => processApi.restart(sid),
       probe: async (sid) => {
-        await useRunningStore.getState().refresh();
+        // 共享 1 秒内的新鲜数据：观察窗里可能有多个服务同时在探（见 runningStore.refreshIfStale）
+        await useRunningStore.getState().refreshIfStale(1000);
         const st = useRunningStore.getState();
         if (st.failed.some(f => f.service_id === sid)) return 'failed';
-        if (st.running.some(r => r.service_id === sid)) return 'running';
-        return 'unknown';
+        const running = st.running.find(r => r.service_id === sid);
+        if (!running) return 'unknown';
+        // 已在监听端口 = 真的起来了。`running` 只代表进程还活着：
+        // Maven/NPM 这类"先构建再启动"的服务在编译阶段就已经在运行表里了，
+        // 这期间既不是 ready 也不能据此判定成功（正是原实现漏掉晚失败的原因）
+        return (running.listening_ports?.length ?? 0) > 0 ? 'ready' : 'running';
       },
       sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
       onGiveUp: ({ serviceName, attempts }) => {

@@ -3,27 +3,32 @@
  *
  * ## 它修的是什么
  *
- * 原实现（`RestartConfirm` 里那段）是两个问题的叠加：
+ * 原实现（`RestartConfirm` 里那段）是三个问题的叠加：
  *
  * 1. **冷却期内的事件被丢弃**：`if (cooldown.has(sid)) continue` —— 2 秒窗口里到达的变更
  *    既不排队也不重新计时。于是 AI 连续改代码时，服务跑的往往不是最新代码；更糟的是
  *    **最后一次变更可能正好落在窗口里被吞掉**，之后不再有新事件，服务就停在那个旧状态上。
  * 2. **重启完就撒手**：`processApi.restart()` 是发了不管，而它返回 `Ok` 只代表 spawn 成功。
  *    服务秒退由后端 2 秒后的心跳发现，那时前端早把这次重启忘了——**没有任何重试**。
+ * 3. **只探一次、窗口太短**（这一轮补的）：Maven / NPM 这类"先构建再启动"的服务，
+ *    重启后几十秒内进程都活着（在跑构建），原实现 7 秒时探一次看到 `running` 就判成功。
+ *    随后构建失败进失败表，已经没人观察——用户看到的就是"自动重启后起不来，手动重启
+ *    又好了"（手动那次文件写完了、端口也空了）。
  *
- * 两条叠起来就是你遇到的现象：自动重启撞在"文件写到一半 / 旧进程还没释放端口"上 →
- * 服务秒退 → 再也没人管 → 手动点一下就好了（那时文件写完了、端口也空了）。
+ * 三条叠起来就是你遇到的现象：自动重启撞在"文件写到一半 / 旧进程还没释放端口 /
+ * 构建还没结束"上 → 服务失败 → 再也没人管 → 手动点一下就好了。
  *
  * ## 这一版的规则
  *
  * - 同一服务的变更**合并**为一轮（`change` 在轮内只置一个待办标记，不丢弃）；
- * - 一轮 = 重启 → 等节流窗口（`throttleMs`）→
+ * - 一轮 = 重启 → 等节流窗口（`throttleMs`）→ **观察窗（`verifyMs`）内轮询探头**：
  *   - 期间又有变更 → **立刻再起一轮**（尾沿：代码又变了，这一轮的结果已经过时），
  *     这不算"重试"，所以不消耗重试次数；
- *   - 期间没变更 → 再等到观察窗口结束（`verifyMs`）看结果；
- * - 判定为 **`failed` 才重试**（最多 `maxAttempts`，退避 `backoffMs`）。
- *   `unknown`（还在启动 / 状态未知）**一律不动它**——重试会把"启动慢但健康"的服务
- *   越搞越糟，那比不重试更坏；
+ *   - 探头为 `ready`（已监听端口）→ 连续两拍确认后收手（防"绑定端口后秒退"）；
+ *   - 探头为 `failed` → 立即按失败处理（**不等到窗口结束**）；
+ *   - 窗口结束时仍是 `running`（构建/启动中）或 `unknown` → 视为成功，**不重试**。
+ *     "启动慢但健康"的服务不能因为"还没探到 ready"就反复重启；
+ * - 判定为 **`failed` 才重试**（最多 `maxAttempts`，退避 `backoffMs`）；
  * - 重试用尽仍然失败才通知用户（`onGiveUp`）。中间的重试是静默的：改动代码时每两秒
  *   弹一条"正在重试"只会淹没日志面板。
  *
@@ -35,8 +40,16 @@
  * 这与 `core/process.rs` 把运行表/句柄/发送端变成参数是同一套路子。
  */
 
-/** 服务在一次探查里的状态（`unknown` = 还没起来也没失败：仍在启动中，或状态未知） */
-export type ProbeOutcome = 'running' | 'failed' | 'unknown';
+/** 服务在一次探查里的状态 */
+export type ProbeOutcome =
+  /** 已监听端口：确定已就绪（build-then-run 的服务必须用它判定，不能只看进程在） */
+  | 'ready'
+  /** 进程活着但还没监听端口（构建 / 启动中）：继续观察，不能据此判成功 */
+  | 'running'
+  /** 意外退出（后端失败表）：可重试 */
+  | 'failed'
+  /** 既不在运行也不在失败表（重启还没落表 / 状态未知） */
+  | 'unknown';
 
 export interface AutoRestartDeps {
   /** 重启服务；抛错 = 这次重启**根本没发出去**（spawn 失败等） */
@@ -55,8 +68,16 @@ export interface AutoRestartDeps {
 
   /** 节流窗口（ms）：期内到达的变更只记为待办，不再起新轮 */
   throttleMs?: number;
-  /** 观察窗口（ms，自重启起算）：到这里才判定成败 —— 要给服务留出"起来或秒退"的时间 */
+  /**
+   * 观察窗口上限（ms，自重启起算）：期内**持续轮询**探头，失败随时捕获；
+   * 到窗口结束仍是 running/unknown 则视为成功。
+   *
+   * 不能是"到点探一次"：Maven/NPM 先构建再启动，失败发生在构建结束时（几十秒），
+   * 一次性探头的时点稍早就会把"还在构建"误判成成功。
+   */
   verifyMs?: number;
+  /** 观察窗的轮询间隔（ms） */
+  pollMs?: number;
   /** 一轮里最多重启几次（含首次） */
   maxAttempts?: number;
   /** 第 n 次重试前等多久（ms），越界取最后一项 */
@@ -73,12 +94,25 @@ export interface AutoRestarter {
 /** 节流窗口：与原来的 2 秒冷却同一数值（改动前就是这个节奏，这次只改"事件不再被丢弃"） */
 const DEFAULT_THROTTLE_MS = 2000;
 /**
- * 观察窗口：自重启起算 7 秒。
+ * 观察窗口上限：自重启起算 60 秒（期内轮询，不是到点只看一眼）。
  *
- * 为什么是 7 而不是 2：秒退的服务要等后端心跳（2 秒一轮）把它写进失败表，
- * 服务本身启动也要时间——2 秒就开始判定会把"正在启动"误判成"没起来"。
+ * 为什么需要这么长：Maven 服务的失败发生在构建结束时——`mvn package` 本身就可能
+ * 跑几十秒，7 秒的窗口里进程一直"活着"（在构建），根本看不到随后的失败。
+ * 60 秒足够覆盖常见构建；窗口只是**上限**——探到 `ready`（已监听端口）或 `failed`
+ * 都会提前结束。
  */
-const DEFAULT_VERIFY_MS = 7000;
+const DEFAULT_VERIFY_MS = 60_000;
+/**
+ * 观察窗轮询间隔。后端心跳 2 秒一轮把崩溃写进失败表，1.5 秒的轮询能在一个心跳内
+ * 发现它；共享 `runningStore.refreshIfStale` 后多服务并发探测也只多打一次 `get_running`。
+ */
+const DEFAULT_OBSERVE_POLL_MS = 1_500;
+/**
+ * `ready` 需要连续几拍确认。
+ *
+ * 有些服务绑定端口后几秒才退出（配置/依赖错误）；只探到一拍 ready 就收手会漏掉它。
+ */
+const READY_CONFIRM_POLLS = 2;
 /** 一轮里最多重启 3 次（首次 + 2 次重试）：再多就不像"重试"而像"卡在重启循环里" */
 const DEFAULT_MAX_ATTEMPTS = 3;
 /** 退避：2 秒 → 5 秒（第三次不给——尝试次数只有 3 次，第 2 次重试前等到 5 秒已足够让端口冷却） */
@@ -88,6 +122,7 @@ export function createAutoRestarter(deps: AutoRestartDeps): AutoRestarter {
   const { restart, probe, sleep, onGiveUp, onError } = deps;
   const throttleMs = deps.throttleMs ?? DEFAULT_THROTTLE_MS;
   const verifyMs = Math.max(deps.verifyMs ?? DEFAULT_VERIFY_MS, throttleMs);
+  const pollMs = Math.max(1, deps.pollMs ?? DEFAULT_OBSERVE_POLL_MS);
   const maxAttempts = Math.max(1, deps.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
   const backoffMs = deps.backoffMs ?? DEFAULT_BACKOFF_MS;
 
@@ -121,18 +156,53 @@ export function createAutoRestarter(deps: AutoRestartDeps): AutoRestarter {
           continue;
         }
 
-        // 变更停了：再等它把结果显出来（起不来就会进失败表）
-        if (verifyMs > throttleMs) await sleep(verifyMs - throttleMs);
+        // 观察窗：轮询到窗口上限，而不是睡满再探一次。
+        // build-then-run 的服务（Maven/NPM）失败发生在构建结束时——一次性探头
+        // 只要早于那一刻，就会把"还在构建"误判成成功，之后没人再观察。
+        const budget = Math.max(0, verifyMs - throttleMs);
         let outcome: ProbeOutcome = 'unknown';
-        try {
-          outcome = await probe(serviceId);
-        } catch (e) {
-          // 探查本身失败（IPC 抖动等）→ 按 `unknown` 处理，**不重试**：
-          // 判据缺失时最安全的动作是什么都不做，而不是去重启一个可能好好的服务
-          onError(serviceId, e);
+        let waited = 0;
+        let readyStreak = 0;
+        let probeErrorReported = false;
+        let changed = false;
+        while (waited < budget) {
+          const step = Math.min(pollMs, budget - waited);
+          await sleep(step);
+          waited += step;
+          // 观察期间又变了：这一轮基于的代码已过时，立刻重开一轮（不算重试）
+          if (state.pending) {
+            state.pending = false;
+            changed = true;
+            break;
+          }
+          try {
+            outcome = await probe(serviceId);
+          } catch (e) {
+            // 探查失败（IPC 抖动等）→ 按 unknown 继续观察；同一轮只报一次，避免刷屏。
+            // 判据缺失时最安全的动作是什么都不做，绝不据此重启一个可能好好的服务。
+            if (!probeErrorReported) {
+              onError(serviceId, e);
+              probeErrorReported = true;
+            }
+            outcome = 'unknown';
+            continue;
+          }
+          if (outcome === 'failed') break;
+          if (outcome === 'ready') {
+            // 连续两拍确认：防"绑定端口后几秒才退出"被当成成功
+            readyStreak += 1;
+            if (readyStreak >= READY_CONFIRM_POLLS) break;
+          } else {
+            readyStreak = 0;
+          }
+        }
+        if (changed) {
+          attempts = 0;
+          continue;
         }
 
-        // running / unknown 都不再动它（unknown 见文件头：重试会毁掉"启动慢但健康"的服务）
+        // 窗口结束仍是 running（还在构建/启动）或 unknown（状态不可判）→ 不动它：
+        // 重试会把"启动慢但健康"的服务越搞越糟
         if (outcome !== 'failed') return;
 
         if (attempts >= maxAttempts) {

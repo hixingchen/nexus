@@ -54,6 +54,8 @@ function setup(opts: {
   restartError?: unknown;
   probeError?: unknown;
   maxAttempts?: number;
+  pollMs?: number;
+  verifyMs?: number;
 }) {
   const clock = createManualClock();
   const restarts: string[] = [];
@@ -76,7 +78,8 @@ function setup(opts: {
     onGiveUp: (info) => { giveUps.push(info); },
     onError: (serviceId, error) => { errors.push({ serviceId, error }); },
     throttleMs: 10,
-    verifyMs: 30,
+    verifyMs: opts.verifyMs ?? 30,
+    pollMs: opts.pollMs,
     maxAttempts: opts.maxAttempts ?? 3,
     backoffMs: [5, 7],
   });
@@ -225,4 +228,60 @@ test('不同服务各记各的轮（一个服务的重启不阻塞另一个）',
   await drain(t.clock);
   assert.equal(t.restarter.activeCount(), 0);
   assert.equal(t.giveUps.length, 0);
+});
+
+test('构建中的 running 不算成功：窗口内晚到的 failed 仍会被重试', async () => {
+  // Maven/NPM 的真实形态：重启后几十秒内进程都活着（在构建），随后才失败。
+  // 原实现在固定时点探一次，看到 running 就收手 → 晚失败永远没人管。
+  const t = setup({
+    outcomes: ['running', 'running', 'failed', 'ready'],
+    pollMs: 10,
+    verifyMs: 50,
+  });
+
+  t.restarter.change('s1', 'web');
+  await drain(t.clock);
+
+  assert.equal(t.restarts.length, 2, '晚失败被观察到后必须重试一次');
+  assert.equal(t.probes.length >= 5, true, '观察窗内应轮询到失败出现');
+  assert.equal(t.giveUps.length, 0, '重试后起来了就不该打扰用户');
+  assert.equal(t.restarter.activeCount(), 0);
+});
+
+test('ready（已监听端口）连续两拍后收手，不等到窗口结束', async () => {
+  const t = setup({ outcomes: ['ready'], pollMs: 10, verifyMs: 50 });
+
+  t.restarter.change('s1', 'web');
+  await drain(t.clock);
+
+  assert.equal(t.restarts.length, 1);
+  assert.equal(t.probes.length, 2, 'ready 需要连续两拍确认（防绑定端口后秒退）');
+  assert.equal(t.giveUps.length, 0);
+});
+
+test('一直只到 running（慢启动）到窗口结束：不重试', async () => {
+  const t = setup({ outcomes: ['running'], pollMs: 10, verifyMs: 50 });
+
+  t.restarter.change('s1', 'web');
+  await drain(t.clock);
+
+  assert.equal(t.restarts.length, 1, '启动慢但健康不能反复重启');
+  assert.equal(t.probes.length >= 4, true, '窗口内应持续轮询，而不是只看一眼');
+  assert.equal(t.giveUps.length, 0);
+});
+
+test('观察窗内又改文件：立刻重开一轮，不等到窗口结束', async () => {
+  const t = setup({ outcomes: ['running'], pollMs: 10, verifyMs: 50 });
+
+  t.restarter.change('s1', 'web');
+  await flush();
+  t.clock.releaseOne();                // 节流窗口
+  await flush();
+  t.clock.releaseOne();                // 观察窗第一拍（running）
+  await flush();
+
+  t.restarter.change('s1', 'web');     // 观察期间又变了
+  await drain(t.clock);
+
+  assert.equal(t.restarts.length, 2, '旧内容的重启结果已过时，必须按新内容再重启');
 });

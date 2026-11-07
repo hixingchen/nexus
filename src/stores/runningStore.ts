@@ -23,6 +23,15 @@ let intervalId: ReturnType<typeof setInterval> | null = null;
 let refreshInFlight = false;
 
 /**
+ * 最近一次**成功**拿到后端状态的时刻（模块级，不触发渲染）。
+ *
+ * 用途：自动重启的观察窗里，多个服务可能同时每 1.5 秒探一次；每次都强制 `refresh()`
+ * 会让最重的 `get_running`（全系统进程快照 + TCP 表）被打成每秒好几次。调用方用
+ * `refreshIfStale` 共享同一份新鲜数据，最多每 ~1 秒真查一次。
+ */
+let lastFetchAt = 0;
+
+/**
  * 状态代际号：每次"被采纳的写入"（轮询响应或动作后的主动刷新）都 +1。
  *
  * 为什么需要：轮询响应在途时，一次用户动作（启停服务）会走 `refresh()` 拿到
@@ -51,6 +60,13 @@ interface RunningStore {
   /** 记录一次显式停止（由 `stores/serviceActions.ts` 的停止动作调用） */
   markStopped: (serviceIds: string[]) => void;
   refresh: () => Promise<void>;
+  /**
+   * 仅当现有数据早于 `maxAgeMs` 时才真的查一次。
+   *
+   * 自动重启的观察窗会高频探测（每个在重启的服务每 1.5 秒一次）；共享同一份
+   * `get_running` 结果，避免把最重的命令打成每秒多次。
+   */
+  refreshIfStale: (maxAgeMs: number) => Promise<void>;
   startPolling: () => void;
   stopPolling: () => void;
 }
@@ -70,6 +86,9 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
     refreshInFlight = true;
     try {
       const r = await processApi.getRunning();
+      // 请求已返回就记"数据新鲜"——即使下面因为代际更晚而丢弃这次响应，
+      // 后端那一份状态本身就是刚查到的
+      lastFetchAt = Date.now();
       // 期间有更新的写入（动作结果 / 更晚的刷新）→ 丢弃这次过期响应
       if (statusSeq !== reqSeq) return;
       const st = get();
@@ -85,6 +104,11 @@ export const useRunningStore = create<RunningStore>((set, get) => ({
     } finally {
       refreshInFlight = false;
     }
+  },
+
+  refreshIfStale: async (maxAgeMs) => {
+    if (Date.now() - lastFetchAt < maxAgeMs) return;
+    await get().refresh();
   },
 
   /** 启动轮询（幂等：MainLayout 挂载时调用一次） */
