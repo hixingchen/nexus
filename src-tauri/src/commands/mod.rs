@@ -5,6 +5,8 @@ pub mod boot;
 pub mod editor;
 pub mod fileops;
 pub mod layout;
+/// AI（MCP）高危操作的用户确认（界面弹窗 → 用户点「允许一次」才执行）
+pub mod mcp_confirm;
 pub mod node;
 pub mod paths;
 pub mod process;

@@ -51,6 +51,14 @@ export const LAYOUT_KEYS = {
    */
   aiSessionMode: 'ai_session_mode',
   /**
+   * AI 高危操作是否弹窗确认：`'1'`/缺省 = 弹窗（默认），`'0'` = 不弹窗。
+   *
+   * 安全偏好，不是几何：`reset_layout` 的保留清单（`commands/layout.rs` 的
+   * `KEEP_ON_RESET`）里必须带上它。**只能由用户在「设置 > AI 运行时」里切换**——
+   * MCP 的 `save_layout` 桥会拒绝这个键，否则 AI 可以关掉自己的确认闸门再执行任意命令。
+   */
+  mcpConfirm: 'mcp_confirm',
+  /**
    * 用户点过「跳过此版本」的版本号（GitHub tag，如 `v1.9.1`）。
    *
    * 只影响**启动时的自动提示**：手动「检查更新」永远显示结果；新版本发布后照常提示。

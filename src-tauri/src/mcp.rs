@@ -233,6 +233,41 @@ fn write_patch_file(port: u16, token: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// 清理上次进程遗留的 MCP patch 文件（内含一次性 Bearer token）。
+///
+/// 正常路径由 `McpHandle::drop` 删除；进程被强杀/崩溃/开发热重启时走不到。
+/// 按文件名中的 pid 判活：**只删进程已不存在的那份**——本机可能同时跑着安装版与
+/// dev 版（实测过），另一个实例的 patch 可能正要被它自己启动的 dsh 读取。
+/// pid 被无关进程复用时只会"多留一个文件"，不会误删活实例的配置。
+#[cfg(windows)]
+pub(crate) fn cleanup_stale_patch_files() {
+    let dir = crate::data_dir().join("ai");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("nexus-mcp-") else { continue };
+        if !name.ends_with(".yml") { continue; }
+        let Some(pid) = rest.split('-').next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        // 句柄身份不受 pid 复用影响；查不到（进程已退出/无权限）按"已退出"处理。
+        // 这些文件只在启动时被读一次，误删活实例的文件的唯一后果是它本次 MCP 不可用
+        let owner_alive = crate::core::winproc::OwnedProcess::open(pid)
+            .map(|p| p.is_alive())
+            .unwrap_or(false);
+        if owner_alive {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => log::info!("[mcp] 已清理遗留 patch 文件: {}", name),
+            Err(e) => log::warn!(
+                "[mcp] 清理遗留 patch 文件失败（{}）: {}",
+                entry.path().display(),
+                e
+            ),
+        }
+    }
+}
+
 /// 会话 cwd → 所属项目。取**最长前缀**：cwd 可能是项目下的服务工作目录。
 fn resolve_bound_project(app: &tauri::AppHandle, cwd: Option<&str>) -> Option<BoundProject> {
     let cwd = cwd?;
@@ -580,7 +615,15 @@ impl NexusMcpServer {
 
     async fn tool_nexus_invoke(&self, args: Option<JsonObject>) -> Result<Value, String> {
         let args: InvokeArgs = parse_args(args)?;
-        let value = crate::mcp_commands::invoke(&self.app, &args.command, &args.params).await?;
+        // 把绑定项目传进桥里：语义工具（list_services/start_service…）早在
+        // `require_project` 收死了范围，通用桥不能成为绕过它的后门。
+        let value = crate::mcp_commands::invoke(
+            &self.app,
+            &args.command,
+            &args.params,
+            self.project.as_ref().map(|p| p.id.as_str()),
+        )
+        .await?;
         // 统一包一层对象：MCP 的 structuredContent 必须是 record（对象），而
         // get_services / list_node_versions 这类命令本身返回数组，直接塞进去会被
         // 客户端判为 invalid result（实测：SDK 报 "expected record, received array"）。
@@ -923,6 +966,12 @@ impl NexusMcpServer {
         if !has_change {
             return Err("没有提供要修改的字段".into());
         }
+        // 命令 / 工作目录 / 环境变量 = 能把服务换成任意代码执行；改这三类必须由用户
+        // 在界面点「允许一次」。名称、监听 glob、启用状态不打断用户。
+        let risky_change = args.command.is_some()
+            || args.cwd.is_some()
+            || args.env_set.as_ref().is_some_and(|m| !m.is_empty())
+            || args.env_unset.as_ref().is_some_and(|v| !v.is_empty());
 
         let current = self.resolve_service(&args.service)?;
         let name = match args.name {
@@ -968,6 +1017,17 @@ impl NexusMcpServer {
         // 渲染后再解析一次：写进库的形态必须和启动路径能解析的形态一致，
         // 否则会出现"保存成功、下次启动才炸"。
         crate::core::process::parse_env_vars(&env_vars)?;
+
+        if risky_change {
+            let detail = format!(
+                "修改服务配置\n服务：{}\n命令：{}\n工作目录：{}\n环境变量：{} 项（值不展开）\n\n修改后，下次启动服务将执行上面的命令。",
+                name,
+                command,
+                cwd,
+                env.len()
+            );
+            crate::commands::mcp_confirm::ask(&self.app, "AI 请求修改服务配置", &detail).await?;
+        }
 
         let params = crate::commands::service::UpdateServiceParams {
             id: current.id.clone(),
@@ -1238,11 +1298,25 @@ impl ServerHandler for NexusMcpServer {
 /// 端点在回环地址上，本机其它进程也可能连到；token 每次会话随机，只写进 dsh 的
 /// 会话级 patch 文件。任何缺失/格式不符/值不匹配都一律拒绝，不暴露服务信息。
 fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
-    headers
+    let Some(token) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == expected)
+    else {
+        return false;
+    };
+    // 常量时间比较：回环上的时序攻击不现实（token 是每会话 64 hex 随机串），
+    // 但比较凭据没有理由在第一个不同的字节就返回。长度不等直接失败不泄漏内容。
+    let a = token.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn schema(value: Value) -> JsonObject {
@@ -1538,5 +1612,24 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("本行已截断"));
         assert!(truncated);
+    }
+
+    /// Bearer 校验只认**完全匹配**的 token：前缀/长度不同/缺头都必须失败
+    #[test]
+    fn test_bearer_matches_requires_exact_token() {
+        use axum::http::header::AUTHORIZATION;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer abc123".parse().expect("构造 header"));
+        assert!(bearer_matches(&headers, "abc123"));
+        assert!(
+            !bearer_matches(&headers, "abc124"),
+            "最后一个字节不同必须拒绝"
+        );
+        assert!(!bearer_matches(&headers, "abc1234"), "长度不同必须拒绝");
+        assert!(!bearer_matches(&headers, ""));
+        assert!(
+            !bearer_matches(&axum::http::HeaderMap::new(), "abc123"),
+            "缺 Authorization 必须拒绝"
+        );
     }
 }

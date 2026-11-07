@@ -172,6 +172,13 @@ export const aiService = {
   focusPanel: (windowLabel: string, label: string) =>
     invoke<void>('ai_panel_focus', { windowLabel, label }),
 
+  /**
+   * 提交 AI（MCP）高危操作的确认结果。只有用户点「允许一次」才传 approved=true；
+   * 关闭弹窗（✕ / Esc / 遮罩）按拒绝处理。
+   */
+  confirmMcpAction: (id: number, approved: boolean) =>
+    invoke<void>('mcp_confirm_response', { id, approved }),
+
   // ─── 私有运行时（设置 > AI 运行时） ───────────────────────
   /** 运行时状态：版本、路径、占用空间、跑不起来时的原因 */
   runtimeStatus: () => invoke<AiRuntimeStatus>('ai_runtime_status'),

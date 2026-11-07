@@ -121,7 +121,13 @@ pub fn init() {
     if log::set_boxed_logger(Box::new(CompositeLogger { console, file })).is_ok() {
         log::set_max_level(log::LevelFilter::Trace);
     }
-    log::info!("[nexus] 日志已就绪（文件日志: {}）", if file_log_enabled { "开" } else { "关" });
+    // 带 PID：本机常同时跑安装版与 dev 版（同一份 nexus.log），没有 PID 就无法把
+    // 交错的行归回各自的进程——排查"某实例无声消失"时连是哪一条都没法说清。
+    log::info!(
+        "[nexus] 日志已就绪（pid={}，文件日志: {}）",
+        std::process::id(),
+        if file_log_enabled { "开" } else { "关" }
+    );
 }
 
 /* ---- 前端日志回传（NEW-28） ---- */

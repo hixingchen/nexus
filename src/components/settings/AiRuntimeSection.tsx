@@ -21,6 +21,7 @@ import { reportError, toMessage } from '../../utils/error';
 import { parseAiSessionMode, type AiSessionMode } from '../../utils/aiSession';
 import { LAYOUT_KEYS, flushLayoutWrites, saveLayout, useLayoutStore } from '../../stores/layoutStore';
 import { Modal } from '../ui/Modal';
+import { Switch } from '../ui/Switch';
 
 /**
  * 设置 > AI 运行时。
@@ -62,6 +63,26 @@ export function AiRuntimeSection() {
     useLayoutStore((s) => s.values?.[LAYOUT_KEYS.aiSessionMode]),
   );
   const setSessionMode = (mode: AiSessionMode) => saveLayout({ [LAYOUT_KEYS.aiSessionMode]: mode });
+
+  /**
+   * AI 高危操作是否弹窗确认（缺省/`"1"` = 弹，`"0"` = 不弹）。
+   *
+   * 只能在这里改：MCP 的 `save_layout` 桥拒绝写这个键——AI 不能关掉自己的闸门。
+   */
+  const mcpConfirmEnabled = useLayoutStore((s) => s.values?.[LAYOUT_KEYS.mcpConfirm] !== '0');
+  const setMcpConfirm = (enabled: boolean) => {
+    saveLayout({ [LAYOUT_KEYS.mcpConfirm]: enabled ? '1' : '0' });
+    // 后端每次 ask 都读库；只走 500ms 防抖的话，切完马上让 AI 干活会按旧值多弹一次
+    void flushLayoutWrites();
+    if (!enabled) {
+      notify({
+        variant: 'warning',
+        title: '已关闭 AI 操作确认',
+        description: 'AI 将可以不经确认直接新建服务、修改启动命令或做系统级操作。',
+        duration: 8000,
+      });
+    }
+  };
 
   // npm 源：存的是用户配置；空/缺省时后端回落默认淘宝源（见 utils/npmRegistry.ts）
   const rawRegistry = useLayoutStore((s) => s.values?.[LAYOUT_KEYS.npmRegistry]);
@@ -509,6 +530,28 @@ export function AiRuntimeSection() {
           <p className="text-[11px] text-nexus-muted leading-relaxed pt-0.5">
             修改后在下一次启动/重建 AI 会话时生效（关闭面板只是隐藏，当前对话会保留）。
           </p>
+        </div>
+      </section>
+
+      {/* ── AI 高危操作确认 ─────────────────────────────────────
+          默认开启。关掉后 AI 的 MCP 写操作（新建服务/改命令/系统级操作）不再弹窗；
+          这个键 AiPanel 已不再提供入口，只在这里——AI 自身也改不了（save_layout 桥拒绝）。 */}
+      <section>
+        <SectionTitle>AI 操作确认</SectionTitle>
+        <div className="flex items-center gap-3 px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30">
+          <div className="flex-1 min-w-0">
+            <div className="text-[12px] text-nexus-text">高危操作前弹窗确认</div>
+            <div className="text-[11px] text-nexus-muted mt-1 leading-relaxed">
+              默认开启：AI 通过 MCP 新建服务、修改启动命令、保存外部打开工具或做系统级操作前，
+              会先弹窗等你点「允许一次」。关闭后这些操作会直接执行，只建议在完全信任当前
+              AI 会话时关闭。AI 自身无法修改这个开关。
+            </div>
+          </div>
+          <Switch
+            checked={mcpConfirmEnabled}
+            label="AI 高危操作前弹窗确认"
+            onChange={setMcpConfirm}
+          />
         </div>
       </section>
 

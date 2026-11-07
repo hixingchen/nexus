@@ -1,4 +1,5 @@
 import { MainLayout } from './components/layout/MainLayout';
+import { McpConfirmDialog } from './components/ai/McpConfirmDialog';
 import { Toaster } from 'sonner';
 import { useAiPanelReserve } from './hooks/useAiPanelReserve';
 import { useAiRuntimeTransferEvents } from './hooks/useAiRuntimeTransferEvents';
@@ -15,6 +16,8 @@ function App() {
   return (
     <div className="h-screen flex flex-col bg-nexus-bg text-nexus-text">
       <MainLayout />
+      {/* AI（MCP）高危操作的确认弹窗：全局挂载，跨面板存活 */}
+      <McpConfirmDialog />
       <Toaster
         position="top-center"
         // sonner 容器默认按**窗口**居中（left:50% + translate(-50%)，transform 不能动，

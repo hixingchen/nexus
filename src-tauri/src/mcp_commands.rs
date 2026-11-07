@@ -189,8 +189,229 @@ fn c(name: &str, description: &str, params: Value, destructive: bool) -> Value {
     })
 }
 
+/// 需要在 Nexus 界面由用户点「允许一次」的命令。
+///
+/// 判据 =「能执行代码 / 能改系统级持久化或全局工具链」。注意与 `DESTRUCTIVE` 的区别：
+/// `confirm: true` 是**给模型写的意图声明**——模型照写不误，它不是人点的；这里的命令
+/// 必须过人（项目文件/日志里的一段提示注入就足以让模型替用户按下按钮）。
+const NEEDS_USER_CONFIRM: &[&str] = &[
+    "add_service",
+    // 从模板建服务同样是"写一条将被执行的命令"：模板可能刚被 AI 导入/修改过
+    // （import/update_service_template 不弹窗），不能成为绕过 add_service 闸门的后门
+    "add_service_from_template",
+    "update_service",
+    "save_open_tool",
+    "open_service_with_tool",
+    "run_tool_command",
+    "open_path_with_default_app",
+    "install_boot_runner",
+    "start_boot_runner",
+    "stop_boot_runner",
+    "set_service_boot_enabled",
+    "set_autostart_enabled",
+    "install_node_version",
+    "use_node_version",
+    "set_nvm_mirrors",
+    "run_nvm_installer",
+];
+
+/// AI 自身安全边界的布局键：MCP 桥拒绝写入，只能由用户在「设置 > AI 运行时」里改。
+///
+/// 目前只有「AI 高危操作是否弹窗确认」——如果 AI 能改它，就能先关掉确认再执行，
+/// 整个闸门等于不存在。
+fn protected_layout_key(key: &str) -> bool {
+    key == crate::commands::layout::KEY_MCP_CONFIRM
+}
+
+/// 项目/服务域命令的「目标项目」；`None` = 全局域命令（不参与绑定项目校验）。
+///
+/// 语义工具（list_services/start_service…）早就用 `BoundProject` 收死了范围；
+/// 通用桥必须作同一套判定，否则 `nexus_invoke` 就是绕过它的后门。
+fn target_project_id(
+    command: &str,
+    params: &Value,
+    service_owner_of: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    let need = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("缺少字符串参数 {}", key))
+    };
+    let service_owner = |key: &str| -> Result<String, String> {
+        let id = need(key)?;
+        service_owner_of(&id).ok_or_else(|| format!("找不到服务: {}", id))
+    };
+    Ok(match command {
+        // 参数里直接带 projectId
+        "get_project_detail"
+        | "get_services"
+        | "add_service"
+        | "reorder_services"
+        | "add_service_from_template"
+        | "start_project_services"
+        | "stop_project_services"
+        | "list_service_open_tool_bindings" => Some(need("projectId")?),
+        // 项目 id 在 `id` 里
+        "update_project" | "delete_project" | "duplicate_project" | "toggle_pin_project" => {
+            Some(need("id")?)
+        }
+        // 服务域：按服务 id 反查所属项目
+        "update_service" | "delete_service" => Some(service_owner("id")?),
+        "save_service_as_template"
+        | "start_service"
+        | "stop_service"
+        | "restart_service"
+        | "run_tool_command"
+        | "unfollow_service_log"
+        | "set_service_open_tool"
+        | "open_service_with_tool" => Some(service_owner("serviceId")?),
+        "get_service_logs" => Some(service_owner("serviceKey")?),
+        _ => None,
+    })
+}
+
+/// 服务配置里除 command/cwd 之外、同样能提权或持久化的字段。
+///
+/// 确认框如果只显示主命令，用户就不知道这一次还顺带写入了"工具命令"（之后可由
+/// run_tool_command 执行）或"开机启动"（提权持久化）——这些不是同一件事，必须说出来。
+fn extra_risk_notes(params: &Value) -> String {
+    let mut out = String::new();
+    if let Some(commands) = params.get("toolCommands").and_then(Value::as_str) {
+        let commands = commands.trim();
+        if !commands.is_empty() && commands != "[]" {
+            let shown: String = commands.chars().take(300).collect();
+            out.push_str(&format!("\n工具命令：{shown}"));
+        }
+    }
+    if params.get("bootEnabled").and_then(Value::as_bool) == Some(true) {
+        let mode = params
+            .get("bootCredentialMode")
+            .and_then(Value::as_str)
+            .unwrap_or("s4u");
+        out.push_str(&format!("\n开机启动：开（{mode}）"));
+    }
+    out
+}
+
+/// 弹窗文案：人话 + 关键参数。
+///
+/// **不展开环境变量值**（可能是密钥）：只报条数。命令本身要原样展示——用户是在
+/// 批准"这条命令将被执行"，藏起来就等于没批准。
+fn confirm_prompt(
+    command: &str,
+    params: &Value,
+    template_of: impl Fn(&str) -> Option<(String, String, String)>,
+) -> (String, String) {
+    let s = |key: &str| params.get(key).and_then(Value::as_str).unwrap_or("");
+    let env_count = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|v| {
+                v.lines()
+                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let bool_param = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_bool)
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "未指定".to_string())
+    };
+    let detail = match command {
+        "add_service" => format!(
+            "新建服务（服务启动时会执行下面这条命令）\n名称：{}\n命令：{}\n工作目录：{}\n环境变量：{} 项（值不展开）{}",
+            s("name"),
+            s("command"),
+            s("cwd"),
+            env_count("envVars"),
+            extra_risk_notes(params)
+        ),
+        "update_service" => format!(
+            "修改服务配置（服务下次启动时会执行新的命令）\n名称：{}\n命令：{}\n工作目录：{}\n环境变量：{} 项（值不展开）{}",
+            s("name"),
+            s("command"),
+            s("cwd"),
+            env_count("envVars"),
+            extra_risk_notes(params)
+        ),
+        "add_service_from_template" => {
+            let template_id = s("templateId");
+            match template_of(template_id) {
+                Some((name, command, cwd)) => format!(
+                    "从模板新建服务（启动时会执行模板里的命令）\n模板：{}\n命令：{}\n工作目录：{}\n目标项目：{}",
+                    name, command, cwd, s("projectId")
+                ),
+                None => format!(
+                    "从模板新建服务\n模板 id：{}\n目标项目：{}\n\n（读取模板内容失败；执行分支会再校验一次）",
+                    template_id, s("projectId")
+                ),
+            }
+        }
+        "save_open_tool" => format!(
+            "保存外部打开工具\n名称：{}\n可执行文件：{}\n参数：{}\n\n保存后，用该工具打开服务时会启动这个程序。",
+            s("name"), s("executable"), s("args")
+        ),
+        "open_service_with_tool" => format!(
+            "用外部工具打开服务目录\nserviceId：{}\n\n这会启动该服务绑定的外部程序。",
+            s("serviceId")
+        ),
+        "run_tool_command" => format!(
+            "执行服务配置里的工具命令\nserviceId：{}\ncommandId：{}\n\n命令内容来自该服务的工具命令配置。",
+            s("serviceId"), s("commandId")
+        ),
+        "open_path_with_default_app" => format!(
+            "用系统默认程序打开文件\n路径：{}\n\n如果该文件是可执行文件，这等于直接运行它。",
+            s("path")
+        ),
+        "install_boot_runner" => format!(
+            "安装/修复开机启动器（创建系统级计划任务）\nmode：{}",
+            s("mode")
+        ),
+        "start_boot_runner" => format!("启动开机启动器\nmode：{}", s("mode")),
+        "stop_boot_runner" => format!("停止开机启动器\nmode：{}", s("mode")),
+        "set_service_boot_enabled" => format!(
+            "修改服务的开机启动设置\nserviceId：{}\nenabled：{}",
+            s("serviceId"),
+            bool_param("enabled")
+        ),
+        "set_autostart_enabled" => {
+            format!("修改 Nexus 是否随登录自启\nenabled：{}", bool_param("enabled"))
+        }
+        "install_node_version" => format!("安装 Node 版本：{}", s("version")),
+        "use_node_version" => format!("切换全局 Node 版本：{}", s("version")),
+        "set_nvm_mirrors" => format!(
+            "修改 nvm 镜像（影响后续 Node 下载的来源）\nnode 镜像：{}\nnpm 镜像：{}",
+            s("nodeMirror"),
+            s("npmMirror")
+        ),
+        "run_nvm_installer" => "运行 nvm 安装器（会弹出系统级安装/UAC 窗口）".to_string(),
+        _ => {
+            let text: String = params.to_string().chars().take(800).collect();
+            format!("参数：{}", text)
+        }
+    };
+    (
+        format!("AI 请求执行：{}", command),
+        format!("{detail}\n\n这是 AI 通过 MCP 发起的操作。请确认内容可信后再允许。"),
+    )
+}
+
 /// 执行一条 Nexus 用户命令。
-pub async fn invoke(app: &AppHandle, command: &str, params: &Value) -> Result<Value, String> {
+///
+/// `bound_project` = 本次 AI 会话绑定的项目 id（见 `mcp.rs::BoundProject`）：
+/// 项目/服务域命令只能落在它身上；`None`（会话没有有效工作目录）时这类命令一律拒绝。
+pub async fn invoke(
+    app: &AppHandle,
+    command: &str,
+    params: &Value,
+    bound_project: Option<&str>,
+) -> Result<Value, String> {
     if DESTRUCTIVE.contains(&command) && params.get("confirm").and_then(Value::as_bool) != Some(true) {
         return Err(format!(
             "「{}」是不可逆操作，需要在 params 里显式传 confirm: true（确认后才执行）",
@@ -198,6 +419,38 @@ pub async fn invoke(app: &AppHandle, command: &str, params: &Value) -> Result<Va
         ));
     }
     let state = app.state::<AppState>();
+
+    // ① 项目边界：通用桥不能操作绑定项目之外的项目/服务
+    if let Some(target) = target_project_id(command, params, |id| service_project_id(&state, id))? {
+        let Some(bound) = bound_project else {
+            return Err(
+                "当前 AI 会话没有绑定项目（启动会话时未带有效工作目录），项目/服务类命令不可用"
+                    .into(),
+            );
+        };
+        if target != bound {
+            return Err(format!(
+                "权限边界：当前 AI 会话只允许操作绑定项目（{bound}），已拒绝操作其它项目（{target}）。如需操作其它项目，请在 Nexus 里切换到该项目后重新打开 AI 面板。"
+            ));
+        }
+    }
+
+    // ② 能执行代码 / 改系统级持久化的命令：必须用户在界面点「允许一次」
+    if NEEDS_USER_CONFIRM.contains(&command) {
+        let (title, mut detail) =
+            confirm_prompt(command, params, |id| template_summary(&state, id));
+        // 工具命令的实际内容在服务配置里，confirm_prompt 拿不到：补一次查询，
+        // 让用户看到"将执行什么"，而不是只看到一个 commandId。
+        if command == "run_tool_command" {
+            let service_id = params.get("serviceId").and_then(Value::as_str).unwrap_or("");
+            let command_id = params.get("commandId").and_then(Value::as_str).unwrap_or("");
+            match tool_command_text(&state, service_id, command_id) {
+                Some(text) => detail.push_str(&format!("\n\n即将执行：{}", text)),
+                None => detail.push_str("\n\n（读取工具命令内容失败；执行分支会再校验一次）"),
+            }
+        }
+        crate::commands::mcp_confirm::ask(app, &title, &detail).await?;
+    }
     let s = |key: &str| -> Result<String, String> {
         params
             .get(key)
@@ -443,6 +696,14 @@ pub async fn invoke(app: &AppHandle, command: &str, params: &Value) -> Result<Va
             let items: HashMap<String, String> = from_params(
                 params.get("items").ok_or_else(|| "缺少 items 对象".to_string())?,
             )?;
+            // AI 不能改自己的安全设置：否则它可以先关掉确认闸门、再执行任意命令，
+            // 闸门就只是个装饰。只能由用户在 AI 面板头部切换。
+            if items.keys().any(|key| protected_layout_key(key)) {
+                return Err(
+                    "「AI 操作确认」开关只能由用户在「设置 > AI 运行时」里修改，AI 不能修改"
+                        .into(),
+                );
+            }
             crate::commands::layout::save_layout(state, items)?;
             Ok(json!({ "ok": true }))
         }
@@ -495,6 +756,44 @@ fn mutation_kind(command: &str) -> Option<&'static str> {
     }
 }
 
+/// 服务里某条工具命令的实际命令行（确认框要让用户看到"将执行什么"）。
+fn tool_command_text(state: &AppState, service_id: &str, command_id: &str) -> Option<String> {
+    let json: String = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT tool_commands FROM services WHERE id=?1",
+                [service_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("查询服务失败: {}", e))
+        })
+        .ok()?;
+    let commands: Vec<crate::models::ToolCommand> = serde_json::from_str(&json).ok()?;
+    commands
+        .into_iter()
+        .find(|c| c.id == command_id)
+        .map(|c| c.command)
+}
+
+/// 模板 id → (名称, 命令, 工作目录)；查不到返回 None。
+///
+/// 只用于确认框展示"用户将要批准的到底是什么命令"——查不到时确认框仍会出现，
+/// 真正的执行分支会再校验一次。
+fn template_summary(state: &AppState, template_id: &str) -> Option<(String, String, String)> {
+    state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT name, command, cwd FROM service_templates WHERE id=?1",
+                [template_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("查询模板失败: {}", e))
+        })
+        .ok()
+}
+
 fn service_project_id(state: &AppState, service_id: &str) -> Option<String> {
     state
         .db
@@ -537,6 +836,134 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// 确认清单不能写出目录里不存在的命令（改名/删命令时这里先炸，而不是运行时才发现）
+    #[test]
+    fn confirm_required_commands_exist_in_catalog() {
+        let cat = catalog();
+        let names: Vec<&str> = cat["commands"]
+            .as_array()
+            .expect("commands 是数组")
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        for cmd in NEEDS_USER_CONFIRM {
+            assert!(
+                names.contains(cmd),
+                "确认清单里的「{}」不在命令目录里——改名时漏了同步？",
+                cmd
+            );
+        }
+        // 从模板建服务是 add_service 的等价物（模板命令可能刚被 AI 改过），不能漏
+        assert!(NEEDS_USER_CONFIRM.contains(&"add_service_from_template"));
+    }
+
+    /// 确认框必须展示"要执行的命令"，但**不能展开环境变量的值**（可能是密钥）
+    #[test]
+    fn confirm_prompt_shows_command_but_hides_env_values() {
+        let params = json!({
+            "name": "svc",
+            "command": "python app.py",
+            "cwd": "D:/proj",
+            "envVars": "API_KEY=super-secret\nDEBUG=1"
+        });
+        let (_, detail) = confirm_prompt("add_service", &params, |_| None);
+        assert!(
+            detail.contains("python app.py"),
+            "批准的是命令本身，不能藏起来"
+        );
+        assert!(!detail.contains("super-secret"), "环境变量的值不能进确认框");
+        assert!(detail.contains("2 项"), "应只报环境变量条数: {}", detail);
+    }
+
+    /// AI 不能通过 save_layout 改自己的确认开关
+    #[test]
+    fn ai_cannot_change_its_own_confirm_setting() {
+        assert!(protected_layout_key(crate::commands::layout::KEY_MCP_CONFIRM));
+        assert!(!protected_layout_key("ai_panel_width"));
+        assert!(!protected_layout_key("selected_project_id"));
+    }
+
+    /// 顺带写入的"工具命令 / 开机启动"也要在确认框里说出来（不是只看主命令）
+    #[test]
+    fn confirm_prompt_mentions_boot_and_tool_commands() {
+        let params = json!({
+            "name": "svc",
+            "command": "python app.py",
+            "cwd": "D:/x",
+            "envVars": "SECRET=x",
+            "bootEnabled": true,
+            "bootCredentialMode": "password",
+            "toolCommands": "[{\"name\":\"run\",\"command\":\"yarn build\"}]"
+        });
+        let (_, detail) = confirm_prompt("add_service", &params, |_| None);
+        assert!(detail.contains("开机启动：开（password）"), "{}", detail);
+        assert!(detail.contains("yarn build"), "工具命令也要展示: {}", detail);
+        assert!(!detail.contains("SECRET"), "环境变量值不能进确认框: {}", detail);
+    }
+
+    /// 从模板建服务同样是被执行的命令：确认框必须展示模板里的实际命令
+    #[test]
+    fn confirm_prompt_for_template_shows_the_command() {
+        let params = json!({ "projectId": "p", "templateId": "t1" });
+        let (_, detail) = confirm_prompt("add_service_from_template", &params, |id| {
+            (id == "t1").then(|| {
+                (
+                    "tmpl".to_string(),
+                    "python manage.py runserver".to_string(),
+                    "D:/proj".to_string(),
+                )
+            })
+        });
+        assert!(detail.contains("tmpl"), "应显示模板名: {}", detail);
+        assert!(
+            detail.contains("python manage.py runserver"),
+            "批准的是将要执行的命令，不能藏起来: {}",
+            detail
+        );
+    }
+
+    /// 项目边界：直接带 projectId / 项目 id / 服务 id 三类都要解析出目标项目；
+    /// 全局域命令返回 None；服务不存在时必须报错而不是当作"无目标"放行。
+    #[test]
+    fn target_project_resolves_project_and_service_commands() {
+        let owner = |id: &str| (id == "svc-1").then(|| "proj-1".to_string());
+        assert_eq!(
+            target_project_id("get_services", &json!({ "projectId": "proj-2" }), owner).unwrap(),
+            Some("proj-2".to_string())
+        );
+        assert_eq!(
+            target_project_id("delete_project", &json!({ "id": "proj-3" }), owner).unwrap(),
+            Some("proj-3".to_string())
+        );
+        assert_eq!(
+            target_project_id("start_service", &json!({ "serviceId": "svc-1" }), owner).unwrap(),
+            Some("proj-1".to_string())
+        );
+        assert_eq!(
+            target_project_id(
+                "save_service_as_template",
+                &json!({ "serviceId": "svc-1" }),
+                owner
+            )
+            .unwrap(),
+            Some("proj-1".to_string())
+        );
+        assert_eq!(
+            target_project_id("get_service_logs", &json!({ "serviceKey": "svc-1" }), owner)
+                .unwrap(),
+            Some("proj-1".to_string())
+        );
+        assert_eq!(
+            target_project_id("get_projects", &json!({}), owner).unwrap(),
+            None,
+            "全局域命令不参与绑定项目校验"
+        );
+        assert!(
+            target_project_id("start_service", &json!({ "serviceId": "svc-404" }), owner).is_err(),
+            "解析不到目标项目不能当作全局命令放行"
+        );
     }
 
     /// 不可逆标记只能两处一致：目录里 `destructive` 与 `DESTRUCTIVE` 列表。

@@ -1196,16 +1196,28 @@ fn survivors_of(pids: &[u32]) -> Vec<u32> {
 /// 用途：命令主进程已退出，但后代继承了 stdout/stderr 管道并继续持有写端——reader 永远
 /// 等不到 EOF。先清掉这些后代，管道关闭后 reader 才能退出。只在“主进程已 wait”之后调用，
 /// 且调用方仍持有主进程句柄（pid 不会被复用）。
+///
+/// **先给每个候选开句柄、再杀**（这是本函数唯一的安全边界）：只按快照里的 PID
+/// `taskkill` 时，候选可能在"快照之后、taskkill 之前"退出，系统立刻把 PID 分给无关
+/// 进程，于是杀掉的是一棵无辜的进程树。句柄存活期间进程对象不会被回收、PID 不会
+/// 被复用；开不到句柄（已退出/无权限）的候选直接跳过——本来也不该由我们杀。
+/// 日志里已经出现过 "taskkill 没找到进程 100/18352" 这种快照竞态。
 #[cfg(windows)]
 pub(crate) fn kill_descendants_of(pid: u32) -> usize {
     let snapshot = super::winproc::snapshot_processes();
     let descendants = super::winproc::descendants(pid, &snapshot);
-    for child in &descendants {
+    let mut held: Vec<(u32, super::winproc::OwnedProcess)> = Vec::new();
+    for child in descendants {
+        if let Some(proc_handle) = super::winproc::OwnedProcess::open(child) {
+            held.push((child, proc_handle));
+        }
+    }
+    for (child, _proc_handle) in &held {
         if let Err(e) = kill_process_tree(*child) {
             log::warn!("[nexus] 清理命令后代进程失败 (pid={}): {}", child, e);
         }
     }
-    descendants.len()
+    held.len()
 }
 
 #[cfg(not(windows))]

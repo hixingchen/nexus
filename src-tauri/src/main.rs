@@ -11,5 +11,8 @@ fn main() {
     // 控制台 + 文件双写：默认 info 级别（启动/启停/清理等关键日志可见），
     // 可用 RUST_LOG 覆盖（如 RUST_LOG=debug）。文件日志是打包版唯一可见的诊断通道
     nexus_lib::logger::init();
+    // panic 在打包版里只写 stderr（GUI 子系统没有控制台）→ 必须落盘，
+    // 否则"主线程 panic → 进程直接退出"与"被外部结束"在日志上无法区分
+    nexus_lib::install_panic_hook();
     nexus_lib::run();
 }

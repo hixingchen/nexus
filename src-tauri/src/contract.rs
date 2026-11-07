@@ -149,6 +149,19 @@ fn test_response_dtos_are_snake_case() {
         sorted(&["kind", "project_id", "changed_ids"])
     );
 
+    // AI（MCP）高危操作确认（`mcp-confirm-request` 事件载荷）：
+    // 前端 `McpConfirmDialog` 直接读 `timeout_secs` 启动倒计时
+    let confirm = crate::commands::mcp_confirm::ConfirmRequest {
+        id: 1,
+        title: "t".into(),
+        detail: "d".into(),
+        timeout_secs: 120,
+    };
+    assert_eq!(
+        keys_of(&confirm),
+        sorted(&["id", "title", "detail", "timeout_secs"])
+    );
+
     // dsh 版本信息（面板「检查更新」）
     let info = DshVersionInfo {
         dsh_found: true,
@@ -816,7 +829,7 @@ fn scan_ipc_structs() -> IpcStructs {
 /// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
 const COVERED_RESPONSE: &[&str] = &[
         "AiStatus", "AiMcpStatus", "DshVersionInfo", "AppPaths",
-        "ServiceDraftPayload", "NexusDataChanged",
+        "ServiceDraftPayload", "NexusDataChanged", "ConfirmRequest",
         // AI 私有运行时：状态走 invoke，进度走 `ai-runtime-progress` 事件，失败体是
         // `ai_runtime_install` 的 Err 载荷——三条都出前端，字段名都得钉住
         "DshProbe", "AiRuntimeStatus", "RuntimeProgress", "RuntimeFailure",

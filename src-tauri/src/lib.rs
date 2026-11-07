@@ -87,29 +87,111 @@ pub(crate) fn cleanup_resources(state: &AppState) {
     log::info!("[nexus] 清理完成 (总耗时 {:.0}ms)", start.elapsed().as_millis());
 }
 
+/// WebView2 用户数据目录里的 cookie 存储位置（Windows）。
+///
+/// 目录名来自 `tauri.conf.json` 的 `identifier`：Tauri/wry 在 Windows 上按
+/// `%LOCALAPPDATA%\<identifier>\EBWebView` 存放 WebView2 数据（运行中的进程命令行
+/// 可直接验证）。**不要在这里硬编码目录名**——标识曾从 `com.nexus.app` 改为
+/// `com.hixingchen.nexus`，而清理函数仍写死旧名，于是清理变成空转：日志里
+/// "已清理"在 2026-10-29 之后彻底消失，cookie 继续在新的 profile 里累积。
+/// 用 `include_str!` 读构建期的同一份配置，改名时这里自动跟随。
+#[cfg(windows)]
+fn webview_cookie_dir() -> Option<std::path::PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct TauriConf {
+        identifier: String,
+    }
+    let raw = include_str!("../tauri.conf.json").trim_start_matches('\u{feff}');
+    let conf: TauriConf = serde_json::from_str(raw).ok()?;
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        std::path::PathBuf::from(local)
+            .join(conf.identifier)
+            .join("EBWebView")
+            .join("Default")
+            .join("Network"),
+    )
+}
+
 /// WebView2 cookie 存储清理（Windows，必须在 WebView 创建前调用）。
 ///
 /// 背景：dsh 每次会话签发新 cookie（名带随机串 `dsh-auth-<rand>`，Max-Age 30 天），
 /// localhost 域 cookie 只增不减 → 请求头膨胀 → dsh 服务器对插件 bundle 请求返回
 /// 431 (Request Header Fields Too Large) → 「failed to load plugins」永久错误。
 /// Nexus 自身不依赖任何 cookie（本地应用），每次启动清空无副作用。
+///
+/// 失败必须可见（warn）：这条清理此前静默失效了一个多月，而它正是 431 的唯一防线
+/// ——"配置写了 ≠ 生效了"（铁律 21）。
 #[cfg(windows)]
 fn purge_webview_cookies() {
-    let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
-    let dir = std::path::PathBuf::from(local)
-        .join("com.nexus.app")
-        .join("EBWebView")
-        .join("Default")
-        .join("Network");
+    let Some(dir) = webview_cookie_dir() else {
+        log::warn!("[nexus] 无法确定 WebView2 数据目录（identifier/LOCALAPPDATA 缺失），已跳过 cookie 清理");
+        return;
+    };
     for name in ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"] {
         let f = dir.join(name);
-        if f.exists() {
-            match std::fs::remove_file(&f) {
-                Ok(_) => log::info!("[nexus] 已清理 WebView2 cookie 存储: {}", name),
-                Err(e) => log::debug!("[nexus] 清理 cookie 失败（webview 可能运行中）: {}", e),
-            }
+        if !f.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&f) {
+            Ok(_) => log::info!("[nexus] 已清理 WebView2 cookie 存储: {}", name),
+            Err(e) => log::warn!(
+                "[nexus] 清理 cookie 失败（{}，webview 可能运行中）: {}",
+                f.display(),
+                e
+            ),
         }
     }
+}
+
+/// 安装 panic 钩子：panic 写进 `<数据目录>/logs/panic.log`，再交给原钩子。
+///
+/// 为什么必须有：release 是 `windows_subsystem = "windows"`，默认钩子只写 stderr
+/// （没有控制台 → 信息直接丢失）。更关键的是 tao 会把主线程回调里的 panic 捕获、
+/// 在消息循环里 `resume_unwind`（tao 0.35.3 `windows/event_loop.rs`），于是 panic
+/// 会一路退出 `app.run()`/`main`：现象是"程序无声消失"，且 **WER 不会记录**
+/// （Rust unwind 不是 SEH 异常）。没有这条落盘，"主线程 panic"与"被外部结束"
+/// 在日志上完全无法区分。
+///
+/// 不能用 `log::` 宏：panic 可能发生在持有日志锁的那条调用里（重入同一把
+/// `std::sync::Mutex` 会死锁），所以这里用独立文件句柄直接追加。
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let dir = data_dir().join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("panic.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "{ts} PANIC pid={} thread={thread_name}\n  at {location}\n  {payload}\nbacktrace:\n{backtrace}\n",
+                std::process::id()
+            );
+            let _ = f.flush();
+        }
+        // 保留原行为：dev 控制台仍能看到 panic
+        prev(info);
+    }));
 }
 
 /// Nexus 自己的数据目录（数据库 + 日志）。
@@ -206,6 +288,12 @@ pub fn run() {
     // WebView 创建前清空 cookie 库（见 purge_webview_cookies 注释）
     #[cfg(windows)]
     purge_webview_cookies();
+
+    // 上次进程遗留的 MCP patch 文件（含一次性 Bearer token）：正常路径由
+    // McpHandle::drop 删除，被强杀/崩溃/开发热重启时走不到。按文件名里的 pid 判活，
+    // 只删已不存在进程的文件——本机可能同时跑着安装版与 dev 版（实测过）。
+    #[cfg(windows)]
+    crate::mcp::cleanup_stale_patch_files();
 
     let db = match Database::try_new() {
         Ok(db) => db,
@@ -364,6 +452,8 @@ pub fn run() {
             commands::ai::ai_runtime_import,
             commands::ai::create_ai_panel_webview,
             commands::ai::ai_panel_focus,
+            // AI（MCP）高危操作的界面确认：返回用户是否允许（见 commands/mcp_confirm.rs）
+            commands::mcp_confirm::mcp_confirm_response,
             commands::app::prepare_exit,
             // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
             commands::autostart::get_autostart_enabled,
@@ -464,6 +554,11 @@ pub fn run() {
             log::info!("[nexus] RunEvent::Exit → 完成");
         }
     });
+
+    // 只有事件循环**正常返回**才会走到这里（正常关窗 / 系统注销）。
+    // 主线程 panic 会从 app.run 里 unwind 出去、直接结束进程，这行不会出现——
+    // 它就是"panic 静默退出"与"正常退出"的分界；panic 内容见 panic.log。
+    log::info!("[nexus] 事件循环已返回，进程即将结束");
 }
 
 #[cfg(test)]

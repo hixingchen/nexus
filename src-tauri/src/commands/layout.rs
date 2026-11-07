@@ -8,6 +8,13 @@ use crate::AppState;
 /// 收在这里而不是 `commands::ai`：读写都走本模块的统一 KV，键名只留一个字面量。
 pub const KEY_NPM_REGISTRY: &str = "npm_registry";
 
+/// 「AI 高危操作是否弹窗确认」的键（与前端 `LAYOUT_KEYS.mcpConfirm` 同值）。
+///
+/// 取值：缺省 / `"1"` = 弹窗（默认）；只有 `"0"` = 不弹窗。
+/// **只能由用户在「设置 > AI 运行时」里改**：MCP 的 `save_layout` 桥会拒绝这个键
+/// ——否则 AI 可以先关掉自己的确认闸门再执行任意命令，闸门就不存在了。
+pub const KEY_MCP_CONFIRM: &str = "mcp_confirm";
+
 /// 读一个布局键（非布局模块共用的入口；不存在返回 `None`，读库失败如实返回）。
 pub fn read_layout_value(db: &crate::database::Database, key: &str) -> Result<Option<String>, String> {
     db.with_conn(|conn| read_layout_value_from_conn(conn, key))
@@ -80,6 +87,8 @@ const KEEP_ON_RESET: &[&str] = &[
     "ai_session_mode",
     "update_skipped_version",
     KEY_NPM_REGISTRY,
+    // 安全偏好，不是几何：用户明确关掉确认后，「恢复默认布局」不该悄悄把它打开
+    KEY_MCP_CONFIRM,
 ];
 
 /// 恢复默认布局的**纯逻辑**（单独成函数才测得到，`State<AppState>` 在单测里造不出来）：
