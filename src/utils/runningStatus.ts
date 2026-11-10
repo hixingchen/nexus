@@ -51,6 +51,7 @@ export function sameRunningStatus(
         && x.project_id === y.project_id
         && x.source === y.source
         && x.phase === y.phase
+        && (x.health_note ?? null) === (y.health_note ?? null)
         && samePorts(x.listening_ports, y.listening_ports)
         && (x.followed_log ?? null) === (y.followed_log ?? null);
     })

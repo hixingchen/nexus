@@ -25,6 +25,7 @@ mod imp {
         self, BootCheck, BootCommand, BootCommandResult, BootManifest, BootRunnerState,
         BootService, BootServiceState, MANIFEST_VERSION, STATE_VERSION,
     };
+    use crate::core::health::{log_contains_since, tcp_ready};
 
     /// 服务日志轮转阈值（单文件）
     const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -79,6 +80,9 @@ mod imp {
         adopted: Vec<crate::core::process::AdoptedChild>,
         name: String,
         log_path: String,
+        /// 本次启动时日志文件的长度（含表头）。日志检查只看这之后的**新增**内容，
+        /// 否则上一次运行留在文件里的 "ready" 会让服务刚起来就判定就绪。
+        log_start: u64,
     }
 
     struct Runner {
@@ -405,6 +409,8 @@ mod imp {
             }
             let log_path = PathBuf::from(&svc.log_path);
             let (log_file, _) = open_service_log(&log_path, svc)?;
+            // 表头写完后的长度 = 本次运行日志的起点（就绪检查只匹配之后的新内容）
+            let log_start = log_file.metadata().map(|m| m.len()).unwrap_or(0);
             let started_at = chrono::Utc::now().to_rfc3339();
             self.set_state(&svc.id, |s| {
                 s.phase = "starting".into();
@@ -447,6 +453,7 @@ mod imp {
                 adopted: Vec::new(),
                 name: svc.name.clone(),
                 log_path: svc.log_path.clone(),
+                log_start,
             });
             self.set_state(&svc.id, |s| {
                 s.pid = Some(pid);
@@ -496,6 +503,8 @@ mod imp {
                 BootCheck::LogContains { timeout_secs, .. } => Duration::from_secs(*timeout_secs),
             };
             let deadline = Instant::now() + timeout;
+            // 日志检查只匹配本次运行新增的内容（文件是追加写的，旧关键字不能自证就绪）
+            let log_start = self.running.get(&svc.id).map(|r| r.log_start).unwrap_or(0);
             self.log.info(&format!(
                 "等待服务「{}」就绪（超时 {:?}）",
                 svc.name, timeout
@@ -518,7 +527,9 @@ mod imp {
                     BootCheck::None => true,
                     BootCheck::Delay { .. } => Instant::now() >= deadline,
                     BootCheck::Tcp { host, port, .. } => tcp_ready(host, *port),
-                    BootCheck::LogContains { pattern, .. } => log_contains(&svc.log_path, pattern),
+                    BootCheck::LogContains { pattern, .. } => {
+                        log_contains_since(&svc.log_path, pattern, log_start)
+                    }
                 };
                 if ok {
                     return Ok(());
@@ -899,30 +910,6 @@ mod imp {
         let _ = writeln!(file, "started_at: {}", chrono::Utc::now().to_rfc3339());
         let _ = file.flush();
         Ok((file, path.to_path_buf()))
-    }
-
-    fn tcp_ready(host: &str, port: u16) -> bool {
-        use std::net::ToSocketAddrs;
-        let addrs = match (host, port).to_socket_addrs() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        for addr in addrs {
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn log_contains(path: &str, pattern: &str) -> bool {
-        let Ok(bytes) = std::fs::read(path) else { return false };
-        // 只看尾部 1MB：日志可能已经很大，就绪关键字通常在最近输出里。
-        // 用仓库统一解码口径（UTF-8 → GB18030 回退），中文 Windows 上的服务日志
-        // 常是 GBK；直接 from_utf8_lossy 会让中文关键字永远匹配不到。
-        let start = bytes.len().saturating_sub(1024 * 1024);
-        let text = crate::core::textenc::decode_to_string(&bytes[start..]);
-        text.contains(pattern)
     }
 
     fn write_command_result(results_dir: &Path, id: &str, ok: bool, error: &str) {

@@ -81,6 +81,8 @@ export interface Service {
   boot_required: boolean;
   /** 开机启动凭据模式：s4u / password（两个模式各有一套 runner） */
   boot_credential_mode: BootCredentialMode;
+  /** 本地服务的就绪检查 JSON（空串/缺省 = 进程存活即就绪；与 boot_check 同形状） */
+  health_check?: string;
 }
 
 export type BootCredentialMode = 's4u' | 'password';
@@ -205,6 +207,8 @@ export const serviceApi = {
     bootCheck?: string;
     bootRequired?: boolean;
     bootCredentialMode?: BootCredentialMode;
+    /** 本地服务就绪检查 JSON（空串/不传 = 进程存活即就绪） */
+    healthCheck?: string;
   }) => invoke<Service>('add_service', {
     params: {
       projectId: params.projectId,
@@ -226,6 +230,7 @@ export const serviceApi = {
       bootCheck: params.bootCheck,
       bootRequired: params.bootRequired,
       bootCredentialMode: params.bootCredentialMode,
+      healthCheck: params.healthCheck,
     }
   }),
 
@@ -256,6 +261,8 @@ export const serviceApi = {
     bootCheck: string;
     bootRequired: boolean;
     bootCredentialMode: BootCredentialMode;
+    /** 本地服务就绪检查 JSON（空串 = 进程存活即就绪） */
+    healthCheck: string;
   }) => invoke<{ watch_refreshed: boolean; watch_error: string; boot_manifest_error: string }>('update_service', {
     params: {
       id: params.id,
@@ -277,6 +284,7 @@ export const serviceApi = {
       bootCheck: params.bootCheck,
       bootRequired: params.bootRequired,
       bootCredentialMode: params.bootCredentialMode,
+      healthCheck: params.healthCheck,
     }
   }),
 
@@ -423,8 +431,10 @@ export interface RunningService {
   followed_log?: string | null;
   /** 进程来源：local = Nexus 自己拉起，boot = 开机启动器（旧后端缺省时按 local 处理） */
   source?: 'local' | 'boot';
-  /** 就绪阶段：starting = 刚拉起（宽限期内），ready = 已过宽限期；boot 服务取自启动器 */
+  /** 就绪阶段：starting = 等待检查，ready = 检查通过，unready = 检查超时（进程仍在跑） */
   phase?: 'starting' | 'ready' | 'unready';
+  /** 配置了就绪检查时的说明（如 `TCP 127.0.0.1:3306`）；null/缺省 = 未配置 */
+  health_note?: string | null;
   /** 自动发现的监听端口（去重升序；一个服务可能有多个） */
   listening_ports?: number[];
 }

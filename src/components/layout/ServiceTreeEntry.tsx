@@ -125,15 +125,16 @@ export function ServiceTreeEntry({
     ports,
   );
   const phase = runningInfo?.phase;
+  const healthNote = runningInfo?.health_note ?? null;
   const phaseLabel = phase === 'starting' ? '启动中'
     : phase === 'unready' ? '启动超时'
     : phase === 'ready' ? '已就绪'
     : '运行中';
   const phaseHint = phase === 'starting'
-    ? '进程已启动，尚在就绪宽限期内'
+    ? (healthNote ? `正在等待就绪：${healthNote}` : '进程已启动，尚在就绪宽限期内')
     : phase === 'unready'
-      ? '进程仍在运行，但就绪检查超时'
-      : '进程存活超过就绪宽限期';
+      ? `进程仍在运行，但就绪检查超时${healthNote ? `（${healthNote}）` : ''}`
+      : (healthNote ? `就绪检查已通过（${healthNote}）` : '进程存活超过就绪宽限期');
   const phaseWarn = phase === 'starting' || phase === 'unready';
 
   // 开机启动：徽章只留一个电源图标，凭据模式与“启动器是否已安装”放 tooltip（细节在设置页）。
@@ -385,6 +386,12 @@ export function ServiceTreeEntry({
               <dd className={phaseWarn ? 'text-nexus-warning' : 'text-nexus-success'}>{phaseLabel}</dd>
             </div>
             <div className="flex gap-2">
+              <dt className="w-[52px] flex-shrink-0">就绪检查</dt>
+              <dd className="min-w-0 break-words">
+                {runningInfo.source === 'boot' ? '由开机启动器判定' : (healthNote ?? '进程存活')}
+              </dd>
+            </div>
+            <div className="flex gap-2">
               <dt className="w-[52px] flex-shrink-0">监听端口</dt>
               <dd className="min-w-0 break-words">{ports.length > 0 ? ports.join('、') : '未发现'}</dd>
             </div>
@@ -402,7 +409,9 @@ export function ServiceTreeEntry({
           <p className="mt-2 text-[10px] text-nexus-muted/70 leading-relaxed">
             {runningInfo.source === 'boot'
               ? '就绪阶段采自开机启动器的状态记录。'
-              : '未配置健康检查：进程存活超过 1 秒即视为已就绪；端口为自动发现（仅 TCP）。'}
+              : healthNote
+                ? `按「${healthNote}」判定就绪；超时只标记「启动超时」，不会结束进程。端口为自动发现（仅 TCP）。`
+                : '未配置就绪检查：进程存活超过 1 秒即视为已就绪；端口为自动发现（仅 TCP）。'}
           </p>
           {service.open_enabled && ports.length > 0 && (
             <div className="mt-2 space-y-1">

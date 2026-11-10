@@ -544,6 +544,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: key, name: "n",
             command: HOLD_CMD, cwd: &cwd, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
         let log = temp_log(tag);
         std::fs::write(&log, "").expect("建空日志文件");
@@ -683,6 +684,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "detach-log", name: "n",
             command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
 
         assert!(!wait_for_adoption(&mgr, "detach-log").is_empty(), "应当认领到游离进程");
@@ -736,6 +738,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "growing-1", name: "n",
             command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
         assert!(!wait_for_adoption(&mgr, "growing-1").is_empty(), "应当认领到游离进程");
 

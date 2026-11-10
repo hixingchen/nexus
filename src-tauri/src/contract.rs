@@ -403,6 +403,7 @@ fn test_response_dtos_are_snake_case() {
         boot_check: String::new(),
         boot_required: false,
         boot_credential_mode: "s4u".into(),
+        health_check: String::new(),
     };
     assert_eq!(
         keys_of(&svc),
@@ -410,7 +411,7 @@ fn test_response_dtos_are_snake_case() {
             "id", "project_id", "name", "command", "cwd", "watch_paths", "watch_include",
             "watch_exclude", "env_vars", "restart_mode", "enabled", "show_file_tree",
             "open_enabled", "open_port", "sort_index", "tool_commands", "boot_enabled",
-            "boot_order", "boot_check", "boot_required", "boot_credential_mode",
+            "boot_order", "boot_check", "boot_required", "boot_credential_mode", "health_check",
         ])
     );
 
@@ -506,10 +507,10 @@ fn test_response_dtos_are_snake_case() {
     // 显示「取消跟随日志（文件名）」）
     let run = RunningService {
         service_id: "s".into(), project_id: "p".into(), followed_log: None, source: "local".into(),
-        phase: "ready".into(), listening_ports: vec![8080],
+        phase: "ready".into(), health_note: None, listening_ports: vec![8080],
     };
     assert_eq!(keys_of(&run), sorted(&[
-        "service_id", "project_id", "followed_log", "source", "phase", "listening_ports",
+        "service_id", "project_id", "followed_log", "source", "phase", "health_note", "listening_ports",
     ]));
     let failed = FailedService {
         service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
@@ -986,10 +987,11 @@ fn test_nullable_fields_stay_nullable_and_typed() {
     // 运行中服务：没在跟随日志文件时必须是 null（前端 `?? null` 后判断）
     let running = RunningService {
         service_id: "s1".into(), project_id: "p1".into(), followed_log: None, source: "local".into(),
-        phase: "ready".into(), listening_ports: vec![8080],
+        phase: "ready".into(), health_note: None, listening_ports: vec![8080],
     };
     assert_eq!(types_of(&running), vec![
         ("followed_log".to_string(), "null"),
+        ("health_note".to_string(), "null"),
         ("listening_ports".to_string(), "array"),
         ("phase".to_string(), "string"),
         ("project_id".to_string(), "string"),
@@ -998,7 +1000,7 @@ fn test_nullable_fields_stay_nullable_and_typed() {
     ], "followed_log 为 None 时必须序列化成 null");
     let running2 = RunningService {
         service_id: "s1".into(), project_id: "p1".into(), followed_log: Some("C:/x.log".into()),
-        source: "boot".into(), phase: "starting".into(), listening_ports: vec![],
+        source: "boot".into(), phase: "starting".into(), health_note: None, listening_ports: vec![],
     };
     assert_eq!(types_of(&running2).iter().find(|(k, _)| k == "followed_log").unwrap().1, "string",
         "有跟随文件时是字符串——前端据它显示文件名");

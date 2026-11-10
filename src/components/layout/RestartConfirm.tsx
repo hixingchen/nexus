@@ -50,7 +50,14 @@ export function RestartConfirm() {
         if (st.failed.some(f => f.service_id === sid)) return 'failed';
         const running = st.running.find(r => r.service_id === sid);
         if (!running) return 'unknown';
-        // 已在监听端口 = 真的起来了。`running` 只代表进程还活着：
+        // 配了就绪检查：以检查结果为准（TCP/日志/固定等待）。`unready` = 检查超时，
+        // 按失败处理让状态机重试；慢启动但检查还没通过只是 running，不会误判成功。
+        if (running.health_note) {
+          if (running.phase === 'ready') return 'ready';
+          if (running.phase === 'unready') return 'failed';
+          return 'running';
+        }
+        // 未配置检查（历史行为）：已在监听端口 = 真的起来了。`running` 只代表进程还活着：
         // Maven/NPM 这类"先构建再启动"的服务在编译阶段就已经在运行表里了，
         // 这期间既不是 ready 也不能据此判定成功（正是原实现漏掉晚失败的原因）
         return (running.listening_ports?.length ?? 0) > 0 ? 'ready' : 'running';

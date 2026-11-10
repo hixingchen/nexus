@@ -5,6 +5,7 @@ pub mod decompiler;
 pub mod download;
 pub mod envparse;
 pub mod file_watcher;
+pub mod health;
 pub mod jarfile;
 pub mod logfile;
 pub mod logfollow;

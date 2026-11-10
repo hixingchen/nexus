@@ -42,6 +42,9 @@ export interface ServiceFormDraft {
   bootCheckValue: string;
   bootRequired: boolean;
   bootCredentialMode: BootCredentialMode;
+  /** 本地服务的就绪检查（模板模式不使用） */
+  healthCheckKind: BootCheckKind;
+  healthCheckValue: string;
 }
 
 interface DraftState {

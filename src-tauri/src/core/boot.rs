@@ -128,88 +128,9 @@ pub fn legacy_results_dir() -> PathBuf {
 
 // ─── 就绪检查 ────────────────────────────────────────────────
 
-/// 服务启动后如何算“就绪”。
-///
-/// 空串（DB 里）= `None`，表示进程存活即继续下一个服务。v1 只支持这四种：
-/// 不做任意正则 / 任意命令，避免把“开机启动配置”变成第二个命令执行面。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum BootCheck {
-    #[default]
-    None,
-    Delay {
-        seconds: u64,
-    },
-    Tcp {
-        host: String,
-        port: u16,
-        #[serde(rename = "timeoutSecs", default = "default_timeout_secs")]
-        timeout_secs: u64,
-    },
-    LogContains {
-        pattern: String,
-        #[serde(rename = "timeoutSecs", default = "default_timeout_secs")]
-        timeout_secs: u64,
-    },
-}
-
-fn default_timeout_secs() -> u64 {
-    60
-}
-
-/// 校验并归一化 DB 里的 `boot_check` 文本。
-///
-/// 空串 = 未配置；其余必须是合法 JSON 且参数在合理范围。返回的字符串是**规范化后的
-/// JSON**，这样保存入口与 manifest 生成共用同一份判据。
-pub fn normalize_check(raw: &str) -> Result<String, String> {
-    let text = raw.trim();
-    if text.is_empty() {
-        return Ok(String::new());
-    }
-    let check: BootCheck = serde_json::from_str(text)
-        .map_err(|e| format!("开机就绪检查不是合法 JSON: {}", e))?;
-    match &check {
-        BootCheck::None => Ok(String::new()),
-        BootCheck::Delay { seconds } => {
-            if *seconds > 3600 {
-                return Err("开机就绪检查的等待时间不能超过 3600 秒".into());
-            }
-            serde_json::to_string(&check).map_err(|e| e.to_string())
-        }
-        BootCheck::Tcp { host, port, timeout_secs } => {
-            if host.trim().is_empty() {
-                return Err("开机就绪检查的 TCP host 不能为空".into());
-            }
-            if *port == 0 {
-                return Err("开机就绪检查的 TCP 端口必须在 1-65535 之间".into());
-            }
-            if *timeout_secs == 0 || *timeout_secs > 3600 {
-                return Err("开机就绪检查的超时必须在 1-3600 秒之间".into());
-            }
-            serde_json::to_string(&check).map_err(|e| e.to_string())
-        }
-        BootCheck::LogContains { pattern, timeout_secs } => {
-            if pattern.trim().is_empty() {
-                return Err("开机就绪检查的日志关键字不能为空".into());
-            }
-            if pattern.len() > 512 {
-                return Err("开机就绪检查的日志关键字不能超过 512 字节".into());
-            }
-            if *timeout_secs == 0 || *timeout_secs > 3600 {
-                return Err("开机就绪检查的超时必须在 1-3600 秒之间".into());
-            }
-            serde_json::to_string(&check).map_err(|e| e.to_string())
-        }
-    }
-}
-
-fn parse_check(raw: &str) -> Result<BootCheck, String> {
-    let text = raw.trim();
-    if text.is_empty() {
-        return Ok(BootCheck::None);
-    }
-    serde_json::from_str(text).map_err(|e| format!("开机就绪检查解析失败: {}", e))
-}
+/// 兼容原名：就绪检查的定义/校验/探测已抽到 `core::health`，开机启动与本地服务共用。
+pub use crate::core::health::{HealthCheck as BootCheck, normalize as normalize_check};
+pub(crate) use crate::core::health::parse as parse_check;
 
 // ─── Manifest ───────────────────────────────────────────────
 

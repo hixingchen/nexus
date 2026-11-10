@@ -128,6 +128,10 @@ pub struct UpdateServiceParams {
     /// s4u / password；空串/旧客户端按 s4u
     #[serde(default)]
     pub boot_credential_mode: String,
+    /// 本地服务的就绪检查 JSON；**不传 = 保持原值**（通用 MCP 桥的全量更新可能不带
+    /// 这个新字段，缺省成空串会把用户配置静默清掉），空串 = 进程存活即就绪
+    #[serde(default)]
+    pub health_check: Option<String>,
 }
 
 /// 服务添加参数
@@ -171,6 +175,9 @@ pub struct AddServiceParams {
     pub boot_required: Option<bool>,
     #[serde(default)]
     pub boot_credential_mode: Option<String>,
+    /// 本地服务的就绪检查 JSON；不传 = 进程存活即就绪
+    #[serde(default)]
+    pub health_check: Option<String>,
 }
 
 /// 获取某个项目下的所有服务
@@ -254,6 +261,9 @@ pub(crate) fn insert_service_row(
         let boot_credential_mode = crate::core::boot::BootMode::parse(
             params.boot_credential_mode.as_deref().unwrap_or("s4u"),
         )?.as_str().to_string();
+        let health_check = crate::core::health::normalize(
+            params.health_check.as_deref().unwrap_or(""),
+        )?;
         conn.execute(
             &format!(
                 "INSERT INTO services ({}) VALUES ({})",
@@ -272,6 +282,7 @@ pub(crate) fn insert_service_row(
                 ":boot_enabled": boot_enabled, ":boot_order": boot_order,
                 ":boot_check": boot_check, ":boot_required": boot_required,
                 ":boot_credential_mode": boot_credential_mode,
+                ":health_check": health_check,
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
@@ -281,7 +292,7 @@ pub(crate) fn insert_service_row(
             show_file_tree: sft, open_enabled, open_port,
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
-            boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode,
+            boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode, health_check,
         })
     })
 }
@@ -368,10 +379,10 @@ pub(crate) fn write_service_update(
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
         validate_open_port(params.open_port)?;
-        let old: (String, String, String) = conn.query_row(
-            "SELECT cwd, watch_paths, project_id FROM services WHERE id=?1",
+        let old: (String, String, String, String) = conn.query_row(
+            "SELECT cwd, watch_paths, project_id, health_check FROM services WHERE id=?1",
             [&params.id],
-            |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?)),
+            |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?, r.get("health_check")?)),
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         ensure_open_port_unique_in_project(
             conn, &old.2, params.open_enabled, params.open_port, Some(&params.id),
@@ -395,6 +406,10 @@ pub(crate) fn write_service_update(
             params.boot_credential_mode.as_str()
         };
         let boot_credential_mode = crate::core::boot::BootMode::parse(boot_mode_raw)?.as_str().to_string();
+        let health_check = match &params.health_check {
+            Some(raw) => crate::core::health::normalize(raw)?,
+            None => old.3.clone(),
+        };
         let affected = conn.execute(
             &format!(
                 "UPDATE services SET {} WHERE id=:id",
@@ -412,6 +427,7 @@ pub(crate) fn write_service_update(
                 ":boot_enabled": params.boot_enabled, ":boot_order": params.boot_order,
                 ":boot_check": boot_check, ":boot_required": params.boot_required,
                 ":boot_credential_mode": boot_credential_mode,
+                ":health_check": health_check,
                 ":id": params.id,
             },
         ).map_err(|e| format!("更新服务失败: {}", e))?;
@@ -710,6 +726,8 @@ fn add_service_from_template_impl(
                 // 模板不携带开机启动：从模板添加的服务默认不参与登录前启动
                 ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
                 ":boot_credential_mode": "s4u",
+                // 模板暂不携带就绪检查；新服务从"进程存活即就绪"开始
+                ":health_check": "",
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
@@ -730,7 +748,7 @@ fn add_service_from_template_impl(
             env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port,
             sort_index: max_sort + 1, tool_commands,
             boot_enabled: false, boot_order: 0, boot_check: String::new(), boot_required: false,
-            boot_credential_mode: "s4u".into(),
+            boot_credential_mode: "s4u".into(), health_check: String::new(),
         })
     })
 }
@@ -956,6 +974,7 @@ mod tests {
             boot_check: None,
             boot_required: None,
             boot_credential_mode: None,
+            health_check: None,
         }
     }
 
@@ -1023,6 +1042,7 @@ mod tests {
             enabled: true, show_file_tree: false, open_enabled: true, open_port: 10001,
             tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
             boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
+            health_check: None,
         };
         assert!(write_service_update(&db, &params, "C:/p", "[]").is_ok(), "更新自己不该报冲突");
 
@@ -1038,6 +1058,7 @@ mod tests {
             enabled: true, show_file_tree: false, open_enabled: true, open_port: 10001,
             tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
             boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
+            health_check: None,
         };
         let err = write_service_update(&db, &update_b2, "C:/p", "[]")
             .expect_err("更新到与他人相同的端口必须被拒绝");
@@ -1096,6 +1117,7 @@ mod tests {
             boot_check: String::new(),
             boot_required: false,
             boot_credential_mode: "password".into(),
+            health_check: None,
         };
         let project_id = write_service_update(&db, &params, "C:/p/sub", "[]").unwrap();
         assert_eq!(project_id, "p1", "应回传所属项目，供调用方刷新监听");

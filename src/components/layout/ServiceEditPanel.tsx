@@ -149,6 +149,17 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
     initialDraft?.bootCredentialMode ?? service.boot_credential_mode ?? 's4u',
   );
 
+  // 本地服务的就绪检查（模板不携带）。形状与开机检查相同，复用同一套表单转换。
+  const [originalHealth] = useState(() => parseBootCheck(service.health_check ?? ''));
+  const [healthCheckKind, setHealthCheckKind] = useState<BootCheckKind>(
+    initialDraft?.healthCheckKind ?? originalHealth.kind,
+  );
+  const [healthCheckValue, setHealthCheckValue] = useState(
+    initialDraft?.healthCheckValue ?? originalHealth.value,
+  );
+  /** 就绪检查是低频设置：默认折叠，标题行只显示当前检查方式 */
+  const [healthExpanded, setHealthExpanded] = useState(false);
+
   const [saving, setSaving] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   /** 「放弃修改」的两步确认（UX-19）：它同时会清掉草稿，一次点击不够 */
@@ -208,6 +219,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
     || bootCredentialMode !== (service.boot_credential_mode ?? 's4u')
     || bootCheckKind !== originalBoot.kind
     || bootCheckValue !== originalBoot.value
+    || (mode === 'service' && (healthCheckKind !== originalHealth.kind || healthCheckValue !== originalHealth.value))
     || (mode === 'template' && tplToolId !== (service.open_tool_id ?? ''))
     || JSON.stringify(toolCommands) !== originalToolCommands;
 
@@ -219,10 +231,12 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
       restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
       toolCommands, tplToolId,
       bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
+      healthCheckKind, healthCheckValue,
     } : null);
   }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
       restartMode, enabled, showFileTree, openEnabled, openPortNum, toolCommands, tplToolId,
-      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode]);
+      bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
+      healthCheckKind, healthCheckValue]);
 
   /** 放弃未保存修改：回到已持久化的配置，并清掉草稿 */
   const handleDiscard = () => {
@@ -246,6 +260,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
     setBootCheckValue(originalBoot.value);
     setBootRequired(service.boot_required ?? false);
     setBootCredentialMode(service.boot_credential_mode ?? 's4u');
+    setHealthCheckKind(originalHealth.kind);
+    setHealthCheckValue(originalHealth.value);
     setTplToolId(service.open_tool_id ?? '');
     setToolCommands(parseToolCommands(service.tool_commands));
     useServiceDraftStore.getState().setDraft(draftKey, null);
@@ -337,6 +353,12 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
         setSaving(false);
         return;
       }
+      const health = serializeBootCheck(healthCheckKind, healthCheckValue);
+      if (mode === 'service' && !health.ok) {
+        reportError('就绪检查配置有误', new Error(health.error));
+        setSaving(false);
+        return;
+      }
       if (!Number.isInteger(openPortNum) || openPortNum < 0 || openPortNum > 65535) {
         reportError('打开端口无效', new Error('端口必须在 0-65535 之间（0 = 自动）'));
         setSaving(false);
@@ -376,6 +398,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
           envVars, restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
           toolCommands: JSON.stringify(toolCommands),
           bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
+          healthCheck: health.json,
         });
         // 保存拿到 id 之后才能绑：新建时选的打开工具在这里补上
         if (pendingToolId) {
@@ -390,6 +413,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
         const res = await serviceApi.update({
           ...basePayload,
           bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
+          healthCheck: health.json,
         });
         // 配置已落库，但文件监听没跟上必须说出来（CQ-35）：不说的话界面提示"已保存"，
         // 而用户改文件毫无反应——这正是 file_watcher.rs 把同类结论从 Ok(()) 改成 Err 的原因
@@ -670,6 +694,78 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
 
           </div>
         </div>
+
+        {/* ── 就绪检查卡片（仅服务；模板不携带） ──
+            配置后，运行态不再只按"进程存活 1 秒"判断；项目「全部启动」也会在
+            本服务就绪后再启动下一个。默认折叠，低频设置不占纵向空间。 */}
+        {mode === 'service' && (
+          <div className={cardCls}>
+            <button
+              type="button"
+              className="flex items-center gap-1.5 w-full text-left"
+              aria-expanded={healthExpanded}
+              onClick={() => setHealthExpanded(v => !v)}
+            >
+              <svg
+                className={`flex-shrink-0 text-nexus-muted transition-transform ${healthExpanded ? 'rotate-90' : ''}`}
+                width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
+              >
+                <polyline points="3,1 7,5 3,9" />
+              </svg>
+              <span className="flex-1 min-w-0 text-[13px] text-nexus-text truncate">服务就绪检查</span>
+              <span className="flex-shrink-0 text-[10px] leading-[16px] px-1.5 rounded-full bg-nexus-hover/40 text-nexus-muted">
+                {BOOT_CHECK_KIND_SHORT[healthCheckKind]}
+              </span>
+            </button>
+
+            {healthExpanded && (
+              <div className="mt-3 pt-3 border-t border-nexus-border/30 space-y-2">
+                <div className="grid grid-cols-4 gap-0.5 bg-nexus-bg rounded-md p-0.5">
+                  {(Object.keys(BOOT_CHECK_KIND_LABEL) as BootCheckKind[]).map(k => (
+                    <button
+                      key={k}
+                      type="button"
+                      aria-pressed={healthCheckKind === k}
+                      title={BOOT_CHECK_KIND_LABEL[k]}
+                      className={`py-1.5 text-[11px] rounded whitespace-nowrap transition-colors ${
+                        healthCheckKind === k
+                          ? 'bg-nexus-surface text-nexus-text font-medium shadow-sm'
+                          : 'text-nexus-muted hover:text-nexus-text'
+                      }`}
+                      onClick={() => setHealthCheckKind(k)}
+                    >{BOOT_CHECK_KIND_SHORT[k]}</button>
+                  ))}
+                </div>
+                {healthCheckKind !== 'none' && (
+                  <input
+                    className={`${INPUT_CLS} font-mono`}
+                    value={healthCheckValue}
+                    onChange={e => setHealthCheckValue(e.target.value)}
+                    placeholder={
+                      healthCheckKind === 'delay' ? '等待秒数，例如 5'
+                        : healthCheckKind === 'tcp' ? 'host:port，例如 127.0.0.1:3306'
+                          : '日志里出现的关键字，例如 ready for connections'
+                    }
+                  />
+                )}
+                <p className="text-[10px] text-nexus-muted/50 leading-relaxed">
+                  {healthCheckKind === 'none'
+                    ? '进程存活超过 1 秒即视为就绪（原有行为）'
+                    : healthCheckKind === 'delay'
+                      ? '固定等待指定秒数后视为就绪'
+                      : healthCheckKind === 'tcp'
+                        ? '端口可连接后视为就绪（数据库等依赖服务用这个）'
+                        : '日志出现关键字后视为就绪'}
+                </p>
+                <p className="text-[10px] text-nexus-muted/40 leading-relaxed">
+                  本地启动与「全部启动」使用；开机启动的检查在下方「开机启动」卡片单独配置。
+                  配置后项目「全部启动」会等本服务就绪再启动下一个；检查超时只标记「启动超时」，不会结束进程。
+                  修改后需重启服务生效。
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* ── 开机启动卡片（仅服务；模板不携带开机语义） ──
             低频设置，默认折叠成一行；展开后才显示开关、说明与全部参数，

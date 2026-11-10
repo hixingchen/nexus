@@ -3,6 +3,7 @@ use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use serde::Serialize;
 use crate::AppState;
+use crate::core::health::HealthCheck;
 use crate::core::process::LogLine;
 use std::sync::Arc;
 
@@ -258,6 +259,18 @@ struct ServiceInfo {
     env_vars: String,
     boot_enabled: bool,
     boot_credential_mode: String,
+    health_check: String,
+}
+
+/// 解析服务配置里的就绪检查；非法值不阻断启动（按"进程存活即就绪"处理并留痕）。
+fn parse_health(raw: &str) -> crate::core::health::HealthCheck {
+    match crate::core::health::parse(raw) {
+        Ok(check) => check,
+        Err(e) => {
+            log::warn!("[nexus] 服务就绪检查解析失败（按进程存活处理）: {}", e);
+            crate::core::health::HealthCheck::None
+        }
+    }
 }
 
 fn get_service_info(
@@ -266,7 +279,7 @@ fn get_service_info(
 ) -> Result<ServiceInfo, String> {
     db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, project_id, env_vars, boot_enabled, boot_credential_mode \
+            "SELECT name, command, cwd, project_id, env_vars, boot_enabled, boot_credential_mode, health_check \
              FROM services WHERE id=?1",
             [service_id],
             |row| Ok(ServiceInfo {
@@ -277,6 +290,7 @@ fn get_service_info(
                 env_vars: row.get("env_vars")?,
                 boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
                 boot_credential_mode: row.get("boot_credential_mode")?,
+                health_check: row.get("health_check")?,
             }),
         )
         .map_err(|e| format!("服务不存在: {}", e))
@@ -332,8 +346,10 @@ pub struct RunningService {
     pub followed_log: Option<String>,
     /// 进程来源：local（Nexus 自己拉起） / boot（开机启动器）
     pub source: String,
-    /// 就绪阶段：starting（刚拉起，宽限期内） / ready（存活满宽限期）
+    /// 就绪阶段：starting（等待检查） / ready（检查通过） / unready（检查超时，进程仍在跑）
     pub phase: String,
+    /// 配置了就绪检查时的说明（如 `TCP 127.0.0.1:3306`）；None = 未配置
+    pub health_note: Option<String>,
     /// 自动发现的监听端口（去重升序；一个服务可能有多个）
     pub listening_ports: Vec<u16>,
 }
@@ -344,13 +360,6 @@ pub struct RunningService {
 /// （真正的检查在 Phase B；超时也不会标失败）。
 const READY_GRACE_MS: u64 = 1_000;
 
-fn phase_label(started_at_ms: u64, now_ms: u64) -> &'static str {
-    if now_ms.saturating_sub(started_at_ms) < READY_GRACE_MS {
-        "starting"
-    } else {
-        "ready"
-    }
-}
 
 /// 运行状态总览：运行中 + 意外失败（前端分别渲染运行态与失败态）
 #[derive(Serialize)]
@@ -472,9 +481,11 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
             StartRoute::Local => {}
         }
         let envs = crate::core::process::parse_env_vars(&info.env_vars)?;
+        let health_check = parse_health(&info.health_check);
         state.process_mgr.start(crate::core::process::ServiceSpawn {
             project_id: &info.project_id, service_id: &service_id, name: &info.name,
             command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app_handle),
+            health_check,
         }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("启动服务任务失败: {}", e))?
 }
@@ -533,6 +544,7 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
                 return state.process_mgr.restart(crate::core::process::ServiceSpawn {
                     project_id: &info.project_id, service_id: &service_id, name: &info.name,
                     command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
+                    health_check: parse_health(&info.health_check),
                 }).map_err(|e| format!("服务「{}」{}", info.name, e));
             }
         }
@@ -594,8 +606,64 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
         state.process_mgr.restart(crate::core::process::ServiceSpawn {
             project_id: &info.project_id, service_id: &service_id, name: &info.name,
             command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
+            health_check: parse_health(&info.health_check),
         }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
+}
+
+struct ProjectStartRow {
+    id: String,
+    name: String,
+    command: String,
+    cwd: String,
+    env_vars: String,
+    open_port: i32,
+    boot_enabled: bool,
+    boot_credential_mode: String,
+    health_check: String,
+}
+
+/// 就绪检查等待：只对**配置了检查**的服务生效（None 立即返回，不改变原有启动语义）。
+///
+/// 等待在上限内轮询；进程提前退出立即失败，超时带上检查描述（TCP/日志关键字），
+/// 让"卡在哪一项"能在启动结果里直接看到。
+fn wait_for_health(
+    state: &AppState,
+    service_id: &str,
+    check: &crate::core::health::HealthCheck,
+) -> Result<(), String> {
+    use crate::core::health::HealthCheck;
+    let Some(timeout) = crate::core::health::timeout(check) else { return Ok(()) };
+    let started = std::time::Instant::now();
+    loop {
+        if !state.process_mgr.is_running(service_id) {
+            return Err("进程在就绪前退出".into());
+        }
+        let ready = match check {
+            HealthCheck::None => true,
+            HealthCheck::Delay { .. } => started.elapsed() >= timeout,
+            HealthCheck::Tcp { host, port, .. } => crate::core::health::tcp_ready_with_timeout(
+                host, *port, Duration::from_millis(500),
+            ),
+            HealthCheck::LogContains { pattern, .. } => {
+                // 与 get_running 同口径：只认本次运行的日志缓冲（含跟随文件的新增行），
+                // 不读文件里的历史内容，避免上一次运行的关键字让本次"秒就绪"
+                state.process_mgr.logs_contain(service_id, pattern)
+            }
+        };
+        if ready {
+            // 与 get_running 共用同一份缓存：启动等待已经确认就绪，不必下一拍再探测一次
+            state.process_mgr.mark_health_ready(service_id);
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "就绪检查超时（{}）",
+                crate::core::health::describe(check)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// 一键启动项目全部已启用服务。
@@ -611,20 +679,21 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         let state = app_handle.state::<AppState>();
         let services = state.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, command, cwd, env_vars, open_port, boot_enabled, boot_credential_mode \
+                "SELECT id, name, command, cwd, env_vars, open_port, boot_enabled, boot_credential_mode, health_check \
                  FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
             ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
             let rows = stmt.query_map([&project_id], |row| {
-                Ok((
-                    row.get::<_, String>("id")?,
-                    row.get::<_, String>("name")?,
-                    row.get::<_, String>("command")?,
-                    row.get::<_, String>("cwd")?,
-                    row.get::<_, String>("env_vars")?,
-                    row.get::<_, i32>("open_port")?,
-                    row.get::<_, i32>("boot_enabled")? != 0,
-                    row.get::<_, String>("boot_credential_mode")?,
-                ))
+                Ok(ProjectStartRow {
+                    id: row.get("id")?,
+                    name: row.get("name")?,
+                    command: row.get("command")?,
+                    cwd: row.get("cwd")?,
+                    env_vars: row.get("env_vars")?,
+                    open_port: row.get("open_port")?,
+                    boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
+                    boot_credential_mode: row.get("boot_credential_mode")?,
+                    health_check: row.get("health_check")?,
+                })
             }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
             let mut svcs = Vec::new();
             for r in rows { svcs.push(r.map_err(|e| format!("解析项目服务数据失败: {}", e))?); }
@@ -639,7 +708,11 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         // 反复枚举整张 TCP 表（20 个服务 = 20 次全表扫描）
         let ports_by_pid = crate::core::ports::listening_ports_by_pid();
         let proc_snapshot = crate::core::winproc::snapshot_processes();
-        for (id, name, cmd, cwd, env_vars, open_port, boot_enabled, boot_mode) in &services {
+        for svc in &services {
+            let ProjectStartRow {
+                id, name, command: cmd, cwd, env_vars, open_port, boot_enabled,
+                boot_credential_mode: boot_mode, health_check: health_raw,
+            } = svc;
             if boot_ids.contains(id) { continue; }
             // 本地已在运行：直接跳过（必须排在开机启动路由之前，否则本地实例 +
             // 开机启动配置会再起一份 boot 实例）
@@ -685,11 +758,19 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
                 Ok(v) => v,
                 Err(e) => { errors.push(format!("{}: {}", name, e)); continue; }
             };
-            if let Err(e) = state.process_mgr.start(crate::core::process::ServiceSpawn {
+            let health = parse_health(health_raw);
+            match state.process_mgr.start(crate::core::process::ServiceSpawn {
                 project_id: &project_id, service_id: id, name, command: cmd, cwd,
-                env_vars: &envs, log_sink: log_sink(&app_handle),
+                env_vars: &envs, log_sink: log_sink(&app_handle), health_check: health.clone(),
             }) {
-                errors.push(format!("{}: {}", name, e));
+                Ok(()) => {
+                    // 配置了就绪检查才等待；这是“依赖等待”的落点：前一个服务没就绪，
+                    // 后面的服务不启动。超时/早退只记入本次启动结果，不杀进程。
+                    if let Err(e) = wait_for_health(&state, id, &health) {
+                        errors.push(format!("{}: {}", name, e));
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {}", name, e)),
             }
         }
         Ok(errors)
@@ -797,12 +878,55 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
                 }
                 pids.sort_unstable();
                 pids.dedup();
+                let elapsed_ms = now_ms.saturating_sub(d.started_at);
+                // 懒探测：只有配置了对应检查才会真的连 TCP / 扫日志；已经通过的不再重复探测
+                let phase = if d.health_ready {
+                    "ready"
+                } else {
+                    let tcp_ok = || match &d.health_check {
+                        HealthCheck::Tcp { host, port, .. } => crate::core::health::tcp_ready_with_timeout(
+                            host, *port, Duration::from_millis(300),
+                        ),
+                        _ => false,
+                    };
+                    let log_ok = || match &d.health_check {
+                        // 只看本次运行的日志缓冲（启动时已清空）。**不直接读跟随的日志文件**:
+                        // 文件里可能保留着上一次运行的旧关键字，会让服务刚一启动就"已就绪"。
+                        // 跟随线程读到的**新**内容同样会写进这个缓冲（stream=file），
+                        // 所以这里已经覆盖"服务把日志写进文件"的情况。
+                        HealthCheck::LogContains { pattern, .. } => {
+                            state.process_mgr.logs_contain(&d.service_id, pattern)
+                        }
+                        _ => false,
+                    };
+                    crate::core::health::evaluate_phase(
+                        &d.health_check,
+                        elapsed_ms,
+                        elapsed_ms >= READY_GRACE_MS,
+                        tcp_ok,
+                        log_ok,
+                    )
+                };
+                let health_note = match &d.health_check {
+                    HealthCheck::None => None,
+                    check => Some(crate::core::health::describe(check)),
+                };
+                if phase == "ready" && !d.health_ready && !matches!(&d.health_check, HealthCheck::None) {
+                    state.process_mgr.mark_health_ready(&d.service_id);
+                }
+                if phase == "unready" {
+                    if let Some(note) = &health_note {
+                        // 本次运行第一次超时时写一条系统日志（不结束进程）
+                        state.process_mgr.mark_health_unready(&d.service_id, note);
+                    }
+                }
                 RunningService {
                     service_id: d.service_id,
                     project_id: d.project_id,
                     followed_log: d.followed_log,
                     source: "local".into(),
-                    phase: phase_label(d.started_at, now_ms).to_string(),
+                    phase: phase.to_string(),
+                    health_note,
                     listening_ports: crate::core::ports::service_ports(&pids, &ports_by_pid),
                 }
             })
@@ -838,6 +962,9 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
                     followed_log: None,
                     source: "boot".into(),
                     phase: info.phase,
+                    // 开机服务由启动器按 manifest 的 check 判定；状态里已给出 phase，
+                    // 这里不重复解析（GUI 不持有 manifest 的检查详情）
+                    health_note: None,
                     listening_ports: crate::core::ports::service_ports(&pids, &ports_by_pid),
                 });
             }
@@ -1364,15 +1491,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_phase_label_grace_period() {
-        // 刚拉起：宽限期内是 starting（解决"刚起来就绿灯"）
-        assert_eq!(phase_label(10_000, 10_000), "starting");
-        assert_eq!(phase_label(10_000, 10_999), "starting");
-        // 存活满 1 秒：ready
-        assert_eq!(phase_label(10_000, 11_000), "ready");
-        assert_eq!(phase_label(10_000, 99_999), "ready");
-        // 启动时刻未知（0）：按已就绪处理，不把老进程误标成一直启动中
-        assert_eq!(phase_label(0, 5_000), "ready");
+    fn test_phase_grace_period() {
+        // 未配置就绪检查：宽限期内 starting（解决"刚起来就绿灯"），满 1 秒 ready
+        let none = crate::core::health::HealthCheck::None;
+        let phase = |elapsed: u64| crate::core::health::evaluate_phase(
+            &none,
+            elapsed,
+            elapsed >= READY_GRACE_MS,
+            || panic!("None 检查不应探测 TCP"),
+            || panic!("None 检查不应探测日志"),
+        );
+        assert_eq!(phase(0), "starting");
+        assert_eq!(phase(999), "starting");
+        assert_eq!(phase(1_000), "ready");
+        assert_eq!(phase(99_999), "ready");
     }
 
     /// 启停所有权路由的真值表：本地/开机启动器同时存在时，任何组合都不能起第二份。

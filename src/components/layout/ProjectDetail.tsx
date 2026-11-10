@@ -317,7 +317,7 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       env_vars: '', restart_mode: 0, enabled: true, show_file_tree: false,
       sort_index: 0, tool_commands: '[]',
       boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
-      boot_credential_mode: 's4u',
+      boot_credential_mode: 's4u', health_check: '',
     }));
   }, [projectId, setEditingService, setEditingTemplate]);
 

@@ -71,6 +71,8 @@ pub struct Service {
     pub boot_required: bool,
     /// 开机启动凭据模式：`s4u`（不保存密码）或 `password`（保存凭据）
     pub boot_credential_mode: String,
+    /// 本地服务的就绪检查 JSON（空串 = 进程存活即就绪；与 boot_check 同形状）
+    pub health_check: String,
 }
 
 /// 服务模板：跨项目复用的服务配置（独立于项目，复制到项目时值拷贝）

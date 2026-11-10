@@ -690,6 +690,7 @@ impl NexusMcpServer {
                 json!({
                     "service_id": r.service_id,
                     "phase": r.phase,
+                    "health_note": r.health_note,
                     "source": r.source,
                     "listening_ports": r.listening_ports,
                     "followed_log": r.followed_log,
@@ -1080,6 +1081,7 @@ impl NexusMcpServer {
             boot_check: current.boot_check.clone(),
             boot_required: current.boot_required,
             boot_credential_mode: current.boot_credential_mode.clone(),
+            health_check: Some(current.health_check.clone()),
         };
         let result = crate::commands::service::update_service(self.app.clone(), params).await?;
         // 界面同步：AI 改了配置，服务卡片/编辑面板的数据必须跟着刷新
@@ -1566,6 +1568,7 @@ mod tests {
             boot_check: "".into(),
             boot_required: false,
             boot_credential_mode: "s4u".into(),
+            health_check: "".into(),
         };
         let logs: Vec<std::sync::Arc<crate::core::logpipe::LogLine>> = (0..5)
             .map(|i| {

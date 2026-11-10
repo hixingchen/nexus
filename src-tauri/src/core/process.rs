@@ -19,6 +19,7 @@ pub(crate) use super::logpipe::{spawn_log_flush_thread, LogSignal};
 pub(crate) use super::logtext::read_log_lines;
 
 // 本模块自身用到的（路径随拆分变为 core::logfollow / core::logpipe）
+use super::health::HealthCheck;
 use super::logfollow::{system_time_from_millis, LogFollow, LogProbe};
 use super::logpipe::{append_system_line, spawn_log_reader, LogBuffers, LogKey};
 
@@ -125,6 +126,12 @@ pub(crate) struct ProcessInfo {
     cwd: String,
     /// 正在跟随的日志文件（见 `LogFollow`）
     pub(crate) follow: Option<LogFollow>,
+    /// 本地服务的就绪检查（见 `core::health`）
+    pub(crate) health_check: HealthCheck,
+    /// 本次运行是否已经写过"就绪检查超时"的系统日志（避免 3 秒轮询刷屏）
+    pub(crate) health_unready: bool,
+    /// 就绪检查是否已经通过：通过后不再每 3 秒重复连 TCP / 扫日志
+    pub(crate) health_ready: bool,
     /// 认领后找日志文件的采样状态（见 `LogProbe`）；None = 还没采过样
     pub(crate) log_probe: Option<LogProbe>,
     /// 所属项目（供 get_running 返回项目级运行状态）
@@ -145,10 +152,14 @@ pub(crate) struct RunningDetail {
     pub project_id: String,
     pub service_id: String,
     pub followed_log: Option<String>,
-    /// 直接子进程的创建时刻（epoch ms）：用于「启动中」宽限期
+    /// 直接子进程的创建时刻（epoch ms）：用于「启动中」宽限期与就绪检查超时
     pub started_at: u64,
     /// 进程树根：直接子进程 + 已认领的游离进程（调用方再展开它们各自的后代）
     pub pids: Vec<u32>,
+    /// 本地服务的就绪检查（`get_running` 用它计算 starting/ready/unready）
+    pub health_check: HealthCheck,
+    /// 就绪检查是否已经通过（通过后不再重复探测）
+    pub health_ready: bool,
 }
 
 pub struct ProcessManager {
@@ -181,6 +192,8 @@ pub struct ServiceSpawn<'a> {
     pub cwd: &'a str,
     pub env_vars: &'a [(String, String)],
     pub log_sink: LogSink,
+    /// 本地服务的就绪检查；`None` = 进程存活超过宽限期即就绪
+    pub health_check: HealthCheck,
 }
 
 /// 日志批量事件的发送端（ARCH-14）。
@@ -261,7 +274,7 @@ impl ProcessManager {
     }
 
     fn start_locked(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
-        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, log_sink } = spec;
+        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, log_sink, health_check } = spec;
         log::info!("[nexus] 启动服务: {} ({}) cmd={:?}, cwd={:?}", key, name, mask_command(command), cwd);
 
         // 工作目录为空：进程可能依赖相对路径/环境变量，直接拒绝并提示配置
@@ -461,7 +474,8 @@ impl ProcessManager {
         let spawn_started_at = process_start_time_millis(pid).unwrap_or(0);
         procs.insert(key.to_string(), ProcessInfo {
             child: Some(child), pid, spawn_started_at, adopted: Vec::new(),
-            cwd: cwd.to_string(), follow: None, log_probe: None,
+            cwd: cwd.to_string(), follow: None, health_check, health_unready: false,
+            health_ready: false, log_probe: None,
             project_id: project_id.to_string(),
             log_sink: Arc::clone(&log_sink),
             done_stdout: done_rx_opt,
@@ -602,6 +616,67 @@ impl ProcessManager {
             }
         };
         out
+    }
+
+    /// 本服务日志缓冲尾部是否包含关键字（就绪检查用；不克隆整份日志）。
+    ///
+    /// 只看内存缓冲（stdout/stderr）。服务若另开窗口、把日志写进文件，由调用方
+    /// 再查 `followed_log` 指向的文件（见 `get_running` 的日志关键字检查）。
+    pub(crate) fn logs_contain(&self, key: &str, pattern: &str) -> bool {
+        let log_key: LogKey = Arc::from(key);
+        let buf = match self.log_buffers.lock() {
+            Ok(b) => b.get(&*log_key).map(Arc::clone),
+            Err(_) => return false,
+        };
+        let Some(buf) = buf else { return false };
+        let found = match buf.lock() {
+            Ok(b) => b.lines.iter().rev().any(|line| {
+                // 只认**服务自己的输出**：
+                // - `system` 是我们写的诊断行（其中"就绪检查超时（日志包含「xxx」）"本身
+                //   就带着用户的关键字——不排除会导致"超时 → 下一拍命中自己 → 变已就绪"
+                //   的自证循环，实测用户就是这么看到"没日志却已就绪"的）；
+                // - `── …` 是日志跟随线程的操作提示，不是服务写的内容。
+                line.stream != "system"
+                    && !line.text.starts_with("── ")
+                    && line.text.contains(pattern)
+            }),
+            Err(_) => false,
+        };
+        found
+    }
+
+    /// 记录"就绪检查超时"：只在本次运行第一次超时时写一条系统日志，避免轮询刷屏。
+    ///
+    /// 超时**不结束进程**（它可能只是慢），所以这条日志是用户在日志面板里唯一的提示。
+    pub fn mark_health_unready(&self, key: &str, note: &str) {
+        let newly = {
+            let mut procs = match self.processes.lock() {
+                Ok(p) => p,
+                Err(e) => e.into_inner(),
+            };
+            match procs.get_mut(key) {
+                Some(info) if !info.health_unready => {
+                    info.health_unready = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if newly {
+            self.append_system_line(
+                key,
+                format!("就绪检查超时（{}）；进程仍在运行，未结束它", note),
+            );
+        }
+    }
+
+    /// 标记本次运行的就绪检查已通过（之后不再重复连 TCP / 扫日志）。
+    pub fn mark_health_ready(&self, key: &str) {
+        if let Ok(mut procs) = self.processes.lock() {
+            if let Some(info) = procs.get_mut(key) {
+                info.health_ready = true;
+            }
+        }
     }
 
     /// 取某服务的 (工作目录, 启动时刻)；服务不在表里时 None
@@ -857,6 +932,8 @@ impl ProcessManager {
                     followed_log: v.follow.as_ref().map(|f| f.path.clone()),
                     started_at: v.spawn_started_at,
                     pids,
+                    health_check: v.health_check.clone(),
+                    health_ready: v.health_ready,
                 }
             }).collect())
             .unwrap_or_default();
@@ -1979,6 +2056,7 @@ mod tests {
             project_id: "p1", service_id: key, name: "挂起创建",
             command: "echo suspended-ok", cwd: ".", env_vars: &[],
             log_sink: Arc::new(|_| {}),
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功（挂起→纳管→唤醒）");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2061,6 +2139,7 @@ mod tests {
         let err = mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
             cwd: "   ", env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).unwrap_err();
         assert!(err.contains("工作目录为空"), "实际错误: {}", err);
         // 被拒绝的启动不得留下任何痕迹（失败表/日志缓冲都该是干净的）
@@ -2083,6 +2162,7 @@ mod tests {
         let err = mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
             cwd: &missing, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).unwrap_err();
         assert!(err.starts_with("启动失败"), "实际错误: {}", err);
 
@@ -2148,6 +2228,36 @@ mod tests {
         // 主动停止过的服务不该留在失败表里（前端据此显示"失败"按钮）
         mgr.stop("svc-x").unwrap();
         assert!(mgr.failed().iter().all(|f| f.service_id != "svc-x" || f.exit_code != Some(1)));
+    }
+
+    /// 就绪检查的日志匹配只认服务自己的输出：
+    /// 系统诊断行（超时提示里带着关键字）和跟随线程的操作提示都不能算。
+    /// 这条守的是实测 bug："日志里根本没有关键字，下一拍却变成已就绪"。
+    #[test]
+    fn test_logs_contain_ignores_system_and_follow_markers() {
+        use crate::core::logpipe::push_log_line;
+        let mgr = ProcessManager::new();
+        let key = "svc-health";
+        // 我们自己写的超时诊断行里包含用户关键字——不能自证就绪
+        mgr.append_system_line(
+            key,
+            "就绪检查超时（日志包含「Started」）；进程仍在运行，未结束它".into(),
+        );
+        assert!(!mgr.logs_contain(key, "Started"), "系统诊断行不能算服务日志");
+
+        // 真实 stdout 输出才算
+        push_log_line(
+            &mgr.log_buffers, &Arc::from(key), "stdout",
+            "app Started".into(), Arc::from("t"), false,
+        );
+        assert!(mgr.logs_contain(key, "Started"));
+
+        // 跟随线程的轮转提示（stream=file，以 ── 开头）也不是服务内容
+        push_log_line(
+            &mgr.log_buffers, &Arc::from(key), "file",
+            "── 日志文件已轮转或被清空，从新文件开头继续 ──".into(), Arc::from("t"), false,
+        );
+        assert!(!mgr.logs_contain(key, "轮转"));
     }
 
     /// 失败日志 → 端口冲突：真起一个监听，验证"日志端口 → 占用进程"整条链。
@@ -2226,6 +2336,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "detach-1", name: "n",
             command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
 
         let pids = wait_for_adoption(&mgr, "detach-1");
@@ -2267,6 +2378,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: "quick-1", name: "n",
             command: "exit /b 3", cwd: &cwd, env_vars: &[], log_sink: sink,
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
 
         let failed = wait_for_failure(&mgr);
@@ -2376,6 +2488,7 @@ mod tests {
         mgr.start(ServiceSpawn {
             project_id: "p1", service_id: key, name: "n",
             command: "exit /b 0", cwd: ".", env_vars: &[], log_sink: Arc::new(|_| {}),
+            health_check: crate::core::health::HealthCheck::None,
         }).expect("启动应当成功");
 
         let texts: Vec<String> = mgr.get_logs(key).iter().map(|l| l.text.clone()).collect();
