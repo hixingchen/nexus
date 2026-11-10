@@ -12,6 +12,7 @@ import { useCtrlWheelFontSize } from '../../hooks/useCtrlWheelFontSize';
 import { CODE_FONT_STACK, parseEditorFontSize } from '../../utils/editorFont';
 import { isSubmitEnter } from '../../utils/keyboard';
 import { getExtension } from '../../utils/path';
+import { languageKeyOf } from '../../utils/editorLanguage';
 import { rememberScroll, recallScroll } from '../../utils/editorScroll';
 import { indentationMarkers } from '@replit/codemirror-indentation-markers';
 import { oneDark } from '@codemirror/theme-one-dark';
@@ -606,16 +607,32 @@ function legacyLang(mode: StreamParser<unknown>): Language {
   return StreamLanguage.define(mode);
 }
 
-/** 根据文件扩展名获取语言支持（同步版，仅用于 JS 系列：最常用且体量小） */
+/** 根据语言键获取语言支持（同步版，仅用于 JS 系列：最常用且体量小） */
 function getLanguageExtension(filePath: string) {
-  const ext = getExtension(filePath, { lower: true });
+  const ext = languageKeyOf(filePath);
   if (ext === 'js' || ext === 'jsx' || ext === 'mjs' || ext === 'cjs') return [javascript()];
   if (ext === 'ts' || ext === 'tsx') return [javascript({ typescript: true, jsx: ext === 'tsx' })];
   return [];
 }
 
 /**
- * 语言包按需加载表：扩展名 → 加载器。
+ * 同一种语言被多个键共用时的加载器：抽成常量，新增键只改数据、不再复制 import 表达式。
+ * （动态 import 本身是模块级缓存的，重复写只多几行噪音。）
+ */
+const jsonLang = () => import('@codemirror/lang-json').then(m => m.json());
+const xmlLang = () => import('@codemirror/lang-xml').then(m => m.xml());
+const shellLang = () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell));
+const powershellLang = () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell));
+/**
+ * 键值/INI 类配置共用：properties 模式认 `[section]`、`#`/`;` 注释与 `key=value`。
+ * 覆盖 .ini/.conf/.properties/dotenv/.gitignore，以及 systemd 单元（`[Service]` 段）
+ * 与 .editorconfig/.npmrc 这类点文件——它们没有各自的专用解析器，INI 近似是最接近的。
+ */
+const propertiesLang = () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties));
+
+/**
+ * 语言包按需加载表：语言键 → 加载器（键由 `utils/editorLanguage.ts` 的
+ * `languageKeyOf` 解析：文件名特例优先、扩展名其次）。
  *
  * 为什么改成动态导入：原来 30 个语言包全部静态导入（17 个 `@codemirror/lang-*` +
  * 11 个 legacy-modes），冷启动必须解析并执行**全部**语言包，而一次会话通常只用一两种。
@@ -639,10 +656,15 @@ const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
   styl: () => import('@codemirror/legacy-modes/mode/stylus').then(m => legacyLang(m.stylus)),
   html: () => import('@codemirror/lang-html').then(m => m.html()),
   htm: () => import('@codemirror/lang-html').then(m => m.html()),
-  json: () => import('@codemirror/lang-json').then(m => m.json()),
-  jsonc: () => import('@codemirror/lang-json').then(m => m.json()),
-  json5: () => import('@codemirror/lang-json').then(m => m.json()),
-  geojson: () => import('@codemirror/lang-json').then(m => m.json()),
+  json: jsonLang,
+  jsonc: jsonLang,
+  json5: jsonLang,
+  geojson: jsonLang,
+  // JSON Lines / NDJSON：每行一个 JSON，整文档按 JSON 解析会反复报错但逐行着色仍可读
+  jsonl: jsonLang,
+  ndjson: jsonLang,
+  // Web App Manifest（JSON）
+  webmanifest: jsonLang,
   md: () => import('@codemirror/lang-markdown').then(m => m.markdown()),
   rs: () => import('@codemirror/lang-rust').then(m => m.rust()),
   go: () => import('@codemirror/lang-go').then(m => m.go()),
@@ -661,9 +683,13 @@ const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
       ? new LanguageSupport(base.language.configure({ wrap: vueScssMixed }), base.support)
       : base;
   },
-  xml: () => import('@codemirror/lang-xml').then(m => m.xml()),
-  xhtml: () => import('@codemirror/lang-xml').then(m => m.xml()),
-  svg: () => import('@codemirror/lang-xml').then(m => m.xml()),
+  xml: xmlLang,
+  xhtml: xmlLang,
+  svg: xmlLang,
+  // .NET 工程文件（MSBuild XML）：csproj / Directory.Build.props / *.targets
+  csproj: xmlLang,
+  props: xmlLang,
+  targets: xmlLang,
   // C/C++
   c: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
   h: () => import('@codemirror/lang-cpp').then(m => m.cpp()),
@@ -676,48 +702,84 @@ const langLoaders: Record<string, () => Promise<Language | LanguageSupport>> = {
   yaml: () => import('@codemirror/lang-yaml').then(m => m.yaml()),
   php: () => import('@codemirror/lang-php').then(m => m.php()),
   // 脚本（legacy-modes）
-  sh: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
-  bash: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
-  zsh: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)),
+  sh: shellLang,
+  bash: shellLang,
+  zsh: shellLang,
+  // 无扩展名的 shell 配置（`getExtension` 会把 .bashrc 解析成键 bashrc）
+  bashrc: shellLang,
+  zshrc: shellLang,
+  profile: shellLang,
+  // direnv 的 .envrc 是一段 shell 脚本，不是 dotenv 键值
+  envrc: shellLang,
   // 无 batch 模式，PowerShell 近似
-  bat: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
-  cmd: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
-  ps1: () => import('@codemirror/legacy-modes/mode/powershell').then(m => legacyLang(m.powerShell)),
+  bat: powershellLang,
+  cmd: powershellLang,
+  ps1: powershellLang,
+  // PowerShell 模块/数据文件（Windows 上的常用入口）
+  psm1: powershellLang,
+  psd1: powershellLang,
   rb: () => import('@codemirror/legacy-modes/mode/ruby').then(m => legacyLang(m.ruby)),
   erb: () => import('@codemirror/legacy-modes/mode/ruby').then(m => legacyLang(m.ruby)), // ERB，Ruby 近似
   // 其他（legacy-modes）
   dockerfile: () => import('@codemirror/legacy-modes/mode/dockerfile').then(m => legacyLang(m.dockerFile)),
-  makefile: () => import('@codemirror/legacy-modes/mode/shell').then(m => legacyLang(m.shell)), // Shell 近似
+  makefile: shellLang, // Shell 近似
   swift: () => import('@codemirror/legacy-modes/mode/swift').then(m => legacyLang(m.swift)),
+  cmake: () => import('@codemirror/legacy-modes/mode/cmake').then(m => legacyLang(m.cmake)),
   lua: () => import('@codemirror/legacy-modes/mode/lua').then(m => legacyLang(m.lua)),
   toml: () => import('@codemirror/legacy-modes/mode/toml').then(m => legacyLang(m.toml)),
   proto: () => import('@codemirror/legacy-modes/mode/protobuf').then(m => legacyLang(m.protobuf)),
   cs: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.csharp)),
   kt: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.kotlin)),
   kts: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.kotlin)),
-  ini: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
-  conf: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
-  properties: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
-  env: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
-  gitignore: () => import('@codemirror/legacy-modes/mode/properties').then(m => legacyLang(m.properties)),
+  scala: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.scala)),
+  dart: () => import('@codemirror/legacy-modes/mode/clike').then(m => legacyLang(m.dart)),
+  // Groovy 与 Gradle 构建脚本（.gradle 就是 Groovy；.gradle.kts 走上面的 kts）
+  groovy: () => import('@codemirror/legacy-modes/mode/groovy').then(m => legacyLang(m.groovy)),
+  gradle: () => import('@codemirror/legacy-modes/mode/groovy').then(m => legacyLang(m.groovy)),
+  perl: () => import('@codemirror/legacy-modes/mode/perl').then(m => legacyLang(m.perl)),
+  pl: () => import('@codemirror/legacy-modes/mode/perl').then(m => legacyLang(m.perl)),
+  pm: () => import('@codemirror/legacy-modes/mode/perl').then(m => legacyLang(m.perl)),
+  vb: () => import('@codemirror/legacy-modes/mode/vb').then(m => legacyLang(m.vb)),
+  vbs: () => import('@codemirror/legacy-modes/mode/vbscript').then(m => legacyLang(m.vbScript)),
+  // 补丁与 HTTP 请求文件（REST Client / IntelliJ 那套 .http 语法）
+  diff: () => import('@codemirror/legacy-modes/mode/diff').then(m => legacyLang(m.diff)),
+  patch: () => import('@codemirror/legacy-modes/mode/diff').then(m => legacyLang(m.diff)),
+  http: () => import('@codemirror/legacy-modes/mode/http').then(m => legacyLang(m.http)),
+  rest: () => import('@codemirror/legacy-modes/mode/http').then(m => legacyLang(m.http)),
+  ini: propertiesLang,
+  conf: propertiesLang,
+  properties: propertiesLang,
+  env: propertiesLang,
+  gitignore: propertiesLang,
+  // systemd 单元（[Unit]/[Service] + key=value；注释 # 与 ;）
+  service: propertiesLang,
+  socket: propertiesLang,
+  timer: propertiesLang,
+  target: propertiesLang,
+  mount: propertiesLang,
+  // 其他点文件/配置文件（键值或逐行 pattern，与 .gitignore 同构）
+  gitattributes: propertiesLang,
+  dockerignore: propertiesLang,
+  editorconfig: propertiesLang,
+  npmrc: propertiesLang,
 };
 
-/** 语言加载缓存：同一扩展名只加载一次（Promise 也缓存，避免并发重复请求） */
+/** 语言加载缓存：同一语言键只加载一次（Promise 也缓存，避免并发重复请求） */
 const languageCache = new Map<string, Promise<Language | LanguageSupport | null>>();
 
-/** 按扩展名加载语言包；失败一律降级为"无高亮"（不让编辑器创建失败） */
+/** 按语言键（文件名特例 > 扩展名，见 languageKeyOf）加载语言包；失败降级为"无高亮" */
 function loadLanguage(filePath: string): Promise<Language | LanguageSupport | null> {
-  const ext = getExtension(filePath, { lower: true });
-  const loader = langLoaders[ext];
+  const key = languageKeyOf(filePath);
+  const loader = langLoaders[key];
   if (!loader) return Promise.resolve(null);
-  const cached = languageCache.get(ext);
+  const cached = languageCache.get(key);
   if (cached) return cached;
   const p = loader().catch(e => {
     // 只留控制台：已按设计降级（无高亮仍可读可编辑），弹 toast 会在每次打开这类文件时重复打扰
-    console.error(`加载语言包失败（${ext}，已降级为无高亮）:`, e);
+    console.error(`加载语言包失败（${key}，已降级为无高亮）:`, e);
     return null;
   });
-  languageCache.set(ext, p);
+  languageCache.set(key, p);
   return p;
 }
 

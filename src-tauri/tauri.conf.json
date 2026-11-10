@@ -22,7 +22,8 @@
         "maximized": true,
         "decorations": false,
         "transparent": false,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "generalAutofillEnabled": false
       }
     ],
     "security": {

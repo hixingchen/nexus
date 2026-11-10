@@ -101,6 +101,47 @@ const RENAME_ICON = (
 /** 目录展开时初始渲染条数，超出后显示"加载更多" */
 const INITIAL_RENDER_LIMIT = 200;
 
+/* ---- 根目录列表缓存 ---- */
+
+/**
+ * 根目录列表的模块级缓存（同 `cachedProjects` / `cachedIndex` 的口径）。
+ *
+ * 为什么需要：卡片展开时，项目树/服务树是**随展开条件挂载**的。每次重新展开，
+ * `FileTree` 的 `entries` 都从 `[]` 起步，而 `list_directory` 是异步 IPC——
+ * 这段时间界面上先渲染的是「空目录」（80px 高的空态），数据回来后被真正的树顶掉。
+ * 实测（无头 Edge + 150ms 延迟的 mock）「项目目录」展开会先闪 165ms 的空态，
+ * 随后一帧内从 165px 撑到 1048px——用户看到的就是"展开时闪一下"。
+ *
+ * 缓存只服务**首帧**：命中时挂载即渲染上次的列表（同时照常 `loadRoot()` 刷新），
+ * 所以重新展开是"立刻有内容、随后静默更新"，既没有空态闪烁、也没有陈旧数据常驻。
+ * 写入只发生在 `loadRoot()` 成功后，文件系统的新增/删除会在下一次刷新时覆盖它。
+ *
+ * 必须有上限：跨组件卸载活到进程结束，一个 2 万条的根目录不能乘以所有项目/服务。
+ * 按插入顺序淘汰最旧的（Map 保持插入顺序），根数量与条目总数两道限制取更严者。
+ */
+const ROOT_CACHE_MAX_ROOTS = 16;
+const ROOT_CACHE_MAX_ENTRIES = 20_000;
+const rootEntriesCache = new Map<string, FileEntry[]>();
+
+function cacheRootEntries(root: string, entries: FileEntry[]) {
+  // 重新写入的键移到队尾（"刚用过"的最后淘汰）
+  rootEntriesCache.delete(root);
+  rootEntriesCache.set(root, entries);
+  while (rootEntriesCache.size > ROOT_CACHE_MAX_ROOTS) {
+    const oldest = rootEntriesCache.keys().next();
+    if (oldest.done) break;
+    rootEntriesCache.delete(oldest.value);
+  }
+  let total = 0;
+  for (const list of rootEntriesCache.values()) total += list.length;
+  while (total > ROOT_CACHE_MAX_ENTRIES) {
+    const oldest = rootEntriesCache.keys().next();
+    if (oldest.done) break;
+    total -= rootEntriesCache.get(oldest.value)?.length ?? 0;
+    rootEntriesCache.delete(oldest.value);
+  }
+}
+
 /* ---- jar 虚拟节点（树内展开 jar 条目） ---- */
 
 /**
@@ -763,7 +804,17 @@ export function FileTree({ rootPath, embedded, kind = 'service', refreshSeq }: {
    */
   refreshSeq?: number;
 }) {
-  const [entries, setEntries] = useState<FileEntry[]>([]);
+  // 首帧就取缓存：重新展开时挂载即渲染上次的列表，不再先闪一帧空态（见 rootEntriesCache）
+  const [entries, setEntries] = useState<FileEntry[]>(
+    () => (rootPath ? rootEntriesCache.get(rootPath) ?? [] : []),
+  );
+  /**
+   * 根目录是否已有过一次列表结果（缓存命中也算）。
+   *
+   * 「空目录」是个**结论**，只能在"确实列过且确实为空"时说；加载中它是个错误结论，
+   * 而且那 80px 的空态高度会先撑开、再被真正的树顶掉——正是展开闪烁的另一半。
+   */
+  const [loaded, setLoaded] = useState(() => !!rootPath && rootEntriesCache.has(rootPath));
   /** 根节点同样先渲染前 200 项：后端允许单目录 2 万条，一次性挂载会让树卡死 */
   const [showAllRoot, setShowAllRoot] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -820,7 +871,12 @@ export function FileTree({ rootPath, embedded, kind = 'service', refreshSeq }: {
     const seq = ++rootSeqRef.current;
     try {
       const list = await listDirectory(rootPath);
-      if (seq === rootSeqRef.current) { setEntries(list); setErr(null); }
+      if (seq === rootSeqRef.current) {
+        setEntries(list);
+        cacheRootEntries(rootPath, list);
+        setLoaded(true);
+        setErr(null);
+      }
     } catch (e: unknown) {
       if (seq === rootSeqRef.current) setErr(String(e));
     }
@@ -876,7 +932,13 @@ export function FileTree({ rootPath, embedded, kind = 'service', refreshSeq }: {
 
   useEffect(() => {
     setShowAllRoot(false);
-    if (!rootPath) { setEntries([]); setErr(null); return; }
+    if (!rootPath) { setEntries([]); setErr(null); setLoaded(false); return; }
+    // 换了根路径（同一个组件实例被复用）时先摆上缓存/空列表，再由 loadRoot 刷新；
+    // 挂载场景的初值已在 useState 里取过，这里对同一份缓存再赋一次不会造成可见变化
+    const cached = rootEntriesCache.get(rootPath);
+    setEntries(cached ?? []);
+    setLoaded(!!cached);
+    setErr(null);
     loadRoot();
   }, [loadRoot, rootPath]);
 
@@ -935,7 +997,9 @@ export function FileTree({ rootPath, embedded, kind = 'service', refreshSeq }: {
         {rootPath && err && (
           <div className="px-4 py-10 text-center text-[11px] text-nexus-error">{err}</div>
         )}
-        {rootPath && !err && entries.length === 0 && (
+        {/* 「空目录」只在**列过一次且确实为空**时说：加载中/首次挂载时它不是结论
+            （否则展开时会先闪 80px 高的空态，再被真正的树顶掉——见 loaded 的说明） */}
+        {rootPath && !err && loaded && entries.length === 0 && (
           <div className="px-4 py-10 text-center text-[11px] text-nexus-muted">空目录</div>
         )}
         {!err && (showAllRoot ? entries : entries.slice(0, INITIAL_RENDER_LIMIT)).map(ent => (

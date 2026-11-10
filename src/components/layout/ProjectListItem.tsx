@@ -187,19 +187,20 @@ export function ProjectListItem({
         onContextMenu={onContextMenu}
       >
         <div className="flex items-start gap-2">
-          {/* 展开入口 = 双击卡片（见 onDoubleClick）。此处只保留"展开加载中"的反馈：
-              不渲染箭头图标（左侧留白反而更干净），未加载时不占位；
-              spinner 仍必须有——双击到数据回来之间若无反馈，用户会以为双击没生效而反复点 */}
-          {expanding && (
-            <span className="flex-shrink-0 -ml-1 w-3.5 h-[18px] flex items-center justify-center">
+          {/* 图标槽：展开加载中时**原地**换成 spinner，不额外插一个元素。
+              为什么必须同槽（实测闪烁的根因）：此前 spinner 是另一个 span，插在文件夹
+              图标前面、外加 -ml-1 + gap，展开那几十毫秒里把标题/路径整体右推 18px、数据
+              回来后又弹回——双击卡片时肉眼看到的"闪一下"就是这一进一出。
+              现在图标位尺寸固定（w/h 都是 14px），文件夹 ↔ spinner 只是槽内内容替换，
+              整行布局纹丝不动，加载反馈仍然在（双击到数据回来之间没有反馈，用户会反复点） */}
+          <span className="flex-shrink-0 mt-px w-3.5 h-3.5 flex items-center justify-center text-nexus-muted/60 group-hover:text-nexus-muted">
+            {expanding ? (
               <span className="w-[11px] h-[11px] border-[1.5px] border-nexus-success/30 border-t-nexus-success rounded-full animate-spin" />
-            </span>
-          )}
-          {/* 文件夹图标 */}
-          <span className="flex-shrink-0 mt-px text-nexus-muted/60 group-hover:text-nexus-muted">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
-              <path d="M2 3.5a1 1 0 011-1h3l1.5 1.5H12a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1V3.5z"/>
-            </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+                <path d="M2 3.5a1 1 0 011-1h3l1.5 1.5H12a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1V3.5z"/>
+              </svg>
+            )}
           </span>
           <div className="min-w-0 flex-1">
             <span className="text-[13px] text-nexus-text font-medium truncate block">{project.name}</span>

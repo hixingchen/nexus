@@ -53,6 +53,21 @@ export function parentDir(p: string): string {
 }
 
 /**
+ * 取路径最后一段（用于「路径 → 默认名称」）。
+ *
+ * 规则与文件管理器一致：末尾分隔符忽略（`D:/work/foo/` → `foo`），两种分隔符都认；
+ * 根路径（`D:/`、`/`）没有名字段，返回空串。`.` / `..` 不算名称
+ * （它们不是目录名，写进名称只会误导）。
+ */
+export function baseName(p: string): string {
+  const trimmed = p.replace(/[\\/]+$/, '');
+  const i = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  const last = i >= 0 ? trimmed.slice(i + 1) : trimmed;
+  if (/^[a-zA-Z]:$/.test(last) || last === '.' || last === '..') return '';
+  return last.trim();
+}
+
+/**
  * 图片扩展名 → MIME。未知扩展名给 `application/octet-stream`（与既有行为一致）。
  *
  * 为什么提到这里：图片查看器与 Markdown 预览各需要一次，而两份表**不一致时不会报错**，

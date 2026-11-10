@@ -179,9 +179,10 @@ export function DocxViewer({ path, name }: { path: string; name: string }) {
 
   return (
     <div className="h-full flex flex-col bg-nexus-editor relative">
-      <div className="flex items-center gap-3 px-3 h-[38px] border-b border-nexus-border bg-nexus-surface flex-shrink-0 text-[12px] text-nexus-text-muted">
+      {/* min-h 而不是固定 h：下面的提示语完整换行（不省略），窄窗口里需要能长高 */}
+      <div className="flex items-center gap-3 px-3 min-h-[38px] border-b border-nexus-border bg-nexus-surface flex-shrink-0 text-[12px] text-nexus-text-muted">
         <span className="truncate max-w-[200px] flex-shrink-0" title={name}>{name}</span>
-        <span className="text-[11px] text-nexus-muted truncate min-w-0 flex-1">只读预览，版式可能与 Word 有差异</span>
+        <span className="text-[11px] leading-tight text-nexus-muted min-w-0 flex-1">只读预览，版式可能与 Word 有差异</span>
         <button
           className="px-1.5 py-0.5 rounded hover:bg-nexus-hover/60 disabled:opacity-30 flex-shrink-0"
           disabled={loading || !!error}

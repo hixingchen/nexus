@@ -71,8 +71,13 @@ export function showNotification({
 }: ToastOptions) {
   const style = VARIANT_STYLES[variant];
   const hideAfter = duration ?? VARIANT_DURATION[variant];
-  // 错误详情可复制：用户能把原文贴进 issue/聊天，而不必凭记忆转述
-  const copyDetail = variant === 'error' && !!description;
+  /**
+   * 错误通知一律可复制：标题里也可能直接是后端错误原文（见 ProjectModals 的
+   * "创建项目失败"：`reportError(toMessage(e), e, { description: '' })`），此时没有
+   * description 可复制，但错误文本仍要让用户能原样贴出去。普通提示完整显示，不需要复制。
+   */
+  const copyDetail = variant === 'error';
+  const copyContent = description ? `${title}: ${description}` : title;
   // 旧单数 `action` 与新的 `actions` 合并渲染；旧字段按主按钮处理
   const allActions: NotifyAction[] = [
     ...(action ? [{ ...action, variant: 'primary' as const }] : []),
@@ -111,9 +116,12 @@ export function showNotification({
             <span className={`${style.iconColor} text-sm font-bold`}>{style.icon}</span>
           </div>
 
-          {/* 文本：标题单行截断；描述可换行完整显示（错误/诊断信息不能截断） */}
+          {/* 文本：标题与描述都**完整换行**，不做省略。
+              为什么标题也不能截断：通知标题本身就是一句话提示（"服务 xxx 自动重启未成功"），
+              在带按钮的窄列里被截成「Nexus 有新版…」后，用户读不到结论；
+              长错误另有「复制详情」按钮兜底（见 copyDetail），不需要靠省略号藏内容。 */}
           <div className="flex-1 min-w-0">
-            <p className="text-[13px] text-nexus-text font-semibold truncate">{title}</p>
+            <p className="text-[13px] text-nexus-text font-semibold break-words">{title}</p>
             {description && (
               <p className="text-[11px] text-nexus-muted mt-0.5 break-words">{description}</p>
             )}
@@ -130,7 +138,7 @@ export function showNotification({
                 // 这里不调 utils/clipboard 的 copyText：它要弹提示就不得不 import 本文件，
                 // 于是形成 `Toast → clipboard → Toast` 的循环依赖（构建期警告 + 运行期
                 // 绑定可能是 undefined）。三行内联换一个无环的依赖图，值。
-                void navigator.clipboard.writeText(`${title}: ${description}`)
+                void navigator.clipboard.writeText(copyContent)
                   .catch((e) => console.warn('复制错误详情失败:', e));
               }}
             >

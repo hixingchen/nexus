@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getExtension, parentDir } from '../path.ts';
+import { getExtension, parentDir, baseName } from '../path.ts';
 
 /**
  * getExtension 刻意保持了各处原先 `split('.').pop() ?? ''` 的语义，
@@ -90,4 +90,44 @@ test('parentDir：树根下的第一层文件，父目录就是树根本身', ()
 test('parentDir：没有分隔符 / 以分隔符开头都不返回空串（空串会被当成"当前目录")', () => {
   assert.equal(parentDir('a.ts'), 'a.ts', '没有分隔符 → 原样返回，让下游明确报错');
   assert.equal(parentDir('/a.ts'), '/a.ts', '切出来是空串时退回原值');
+});
+
+/**
+ * baseName 服务「路径变化 → 默认名称」：项目/服务表单在路径变化时用它自动填名称。
+ * 取错会把名称改成路径中间的一段，而界面上很难发现（名称本来就可改）。
+ */
+test('baseName：Windows 路径取最后一段（中文目录名原样保留）', () => {
+  assert.equal(baseName('D:/work/SVNProject/福州-福大至诚学院'), '福州-福大至诚学院');
+  assert.equal(baseName('D:\\work\\SVNProject\\福州-福大至诚学院'), '福州-福大至诚学院');
+});
+
+test('baseName：混用分隔符时取最后一段', () => {
+  assert.equal(baseName('D:\\work\\proj/src/foo'), 'foo');
+  assert.equal(baseName('D:/work/proj\\src\\foo'), 'foo');
+});
+
+test('baseName：末尾分隔符被忽略（选择器偶尔会带结尾斜杠）', () => {
+  assert.equal(baseName('D:/work/foo/'), 'foo');
+  assert.equal(baseName('D:\\work\\foo\\'), 'foo');
+  assert.equal(baseName('D:\\work\\foo\\\\'), 'foo');
+});
+
+test('baseName：根路径没有名字段 → 空串（不会把 "D:" 当名称）', () => {
+  assert.equal(baseName('D:/'), '');
+  assert.equal(baseName('D:\\'), '');
+  assert.equal(baseName('D:'), '');
+  assert.equal(baseName('/'), '');
+  assert.equal(baseName(''), '');
+});
+
+test('baseName：UNC 共享目录取共享名，`.` / `..` 不算名称', () => {
+  assert.equal(baseName('\\\\server\\share'), 'share');
+  assert.equal(baseName('\\\\server\\share\\'), 'share');
+  assert.equal(baseName('D:/work/.'), '');
+  assert.equal(baseName('D:/work/..'), '');
+});
+
+test('baseName：没有分隔符时原样返回；首尾空白被去掉（名称提交时会 trim）', () => {
+  assert.equal(baseName('foo'), 'foo');
+  assert.equal(baseName('  foo  '), 'foo');
 });

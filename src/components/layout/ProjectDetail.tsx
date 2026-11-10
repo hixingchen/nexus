@@ -549,6 +549,8 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
             // 新建时 name 是空的，得给个说法，否则标题栏只剩一个 ✕
             title={editingService.id ? editingService.name : '添加服务'}
             onClose={() => setEditingService(null)}
+            // 工作目录为空时，「选择工作目录」从项目根开始（新建服务最常见的落点）
+            projectPath={project?.path}
             // 面板右侧偏移 = 服务列宽（absolute 覆盖需让位）
             rightOffset={servicePanelCollapsed ? 32 : 360}
           />

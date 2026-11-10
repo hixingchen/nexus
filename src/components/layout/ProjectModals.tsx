@@ -9,6 +9,7 @@ import {
   MODAL_DRAFT_KEYS, readModalDraft, useModalDraftStore, type ProjectFormDraft,
 } from '../../stores/modalDraftStore';
 import { shouldSyncProjectDraft } from '../../utils/projectEditDraft';
+import { baseName } from '../../utils/path';
 
 interface CreateModalProps {
   open: boolean;
@@ -51,10 +52,28 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
     onClose();
   };
 
+  /**
+   * 路径变化 → 名称取路径最后一段（输入与「选择目录」两条路同口径）。
+   *
+   * 名称仍然可改：这里的自动填充只发生在**路径变动的那一刻**；之后用户手动改的名称
+   * 会保留到下一次路径变化。路径清空时名称也清空，与"名称跟随路径"同一语义。
+   */
+  const applyPath = (next: string) => {
+    setPath(next);
+    // 重新选中同一个目录（如先修好权限再点一次选择器）不算"路径变化"，
+    // 不该冲掉用户手改过的名称
+    if (next !== path) setName(baseName(next));
+  };
+
   const handleSelectPath = async () => {
-    // 走后端原生选择器：路径会成为文件访问白名单的根，必须由用户亲手选择（见 utils/error 同层说明）
-    const selected = await pickDirectory({ purpose: 'projectDir' });
-    if (selected) setPath(selected);
+    // 走后端原生选择器：路径会成为文件访问白名单的根，必须由用户亲手选择（见 utils/error 同层说明）。
+    // 初始位置 = 表单里当前填的路径：用户往往先敲目标目录再点按钮；若目标还不存在，
+    // 后端会从最近一级已存在的上级开始（见 commands/app.rs::picker_initial_dir）
+    const selected = await pickDirectory({
+      purpose: 'projectDir',
+      defaultPath: path.trim() || undefined,
+    });
+    if (selected) applyPath(selected);
   };
 
   const handleCreate = async () => {
@@ -100,7 +119,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateModalProp
               className="w-full pl-3 pr-8 py-2 text-[13px] bg-nexus-bg border border-nexus-border rounded text-nexus-text font-mono placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent"
               placeholder="/path/to/project"
               value={path}
-              onChange={e => setPath(e.target.value)}
+              onChange={e => applyPath(e.target.value)}
               onKeyDown={e => { if (isSubmitEnter(e)) handleCreate(); }}
             />
             <button
@@ -194,9 +213,20 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName, o
     onClose();
   };
 
+  /** 路径变化 → 名称跟随最后一段（规则同 CreateProjectModal.applyPath；改完名称仍可手改） */
+  const applyPath = (next: string) => {
+    setPath(next);
+    // 同 CreateProjectModal：没有实际变化就不动名称
+    if (next !== path) setName(baseName(next));
+  };
+
   const handleSelectPath = async () => {
-    const selected = await pickDirectory({ purpose: 'projectDir', defaultPath: path || project?.path });
-    if (selected) setPath(selected);
+    // 表单路径 → 已落库路径 → 对话框自己的上次位置（后端对不存在的候选会回落到上级）
+    const selected = await pickDirectory({
+      purpose: 'projectDir',
+      defaultPath: path.trim() || project?.path,
+    });
+    if (selected) applyPath(selected);
   };
 
   const handleSave = async () => {
@@ -245,7 +275,7 @@ export function EditProjectModal({ project, onClose, onUpdated, onProjectName, o
               className="w-full pl-3 pr-8 py-2 text-[13px] bg-nexus-bg border border-nexus-border rounded text-nexus-text font-mono placeholder:text-nexus-muted focus:outline-none focus:border-nexus-accent"
               placeholder="/path/to/project"
               value={path}
-              onChange={e => setPath(e.target.value)}
+              onChange={e => applyPath(e.target.value)}
               onKeyDown={e => { if (isSubmitEnter(e)) handleSave(); }}
             />
             <button

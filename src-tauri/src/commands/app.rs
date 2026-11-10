@@ -2,6 +2,7 @@
 //!
 //! 为什么单独一个模块：这两件事都牵涉应用级时序/授权语义，集中在这里便于说明。
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Manager};
@@ -151,6 +152,39 @@ fn picker_title(purpose: Option<&str>) -> &'static str {
     }
 }
 
+/// 目录选择器的初始目录：默认路径**本身或最近的已存在祖先**。
+///
+/// 为什么不是"不是目录就忽略"（原实现）：用户输入框里敲的往往是**还没建出来的目标目录**，
+/// 或粘了一条更深/含文件名的路径。此时从最近一级已存在的上级开始浏览，比从系统的
+/// 上次位置（可能是文档目录）开始更符合预期——不会出现"点了选择器却跑到不相干的目录"。
+/// 返回 None = 没有可用提示，交给对话框自身行为（它通常记得上次选择的位置）。
+fn picker_initial_dir(raw: Option<&str>) -> Option<PathBuf> {
+    let mut p = PathBuf::from(raw?.trim());
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    loop {
+        if p.is_dir() {
+            // Windows 上必须把 `/` 换成 `\` 再交给原生对话框：rfd 内部用
+            // SHCreateItemFromParsingName 解析初始目录，它**不认正斜杠**（返回
+            // E_INVALIDARG / 0x80070057），而 rfd 把这个失败静默忽略——对话框于是
+            // 退回"上次选择的位置"。本仓库的路径全部以正斜杠存储（D:/work/...），
+            // 不归一化的话初始目录永远不生效（表现为"这个功能没实现"）。
+            #[cfg(windows)]
+            {
+                p = PathBuf::from(p.to_string_lossy().replace('/', "\\"));
+            }
+            return Some(p);
+        }
+        let parent = p.parent()?;
+        // 已经到根/相对路径开头仍然不存在：没有可用的上级
+        if parent.as_os_str().is_empty() || parent == p {
+            return None;
+        }
+        p = parent.to_path_buf();
+    }
+}
+
 /// 原生目录选择器（Rust 侧弹框），并把用户选中的目录记为"已确认"。
 ///
 /// 为什么必须由 Rust 侧弹框：白名单收口要求"项目外的新目录只能由用户显式授权"。
@@ -171,10 +205,14 @@ pub async fn pick_directory(
     let picker = app.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
         let mut builder = picker.dialog().file().set_title(title);
-        if let Some(d) = default_path.as_deref().filter(|d| !d.trim().is_empty()) {
-            if std::path::Path::new(d).is_dir() {
-                builder = builder.set_directory(d);
+        match picker_initial_dir(default_path.as_deref()) {
+            Some(dir) => {
+                // 留痕是必要的：初始位置不生效时界面上只表现为"对话框开在别处"，
+                // 没有任何报错；这条日志能区分"没传""传了没生效""传错了"
+                log::info!("[nexus] 目录选择器初始位置: {}", dir.display());
+                builder = builder.set_directory(dir);
             }
+            None => log::info!("[nexus] 目录选择器未指定初始位置（使用上次位置）"),
         }
         // blocking_* 会阻塞当前线程直到用户操作完成 → 必须放在 spawn_blocking 里，别卡住 IPC 线程
         builder.blocking_pick_folder()
@@ -337,6 +375,45 @@ mod tests {
         for bad in ["", "..", "C:/Windows", "data/../..", "DATA", "logs"] {
             assert!(app_dir(bad).is_err(), "`{}` 不该被当作用途键接受", bad);
         }
+    }
+
+    /// 选择器初始目录：输入的是目标目录（可能尚未创建）时，从最近一级已存在上级开始。
+    ///
+    /// 守的是"点了选择器却跑到不相干目录"：原实现遇到不存在的路径直接忽略，
+    /// 对话框于是回到它自己的上次位置，用户得重新一路点回去。
+    #[test]
+    fn test_picker_initial_dir_uses_nearest_existing_ancestor() {
+        let base = std::env::temp_dir().join(format!("nexus-picker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("创建测试目录");
+        let base_str = base.to_string_lossy().to_string();
+        let deep = base.join("missing-a").join("missing-b");
+        let deep_str = deep.to_string_lossy().to_string();
+
+        assert_eq!(picker_initial_dir(Some(&base_str)), Some(base.clone()), "存在的目录原样返回");
+        assert_eq!(
+            picker_initial_dir(Some(&deep_str)),
+            Some(base.clone()),
+            "不存在的多级子目录回落到最近的已存在祖先"
+        );
+
+        // 本仓库的路径以正斜杠存储（D:/work/...）。Windows 的原生对话框不认正斜杠，
+        // 传给 rfd 之前在 helper 里必须归一化成反斜杠——否则初始位置静默失效。
+        let forward = base_str.replace('\\', "/");
+        let normalized = if cfg!(windows) {
+            PathBuf::from(base_str.replace('/', "\\"))
+        } else {
+            base.clone()
+        };
+        assert_eq!(
+            picker_initial_dir(Some(&forward)),
+            Some(normalized),
+            "正斜杠路径要归一化成平台分隔符"
+        );
+        assert!(picker_initial_dir(None).is_none());
+        assert!(picker_initial_dir(Some("")).is_none());
+        assert!(picker_initial_dir(Some("   ")).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `get_app_paths` 报出来的三个路径必须自洽（数据目录 → logs → nexus.log）。

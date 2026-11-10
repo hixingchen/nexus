@@ -153,7 +153,9 @@ export function RestartConfirm() {
 
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2">
-              <span className="text-[14px] text-nexus-text font-semibold truncate">{item.serviceName}</span>
+              {/* 服务名是一句话提示的主语，换行完整显示：卡片固定宽度下
+                  `truncate` 会把稍长的名字截断，而用户正是靠它确认"是哪一个服务" */}
+              <span className="text-[14px] text-nexus-text font-semibold break-words">{item.serviceName}</span>
               {item.count > 1 && (
                 <span className="text-[11px] bg-nexus-warning/20 text-nexus-warning px-2 py-0.5 rounded-full font-semibold flex-shrink-0">
                   {item.count}

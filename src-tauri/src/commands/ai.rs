@@ -810,6 +810,10 @@ pub async fn create_ai_panel_webview(
     let builder = tauri::webview::WebviewBuilder::new(label, url)
         // HTML5 drag and drop（与 JS 创建时 dragDropEnabled: false 同义）
         .disable_drag_drop_handler()
+        // 自动填充关闭（与主窗口 tauri.conf.json 的 generalAutofillEnabled 同口径）：
+        // 这是独立创建的 WebView，不读窗口配置；不关的话 dsh 页面的输入框同样会弹
+        // WebView2 的「保存的信息」下拉。本地工具没有地址/联系人表单，这些建议只有干扰。
+        .general_autofill_enabled(false)
         // 导航守卫：面板只允许停留在环回 http(s) 上。
         // 只校验创建前的 URL 是不够的——加载后页面里的链接、重定向与 JS 导航可以把面板
         // 带到任意 URL：应用框架内的界面伪装，或指向本机其它环回端口（含 Nexus 自己的 GUI）。

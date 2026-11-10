@@ -11,6 +11,7 @@ import { readServiceDraft, serviceDraftKey, useServiceDraftStore } from '../../s
 import { ToolsManagerModal } from './ToolsManagerModal';
 import { showNotification } from '../ui/Toast';
 import { reportError } from '../../utils/error';
+import { baseName } from '../../utils/path';
 import { watchPathsAfterCwdChange } from '../../utils/watchPaths';
 import { useClickOutside } from '../../hooks/useClickOutside';
 import {
@@ -85,11 +86,19 @@ interface Props {
   onClose?: () => void;
   /** 另存为模板成功后的回调（父组件刷新模板库） */
   onSavedAsTemplate?: () => void;
+  /**
+   * 所属项目的根目录：工作目录为空时，「选择工作目录」从这里开始浏览。
+   *
+   * 为什么需要它：新建服务的工作目录是空串，直接弹选择器会落在系统的上次位置
+   * （可能是文档目录），而服务绝大多数就放在项目里——从项目根开始更省一次远距离导航。
+   * 模板不传（模板是跨项目复用的，没有"所属项目"）。
+   */
+  projectPath?: string;
   /** 面板右侧偏移（px）= 服务列宽度：服务列 absolute 覆盖在主区域上，编辑面板需显示在其左侧 */
   rightOffset?: number;
 }
 
-export function ServiceEditPanel({ service, onSave, mode = 'service', title, rightOffset = 360, onSavedAsTemplate, onClose }: Props) {
+export function ServiceEditPanel({ service, onSave, mode = 'service', title, projectPath, rightOffset = 360, onSavedAsTemplate, onClose }: Props) {
   /** 草稿键与面板的编辑目标一一对应（见 serviceDraftStore 的六条丢失路径说明） */
   const draftKey = serviceDraftKey(service.id, mode);
   /**
@@ -299,13 +308,22 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
    */
   const applyCwd = (next: string) => {
     setCwd(next);
+    // 名称跟随工作目录最后一段（与项目表单同一口径）：服务名默认就是目录名，
+    // 路径一变先给一个对的默认值；用户随后手改的名称保留到下一次路径变化。
+    // 没有实际变化（重新选中同一目录）不动名称。模板不参与：模板名是跨项目复用的标识。
+    if (mode === 'service' && next !== cwd) setName(baseName(next));
     const nextWatch = watchPathsAfterCwdChange({ touched: watchPathsTouchedRef.current, nextCwd: next });
     if (nextWatch !== null) setWatchPaths(nextWatch);
   };
 
   const handleSelectCwd = async () => {
-    // 走后端原生选择器：选中的目录会被记为"用户已确认"，项目外目录才允许配置
-    const selected = await pickDirectory({ purpose: 'serviceCwd', defaultPath: cwd });
+    // 走后端原生选择器：选中的目录会被记为"用户已确认"，项目外目录才允许配置。
+    // 初始位置：已填的工作目录 → 所属项目根 → 对话框自己的上次位置；
+    // 填的目录尚不存在时后端会从最近一级已存在的上级开始（commands/app.rs::picker_initial_dir）
+    const selected = await pickDirectory({
+      purpose: 'serviceCwd',
+      defaultPath: cwd.trim() || projectPath,
+    });
     if (selected) applyCwd(selected);
   };
 
@@ -494,8 +512,9 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
         confirmDiscard ? (
           <div className="flex items-center gap-2 px-4 min-h-[30px] py-1 flex-shrink-0 bg-nexus-error/10 border-b border-nexus-error/30">
             <span className="w-1.5 h-1.5 rounded-full bg-nexus-error flex-shrink-0" />
+            {/* 提示语完整换行显示（不截断）：短句被省略后读不到完整后果 */}
             <span
-              className="flex-1 min-w-0 truncate text-[11.5px] text-nexus-error"
+              className="flex-1 min-w-0 text-[11.5px] text-nexus-error"
               title="丢弃这些修改并清掉草稿？此操作不可撤销"
             >丢弃这些修改并清掉草稿？</span>
             <button
@@ -508,12 +527,12 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, rig
             >确认放弃</button>
           </div>
         ) : (
-          <div className="flex items-center gap-2 px-4 h-[28px] flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
+          // min-h + py 而不是固定 h：提示语现在完整换行（不再 truncate），换行时行高要能长
+          <div className="flex items-center gap-2 px-4 min-h-[28px] py-1 flex-shrink-0 bg-nexus-warning/10 border-b border-nexus-warning/25">
             <span className="w-1.5 h-1.5 rounded-full bg-nexus-warning flex-shrink-0" />
-            <span
-              className="flex-1 min-w-0 truncate text-[11.5px] text-nexus-warning"
-              title="有未保存的修改（切换服务/面板不会丢失）"
-            >有未保存的修改（切换服务/面板不会丢失）</span>
+            <span className="flex-1 min-w-0 text-[11.5px] text-nexus-warning">
+              有未保存的修改（切换服务/面板不会丢失）
+            </span>
             <button
               className="flex-shrink-0 text-[11.5px] text-nexus-warning hover:underline"
               title="回到已保存的配置（会丢弃本面板里未保存的改动与草稿，不可撤销）"

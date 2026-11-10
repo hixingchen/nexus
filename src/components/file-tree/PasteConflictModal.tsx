@@ -37,7 +37,9 @@ export function PasteConflictModal() {
                 i > 0 ? 'border-t border-nexus-border/40' : ''
               }`}
             >
-              <span className="flex-1 truncate text-nexus-text" title={c.name}>{c.name}</span>
+              {/* 名字完整换行显示（文件名没有空格，break-all 才能在任意位置断行）：
+                  用户要据此决定覆盖谁，截断后就看不出是哪一项了 */}
+              <span className="flex-1 break-all text-nexus-text">{c.name}</span>
               <span className="flex-shrink-0 text-[10px] text-nexus-muted">
                 {c.existing_is_dir ? '文件夹' : '文件'}
               </span>
