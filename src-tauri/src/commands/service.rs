@@ -1,5 +1,6 @@
 use tauri::{Manager, State};
 use serde::{Deserialize, Serialize};
+use rusqlite::OptionalExtension;
 use crate::AppState;
 use crate::commands::paths::PathAllowlist;
 use crate::models::{Service, ServiceTemplate};
@@ -29,6 +30,39 @@ pub(crate) fn validate_open_port(port: i32) -> Result<(), String> {
         return Err("打开端口必须在 0-65535 之间（0 = 自动）".into());
     }
     Ok(())
+}
+
+/// 同一项目内不允许两个服务声明同一个「打开端口」。
+///
+/// `open_enabled=false` 或 `open_port=0`（自动）不参与——它们没有固定端口声明。
+/// 更新时用 `exclude_id` 排除自己；从模板添加/新建服务时传 None。
+///
+/// 为什么在保存入口拦：两个服务抢同一个端口，运行时必然有一个起不来，而失败现场
+/// （日志里的 EADDRINUSE）离配置现场很远；保存时直接说清是哪个服务用掉了它。
+fn ensure_open_port_unique_in_project(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    open_enabled: bool,
+    open_port: i32,
+    exclude_id: Option<&str>,
+) -> Result<(), String> {
+    if !open_enabled || open_port <= 0 {
+        return Ok(());
+    }
+    let other: Option<String> = conn.query_row(
+        "SELECT name FROM services \
+         WHERE project_id=?1 AND open_enabled=1 AND open_port=?2 AND id<>?3 \
+         ORDER BY sort_index LIMIT 1",
+        rusqlite::params![project_id, open_port, exclude_id.unwrap_or("")],
+        |r| r.get(0),
+    ).optional().map_err(|e| format!("检查端口冲突失败: {}", e))?;
+    match other {
+        Some(name) => Err(format!(
+            "打开端口 {} 已被本项目服务「{}」使用，请换一个端口",
+            open_port, name
+        )),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn validate_tool_commands(raw: &str) -> Result<(), String> {
@@ -211,6 +245,7 @@ pub(crate) fn insert_service_row(
         let open_enabled = params.open_enabled.unwrap_or(false);
         let open_port = params.open_port.unwrap_or(0);
         validate_open_port(open_port)?;
+        ensure_open_port_unique_in_project(conn, &params.project_id, open_enabled, open_port, None)?;
         // 开机启动：不传 = 关闭；boot_check 必须是受支持的 JSON（空串 = 无检查）
         let boot_enabled = params.boot_enabled.unwrap_or(false);
         let boot_order = params.boot_order.unwrap_or(0);
@@ -338,6 +373,9 @@ pub(crate) fn write_service_update(
             [&params.id],
             |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?)),
         ).map_err(|e| format!("查询服务失败: {}", e))?;
+        ensure_open_port_unique_in_project(
+            conn, &old.2, params.open_enabled, params.open_port, Some(&params.id),
+        )?;
         let default_old = serde_json::to_string(&vec![old.0.clone()]).unwrap_or_default();
         let wp = if params.watch_paths.trim().is_empty() || params.watch_paths.trim() == "[]" {
             if cwd.is_empty() { "[]".to_string() } else {
@@ -647,6 +685,7 @@ fn add_service_from_template_impl(
             "SELECT COUNT(*) > 0 FROM projects WHERE id=?1", [project_id], |r| r.get(0)
         ).map_err(|e| format!("校验所属项目失败: {}", e))?;
         if !project_exists { return Err("所属项目不存在".into()); }
+        ensure_open_port_unique_in_project(&tx, project_id, open_enabled, open_port, None)?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let max_sort: i32 = tx.query_row(
@@ -958,6 +997,59 @@ mod tests {
         let mut p = add_params("bad-port", "C:/s");
         p.open_port = Some(70000);
         assert!(insert_service_row(&db, &p, "C:/s", "[]").is_err(), "非法端口不得落库");
+    }
+
+    /// 同一项目内两个服务不能声明同一个「打开端口」；更新自己不算冲突。
+    #[test]
+    fn test_open_port_must_be_unique_within_project() {
+        let db = test_db();
+        let mut a = add_params("svc-a", "C:/p");
+        a.open_enabled = Some(true);
+        a.open_port = Some(10001);
+        let a = insert_service_row(&db, &a, "C:/p", "[]").expect("第一个服务");
+
+        let mut b = add_params("svc-b", "C:/p");
+        b.open_enabled = Some(true);
+        b.open_port = Some(10001);
+        let err = insert_service_row(&db, &b, "C:/p", "[]")
+            .expect_err("同项目重复打开端口必须被拒绝");
+        assert!(err.contains("已被本项目服务「svc-a」使用"), "错误要说清被谁用了: {}", err);
+
+        // 更新自己（端口不变）不能把自己当成冲突
+        let params = UpdateServiceParams {
+            id: a.id.clone(), name: "svc-a".into(), command: "npm run dev".into(),
+            cwd: "C:/p".into(), watch_paths: String::new(), watch_include: "*".into(),
+            watch_exclude: String::new(), env_vars: String::new(), restart_mode: 1,
+            enabled: true, show_file_tree: false, open_enabled: true, open_port: 10001,
+            tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
+            boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
+        };
+        assert!(write_service_update(&db, &params, "C:/p", "[]").is_ok(), "更新自己不该报冲突");
+
+        // 把另一个服务改成同一个端口也必须被拒绝
+        let mut b2 = add_params("svc-b2", "C:/p");
+        b2.open_enabled = Some(true);
+        b2.open_port = Some(10002);
+        let b2 = insert_service_row(&db, &b2, "C:/p", "[]").unwrap();
+        let mut update_b2 = UpdateServiceParams {
+            id: b2.id, name: "svc-b2".into(), command: "npm run dev".into(),
+            cwd: "C:/p".into(), watch_paths: String::new(), watch_include: "*".into(),
+            watch_exclude: String::new(), env_vars: String::new(), restart_mode: 1,
+            enabled: true, show_file_tree: false, open_enabled: true, open_port: 10001,
+            tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
+            boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
+        };
+        let err = write_service_update(&db, &update_b2, "C:/p", "[]")
+            .expect_err("更新到与他人相同的端口必须被拒绝");
+        assert!(err.contains("已被本项目服务「svc-a」使用"), "错误要点名冲突服务: {}", err);
+        update_b2.open_port = 10002;
+        assert!(write_service_update(&db, &update_b2, "C:/p", "[]").is_ok(), "改回自己的端口应成功");
+
+        // 关闭「打开」开关时不参与唯一性检查
+        let mut c = add_params("svc-c", "C:/p");
+        c.open_enabled = Some(false);
+        c.open_port = Some(10001);
+        assert!(insert_service_row(&db, &c, "C:/p", "[]").is_ok(), "未启用打开按钮时端口只是展示值");
     }
 
     #[test]

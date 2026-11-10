@@ -429,6 +429,22 @@ export interface RunningService {
   listening_ports?: number[];
 }
 
+/** 占用端口的进程（端口冲突提示用） */
+export interface PortOccupant {
+  pid: number;
+  name: string;
+  /** 可执行文件完整路径；无权限/已退出时为 null（此时不能「打开占用者目录」） */
+  path: string | null;
+  /** 是否是 Nexus 自己：界面禁止对自己的进程执行「结束」 */
+  is_self: boolean;
+}
+
+/** 一个端口冲突：端口 + 当前占用它的进程 */
+export interface PortConflict {
+  port: number;
+  occupants: PortOccupant[];
+}
+
 /** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */
 export interface FailedService {
   service_id: string;
@@ -437,6 +453,8 @@ export interface FailedService {
   timestamp: string;
   /** 失败来源：local = Nexus 自己拉起，boot = 开机启动器（旧后端缺省时按 local 处理） */
   source?: 'local' | 'boot';
+  /** 日志里识别出的端口冲突（EADDRINUSE 等）；缺省 = 不是端口问题 */
+  port_conflict?: PortConflict;
 }
 
 /** 运行状态总览：运行中 + 意外失败 */
@@ -457,6 +475,24 @@ export const processApi = {
   /** 重启单个服务 */
   restart: (serviceId: string) =>
     invoke<void>('restart_service', { serviceId }),
+
+  /**
+   * 启动前端口冲突预检：配置了 open_port 用它，否则用上次实际监听的端口。
+   * null = 无冲突；返回 Some 时界面展示占用进程并让用户选择处置方式。
+   */
+  checkStartConflict: (serviceId: string) =>
+    invoke<PortConflict | null>('check_service_start_conflict', { serviceId }),
+
+  /**
+   * 结束占用端口的进程（后端会复核 PID 此刻仍在监听该端口，防 PID 复用误杀）。
+   * 只应在用户确认后调用。
+   */
+  killPortOccupant: (port: number, pid: number) =>
+    invoke<void>('kill_port_occupant', { port, pid }),
+
+  /** 在资源管理器中定位占用者（路径由后端按 PID 解析，避免前端传任意路径绕过白名单） */
+  openPortOccupant: (port: number, pid: number) =>
+    invoke<void>('open_port_occupant', { port, pid }),
 
   /** 一键启动项目所有已启用服务 */
   startProject: (projectId: string) =>

@@ -3,6 +3,7 @@ import { processApi, type Service } from '../services/service';
 import { startSingleService, stopSingleService } from '../stores/serviceActions';
 import { reportError } from '../utils/error';
 import { notify } from '../utils/notify';
+import { usePortConflictStore } from '../stores/portConflict';
 
 /** 服务动作：卡片按钮与右键菜单共同的三档操作 */
 export type ServiceActionName = 'start' | 'stop' | 'restart';
@@ -40,6 +41,22 @@ export function useServiceActions(onDone: () => void) {
     mark(service.id, true);
     try {
       if (action === 'start') {
+        // 启动前端口冲突预检：配置了 open_port 或上次监听端口被占时，先让用户决定
+        // 「结束占用进程 / 仍然尝试 / 取消」，不要直接 spawn 出来撞 EADDRINUSE。
+        // 检查失败不阻断启动（照常继续，真正的失败仍会走原有错误提示）。
+        try {
+          const conflict = await processApi.checkStartConflict(service.id);
+          if (conflict) {
+            const proceed = await usePortConflictStore.getState().ask({
+              serviceName: service.name,
+              conflict,
+              actionLabel: '启动服务',
+            });
+            if (!proceed) return;
+          }
+        } catch (err: unknown) {
+          reportError('检查端口占用失败（继续启动）', err, { variant: 'warning', silent: true });
+        }
         // 共享动作层：启动进程 + 追加该服务的文件监听（口径与详情页一致）
         await startSingleService(service.project_id, service.id);
       } else if (action === 'stop') {
@@ -53,8 +70,12 @@ export function useServiceActions(onDone: () => void) {
       reportError(`${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, err);
       // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
       if (action === 'start') onDone();
+    } finally {
+      // **必须放 finally**：端口冲突弹框里点「取消」会从 try 里提前 return，
+      // 放在 try/catch 之后的 mark(false) 会被跳过——按钮一直灰着，用户再也点不动
+      // （实测复现：取消一次后启动按钮永久禁用，只能重开面板）。
+      mark(service.id, false);
     }
-    mark(service.id, false);
   }, [onDone]);
 
   /**
@@ -74,8 +95,9 @@ export function useServiceActions(onDone: () => void) {
       onDone();
     } catch (err: unknown) {
       reportError('取消跟随日志失败', err);
+    } finally {
+      mark(service.id, false);
     }
-    mark(service.id, false);
   }, [onDone]);
 
   return { isBusy, runAction, unfollowLog };

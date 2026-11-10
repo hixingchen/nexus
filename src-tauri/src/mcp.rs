@@ -461,7 +461,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "wait_for_ready",
-                "等待刚启动的服务结束「启动中」状态（默认最多 20 秒），返回最终运行/失败状态；失败服务的最近日志会自动附带。启动或重启后应调用它。只读，无需确认。",
+                "等待刚启动的服务结束「启动中」状态（默认最多 20 秒），返回最终运行/失败状态；失败服务的最近日志与识别出的端口冲突（占用进程 PID/名称）会自动附带。启动或重启后应调用它。只读，无需确认。",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -498,7 +498,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "start_service",
-                "启动当前项目中的某个服务（直接执行，无需确认）。启动后应调用 wait_for_ready；失败时自动附带最近日志。",
+                "启动当前项目中的某个服务（直接执行，无需确认）。启动前会检查端口占用：被占用时**不会启动**，直接返回占用进程（PID/进程名/路径）与 port_conflict。启动后应调用 wait_for_ready；失败时自动附带最近日志。",
                 service_arg_schema("要启动的服务 id 或名称"),
             ),
             Tool::new(
@@ -542,7 +542,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "start_project",
-                "启动当前项目的全部已启用服务（已在运行的服务会跳过；直接执行，无需确认）。启动后应调用 wait_for_ready；部分失败时会自动附带失败服务的最近日志。",
+                "启动当前项目的全部已启用服务（已在运行的服务会跳过；直接执行，无需确认）。启动前会逐个检查端口占用，被占用的服务会跳过并在 errors 中写明占用进程。启动后应调用 wait_for_ready；部分失败时会自动附带失败服务的最近日志。",
                 schema(json!({
                     "type": "object",
                     "properties": {},
@@ -706,6 +706,9 @@ impl NexusMcpServer {
                     "exit_code": f.exit_code,
                     "timestamp": f.timestamp,
                     "source": f.source,
+                    // 日志里识别出的端口冲突（含占用者 PID/进程名/路径）：模型据此
+                    // 能直接告诉用户"谁占了哪个端口"，不必再从日志里自己解析
+                    "port_conflict": &f.port_conflict,
                 })
             })
             .collect();
@@ -895,6 +898,34 @@ impl NexusMcpServer {
     async fn tool_start_service(&self, args: Option<JsonObject>) -> Result<Value, String> {
         let args: ServiceArgs = parse_args(args)?;
         let service = self.resolve_service(&args.service)?;
+        // 与 UI 的启动前预检同一口径：端口被占时**不 spawn**，直接把占用进程交给模型。
+        // **绝不自动结束占用进程**——MCP 没有这个能力，也不该有；由用户决定怎么处理。
+        match crate::commands::process::check_service_start_conflict(
+            self.app.clone(), service.id.clone(),
+        ).await {
+            Ok(Some(conflict)) => {
+                let who = conflict.occupants.iter()
+                    .map(|o| format!("{} (PID {})", o.name, o.pid))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                log::warn!(
+                    "[mcp] 启动服务 {} ({}) 端口冲突: port={}, occupants={}",
+                    service.name, service.id, conflict.port, who
+                );
+                return Ok(json!({
+                    "ok": false,
+                    "error": format!("端口 {} 已被 {} 占用", conflict.port, who),
+                    "service": { "id": service.id, "name": service.name },
+                    "port_conflict": conflict,
+                    "note": "端口被占用，未启动。请把占用进程信息告诉用户，由用户决定停止占用进程或修改服务端口；不要反复重试，也不要尝试自行结束进程。",
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // 预检失败不阻断启动（与 UI 同口径）；真正的失败会在 wait_for_ready 里带日志
+                log::warn!("[mcp] 启动前端口预检失败（继续启动）: {}", e);
+            }
+        }
         if let Err(e) = crate::commands::process::start_service(self.app.clone(), service.id.clone()).await {
             let log_tail = self.failure_log_tail(&service).await;
             log::warn!("[mcp] 启动服务 {} ({}) 失败: {}（已附带日志）", service.name, service.id, e);

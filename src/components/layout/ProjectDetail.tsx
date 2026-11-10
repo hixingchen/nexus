@@ -41,7 +41,7 @@ import { useAiStore, selectAiRunningHere, selectAiPanelVisible } from '../../sto
 import { RobotIcon } from '../ai/RobotIcon';
 import { openToolsApi, parseToolCommands, serviceApi, type FailedService, type RunningService, type Service, type ServiceTemplate } from '../../services/service';
 import type { NexusDataChanged, ServiceDraftPayload } from '../../services/aiService';
-import { failureLabel } from '../../utils/serviceFailure';
+import { failureLabel, portConflictSummary } from '../../utils/serviceFailure';
 import { openInExplorer, openTerminal, pickOpenFile, pickSaveFile } from '../../services/system';
 import { useToolStore } from '../../stores/toolStore';
 import { useServiceActions } from '../../hooks/useServiceActions';
@@ -870,7 +870,7 @@ function CollapsedView({
               className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors ${
                 clickable ? 'hover:bg-nexus-accent/20 cursor-pointer' : 'cursor-default'
               }`}
-              title={`${svc.name}${running ? '（运行中）' : failure ? `（${failureLabel(failure)}）` : '（未运行）'}${svc.boot_enabled ? ' · 开机启动' : ''}${clickable ? ' · 点击查看日志' : ''}
+              title={`${svc.name}${running ? '（运行中）' : failure ? `（${failureLabel(failure)}）` : '（未运行）'}${svc.boot_enabled ? ' · 开机启动' : ''}${failure?.port_conflict ? `\n${portConflictSummary(failure.port_conflict)}` : ''}${clickable ? ' · 点击查看日志' : ''}
 右键：启停 / 重启、工具、打开位置`}
             >
               <span className={`w-[8px] h-[8px] rounded-full flex-shrink-0 ${
@@ -1118,6 +1118,7 @@ function ServiceSection({
                 service={svc}
                 running={isServiceRunning(svc)}
                 failed={failedInfoOf(svc) !== null}
+                failure={failedInfoOf(svc)}
                 runningInfo={runningInfoOf(svc)}
                 followedLog={followedLogOf(svc)}
                 isEditing={editingService?.id === svc.id}

@@ -5,7 +5,19 @@
 // 看到"已失败 · 退出码 1"，点进日志面板却只看到"未运行"，正是这次要修掉的不一致。
 // 纯函数、不碰 DOM，可直接被 Node 内置测试器跑。
 
-import type { FailedService } from '../services/service';
+import type { FailedService, PortConflict } from '../services/service';
+
+/**
+ * 端口冲突的一句话摘要（失败卡片、日志头部、悬停说明共用）。
+ *
+ * 失败态里能直接说出"哪个端口被谁占着"，用户才不用从日志里自己翻 EADDRINUSE 再找 PID。
+ */
+export function portConflictSummary(conflict: PortConflict): string {
+  const who = conflict.occupants
+    .map(o => `${o.name} (PID ${o.pid})`)
+    .join('、');
+  return `端口 ${conflict.port} 被 ${who || '其它进程'} 占用`;
+}
 
 /**
  * 状态徽章/标签文案。
@@ -23,7 +35,8 @@ export function failureDetail(failed: FailedService): string {
   const what = failed.exit_code === null
     ? '启动失败：进程没有起来'
     : `进程意外退出（退出码 ${failed.exit_code}）`;
-  return clock ? `${what} · ${clock}` : what;
+  const port = failed.port_conflict ? ` · ${portConflictSummary(failed.port_conflict)}` : '';
+  return clock ? `${what} · ${clock}${port}` : `${what}${port}`;
 }
 
 /** 本地 HH:MM:SS；空值 / 解析不了返回空串（与日志行时间戳同一口径，见 LogViewer 的 fmtTime） */

@@ -611,7 +611,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         let state = app_handle.state::<AppState>();
         let services = state.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, command, cwd, env_vars, boot_enabled, boot_credential_mode \
+                "SELECT id, name, command, cwd, env_vars, open_port, boot_enabled, boot_credential_mode \
                  FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
             ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
             let rows = stmt.query_map([&project_id], |row| {
@@ -621,6 +621,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
                     row.get::<_, String>("command")?,
                     row.get::<_, String>("cwd")?,
                     row.get::<_, String>("env_vars")?,
+                    row.get::<_, i32>("open_port")?,
                     row.get::<_, i32>("boot_enabled")? != 0,
                     row.get::<_, String>("boot_credential_mode")?,
                 ))
@@ -634,7 +635,11 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         let running_ids: std::collections::HashSet<String> = state.process_mgr.running()
             .into_iter().map(|(_, service_id, _)| service_id).collect();
         let boot_ids = crate::commands::boot::boot_running_ids();
-        for (id, name, cmd, cwd, env_vars, boot_enabled, boot_mode) in &services {
+        // 端口预检一轮只取一次端口表 + 进程快照：每个服务各查一次会在大项目里
+        // 反复枚举整张 TCP 表（20 个服务 = 20 次全表扫描）
+        let ports_by_pid = crate::core::ports::listening_ports_by_pid();
+        let proc_snapshot = crate::core::winproc::snapshot_processes();
+        for (id, name, cmd, cwd, env_vars, open_port, boot_enabled, boot_mode) in &services {
             if boot_ids.contains(id) { continue; }
             // 本地已在运行：直接跳过（必须排在开机启动路由之前，否则本地实例 +
             // 开机启动配置会再起一份 boot 实例）
@@ -656,6 +661,23 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
             // 已取消开机启动，但启动器里的实例还在跑：同样不能起第二份
             if crate::commands::boot::live_boot_service(id).is_some() {
                 errors.push(format!("{}: 仍由开机启动器运行；已跳过本地启动（先停止该实例）", name));
+                continue;
+            }
+            // 端口冲突预检：批量启动不该明知端口被占用还去 spawn（失败日志更难读）。
+            // 只跳过这一项并计入失败清单，其余服务照常启动。
+            let candidates: Vec<u16> = if *open_port > 0 {
+                vec![*open_port as u16]
+            } else {
+                state.process_mgr.last_ports(id)
+            };
+            if let Some(c) = candidates.into_iter().find_map(|port| {
+                crate::core::ports::conflict_of_with(port, &ports_by_pid, &proc_snapshot)
+            }) {
+                let who = c.occupants.iter()
+                    .map(|o| format!("{} (PID {})", o.name, o.pid))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                errors.push(format!("{}: 端口 {} 已被 {} 占用；已跳过启动", name, c.port, who));
                 continue;
             }
             // 环境变量非法同样计入本次批量启动的失败列表（原实现解析失败会静默忽略该服务）
@@ -789,6 +811,14 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
             running.iter().map(|r| r.service_id.clone()).collect();
 
         let mut failed = state.process_mgr.failed();
+        // 失败日志可能比 tick 晚一拍才被 reader 线程刷进缓冲（try_wait 看到退出时管道
+        // 未必读干净）。轮询时对还没识别出端口冲突的失败项补扫一次：找到就带上，
+        // 找不到也只是几百行字符串扫描，不影响轮询成本。
+        for f in &mut failed {
+            if f.port_conflict.is_none() {
+                f.port_conflict = state.process_mgr.bind_conflict_from_logs(&f.service_id);
+            }
+        }
         let local_failed: std::collections::HashSet<String> =
             failed.iter().map(|f| f.service_id.clone()).collect();
 
@@ -817,8 +847,165 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
                 failed.push(f);
             }
         }
+        // 记住每个服务实际监听的端口：它停止后，下次启动前用"上次端口"做冲突预检
+        for svc in &running {
+            state.process_mgr.remember_last_ports(&svc.service_id, &svc.listening_ports);
+        }
         Ok(ProcessStatus { running, failed })
     }).await.map_err(|e| format!("获取运行状态任务失败: {}", e))?
+}
+
+/// 启动前检查端口冲突：优先用配置的 open_port；未配置时用该服务上次实际监听的端口。
+///
+/// 返回 None = 没有冲突（可以放心启动）。返回 Some 时前端展示占用进程，并给
+/// 「结束占用进程 / 仍然尝试 / 打开占用者目录」三个处置。
+///
+/// 为什么放在后端算：open_port 在库里、上次监听端口在 ProcessManager 内存里，
+/// 前端拿不到一致的结果；而端口表与进程快照也都在后端。
+#[tauri::command]
+pub async fn check_service_start_conflict(
+    app: tauri::AppHandle,
+    service_id: String,
+) -> Result<Option<crate::core::ports::PortConflict>, String> {
+    if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 已在本地运行：不报端口冲突（端口就是它自己的），让 start 走原有的
+        // "已在运行中"提示，避免用户把正在工作的自己当成占用者杀掉
+        if state.process_mgr.is_running(&service_id) {
+            return Ok(None);
+        }
+        // 开机启动器拥有它时同理：start 会路由到启动器或返回"已由启动器运行"的
+        // 明确提示；不能把它自己拉起的进程当成占用者
+        if crate::commands::boot::live_boot_service(&service_id).is_some() {
+            return Ok(None);
+        }
+        let open_port: i32 = state.db.with_conn(|conn| {
+            conn.query_row("SELECT open_port FROM services WHERE id=?1", [&service_id], |r| r.get(0))
+                .map_err(|e| format!("服务不存在或读取端口失败: {}", e))
+        })?;
+        let candidates: Vec<u16> = if open_port > 0 {
+            vec![open_port as u16]
+        } else {
+            // 未配置打开端口：用最近一次实际监听的端口（内存记录，停止后保留）
+            state.process_mgr.last_ports(&service_id)
+        };
+        for port in candidates {
+            if let Some(conflict) = crate::core::ports::conflict_of(port) {
+                log::info!(
+                    "[nexus] 启动前端口冲突: service={}, port={}, occupants={:?}",
+                    service_id, port,
+                    conflict.occupants.iter().map(|o| (o.pid, o.name.as_str())).collect::<Vec<_>>()
+                );
+                return Ok(Some(conflict));
+            }
+        }
+        Ok(None)
+    }).await.map_err(|e| format!("检查端口占用任务失败: {}", e))?
+}
+
+/// 结束占用指定端口的进程。
+///
+/// **安全边界**：
+/// - 只允许结束"当前确实在监听该端口"的进程（调用时复核，防 PID 复用时误杀无辜）；
+/// - 拒绝 Nexus 自身与 PID 0/≤4 的系统进程；
+/// - 终止动作本身就是用户在前端确认过的（原生确认弹窗），不是静默后台行为。
+///
+/// 杀完会等端口真正释放（最多 1.5s）再返回：taskkill 返回不等于内核已回收监听 socket，
+/// 立即启动新服务仍可能撞上同一个端口。
+#[tauri::command]
+pub async fn kill_port_occupant(port: u16, pid: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if port == 0 {
+            return Err("端口不能为 0".into());
+        }
+        if pid <= 4 {
+            return Err(format!("PID {} 是系统进程，不能结束", pid));
+        }
+        if pid == std::process::id() {
+            return Err("不能结束 Nexus 自身".into());
+        }
+        let port_owned_by = |port: u16, pid: u32| {
+            crate::core::ports::listening_ports_by_pid()
+                .get(&pid)
+                .map(|ports| ports.contains(&port))
+                .unwrap_or(false)
+        };
+        // 复核：从"检查冲突"到"用户点结束"之间，占用者可能已经退出、PID 也可能被复用。
+        // 已不再监听 = 用户的目的已经达成（幂等成功），**绝不能**按 pid 去杀一个
+        // 可能已被系统复用的无关进程。
+        if !port_owned_by(port, pid) {
+            log::info!("[nexus] 端口 {} 的占用进程 PID {} 已不再监听，跳过结束", port, pid);
+            return Ok(());
+        }
+        // **先持有进程句柄再杀**：句柄存在期间进程对象不会被回收、PID 不会被系统复用。
+        // 只按快照里的 PID 去 taskkill，存在"复核通过 → 进程退出 → PID 被复用"的竞态，
+        // 那时杀掉的会是一棵无关进程树。打不开句柄（受保护/无权限）就不杀，交回用户处理。
+        let _pin = match crate::core::winproc::OwnedProcess::open(pid) {
+            Some(pin) => pin,
+            None => {
+                if port_owned_by(port, pid) {
+                    return Err(format!(
+                        "无法打开占用进程 PID {}（可能受保护或无权限），请手动结束它",
+                        pid
+                    ));
+                }
+                return Ok(());
+            }
+        };
+        // 持有句柄后再复核一次（开句柄前它仍可能在退出）
+        if !port_owned_by(port, pid) {
+            return Ok(());
+        }
+        if let Err(e) = crate::core::process::kill_process_tree(pid) {
+            // kill 失败但进程已经自己退出 = 目标已达成；仍占着端口才报错
+            if port_owned_by(port, pid) {
+                return Err(format!("结束占用进程失败: {}", e));
+            }
+        }
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if !port_owned_by(port, pid) {
+                log::info!("[nexus] 已结束端口占用进程: port={}, pid={}", port, pid);
+                return Ok(());
+            }
+        }
+        Err(format!("进程已结束，但端口 {} 仍被占用（可能被其它进程接管）", port))
+    }).await.map_err(|e| format!("结束占用进程任务失败: {}", e))?
+}
+
+/// 在资源管理器中定位端口占用者的可执行文件。
+///
+/// 为什么参数是 (port, pid) 而不是路径：占用者的路径由**后端**从进程句柄解析，
+/// 前端传路径会绕过文件白名单（占用者在项目外，`open_in_explorer` 本来就会被拒）。
+/// 复核 (port, pid) 关系后只打开"确实在监听该端口"的那个进程，不接受任意路径。
+#[tauri::command]
+pub fn open_port_occupant(port: u16, pid: u32) -> Result<(), String> {
+    if port == 0 || pid == 0 {
+        return Err("端口或进程 ID 无效".into());
+    }
+    let owns = crate::core::ports::listening_ports_by_pid()
+        .get(&pid)
+        .map(|ports| ports.contains(&port))
+        .unwrap_or(false);
+    if !owns {
+        return Err(format!("PID {} 已不再监听端口 {}，请重新检查", pid, port));
+    }
+    // 同 kill：先持有句柄钉住进程对象，避免"复核后 PID 被复用"时定位到另一个程序
+    let _pin = crate::core::winproc::OwnedProcess::open(pid)
+        .ok_or_else(|| format!("无法打开占用进程 PID {}（权限不足或进程已退出）", pid))?;
+    // 句柄期间 PID 不会被复用，但进程可能刚刚退出——再确认一次端口归属
+    let still_owns = crate::core::ports::listening_ports_by_pid()
+        .get(&pid)
+        .map(|ports| ports.contains(&port))
+        .unwrap_or(false);
+    if !still_owns {
+        return Err(format!("PID {} 已不再监听端口 {}，请重新检查", pid, port));
+    }
+    let path = crate::core::winproc::process_image_path(pid)
+        .ok_or_else(|| format!("拿不到 PID {} 的可执行文件路径（权限不足或进程已退出）", pid))?;
+    log::info!("[nexus] 定位端口占用者: port={}, pid={}, exe={}", port, pid, path);
+    crate::commands::editor::reveal_in_file_manager(std::path::Path::new(&path))
 }
 
 /// 读取服务的日志快照。

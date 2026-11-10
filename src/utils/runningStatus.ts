@@ -1,10 +1,27 @@
-import type { FailedService, RunningService } from '../services/service';
+import type { FailedService, PortConflict, RunningService } from '../services/service';
 
 /** 端口数组逐项比较（后端保证升序去重，这里仍按内容比，不依赖顺序以外的约定） */
 function samePorts(a: number[] | undefined, b: number[] | undefined): boolean {
   const pa = a ?? [];
   const pb = b ?? [];
   return pa.length === pb.length && pa.every((port, i) => port === pb[i]);
+}
+
+/**
+ * 端口冲突信息逐字段比较。
+ *
+ * 为什么必须比：失败项的 `port_conflict` 可能**晚一拍**才由后端从日志里补出来
+ * （tick 时 stderr 还没刷完，下一次 get_running 才识别到）。漏比它就会被判成
+ * "失败项没变化"而丢弃这次响应，失败卡片上的占用者信息永远不出现。
+ */
+function samePortConflict(a?: PortConflict, b?: PortConflict): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  if (a.port !== b.port || a.occupants.length !== b.occupants.length) return false;
+  return a.occupants.every((o, i) => {
+    const y = b.occupants[i];
+    return y && o.pid === y.pid && o.name === y.name && o.path === y.path && o.is_self === y.is_self;
+  });
 }
 
 /**
@@ -40,6 +57,7 @@ export function sameRunningStatus(
     && af.every((x, i) => {
       const y = bf[i];
       return y && x.service_id === y.service_id && x.exit_code === y.exit_code
-        && x.timestamp === y.timestamp && x.source === y.source;
+        && x.timestamp === y.timestamp && x.source === y.source
+        && samePortConflict(x.port_conflict, y.port_conflict);
     });
 }

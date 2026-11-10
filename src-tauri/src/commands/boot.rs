@@ -1029,6 +1029,9 @@ pub fn boot_failed_services() -> Vec<crate::core::process::FailedService> {
                 exit_code: s.exit_code,
                 timestamp: s.ready_at.clone().or_else(|| s.started_at.clone()).unwrap_or_default(),
                 source: "boot".into(),
+                // 开机启动器的日志不在本地缓冲里；端口冲突信息由启动器自己的失败原因
+                // 承担，这里不硬凑（避免把别的进程误标成占用者）
+                port_conflict: None,
             });
         }
     }

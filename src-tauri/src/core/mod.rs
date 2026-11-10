@@ -47,6 +47,10 @@ pub mod winproc {
         "?".to_string()
     }
 
+    pub(crate) fn process_image_path(_pid: u32) -> Option<String> {
+        None
+    }
+
     pub(crate) struct OwnedProcess;
 
     impl OwnedProcess {

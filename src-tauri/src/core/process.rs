@@ -44,6 +44,12 @@ pub struct FailedService {
     /// 失败来源：local（Nexus 自己拉起） / boot（开机启动器）
     #[serde(default)]
     pub source: String,
+    /// 日志里识别出的端口冲突（EADDRINUSE 等）；None = 不是端口问题或没解析出端口。
+    ///
+    /// 为什么不放在 get_running 里现算：失败日志只在失败那一刻完整，之后可能被轮转/
+    /// 清空；而每 3 秒轮询都去扫日志+查端口表是白付成本。失败时算一次并随失败态返回。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_conflict: Option<crate::core::ports::PortConflict>,
 }
 
 /// 后台生命周期心跳线程是否成功启动。
@@ -150,6 +156,11 @@ pub struct ProcessManager {
     pub(crate) log_buffers: LogBuffers,
     /// 意外退出的服务：key → 失败信息。日志保留供查看（正常停止/重启/全部停止时清除）
     failed: Mutex<HashMap<String, FailedService>>,
+    /// 各服务最近一次**实际监听**的端口（运行中由 get_running 写入，停止后保留）。
+    ///
+    /// 用途：服务没有配置 open_port 时，下次启动前用"上次监听的端口"做冲突预检。
+    /// 只活在本进程内存里；重启应用后丢失（此时没有历史可依，预检退化到无候选）。
+    last_ports: Mutex<HashMap<String, Vec<u16>>>,
     /// 每 key 一把生命周期锁，让 start/stop/restart 对同一服务串行（NEW-17）。
     /// 键只增不删，理由见 `lifecycle_guard`。
     lifecycles: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -189,6 +200,7 @@ impl ProcessManager {
             processes: Mutex::new(HashMap::new()),
             log_buffers: Arc::new(Mutex::new(HashMap::new())),
             failed: Mutex::new(HashMap::new()),
+            last_ports: Mutex::new(HashMap::new()),
             lifecycles: Mutex::new(HashMap::new()),
             #[cfg(windows)]
             job: None,
@@ -312,6 +324,7 @@ impl ProcessManager {
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
+                        port_conflict: None,
                     });
                 }
                 msg
@@ -341,6 +354,7 @@ impl ProcessManager {
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
+                        port_conflict: None,
                     });
                 }
                 return Err(msg);
@@ -762,12 +776,14 @@ impl ProcessManager {
         for (key, code) in &exited {
             let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             self.append_system_line(key, format!("进程已退出（退出码: {}）", code_str));
+            let port_conflict = self.bind_conflict_from_logs(key);
             if let Ok(mut failed) = self.failed.lock() {
                 failed.insert(key.clone(), FailedService {
                     service_id: key.clone(),
                     exit_code: *code,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     source: "local".into(),
+                    port_conflict,
                 });
             }
         }
@@ -906,6 +922,48 @@ impl ProcessManager {
         out
     }
 
+    /// 记录某服务最近一次实际监听的端口（空列表不覆盖上一次的有效值）。
+    pub fn remember_last_ports(&self, key: &str, ports: &[u16]) {
+        if ports.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.last_ports.lock() {
+            map.insert(key.to_string(), ports.to_vec());
+        }
+    }
+
+    /// 最近一次实际监听的端口（没有记录返回空）。
+    pub fn last_ports(&self, key: &str) -> Vec<u16> {
+        self.last_ports
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).cloned())
+            .unwrap_or_default()
+    }
+
+    /// 失败日志里若有端口绑定错误，解析出端口并反查当前占用者。
+    ///
+    /// 只扫最近 400 行：EADDRINUSE 一定在进程退出前刚写出的尾部；全量扫描会把
+    /// 上一次运行残留的旧报错也算进来（日志缓冲在启动时已清，但跟随的日志文件未必）。
+    pub(crate) fn bind_conflict_from_logs(&self, key: &str) -> Option<crate::core::ports::PortConflict> {
+        let logs = self.get_logs(key);
+        let texts: Vec<&str> = logs.iter().rev().take(400).map(|line| line.text.as_str()).collect();
+        if let Some(port) = crate::core::ports::port_from_bind_error(&texts) {
+            return crate::core::ports::conflict_of(port);
+        }
+        // 日志确认是绑定失败、但不带端口（Java/Tomcat 的 `Address already in use: bind`）：
+        // 用上次实际监听的端口回查——不能因为"日志里没写端口"就放弃整条线索
+        if !crate::core::ports::has_bind_error(&texts) {
+            return None;
+        }
+        for port in self.last_ports(key) {
+            if let Some(conflict) = crate::core::ports::conflict_of(port) {
+                return Some(conflict);
+            }
+        }
+        None
+    }
+
     /// 测试用：取某服务当前认领到的游离进程 (pid, 映像名)。
     ///
     /// 真实写入路径是 `running()` 轮询里的认领（需要真起一个"另开窗口"的进程才能走到），
@@ -934,6 +992,7 @@ impl ProcessManager {
                 exit_code,
                 timestamp: "test".into(),
                 source: "local".into(),
+                port_conflict: None,
             });
         }
     }
@@ -2089,6 +2148,26 @@ mod tests {
         // 主动停止过的服务不该留在失败表里（前端据此显示"失败"按钮）
         mgr.stop("svc-x").unwrap();
         assert!(mgr.failed().iter().all(|f| f.service_id != "svc-x" || f.exit_code != Some(1)));
+    }
+
+    /// 失败日志 → 端口冲突：真起一个监听，验证"日志端口 → 占用进程"整条链。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_bind_conflict_from_logs_matches_real_listener() {
+        let mgr = ProcessManager::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+        let port = listener.local_addr().expect("本地地址").port();
+        mgr.append_system_line(
+            "svc-port",
+            format!("Error: listen EADDRINUSE: address already in use :::{}", port),
+        );
+        let conflict = mgr.bind_conflict_from_logs("svc-port").expect("应识别出端口冲突");
+        assert_eq!(conflict.port, port);
+        assert!(
+            conflict.occupants.iter().any(|o| o.pid == std::process::id() && o.is_self),
+            "占用者应包含测试进程自身: {:?}",
+            conflict.occupants.iter().map(|o| (o.pid, &o.name)).collect::<Vec<_>>()
+        );
     }
 
     // ── 游离进程认领（"另开窗口"的服务，如 Tomcat 的 startup.bat）──────────

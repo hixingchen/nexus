@@ -563,7 +563,22 @@ pub async fn invoke(
         }
         // ── 进程 ──
         "start_service" => {
-            crate::commands::process::start_service(app.clone(), s("serviceId")?).await?;
+            let sid = s("serviceId")?;
+            // 通用桥也必须走与语义工具相同的端口预检：否则 AI 改用 nexus_invoke
+            // 就能绕过"冲突时不启动、不自动结束进程"的闸门
+            if let Some(c) = crate::commands::process::check_service_start_conflict(
+                app.clone(), sid.clone(),
+            ).await? {
+                let who = c.occupants.iter()
+                    .map(|o| format!("{} (PID {})", o.name, o.pid))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                return Err(format!(
+                    "端口 {} 已被 {} 占用，未启动；请先停止占用进程或改用其它端口",
+                    c.port, who
+                ));
+            }
+            crate::commands::process::start_service(app.clone(), sid).await?;
             Ok(json!({ "ok": true }))
         }
         "stop_service" => {

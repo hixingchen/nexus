@@ -5,11 +5,13 @@ import { openInExplorer, openTerminal } from '../../services/system';
 import { useDndMonitor } from '@dnd-kit/core';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { openToolsApi, parseToolCommands, type RunningService, type Service, type ToolCommand } from '../../services/service';
+import { openToolsApi, parseToolCommands, processApi, type FailedService, type RunningService, type Service, type ToolCommand } from '../../services/service';
 import { useServiceActions, type ServiceActionName } from '../../hooks/useServiceActions';
 import { useClickOutside } from '../../hooks/useClickOutside';
 import { useToolStore } from '../../stores/toolStore';
+import { usePortConflictStore } from '../../stores/portConflict';
 import { reportError } from '../../utils/error';
+import { portConflictSummary } from '../../utils/serviceFailure';
 import { resolveOpenPort } from '../../utils/serviceOpen';
 import { ServiceContextMenu } from './ServiceContextMenu';
 
@@ -31,6 +33,13 @@ interface Props {
    * 在日志面板头部与悬停说明里（见 utils/serviceFailure），那里才是看原因的地方。
    */
   failed: boolean;
+  /**
+   * 失败详情（含日志里识别出的端口冲突）。
+   *
+   * 卡片上除红点外，只额外展示"端口 X 被谁占用"这一条可行动信息——退出码/时刻
+   * 仍在日志面板与悬停说明里，避免把一行卡片撑成诊断面板。
+   */
+  failure?: FailedService | null;
   /** 正在跟随的日志文件（null = 没在跟随）：菜单据此给「取消跟随」入口 */
   followedLog: string | null;
   /** 运行详情：阶段（启动中/已就绪）与自动发现的监听端口；null = 未运行 */
@@ -44,7 +53,7 @@ interface Props {
 }
 
 export function ServiceTreeEntry({
-  service, running, failed, followedLog, runningInfo, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
+  service, running, failed, failure = null, followedLog, runningInfo, isEditing, onEdit, onRefresh, onContextMenu, onViewLog, onRunToolCommand,
 }: Props) {
   // dnd-kit 可排序：长按卡片 250ms 进入拖拽（快速点击照常打开编辑面板）
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id });
@@ -199,6 +208,32 @@ export function ServiceTreeEntry({
     }
   };
 
+  const portConflict = failure?.port_conflict ?? null;
+
+  /**
+   * 失败卡片上的端口冲突：打开同一个处置弹框。
+   *
+   * 失败态的服务已经退出，"处理"之后要做的是**重启**而不是"启动"；弹框只负责
+   * 结束占用者，真正的重启在这里执行并刷新卡片状态。
+   */
+  const handlePortConflict = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!portConflict) return;
+    const proceed = await usePortConflictStore.getState().ask({
+      serviceName: service.name,
+      conflict: portConflict,
+      actionLabel: '重启服务',
+    });
+    if (!proceed) return;
+    try {
+      await processApi.restart(service.id);
+    } catch (err: unknown) {
+      reportError('重启服务失败', err);
+    } finally {
+      onRefresh();
+    }
+  };
+
   return (
     <div className="px-2 py-0.5" ref={setNodeRef} style={style}>
       <div
@@ -256,8 +291,22 @@ export function ServiceTreeEntry({
             </span>
           )}
 
-          {/* 名称 */}
-          <span className="flex-1 text-[13px] text-nexus-text font-medium truncate">{service.name}</span>
+          {/* 名称 + 失败时可行动的端口冲突一行 */}
+          <span className="flex-1 min-w-0">
+            <span className="block truncate text-[13px] text-nexus-text font-medium">{service.name}</span>
+            {portConflict && (
+              <button
+                type="button"
+                className="mt-0.5 block max-w-full text-left text-[10.5px] text-nexus-error/85 break-words hover:text-nexus-error hover:underline"
+                title={`${portConflictSummary(portConflict)} · 点击处理`}
+                // 卡片整体可拖拽/点击编辑：按钮自己的按下与点击都不能冒泡
+                onPointerDown={e => e.stopPropagation()}
+                onClick={e => void handlePortConflict(e)}
+              >
+                {portConflictSummary(portConflict)} · 处理
+              </button>
+            )}
+          </span>
 
           {/* Hover 操作按钮（拖拽中隐藏；onPointerDown 阻止冒泡，长按按钮不触发拖拽）。
               用 opacity 而非 display：位置一直占着，hover 时服务名不会被按钮挤动。

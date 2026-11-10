@@ -10,6 +10,7 @@ const ProjectDetail = lazy(() =>
   import('./ProjectDetail').then(m => ({ default: m.ProjectDetail })));
 import { RestartConfirm } from './RestartConfirm';
 import { PasteConflictModal } from '../file-tree/PasteConflictModal';
+import { PortConflictModal } from './PortConflictModal';
 import { AiPanel } from '../ai/AiPanel';
 import type { NexusDataChanged } from '../../services/aiService';
 import { CloseGuard } from './CloseGuard';
@@ -379,6 +380,7 @@ export function MainLayout() {
       {/* 粘贴同名冲突弹框：**全局只挂一份**——放 FileTree 里会随"项目树 + 每个服务树"各挂一个，
           打开时同时渲染出好几层遮罩（见 stores/pasteConflict 的说明） */}
       <PasteConflictModal />
+      <PortConflictModal />
       <CloseGuard />
       <ToolCommandResultDialog
         open={!!toolCommandDialog.state}

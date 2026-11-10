@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { failureLabel, failureDetail } from '../serviceFailure.ts';
+import { failureLabel, failureDetail, portConflictSummary } from '../serviceFailure.ts';
 
 /**
  * 这两个函数是"服务失败了"这句话的全部措辞来源（卡片徽章 / 日志面板头部 / 收起态 tooltip）。
@@ -33,5 +33,35 @@ test('时间戳缺失或不可解析时只少说时间，不显示 Invalid Date'
   assert.equal(
     failureDetail({ service_id: 's', exit_code: 3, timestamp: '' }),
     '进程意外退出（退出码 3）',
+  );
+});
+
+test('端口冲突摘要：端口 + 进程名 + PID，多个占用者用顿号连接', () => {
+  assert.equal(
+    portConflictSummary({
+      port: 8080,
+      occupants: [{ pid: 1234, name: 'java.exe', path: null, is_self: false }],
+    }),
+    '端口 8080 被 java.exe (PID 1234) 占用',
+  );
+  assert.equal(
+    portConflictSummary({
+      port: 3000,
+      occupants: [
+        { pid: 1, name: 'node.exe', path: null, is_self: false },
+        { pid: 2, name: 'node.exe', path: null, is_self: false },
+      ],
+    }),
+    '端口 3000 被 node.exe (PID 1)、node.exe (PID 2) 占用',
+  );
+});
+
+test('悬停说明在有端口冲突时追加摘要；没有冲突时保持原样', () => {
+  assert.equal(
+    failureDetail({
+      service_id: 's', exit_code: 1, timestamp: '2026-09-20T18:22:31',
+      port_conflict: { port: 8080, occupants: [{ pid: 9, name: 'java.exe', path: null, is_self: false }] },
+    }),
+    '进程意外退出（退出码 1） · 18:22:31 · 端口 8080 被 java.exe (PID 9) 占用',
   );
 });

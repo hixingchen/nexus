@@ -50,6 +50,12 @@ extern "system" {
     fn GetExitCodeProcess(handle: Handle, code: *mut Dword) -> Bool;
     fn WaitForSingleObject(handle: Handle, milliseconds: Dword) -> Dword;
     fn CloseHandle(handle: Handle) -> Bool;
+    fn QueryFullProcessImageNameW(
+        process: Handle,
+        flags: Dword,
+        exe_name: *mut u16,
+        size: *mut Dword,
+    ) -> Bool;
 }
 
 /// 进程快照里的一项
@@ -132,6 +138,30 @@ pub(crate) fn descendants(root: u32, snapshot: &[ProcEntry]) -> Vec<u32> {
 }
 
 /// 快照里某个 pid 的映像名（找不到时返回 "?"）
+/// 取进程的可执行文件完整路径（给「打开占用者目录」用）。
+///
+/// 失败返回 None（受保护进程无权限 / 已退出 / pid 无效）——界面据此禁用那个按钮，
+/// 而不是给一个空路径去打开资源管理器。
+pub(crate) fn process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as Dword;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
 pub(crate) fn name_of(pid: u32, snapshot: &[ProcEntry]) -> String {
     snapshot
         .iter()

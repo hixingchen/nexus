@@ -37,6 +37,7 @@ use crate::commands::template_io::ImportTemplatesResult;
 use crate::commands::tools::{DetectedToolsResult, OpenToolUsage, SaveOpenToolParams};
 use crate::core::file_watcher::{FileChange, FileChangeEvent};
 use crate::core::jarfile::JarEntryInfo;
+use crate::core::ports::{PortConflict, PortOccupant};
 use crate::core::process::{FailedService, LogLine, ServiceLogBatchPayload};
 use crate::models::{
     OpenTool, Project, ProjectDetail, Service, ServiceOpenToolBinding, ServiceTemplate, ToolCommand,
@@ -512,8 +513,27 @@ fn test_response_dtos_are_snake_case() {
     ]));
     let failed = FailedService {
         service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        port_conflict: None,
     };
     assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp", "source"]));
+
+    // 端口冲突：失败卡片与启动前预检共用（前端按 port/occupants 渲染处置入口）
+    let conflict = PortConflict {
+        port: 8080,
+        occupants: vec![PortOccupant {
+            pid: 1234, name: "java.exe".into(), path: Some("C:/Java/bin/java.exe".into()), is_self: false,
+        }],
+    };
+    assert_eq!(keys_of(&conflict), sorted(&["port", "occupants"]));
+    assert_eq!(keys_of(&conflict.occupants[0]), sorted(&["pid", "name", "path", "is_self"]));
+    // Some 时 FailedService 必须带上该字段（None 时省略，旧字段契约不变）
+    let failed_with_conflict = FailedService {
+        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        port_conflict: Some(conflict),
+    };
+    assert_eq!(keys_of(&failed_with_conflict), sorted(&[
+        "service_id", "exit_code", "timestamp", "source", "port_conflict",
+    ]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };
     assert_eq!(keys_of(&ps), sorted(&["running", "failed"]));
     // 删除结果：删除成功但停止进程失败时必须能把原因带回前端
@@ -850,6 +870,8 @@ const COVERED_RESPONSE: &[&str] = &[
         "PasteFilesResult", "PasteConflict",
         "ToolCommandResult", "ToolCommandLogLine", "ToolCommandLogBatchPayload",
         "RunningService", "ProcessStatus", "DeleteResult",
+        // 端口冲突（启动前预检 + 失败卡片）：PID/进程名/路径都要原样到前端
+        "PortConflict", "PortOccupant",
         "SearchResultItem", "SearchResponse",
         "FileChangeEvent", "FileChange", "JarEntryInfo",
         "LogLine", "FailedService", "ServiceLogBatchPayload",
@@ -984,6 +1006,7 @@ fn test_nullable_fields_stay_nullable_and_typed() {
     // 失败服务：spawn 失败（进程没起来）时 exit_code 为 null
     let failed = FailedService {
         service_id: "s1".into(), exit_code: None, timestamp: "t".into(), source: "local".into(),
+        port_conflict: None,
     };
     assert_eq!(types_of(&failed).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");
 

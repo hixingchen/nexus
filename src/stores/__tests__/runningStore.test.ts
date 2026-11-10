@@ -72,6 +72,19 @@ test('failed 分支仍是逐字段全比（exit_code / timestamp 变了要判为
   assert.equal(sameRunningStatus(r, r, f1, f2), false, '退出码变化必须被认出来');
 });
 
+test('失败项稍后补上端口冲突：必须判为“变了”（否则失败卡片永远不显示占用者）', () => {
+  const f1 = [{ service_id: 's1', exit_code: 1, timestamp: 't1', source: 'local' as const }];
+  const withConflict = [{
+    ...f1[0],
+    port_conflict: {
+      port: 8080,
+      occupants: [{ pid: 9, name: 'java.exe', path: null, is_self: false }],
+    },
+  }];
+  assert.equal(sameRunningStatus([], [], f1, withConflict), false);
+  assert.equal(sameRunningStatus([], [], f1, [{ ...f1[0] }]), true);
+});
+
 /**
  * 显式停止信号：日志面板的自动关闭只认它，不认"running/failed 里暂时没有"。
  * 后者在自动重启 stop→start 的空窗里会误触发，把面板当开关拉。
