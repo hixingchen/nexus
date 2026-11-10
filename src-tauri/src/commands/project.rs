@@ -333,7 +333,8 @@ mod tests {
     /// 加一列时它同样会漏，而"这一列没被复制"正是本测试要发现的东西。
     fn row_map(conn: &rusqlite::Connection, sql: &str, id: &str) -> BTreeMap<String, String> {
         let mut stmt = conn.prepare(sql).expect("prepare");
-        let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        // rusqlite 0.41 起 `column_names()` 直接返回迭代器（旧版返回 &[&str]）
+        let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
         let mut rows = stmt.query([id]).expect("query");
         let row = rows.next().expect("query 应成功").expect("应恰好有一行");
         cols.iter()
