@@ -404,6 +404,7 @@ fn test_response_dtos_are_snake_case() {
         boot_required: false,
         boot_credential_mode: "s4u".into(),
         health_check: String::new(),
+        crash_restart: true,
     };
     assert_eq!(
         keys_of(&svc),
@@ -412,6 +413,7 @@ fn test_response_dtos_are_snake_case() {
             "watch_exclude", "env_vars", "restart_mode", "enabled", "show_file_tree",
             "open_enabled", "open_port", "sort_index", "tool_commands", "boot_enabled",
             "boot_order", "boot_check", "boot_required", "boot_credential_mode", "health_check",
+            "crash_restart",
         ])
     );
 
@@ -476,6 +478,7 @@ fn test_response_dtos_are_snake_case() {
         open_port: 0,
         tool_commands: "[]".into(),
         open_tool_id: "".into(),
+        crash_restart: true,
         created_at: "t".into(),
     };
     assert_eq!(
@@ -483,7 +486,7 @@ fn test_response_dtos_are_snake_case() {
         sorted(&[
             "id", "name", "command", "cwd", "watch_paths", "watch_include", "watch_exclude",
             "env_vars", "restart_mode", "enabled", "show_file_tree", "open_enabled",
-            "open_port", "tool_commands", "open_tool_id", "created_at",
+            "open_port", "tool_commands", "open_tool_id", "crash_restart", "created_at",
         ])
     );
 
@@ -514,9 +517,19 @@ fn test_response_dtos_are_snake_case() {
     ]));
     let failed = FailedService {
         service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
-        port_conflict: None,
+        port_conflict: None, uptime_ms: None, crash_restart: true,
     };
-    assert_eq!(keys_of(&failed), sorted(&["service_id", "exit_code", "timestamp", "source"]));
+    assert_eq!(keys_of(&failed), sorted(&[
+        "service_id", "exit_code", "timestamp", "source", "crash_restart",
+    ]));
+    // 运行时长只在能算出来时出现（崩溃自动重启据此区分启动失败），None 时省略
+    let failed_with_uptime = FailedService {
+        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        port_conflict: None, uptime_ms: Some(30_000), crash_restart: true,
+    };
+    assert_eq!(keys_of(&failed_with_uptime), sorted(&[
+        "service_id", "exit_code", "timestamp", "source", "uptime_ms", "crash_restart",
+    ]));
 
     // 端口冲突：失败卡片与启动前预检共用（前端按 port/occupants 渲染处置入口）
     let conflict = PortConflict {
@@ -530,10 +543,18 @@ fn test_response_dtos_are_snake_case() {
     // Some 时 FailedService 必须带上该字段（None 时省略，旧字段契约不变）
     let failed_with_conflict = FailedService {
         service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
-        port_conflict: Some(conflict),
+        port_conflict: Some(conflict), uptime_ms: None, crash_restart: true,
     };
     assert_eq!(keys_of(&failed_with_conflict), sorted(&[
-        "service_id", "exit_code", "timestamp", "source", "port_conflict",
+        "service_id", "exit_code", "timestamp", "source", "port_conflict", "crash_restart",
+    ]));
+    // 崩溃自动重启通知（事件 service-auto-restart）：前端按 status 决定提示文案
+    let notice = crate::commands::process::AutoRestartNotice {
+        service_id: "s".into(), service_name: "n".into(), status: "gave_up",
+        attempts: 5, error: "e".into(),
+    };
+    assert_eq!(keys_of(&notice), sorted(&[
+        "service_id", "service_name", "status", "attempts", "error",
     ]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };
     assert_eq!(keys_of(&ps), sorted(&["running", "failed"]));
@@ -626,6 +647,7 @@ fn test_request_params_are_camel_case() {
         "bootCheck": "{\"type\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":8080}",
         "bootRequired": true,
         "bootCredentialMode": "password",
+        "crashRestart": false,
     });
     let params: AddServiceParams = serde_json::from_value(json).expect("应能按驼峰反序列化");
     assert_eq!(params.project_id, "p1");
@@ -636,6 +658,7 @@ fn test_request_params_are_camel_case() {
     assert!(params.boot_check.as_deref().unwrap_or("").contains("8080"), "bootCheck 被静默忽略");
     assert_eq!(params.boot_required, Some(true), "bootRequired 被静默忽略");
     assert_eq!(params.boot_credential_mode.as_deref(), Some("password"), "bootCredentialMode 被静默忽略");
+    assert_eq!(params.crash_restart, Some(false), "crashRestart 被静默忽略");
 
     // ARCH-12：`SearchParams` 的这三个字段都带 `#[serde(default)]`——这里丢了
     // `rename_all = "camelCase"` 不会报 `missing field`，而是**静默取默认值**：
@@ -667,7 +690,7 @@ fn test_request_params_are_camel_case() {
         "toolCommands": "[{\"id\":\"c1\"}]",
         "bootEnabled": true, "bootOrder": 9,
         "bootCheck": "{\"type\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":8080}",
-        "bootRequired": true, "bootCredentialMode": "s4u",
+        "bootRequired": true, "bootCredentialMode": "s4u", "crashRestart": false,
     })).expect("UpdateServiceParams 应能按驼峰反序列化");
     assert_eq!(upd.id, "s1");
     assert_eq!(upd.watch_paths, "[\"C:/p\"]", "watchPaths 被静默忽略");
@@ -677,6 +700,7 @@ fn test_request_params_are_camel_case() {
     assert_eq!(upd.tool_commands, "[{\"id\":\"c1\"}]", "toolCommands 被静默忽略");
     assert!(upd.boot_enabled && upd.boot_required, "开机开关被静默忽略");
     assert_eq!(upd.boot_order, 9, "bootOrder 被静默忽略");
+    assert_eq!(upd.crash_restart, Some(false), "crashRestart 被静默忽略");
     assert!(upd.boot_check.contains("8080"), "bootCheck 被静默忽略");
     assert_eq!(upd.boot_credential_mode, "s4u", "bootCredentialMode 被静默忽略");
 
@@ -684,18 +708,20 @@ fn test_request_params_are_camel_case() {
         "id": "t1", "name": "tpl", "command": "c", "cwd": "C:/p",
         "watchPaths": "[]", "watchInclude": "*", "watchExclude": "", "envVars": "",
         "restartMode": 1, "enabled": true, "showFileTree": false,
-        "toolCommands": "[]", "openToolId": "tool1",
+        "toolCommands": "[]", "openToolId": "tool1", "crashRestart": false,
     })).expect("UpdateServiceTemplateParams 应能按驼峰反序列化");
     assert_eq!(tpl.open_tool_id, "tool1", "openToolId 被静默忽略（模板的默认打开工具会丢）");
+    assert_eq!(tpl.crash_restart, Some(false), "crashRestart 被静默忽略");
 
     let created: CreateServiceTemplateParams = serde_json::from_value(serde_json::json!({
         "name": "tpl", "command": "c", "cwd": "C:/p",
         "watchPaths": "[]", "watchInclude": "*", "watchExclude": "", "envVars": "",
         "restartMode": 1, "enabled": true, "showFileTree": false,
-        "toolCommands": "[]", "openToolId": "",
+        "toolCommands": "[]", "openToolId": "", "crashRestart": false,
     })).expect("CreateServiceTemplateParams 应能按驼峰反序列化");
     assert_eq!(created.name, "tpl");
     assert_eq!(created.restart_mode, 1, "restartMode 被静默忽略");
+    assert_eq!(created.crash_restart, Some(false), "crashRestart 被静默忽略");
 
     // 工具：`id` 为 null 是"新建"语义（见 `save_open_tool`），必须能显式收到 null
     let tool: SaveOpenToolParams = serde_json::from_value(serde_json::json!({
@@ -876,6 +902,8 @@ const COVERED_RESPONSE: &[&str] = &[
         "SearchResultItem", "SearchResponse",
         "FileChangeEvent", "FileChange", "JarEntryInfo",
         "LogLine", "FailedService", "ServiceLogBatchPayload",
+        // 崩溃自动重启通知（`service-auto-restart` 事件）
+        "AutoRestartNotice",
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "DetectedToolsResult",
         "Service", "ServiceTemplate", "ProjectDetail",
@@ -1008,7 +1036,7 @@ fn test_nullable_fields_stay_nullable_and_typed() {
     // 失败服务：spawn 失败（进程没起来）时 exit_code 为 null
     let failed = FailedService {
         service_id: "s1".into(), exit_code: None, timestamp: "t".into(), source: "local".into(),
-        port_conflict: None,
+        port_conflict: None, uptime_ms: None, crash_restart: true,
     };
     assert_eq!(types_of(&failed).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");
 

@@ -51,7 +51,25 @@ pub struct FailedService {
     /// 清空；而每 3 秒轮询都去扫日志+查端口表是白付成本。失败时算一次并随失败态返回。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_conflict: Option<crate::core::ports::PortConflict>,
+    /// 本次运行存活了多久（毫秒）；spawn 失败/启动时刻不可知时为 None。
+    ///
+    /// 崩溃自动重启据此区分"启动失败"与"稳定运行后崩溃"（见 `core::restart_policy`）。
+    /// None 时一律按启动失败处理——判不了就不重启，避免 AI 改到一半时代码反复拉起。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_ms: Option<u64>,
+    /// 该服务当前是否允许崩溃自动重启（服务设置里的开关）。
+    ///
+    /// 失败发生时随进程信息快照下来：监督器在 `core` 层，不查数据库；
+    /// 用户在这个失败期间改开关，不影响已经发生的这次退出（下次启动后生效）。
+    #[serde(default = "default_true")]
+    pub crash_restart: bool,
 }
+
+/// serde 默认值：崩溃自动重启默认开启（与开关上线前的行为一致）。
+///
+/// serde 通过字符串路径调用它，编译器看不见这次使用，故显式放行 dead_code。
+#[allow(dead_code)]
+fn default_true() -> bool { true }
 
 /// 后台生命周期心跳线程是否成功启动。
 ///
@@ -132,6 +150,8 @@ pub(crate) struct ProcessInfo {
     pub(crate) health_unready: bool,
     /// 就绪检查是否已经通过：通过后不再每 3 秒重复连 TCP / 扫日志
     pub(crate) health_ready: bool,
+    /// 崩溃自动重启开关（失败记录会带上它，监督器据此决定是否排期）
+    crash_restart: bool,
     /// 认领后找日志文件的采样状态（见 `LogProbe`）；None = 还没采过样
     pub(crate) log_probe: Option<LogProbe>,
     /// 所属项目（供 get_running 返回项目级运行状态）
@@ -175,6 +195,14 @@ pub struct ProcessManager {
     /// 每 key 一把生命周期锁，让 start/stop/restart 对同一服务串行（NEW-17）。
     /// 键只增不删，理由见 `lifecycle_guard`。
     lifecycles: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 显式停止的代际（每 stop 一次 +1）。
+    ///
+    /// `tick` 在 Phase 2 摘表、Phase 2.5 才写失败记录，两步之间没有生命周期锁；
+    /// 用户恰好在这时点停止，旧的"进程已退出"就会在停止之后落表——卡片显示失败，
+    /// 崩溃自动重启还会据此把一个用户刚停掉的服务拉起来。`tick` 摘表前记下代际，
+    /// 落表前复核；变了就说明期间被显式停过，丢弃这次退出事件。
+    /// 键只增不删：每个曾停止过的服务留一个 `String + u64`，量级可忽略。
+    stop_epochs: Mutex<HashMap<String, u64>>,
     #[cfg(windows)]
     job: Option<Arc<super::job_object::JobObject>>,
 }
@@ -194,6 +222,8 @@ pub struct ServiceSpawn<'a> {
     pub log_sink: LogSink,
     /// 本地服务的就绪检查；`None` = 进程存活超过宽限期即就绪
     pub health_check: HealthCheck,
+    /// 稳定运行后崩溃是否自动重启（来自服务设置；启动失败始终不重启）
+    pub crash_restart: bool,
 }
 
 /// 日志批量事件的发送端（ARCH-14）。
@@ -215,9 +245,29 @@ impl ProcessManager {
             failed: Mutex::new(HashMap::new()),
             last_ports: Mutex::new(HashMap::new()),
             lifecycles: Mutex::new(HashMap::new()),
+            stop_epochs: Mutex::new(HashMap::new()),
             #[cfg(windows)]
             job: None,
         }
+    }
+
+    /// 读显式停止代际（不存在 = 0）
+    fn stop_epoch(&self, key: &str) -> u64 {
+        self.stop_epochs
+            .lock()
+            .map(|m| m.get(key).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// 记一次显式停止；返回新代际。停止发生在 `stop` 的最前面——见 `stop_epochs` 的说明。
+    fn bump_stop_epoch(&self, key: &str) -> u64 {
+        let mut m = self.stop_epochs.lock().unwrap_or_else(|e| {
+            log::error!("[nexus] stop_epochs 锁已中毒，继续使用: {}", e);
+            e.into_inner()
+        });
+        let epoch = m.entry(key.to_string()).or_insert(0);
+        *epoch += 1;
+        *epoch
     }
 
     /// 测试用：带 Job Object 的实例。
@@ -274,7 +324,13 @@ impl ProcessManager {
     }
 
     fn start_locked(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
-        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, log_sink, health_check } = spec;
+        self.start_locked_with(spec, true)
+    }
+
+    /// `clear_logs=false` 只给崩溃自动重启用：保留上一次运行的输出（崩溃现场），
+    /// 新输出追加在后面。手动启动/重启/停止仍然清空日志（"本次运行"的语义不变）。
+    fn start_locked_with(&self, spec: ServiceSpawn<'_>, clear_logs: bool) -> Result<(), String> {
+        let ServiceSpawn { project_id, service_id: key, name, command, cwd, env_vars, log_sink, health_check, crash_restart } = spec;
         log::info!("[nexus] 启动服务: {} ({}) cmd={:?}, cwd={:?}", key, name, mask_command(command), cwd);
 
         // 工作目录为空：进程可能依赖相对路径/环境变量，直接拒绝并提示配置
@@ -299,13 +355,14 @@ impl ProcessManager {
             }
         }
 
-        if let Ok(mut buffers) = self.log_buffers.lock() {
-            buffers.remove(key);
+        if clear_logs {
+            if let Ok(mut buffers) = self.log_buffers.lock() {
+                buffers.remove(key);
+            }
         }
-        // 重新启动：清除旧失败标记（新生命周期）
-        if let Ok(mut failed) = self.failed.lock() {
-            failed.remove(key);
-        }
+        // 注意：旧失败标记**不在这里清**。清除必须与"进程表里出现新实例"原子发生
+        // （见 Phase 3）：否则 tick 的 Phase 2.5 可能在本句与插表之间写入一条旧失败，
+        // 造成"运行中 + 失败"并存，崩溃自动重启会去重启一个正在运行的服务。
 
         // Phase 2: 在锁外执行 spawn 和线程创建
         let mut cmd = build_command(command);
@@ -338,6 +395,8 @@ impl ProcessManager {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
                         port_conflict: None,
+                        uptime_ms: None,
+                        crash_restart,
                     });
                 }
                 msg
@@ -368,6 +427,8 @@ impl ProcessManager {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
                         port_conflict: None,
+                        uptime_ms: None,
+                        crash_restart,
                     });
                 }
                 return Err(msg);
@@ -475,13 +536,19 @@ impl ProcessManager {
         procs.insert(key.to_string(), ProcessInfo {
             child: Some(child), pid, spawn_started_at, adopted: Vec::new(),
             cwd: cwd.to_string(), follow: None, health_check, health_unready: false,
-            health_ready: false, log_probe: None,
+            health_ready: false, crash_restart, log_probe: None,
             project_id: project_id.to_string(),
             log_sink: Arc::clone(&log_sink),
             done_stdout: done_rx_opt,
             done_stderr: Some(done_rx2),
             stop_flag,
         });
+        // 与新实例入表在同一把 processes 锁内清除旧失败标记（锁序 processes → failed，
+        // 与 tick 的落表路径一致）。这样 tick 的落表只有两种结局：先于本句（被本句清掉）
+        // 或后于本句（看到进程已在表，直接跳过）。
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.remove(key);
+        }
         Ok(())
     }
 
@@ -501,7 +568,7 @@ impl ProcessManager {
     }
 
     fn stop_locked(&self, key: &str, snapshot: Option<&[super::winproc::ProcEntry]>) -> Result<(), String> {
-        let outcome = self.stop_locked_outcome(key, snapshot);
+        let outcome = self.stop_locked_outcome(key, snapshot, true);
         // **收尸没干净就如实上报**（CQ-25）：表项此时已经被摘掉，`get_running()` 会报它
         // "未运行"，界面显示已停止，而进程仍在跑并占着端口。上层（stop_project_services /
         // delete_service）本来就是按"可能失败"写的，这条 Err 才是那些分支的第一个真实来源
@@ -516,8 +583,16 @@ impl ProcessManager {
     /// 为什么拆成两个（ARCH-31）：`restart` 需要在"旧进程没退干净"时再等一会儿，而那需要
     /// **pid**（`CleanupOutcome.survivors`）——`stop_locked` 把它拍成了一句错误字符串，pid 就
     /// 没了。两条路径共用这一段实现，停止语义因此只有一处。
-    fn stop_locked_outcome(&self, key: &str, snapshot: Option<&[super::winproc::ProcEntry]>) -> CleanupOutcome {
+    fn stop_locked_outcome(
+        &self,
+        key: &str,
+        snapshot: Option<&[super::winproc::ProcEntry]>,
+        clear_logs: bool,
+    ) -> CleanupOutcome {
         log::info!("[nexus] 停止服务: {}", key);
+        // 先记代际再摘表：tick 可能已经摘了表、正准备写"进程已退出"的失败记录，
+        // 它会在落表前复核这个代际（见 `stop_epochs`）
+        self.bump_stop_epoch(key);
 
         // Phase 1: 从 map 中移除 entry，释放锁
         let entry: Option<CleanupEntry> = {
@@ -536,13 +611,16 @@ impl ProcessManager {
             CleanupOutcome::default()
         };
         // 主动停止 = 正常关闭：无论进程是否还在管理表（崩溃的服务已被 running() 移出），
-        // 都清除失败标记并清空日志（含失败日志）——项目"全部停止"依赖此语义
+        // 都清除失败标记；日志只有"主动停止"才清空（含失败日志）——项目"全部停止"
+        // 依赖此语义。崩溃自动重启传 `clear_logs=false`，把崩溃现场留给用户排查。
         if let Ok(mut failed) = self.failed.lock() {
             failed.remove(key);
         }
-        if let Ok(mut buffers) = self.log_buffers.lock() {
-            let log_key: LogKey = Arc::from(key);
-            buffers.remove(&*log_key);
+        if clear_logs {
+            if let Ok(mut buffers) = self.log_buffers.lock() {
+                let log_key: LogKey = Arc::from(key);
+                buffers.remove(&*log_key);
+            }
         }
         outcome
     }
@@ -555,6 +633,67 @@ impl ProcessManager {
     pub fn restart(&self, spec: ServiceSpawn<'_>) -> Result<(), String> {
         let lock = self.lifecycle_lock(spec.service_id);
         let _guard = lock_lifecycle(&lock, spec.service_id);
+        self.restart_locked(spec, true)
+    }
+
+    /// 崩溃自动重启：**保留崩溃日志**，且只在失败记录仍是 `expected_failure_timestamp`
+    /// 时执行。
+    ///
+    /// 为什么必须复核（ARCH-31 的同一类窗口）：监督器从失败表里拿到计划到真正执行之间，
+    /// 用户可能已经点了停止/重启，或文件监听已经重启过。失败记录被清掉后还照原计划拉起，
+    /// 就是"用户刚停下、它又自己起来了"。生命周期锁保证复核与 stop/start 之间没有窗口——
+    /// 复核不通过时直接返回 `Ok(false)`，本次不动作（调用方按"已被抢先处理"处理）。
+    ///
+    /// 返回 `Ok(true)` = 本次确实执行了重启；`Err` = 重启命令本身失败（失败记录由
+    /// `start_locked_with` 重新写入，且运行时长不可知 → 不会再次进入崩溃重启循环）。
+    pub(crate) fn auto_restart(
+        &self,
+        spec: ServiceSpawn<'_>,
+        expected_failure_timestamp: &str,
+        note: String,
+    ) -> Result<bool, String> {
+        let lock = self.lifecycle_lock(spec.service_id);
+        let _guard = lock_lifecycle(&lock, spec.service_id);
+        // 防御：进程表里已经有实例时绝不"重启"它。失败记录与运行实例原则上不会并存
+        // （tick 落表前复核、start 入表时清失败），但这条判据更便宜也更硬——
+        // 任何来源的陈旧失败记录都不能让监督器杀掉一个正在工作的服务。
+        let already_running = self
+            .processes
+            .lock()
+            .map(|procs| procs.contains_key(spec.service_id))
+            .unwrap_or(false);
+        if already_running {
+            log::info!(
+                "[nexus] 自动重启跳过: {} 当前已在运行，忽略陈旧失败记录",
+                spec.service_id
+            );
+            return Ok(false);
+        }
+        let same_failure = self
+            .failed
+            .lock()
+            .ok()
+            .and_then(|f| {
+                f.get(spec.service_id)
+                    .map(|entry| entry.timestamp == expected_failure_timestamp)
+            })
+            .unwrap_or(false);
+        if !same_failure {
+            log::info!(
+                "[nexus] 自动重启跳过: {} 的失败记录已被用户/文件监听处理",
+                spec.service_id
+            );
+            return Ok(false);
+        }
+        // 写在启动之前：日志保留着崩溃现场，这条说明紧接其后，读起来是
+        // "崩溃输出 → 为什么又出现了一份新输出（自动重启第 N 次）"
+        self.append_system_line(spec.service_id, note);
+        self.restart_locked(spec, false)?;
+        Ok(true)
+    }
+
+    /// 重启的共用实现，调用方必须已持有该 key 的生命周期锁。
+    fn restart_locked(&self, spec: ServiceSpawn<'_>, clear_logs: bool) -> Result<(), String> {
         // 旧进程没确认退出**不阻塞重启**（CQ-25）：用户的诉求是"把它跑起来"，而新进程
         // 起不来时后端会如实报端口/启动错误——那比"重启被拒绝"更接近用户意图。
         //
@@ -565,15 +704,16 @@ impl ProcessManager {
         // 它每 2 秒就可能来一次，而用户手动点的时候这些资源通常已经释放了。
         // 先取出来：`start_locked` 会消费 `spec`，而提示要写在它**之后**（见下）
         let service_id = spec.service_id;
-        let outcome = self.stop_locked_outcome(service_id, None);
+        let outcome = self.stop_locked_outcome(service_id, None, clear_logs);
         let left = settle_survivors(outcome);
-        let started = self.start_locked(spec);
-        // 这条提示必须写在 `start_locked` **之后**。
+        let started = self.start_locked_with(spec, clear_logs);
+        // 这条提示必须写在启动**之后**。
         //
-        // `start_locked` 的第一步就是清空该服务的日志缓冲（新生命周期的起点，见那里的
-        // `buffers.remove(key)`）——写在它前面的话，刚写完的这条会被那一句整条删掉：
-        // 消息"写进去了"、日志面板里永远看不到，而这条提示恰恰是"为什么重启后起不来"
-        // 的唯一线索（ARCH-31 的改动就是这么等于没写的）。
+        // 启动的第一步就是清空该服务的日志缓冲（新生命周期的起点）——写在它前面的话，
+        // 刚写完的这条会被那一句整条删掉：消息"写进去了"、日志面板里永远看不到，
+        // 而这条提示恰恰是"为什么重启后起不来"的唯一线索（ARCH-31 的改动就是这么
+        // 等于没写的）。自动重启（clear_logs=false）虽然不清理缓冲，但保持同一顺序
+        // 可以让两条路径只有一种读法，不必再按模式推理"这次会不会被清"。
         //
         // 放在启动之后还有个好处：启动失败时系统行的顺序是"失败原因 → 本次的嫌疑"，
         // 读起来是"失败了，因为……"。
@@ -591,6 +731,39 @@ impl ProcessManager {
     /// 追加系统标记行前，先调用者已确认需要写；锁失败时静默忽略（不影响主流程）
     pub fn append_system_line(&self, key: &str, text: String) {
         append_system_line(&self.log_buffers, key, text);
+    }
+
+    /// 服务设置里的「崩溃后自动重启」变更时，同步到**正在运行**的实例。
+    ///
+    /// 不同步的话，用户在服务运行时关掉开关，要等下次重启才生效——而这恰恰是
+    /// 一个"我现在不想让它再自动起来"的安全开关，延迟生效不符合预期。
+    /// 已失败的服务没有进程表项；执行层会再查一次数据库兜底（见 auto_restart_tick）。
+    pub(crate) fn set_crash_restart(&self, key: &str, enabled: bool) {
+        if let Ok(mut procs) = self.processes.lock() {
+            if let Some(info) = procs.get_mut(key) {
+                info.crash_restart = enabled;
+            }
+        }
+    }
+
+    /// 自动重启**本身**失败（配置错误等、进程根本没起来）时补一条失败记录。
+    ///
+    /// 为什么需要它：`auto_restart` 的 stop 阶段已经清掉旧失败记录，而 `start_locked_with`
+    /// 的早退（工作目录为空、已达并发上限）不会再写失败记录。不补的话，卡片上既不是
+    /// 运行中也不是失败——服务凭空消失，只剩一条用户可能没看到的系统日志。
+    /// `uptime_ms: None` 表示"启动就没成功"，监督器不会再为它排自动重启（避免配置错误循环）。
+    pub(crate) fn record_auto_restart_failure(&self, key: &str) {
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.insert(key.to_string(), FailedService {
+                service_id: key.to_string(),
+                exit_code: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "local".into(),
+                port_conflict: None,
+                uptime_ms: None,
+                crash_restart: true,
+            });
+        }
     }
 
     /// 取某服务的日志快照（锁内只拷 `Arc` 指针，字符串拷贝交给调用方的序列化）。
@@ -721,6 +894,10 @@ impl ProcessManager {
             exit_code: Option<i32>,
             /// true = 直接子进程退出（要走查游离后代）；false = 认领的进程全退了
             check_survivors: bool,
+            /// 摘表时的显式停止代际：落表前复核（见 `stop_epochs`）
+            stop_epoch: u64,
+            /// 崩溃自动重启开关：随失败记录带给监督器
+            crash_restart: bool,
         }
 
         // Phase 1（锁内，只做判定）：child 存活的跳过；child 已退出的记为候选；
@@ -742,6 +919,8 @@ impl ProcessManager {
                             started_at: info.spawn_started_at,
                             exit_code: status.code(),
                             check_survivors: true,
+                            stop_epoch: self.stop_epoch(k),
+                            crash_restart: info.crash_restart,
                         }),
                         Ok(None) => {} // 运行中
                         Err(e) => {
@@ -761,6 +940,8 @@ impl ProcessManager {
                                 started_at: info.spawn_started_at,
                                 exit_code: info.adopted.iter().find_map(|a| a.handle.exit_code()),
                                 check_survivors: false,
+                                stop_epoch: self.stop_epoch(k),
+                                crash_restart: info.crash_restart,
                             });
                         } else if info.follow.is_none() {
                             // 认领意味着 stdout 拿不到东西了：找找它在写哪个日志文件。
@@ -796,7 +977,10 @@ impl ProcessManager {
         // ① 把新 Child 的 wait() 放进全局 processes 锁里 → 整个进程管理假死；
         // ② 摘掉新实例并 taskkill → 刚重启的服务被杀；
         // ③ 对已被 stop 的 key 写“进程已退出”并插入 failed。
-        let mut exited: Vec<(String, Option<i32>)> = Vec::new();
+        // (key, 退出码, 进程启动时刻, 摘表时的停止代际, 崩溃自动重启开关)：
+        // 启动时刻用来在失败记录里带上运行时长（自动重启区分启动失败/崩溃）；
+        // 停止代际用于落表前复核；开关随失败记录交给监督器。
+        let mut exited: Vec<(String, Option<i32>, u64, u64, bool)> = Vec::new();
         let mut dead: Vec<CleanupEntry> = Vec::new();
         let mut adopted_logs: Vec<(String, String)> = Vec::new();
         // child.wait() 不能在锁内做：新启动的进程可能长期运行，持锁等待会冻结所有 IPC。
@@ -817,7 +1001,7 @@ impl ProcessManager {
                         continue;
                     }
                     let Some(mut info) = procs.remove(&e.key) else { continue };
-                    exited.push((e.key.clone(), e.exit_code));
+                    exited.push((e.key.clone(), e.exit_code, e.started_at, e.stop_epoch, e.crash_restart));
                     dead.push(take_cleanup_entry(e.key, &mut info));
                     continue;
                 };
@@ -848,18 +1032,48 @@ impl ProcessManager {
         }
 
         // Phase 2.5（锁外）：写日志标记与失败状态（原实现在持锁期间做）
-        for (key, code) in &exited {
+        for (key, code, started_at, stop_epoch, crash_restart) in &exited {
             let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
-            self.append_system_line(key, format!("进程已退出（退出码: {}）", code_str));
+            // 端口冲突要读日志（日志缓冲锁），放在进程锁之外算
             let port_conflict = self.bind_conflict_from_logs(key);
-            if let Ok(mut failed) = self.failed.lock() {
-                failed.insert(key.clone(), FailedService {
-                    service_id: key.clone(),
-                    exit_code: *code,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    source: "local".into(),
-                    port_conflict,
+            // 运行时长：启动时刻为 0（取不到）时保持 None，判不了就不自动重启
+            let uptime_ms = if *started_at > 0 {
+                Some(crate::core::restart_policy::now_millis().saturating_sub(*started_at))
+            } else {
+                None
+            };
+            // **落表与"期间是否被停止/重启"在同一把 processes 锁内判断**：
+            // Phase 2 摘表到这里之间没有生命周期锁，用户可能刚点停止（stop 代际 +1）
+            // 或已经重新启动（进程表里有新实例）。这时再写失败标记，会出现
+            // "已停止/运行中 + 失败"并存，崩溃自动重启还会去拉一个用户刚停的服务。
+            let recorded = {
+                let procs = self.processes.lock().unwrap_or_else(|e| {
+                    log::error!("ProcessManager processes 锁已中毒，继续使用: {}", e);
+                    e.into_inner()
                 });
+                if procs.contains_key(key) || self.stop_epoch(key) != *stop_epoch {
+                    false
+                } else {
+                    self.append_system_line(key, format!("进程已退出（退出码: {}）", code_str));
+                    if let Ok(mut failed) = self.failed.lock() {
+                        failed.insert(key.clone(), FailedService {
+                            service_id: key.clone(),
+                            exit_code: *code,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            source: "local".into(),
+                            port_conflict,
+                            uptime_ms,
+                            crash_restart: *crash_restart,
+                        });
+                    }
+                    true
+                }
+            };
+            if !recorded {
+                log::debug!(
+                    "[nexus] tick: {} 在落表前已被停止/重启，丢弃旧退出事件",
+                    key
+                );
             }
         }
         // 认领成功必须**说出来**：否则面板上只有那行"进程已退出（退出码: 0）"，
@@ -958,6 +1172,8 @@ impl ProcessManager {
             }
             procs.drain().map(|(key, mut info)| {
                 log::debug!("[nexus]   清理 {} (pid={})", key, info.pid);
+                // 同 stop：让正在落表的 tick 丢弃这次退出事件（退出路径主要防日志复活）
+                self.bump_stop_epoch(&key);
                 take_cleanup_entry(key, &mut info)
             }).collect()
         };
@@ -978,8 +1194,12 @@ impl ProcessManager {
         if let Ok(mut buffers) = self.log_buffers.lock() {
             buffers.clear();
         }
-        // 全部停止 = 主动关闭：清除所有失败标记（正常日志与失败日志都已清空）
+        // 全部停止 = 主动关闭：先给每个失败项也记一次停止代际（丢弃可能正在落表的
+        // tick 事件，避免退出过程中日志/失败态复活），再清除所有失败标记
         if let Ok(mut failed) = self.failed.lock() {
+            for key in failed.keys() {
+                self.bump_stop_epoch(key);
+            }
             failed.clear();
         }
         log::info!("[nexus] stop_all: 已完成");
@@ -1070,6 +1290,8 @@ impl ProcessManager {
                 timestamp: "test".into(),
                 source: "local".into(),
                 port_conflict: None,
+                uptime_ms: None,
+                crash_restart: true,
             });
         }
     }
@@ -2057,6 +2279,7 @@ mod tests {
             command: "echo suspended-ok", cwd: ".", env_vars: &[],
             log_sink: Arc::new(|_| {}),
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).expect("启动应当成功（挂起→纳管→唤醒）");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2140,6 +2363,7 @@ mod tests {
             project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
             cwd: "   ", env_vars: &[], log_sink: sink,
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).unwrap_err();
         assert!(err.contains("工作目录为空"), "实际错误: {}", err);
         // 被拒绝的启动不得留下任何痕迹（失败表/日志缓冲都该是干净的）
@@ -2163,6 +2387,7 @@ mod tests {
             project_id: "p1", service_id: "s1", name: "n", command: "echo hi",
             cwd: &missing, env_vars: &[], log_sink: sink,
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).unwrap_err();
         assert!(err.starts_with("启动失败"), "实际错误: {}", err);
 
@@ -2228,6 +2453,109 @@ mod tests {
         // 主动停止过的服务不该留在失败表里（前端据此显示"失败"按钮）
         mgr.stop("svc-x").unwrap();
         assert!(mgr.failed().iter().all(|f| f.service_id != "svc-x" || f.exit_code != Some(1)));
+    }
+
+    /// 崩溃自动重启的**安全边界**：失败记录已被用户/其它路径处理掉时不得再拉起服务。
+    ///
+    /// 监督器从"看到失败"到"执行重启"之间隔着退避窗口；这期间用户点停止、或文件监听
+    /// 已经重启过，失败记录就没了。不复核的话会变成"用户刚停下，它又自己起来了"。
+    #[test]
+    fn test_auto_restart_refuses_when_failure_was_superseded() {
+        let mgr = ProcessManager::new();
+        mgr.record_failure_for_test("svc-auto", Some(1));
+        // 清除失败记录（模拟停止/手动重启）——此时再执行自动重启必须拒绝
+        mgr.stop("svc-auto").expect("stop 应当成功");
+        let started = mgr.auto_restart(
+            ServiceSpawn {
+                project_id: "p1", service_id: "svc-auto", name: "n",
+                command: "echo should-not-start", cwd: ".", env_vars: &[],
+                log_sink: Arc::new(|_| {}),
+                health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
+            },
+            "test",
+            "自动重启（第 1 次）".into(),
+        ).expect("复核不通过不是错误");
+        assert!(!started, "失败记录已消失时不得自动拉起服务");
+        assert!(!mgr.is_running("svc-auto"), "拒绝后不得留下进程");
+        assert!(mgr.get_logs("svc-auto").is_empty(), "拒绝后连说明都不该写（日志已被主动停止清空）");
+    }
+
+    /// 防御：进程已在运行时，任何陈旧失败记录都不得让它被"自动重启"（= 先停后起）。
+    ///
+    /// 正常的落表路径已经保证了失败与运行不并存（tick 落表前复核、start 入表时清失败），
+    /// 但自动重启会杀进程，判据值得多一道最便宜的硬防线。
+    #[cfg(windows)]
+    #[test]
+    fn test_auto_restart_never_touches_a_running_service() {
+        let mgr = ProcessManager::new();
+        let key = "svc-auto-running";
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        mgr.start(ServiceSpawn {
+            project_id: "p1", service_id: key, name: "n",
+            command: "ping -n 20 127.0.0.1 > NUL", cwd: &cwd, env_vars: &[],
+            log_sink: Arc::new(|_| {}),
+            health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
+        }).expect("启动应当成功");
+        let started_at = || {
+            mgr.snapshot_running_detail()
+                .into_iter()
+                .find(|d| d.service_id == key)
+                .map(|d| d.started_at)
+        };
+        let before = started_at().expect("应能读到启动时刻");
+
+        mgr.record_failure_for_test(key, Some(1));
+        let restarted = mgr.auto_restart(
+            ServiceSpawn {
+                project_id: "p1", service_id: key, name: "n",
+                command: "ping -n 20 127.0.0.1 > NUL", cwd: &cwd, env_vars: &[],
+                log_sink: Arc::new(|_| {}),
+                health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
+            },
+            "test",
+            "自动重启（第 1 次）".into(),
+        ).expect("调用应成功");
+        assert!(!restarted, "运行中的服务不得被自动重启");
+        assert_eq!(started_at(), Some(before), "服务不能被停掉再拉起（启动时刻必须不变）");
+        let _ = mgr.stop(key);
+    }
+
+    /// 正面路径：失败记录仍是同一次时真的重启，并且**保留崩溃日志**、写明第几次重启。
+    ///
+    /// 不保留日志的话，用户点开"失败"看到的是刚启动的新进程输出——崩溃现场没了，
+    /// 自动重启反而让排查变难。
+    #[test]
+    fn test_auto_restart_preserves_crash_logs_and_note() {
+        let mgr = ProcessManager::new();
+        let key = "svc-auto-logs";
+        mgr.record_failure_for_test(key, Some(1));
+        mgr.append_system_line(key, "崩溃前的输出：NullPointerException".into());
+        let started = mgr.auto_restart(
+            ServiceSpawn {
+                project_id: "p1", service_id: key, name: "n",
+                command: "echo auto-restarted", cwd: ".", env_vars: &[],
+                log_sink: Arc::new(|_| {}),
+                health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
+            },
+            "test",
+            "自动重启（第 1 次）：上次运行意外退出（退出码: 1）".into(),
+        ).expect("自动重启应当成功");
+        assert!(started, "失败记录匹配时必须执行重启");
+        let texts: Vec<String> = mgr.get_logs(key).iter().map(|l| l.text.clone()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("NullPointerException")),
+            "自动重启必须保留崩溃日志，实际: {:?}", texts
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("自动重启（第 1 次）")),
+            "日志里要写明这是第几次自动重启，实际: {:?}", texts
+        );
+        assert!(mgr.failed().is_empty(), "新生命周期开始后失败记录应清除");
+        let _ = mgr.stop(key);
     }
 
     /// 就绪检查的日志匹配只认服务自己的输出：
@@ -2337,6 +2665,7 @@ mod tests {
             project_id: "p1", service_id: "detach-1", name: "n",
             command: &command, cwd: &cwd, env_vars: &[], log_sink: sink,
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).expect("启动应当成功");
 
         let pids = wait_for_adoption(&mgr, "detach-1");
@@ -2379,11 +2708,17 @@ mod tests {
             project_id: "p1", service_id: "quick-1", name: "n",
             command: "exit /b 3", cwd: &cwd, env_vars: &[], log_sink: sink,
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).expect("启动应当成功");
 
         let failed = wait_for_failure(&mgr);
         assert_eq!(failed.len(), 1, "秒退服务应记为失败，实际 {:?}", failed.iter().map(|f| &f.service_id).collect::<Vec<_>>());
         assert_eq!(failed[0].exit_code, Some(3), "退出码应原样带出");
+        // 运行时长必须随失败记录带出：崩溃自动重启靠它区分"启动失败"与"稳定后崩溃"。
+        // 秒退服务的值必然远小于 10 秒阈值，因此不会进入自动重启。
+        let uptime = failed[0].uptime_ms.expect("进程真实退出时必须能算出运行时长");
+        assert!(uptime < crate::core::restart_policy::MIN_UPTIME_MS,
+            "秒退服务的运行时长应小于自动重启门槛，实际 {}ms", uptime);
         assert!(mgr.adopted_pids_for_test("quick-1").is_empty(), "没有游离后代时不该认领任何东西");
     }
 
@@ -2489,6 +2824,7 @@ mod tests {
             project_id: "p1", service_id: key, name: "n",
             command: "exit /b 0", cwd: ".", env_vars: &[], log_sink: Arc::new(|_| {}),
             health_check: crate::core::health::HealthCheck::None,
+            crash_restart: true,
         }).expect("启动应当成功");
 
         let texts: Vec<String> = mgr.get_logs(key).iter().map(|l| l.text.clone()).collect();

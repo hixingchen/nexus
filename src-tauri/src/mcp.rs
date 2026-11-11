@@ -1082,6 +1082,9 @@ impl NexusMcpServer {
             boot_required: current.boot_required,
             boot_credential_mode: current.boot_credential_mode.clone(),
             health_check: Some(current.health_check.clone()),
+            // AI 只改命令/环境变量等字段，不碰这个开关；显式带原值防"全量更新"
+            // 把用户关掉的崩溃自动重启又打开
+            crash_restart: Some(current.crash_restart),
         };
         let result = crate::commands::service::update_service(self.app.clone(), params).await?;
         // 界面同步：AI 改了配置，服务卡片/编辑面板的数据必须跟着刷新
@@ -1569,6 +1572,7 @@ mod tests {
             boot_required: false,
             boot_credential_mode: "s4u".into(),
             health_check: "".into(),
+            crash_restart: true,
         };
         let logs: Vec<std::sync::Arc<crate::core::logpipe::LogLine>> = (0..5)
             .map(|i| {

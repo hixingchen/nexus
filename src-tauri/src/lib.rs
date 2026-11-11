@@ -534,6 +534,10 @@ pub fn run() {
         }
     }
 
+    // 崩溃自动重启（本地服务）：独立线程做决策，不受前端定时器节流影响。
+    // 开机启动器拉起的服务由 runner 自己的监督逻辑负责，两者互不越界。
+    crate::commands::process::spawn_auto_restart_thread(app.handle().clone());
+
     // Exit 是最后的安全网：确保所有资源被释放，子进程被终止
     // cleanup_resources 是幂等的（对空集合 no-op），多次调用安全
     app.run(move |app, event| {

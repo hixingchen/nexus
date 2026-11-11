@@ -59,6 +59,8 @@ export function sameRunningStatus(
       const y = bf[i];
       return y && x.service_id === y.service_id && x.exit_code === y.exit_code
         && x.timestamp === y.timestamp && x.source === y.source
+        && x.uptime_ms === y.uptime_ms
+        && x.crash_restart === y.crash_restart
         && samePortConflict(x.port_conflict, y.port_conflict);
     });
 }

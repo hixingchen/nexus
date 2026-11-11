@@ -53,7 +53,7 @@ test('服务/模板草稿的清理不会误删弹窗草稿（两套键空间隔�
     envVars: '', restartMode: 0, enabled: true, showFileTree: false,
     openEnabled: false, openPort: 0, toolCommands: [], tplToolId: '',
     bootEnabled: false, bootOrder: 0, bootCheckKind: 'none', bootCheckValue: '', bootRequired: false,
-    bootCredentialMode: 's4u', healthCheckKind: 'none', healthCheckValue: '',
+    bootCredentialMode: 's4u', healthCheckKind: 'none', healthCheckValue: '', crashRestart: true,
   };
   useServiceDraftStore.getState().setDraft('svc-1', serviceDraft);
   useModalDraftStore.getState().setDraft(MODAL_DRAFT_KEYS.projectCreate, { name: 'n', path: 'p' });

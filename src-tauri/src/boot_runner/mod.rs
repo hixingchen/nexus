@@ -26,6 +26,12 @@ mod imp {
         BootService, BootServiceState, MANIFEST_VERSION, STATE_VERSION,
     };
     use crate::core::health::{log_contains_since, tcp_ready};
+    // 崩溃自动重启的策略与本地服务共用一份（见 core::restart_policy）：
+    // 启动失败不重启、稳定运行后崩溃才重启、窗口内最多 5 次。
+    use crate::core::restart_policy::{
+        classify_exit, next_restart_delay, now_millis, ExitKind, MAX_RESTARTS, MIN_UPTIME_MS,
+        WINDOW_MS,
+    };
 
     /// 服务日志轮转阈值（单文件）
     const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -85,6 +91,14 @@ mod imp {
         log_start: u64,
     }
 
+    /// 退避窗口内等待执行的一次自动重启。
+    struct PendingRestart {
+        /// 到点时刻（epoch ms）
+        due_at_ms: u64,
+        /// 第几次自动重启（从 1 开始）
+        attempt: u32,
+    }
+
     struct Runner {
         manifest: BootManifest,
         manifest_path: PathBuf,
@@ -96,6 +110,13 @@ mod imp {
         boot_dir: PathBuf,
         state: BootRunnerState,
         running: HashMap<String, RunningChild>,
+        /// 服务 id → 窗口内已安排的自动重启时刻（epoch ms）。
+        ///
+        /// 与本地监督器同一套预算（`core::restart_policy`）：启动失败不重启、
+        /// 10 分钟内最多 5 次。用户显式停止/启动会清掉它（见 stop_service / 命令处理）。
+        restart_times: HashMap<String, Vec<u64>>,
+        /// 服务 id → 尚未到点的自动重启
+        pending_restarts: HashMap<String, PendingRestart>,
         log: Arc<RunnerLog>,
         #[cfg(windows)]
         job: Option<crate::core::job_object::JobObject>,
@@ -209,6 +230,8 @@ mod imp {
             manifest_path,
             boot_dir: boot_dir.clone(),
             running: HashMap::new(),
+            restart_times: HashMap::new(),
+            pending_restarts: HashMap::new(),
             log,
             #[cfg(windows)]
             job,
@@ -267,6 +290,7 @@ mod imp {
         while !runner.shutdown {
             runner.process_commands();
             runner.poll_children();
+            runner.process_due_restarts();
             if last_heartbeat.elapsed() >= HEARTBEAT {
                 runner.write_state();
                 last_heartbeat = Instant::now();
@@ -407,6 +431,9 @@ mod imp {
             if self.running.contains_key(&svc.id) {
                 return Err("服务已在运行中".into());
             }
+            // 任何路径的启动都取消该服务待执行的自动重启：
+            // 用户手动启动/重启，或本函数正是那个到点的自动重启（调用方已移除计划）。
+            self.pending_restarts.remove(&svc.id);
             let log_path = PathBuf::from(&svc.log_path);
             let (log_file, _) = open_service_log(&log_path, svc)?;
             // 表头写完后的长度 = 本次运行日志的起点（就绪检查只匹配之后的新内容）
@@ -603,13 +630,17 @@ mod imp {
         }
 
         fn poll_children(&mut self) {
-            let mut exited: Vec<(String, Option<i32>)> = Vec::new();
-            let mut exited_direct: Vec<String> = Vec::new();
+            // (id, 退出码, 本次启动时刻)：启动时刻用来算运行时长，决定是否自动重启
+            let mut exited: Vec<(String, Option<i32>, u64)> = Vec::new();
+            // (id, 本次启动时刻)：直接子进程退出，稍后决定认领还是按服务退出处理
+            let mut exited_direct: Vec<(String, u64)> = Vec::new();
             let mut poll_errors: Vec<String> = Vec::new();
             for (id, run) in self.running.iter_mut() {
+                // 先拷出来：`run.child.as_mut()` 的可变借用会挡住对 run 其它字段的读取
+                let started_at_ms = run.child_started_at;
                 match run.child.as_mut() {
                     Some(child) => match child.try_wait() {
-                        Ok(Some(_)) => exited_direct.push(id.clone()),
+                        Ok(Some(_)) => exited_direct.push((id.clone(), started_at_ms)),
                         Ok(None) => {}
                         Err(e) => poll_errors.push(format!("查询服务「{}」状态失败: {}", run.name, e)),
                     },
@@ -617,7 +648,7 @@ mod imp {
                     None => {
                         if !run.adopted.iter().any(|a| a.handle.is_alive()) {
                             let code = run.adopted.iter().find_map(|a| a.handle.exit_code());
-                            exited.push((id.clone(), code));
+                            exited.push((id.clone(), code, started_at_ms));
                         }
                     }
                 }
@@ -626,14 +657,14 @@ mod imp {
                 self.log.info(&msg);
             }
 
-            for id in exited_direct {
+            for (id, started_at_ms) in exited_direct {
                 // 先取直接子进程的退出码（认领失败时它就是服务的退出码）
                 let code = self.running.get_mut(&id)
                     .and_then(|r| r.child.as_mut())
                     .and_then(|c| c.try_wait().ok().flatten())
                     .and_then(|s| s.code());
                 if !self.adopt_if_survivors(&id) {
-                    exited.push((id, code));
+                    exited.push((id, code, started_at_ms));
                 }
             }
             // 接管后代表进程可能换了（原 leader 退出、其余仍活）：同步 state.pid
@@ -645,25 +676,202 @@ mod imp {
                 self.sync_state_pid(&id);
             }
 
-            for (id, code) in exited {
+            let now = now_millis();
+            for (id, code, started_at_ms) in exited {
                 let run = self.running.remove(&id);
                 let (name, log_path) = run
                     .map(|r| (r.name, r.log_path))
                     .unwrap_or_else(|| (id.clone(), String::new()));
-                let note = if code == Some(0) { "已退出" } else { "意外退出" };
-                self.log.info(&format!("服务「{}」{}（退出码: {:?}）", name, note, code));
-                self.set_state(&id, |s| {
-                    s.phase = "exited".into();
+                self.handle_service_exit(&id, &name, code, started_at_ms, log_path, now);
+            }
+        }
+
+        /// 处理一次"服务进程已经退出"（不再有运行中的子进程）。
+        ///
+        /// 三类处置（策略见 `core::restart_policy`）：
+        /// - 正常结束（退出码 0）→ 记 exited，不重启；
+        /// - 启动失败（运行不足 10 秒）→ 记 failed，**不重启**——开发期 AI 改到一半
+        ///   触发的启动失败就落在这里，绝不能让 runner 形成"重启→又失败"的循环；
+        /// - 稳定运行后崩溃 → 排一次退避重启；预算用尽则记 failed 并保留日志。
+        fn handle_service_exit(
+            &mut self,
+            id: &str,
+            name: &str,
+            code: Option<i32>,
+            started_at_ms: u64,
+            log_path: String,
+            now_ms: u64,
+        ) {
+            // 启动时刻为 0 = 当时没取到：按"运行时长不可知"处理（不自动重启），
+            // 与本地监督器同一方向——判不了就不拉起，避免进入重启循环。
+            let uptime_ms = (started_at_ms > 0).then(|| now_ms.saturating_sub(started_at_ms));
+            let kind = classify_exit(code, uptime_ms);
+            let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+            let uptime_secs = uptime_ms.unwrap_or(0) / 1000;
+            // 服务设置里关掉了崩溃自动重启：即使是稳定运行后的崩溃也不排期
+            let crash_restart = self.find_service(id).map(|s| s.crash_restart).unwrap_or(true);
+            if kind == ExitKind::Crash && !crash_restart {
+                self.log.info(&format!(
+                    "服务「{}」意外退出（退出码: {}，运行 {} 秒），未开启崩溃自动重启",
+                    name, code_str, uptime_secs
+                ));
+                self.set_state(id, |s| {
+                    s.phase = "failed".into();
                     s.exit_code = code;
                     s.pid = None;
                     s.process_alive = Some(false);
-                    s.error = format!("进程{}（退出码: {:?}）", note, code);
+                    s.error = format!(
+                        "意外退出（退出码: {}）；未开启崩溃自动重启",
+                        code_str
+                    );
                     s.log_path = log_path;
                 });
+                self.write_state();
+                return;
+            }
+            match kind {
+                ExitKind::Clean => {
+                    self.log.info(&format!(
+                        "服务「{}」已退出（退出码: {}，运行 {} 秒），不自动重启",
+                        name, code_str, uptime_secs
+                    ));
+                    self.set_state(id, |s| {
+                        s.phase = "exited".into();
+                        s.exit_code = code;
+                        s.pid = None;
+                        s.process_alive = Some(false);
+                        s.error = format!("进程已退出（退出码: {}）", code_str);
+                        s.log_path = log_path;
+                    });
+                }
+                ExitKind::StartupFailure => {
+                    self.log.info(&format!(
+                        "服务「{}」启动失败（退出码: {}，运行不足 {} 秒），不自动重启",
+                        name, code_str, MIN_UPTIME_MS / 1000
+                    ));
+                    self.set_state(id, |s| {
+                        s.phase = "failed".into();
+                        s.exit_code = code;
+                        s.pid = None;
+                        s.process_alive = Some(false);
+                        s.error = format!(
+                            "启动失败（退出码: {}，运行不足 {} 秒），不自动重启",
+                            code_str, MIN_UPTIME_MS / 1000
+                        );
+                        s.log_path = log_path;
+                    });
+                }
+                ExitKind::Crash => {
+                    // 预算检查会 prune 窗口外的旧记录；通过则记下本次重启时刻并给出退避
+                    let (delay, attempt) = {
+                        let times = self.restart_times.entry(id.to_string()).or_default();
+                        let delay = next_restart_delay(times, now_ms);
+                        (delay, times.len() as u32)
+                    };
+                    match delay {
+                        Some(delay) => {
+                            let secs = (delay / 1000).max(1);
+                            self.pending_restarts.insert(
+                                id.to_string(),
+                                PendingRestart { due_at_ms: now_ms.saturating_add(delay), attempt },
+                            );
+                            self.log.info(&format!(
+                                "服务「{}」意外退出（退出码: {}，运行 {} 秒），{} 秒后自动重启（第 {}/{} 次）",
+                                name, code_str, uptime_secs, secs, attempt, MAX_RESTARTS
+                            ));
+                            self.set_state(id, |s| {
+                                s.phase = "restarting".into();
+                                s.exit_code = code;
+                                s.pid = None;
+                                s.process_alive = Some(false);
+                                s.error = format!(
+                                    "意外退出（退出码: {}），{} 秒后自动重启（第 {}/{} 次）",
+                                    code_str, secs, attempt, MAX_RESTARTS
+                                );
+                                s.log_path = log_path;
+                            });
+                        }
+                        None => {
+                            self.log.info(&format!(
+                                "服务「{}」意外退出（退出码: {}），{} 分钟内已自动重启 {} 次，不再重启",
+                                name, code_str, WINDOW_MS / 60_000, MAX_RESTARTS
+                            ));
+                            self.set_state(id, |s| {
+                                s.phase = "failed".into();
+                                s.exit_code = code;
+                                s.pid = None;
+                                s.process_alive = Some(false);
+                                s.error = format!(
+                                    "意外退出（退出码: {}）；{} 分钟内自动重启次数已用尽，不再重启",
+                                    code_str, WINDOW_MS / 60_000
+                                );
+                                s.log_path = log_path;
+                            });
+                        }
+                    }
+                }
+            }
+            self.write_state();
+        }
+
+        /// 执行到点的自动重启。未到点的只等待，不占主循环。
+        ///
+        /// 主循环 250ms 一拍；`start_service` 本身可能因就绪检查阻塞（与命令启动同一条
+        /// 路径），因此这里不做并发。等待某个服务就绪期间到点的重启会在那之后执行——
+        /// 延迟有界（该服务的就绪超时），且不会丢。
+        fn process_due_restarts(&mut self) {
+            let now = now_millis();
+            let due: Vec<String> = self.pending_restarts.iter()
+                .filter(|(_, plan)| now >= plan.due_at_ms)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in due {
+                let Some(plan) = self.pending_restarts.remove(&id) else { continue };
+                let Some(svc) = self.find_service(&id) else {
+                    self.log.info(&format!(
+                        "自动重启 {} 跳过：服务已不在开机启动清单中",
+                        id
+                    ));
+                    self.set_state(&id, |s| {
+                        s.phase = "failed".into();
+                        s.pid = None;
+                        s.process_alive = Some(false);
+                        s.error = "自动重启失败：服务已不在开机启动清单中".into();
+                    });
+                    self.write_state();
+                    continue;
+                };
+                self.log.info(&format!(
+                    "自动重启服务「{}」（第 {}/{} 次）",
+                    svc.name, plan.attempt, MAX_RESTARTS
+                ));
+                if let Err(e) = self.start_service(&svc) {
+                    // start_service 的早退（打开日志文件失败等）可能发生在写 phase 之前；
+                    // 不补这一下，state 会永远停在 "restarting" 而进程根本不存在。
+                    if !self.running.contains_key(&id) {
+                        self.set_state(&id, |s| {
+                            s.phase = "failed".into();
+                            s.pid = None;
+                            s.process_alive = Some(false);
+                            s.error = format!("自动重启失败：{}", e);
+                        });
+                        self.write_state();
+                    }
+                    // **不在这里再排一次**：启动失败（运行不足 10 秒）不属于崩溃，
+                    // 继续排就是重启循环。
+                    self.log.info(&format!(
+                        "服务「{}」自动重启未成功: {}（不再自动重试，请检查日志）",
+                        svc.name, e
+                    ));
+                }
             }
         }
 
         fn stop_service(&mut self, id: &str) -> Result<(), String> {
+            // 显式停止 = 取消该服务所有自动重启（含退避等待中的）并重置预算。
+            // 少了这一句，"用户刚点停止、60 秒后它又自己起来了"。
+            self.pending_restarts.remove(id);
+            self.restart_times.remove(id);
             // 不在当前 manifest 里（已删除服务/已取消开机自启）的记录在停止后没有保留价值：
             // 直接删掉，设置页就不会再显示一条点不动的历史项。仍在 manifest 里的保留
             // （配置还在，只是这次停了）。
@@ -765,6 +973,9 @@ mod imp {
             for id in ids {
                 let _ = self.stop_service(&id);
             }
+            // 不在 running 里、但还在退避等待中的计划也必须清掉（runner 正在退出/全部停止）
+            self.pending_restarts.clear();
+            self.restart_times.clear();
         }
 
         fn restart_service(&mut self, id: &str) -> Result<(), String> {
@@ -802,6 +1013,9 @@ mod imp {
             self.state.services.retain(|id, _| {
                 manifest_ids.contains(id) || running_ids.contains(id)
             });
+            // 已取消开机自启/已删除的服务不再自动重启：把它们的计划与预算一并清掉
+            self.pending_restarts.retain(|id, _| manifest_ids.contains(id));
+            self.restart_times.retain(|id, _| manifest_ids.contains(id));
             self.log.info("manifest 已重新加载");
             self.write_state();
             Ok(())
@@ -837,6 +1051,10 @@ mod imp {
                             }
                             if ok {
                                 if let Some(svc) = self.find_service(id) {
+                                    // 显式启动 = 用户接管：清掉旧的崩溃预算（否则手动拉起后
+                                    // 下一次崩溃可能被十分钟前的旧账直接判成"用尽"）。
+                                    // start_service 内部会取消待执行的自动重启计划。
+                                    self.restart_times.remove(id);
                                     if let Err(e) = self.start_service(&svc) {
                                         ok = false; error = e;
                                     }
@@ -930,6 +1148,25 @@ mod imp {
         use super::*;
         use std::collections::BTreeMap;
 
+        /// 构造一个可直接驱动的 Runner（测试不经过计划任务/manifest 读盘）。
+        ///
+        /// `manifest_path` 固定为 `dir/manifest.json`：需要 reload 的用例自己写这个文件。
+        fn new_test_runner(dir: &Path, manifest: BootManifest) -> Runner {
+            let log = Arc::new(RunnerLog::open(&dir.join("runner.log")).expect("打开日志"));
+            Runner {
+                state: init_state(&manifest, std::process::id(), 0, "s4u"),
+                manifest,
+                manifest_path: dir.join("manifest.json"),
+                boot_dir: dir.to_path_buf(),
+                running: HashMap::new(),
+                restart_times: HashMap::new(),
+                pending_restarts: HashMap::new(),
+                log,
+                job: None,
+                shutdown: false,
+            }
+        }
+
         /// 回归：`startup.bat` / `start` 这类命令的**直接子进程会立即退出**，
         /// 真正的工作进程另开窗口继续跑。启动器必须接管它并继续算运行中，
         /// 不能把服务标成“已退出/失败”（用户报的 Tomcat 场景）。
@@ -950,6 +1187,7 @@ mod imp {
                 check: BootCheck::Delay { seconds: 1 },
                 required: false,
                 order: 0,
+                crash_restart: true,
                 log_path: log_path.to_string_lossy().to_string(),
             };
             let manifest = BootManifest {
@@ -958,17 +1196,7 @@ mod imp {
                 env: BTreeMap::new(),
                 services: vec![svc.clone()],
             };
-            let log = Arc::new(RunnerLog::open(&dir.join("runner.log")).expect("打开日志"));
-            let mut runner = Runner {
-                state: init_state(&manifest, std::process::id(), 0, "s4u"),
-                manifest,
-                manifest_path: dir.join("manifest.json"),
-                boot_dir: dir.clone(),
-                running: HashMap::new(),
-                log,
-                job: None,
-                shutdown: false,
-            };
+            let mut runner = new_test_runner(&dir, manifest);
 
             runner.start_service(&svc).expect("启动服务");
             std::thread::sleep(Duration::from_millis(1200));
@@ -1044,6 +1272,7 @@ mod imp {
                 check,
                 required: false,
                 order: 0,
+                crash_restart: true,
                 log_path: dir.join("logs").join(format!("{}.log", id)).to_string_lossy().to_string(),
             };
             // A：包装进程（cmd）立即退出，真正的 ping 留在后台
@@ -1058,17 +1287,7 @@ mod imp {
             };
             std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).expect("序列化"))
                 .expect("写 manifest");
-            let log = Arc::new(RunnerLog::open(&dir.join("runner.log")).expect("打开日志"));
-            let mut runner = Runner {
-                state: init_state(&manifest, std::process::id(), 0, "s4u"),
-                manifest,
-                manifest_path: dir.join("manifest.json"),
-                boot_dir: dir.clone(),
-                running: HashMap::new(),
-                log,
-                job: None,
-                shutdown: false,
-            };
+            let mut runner = new_test_runner(&dir, manifest);
 
             runner.start_service(&svc_a).expect("启动 A");
             // 前置：A 的直接子进程（cmd）已经退出，但启动器还没轮询认领——state.pid 仍指向它。
@@ -1123,6 +1342,138 @@ mod imp {
 
             runner.stop_service("a").expect("停止 A");
             runner.stop_service("b").expect("停止 B");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// 崩溃自动重启的判定：正常退出/启动失败都不排期，稳定运行后崩溃才排期；
+        /// 窗口内次数用尽后停手并保留失败态。
+        ///
+        /// 启动失败这一条是开发期最关键的防线：AI 改代码改到一半导致的启动失败
+        /// 绝不能被启动器反复拉起（与本地监督器共用 `core::restart_policy`）。
+        #[test]
+        fn test_crash_restart_policy_startup_failure_vs_crash() {
+            let dir = std::env::temp_dir()
+                .join(format!("nexus_runner_restart_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("建临时目录");
+            let svc = BootService {
+                id: "s1".into(),
+                project_id: "p1".into(),
+                name: "svc".into(),
+                command: "echo x".into(),
+                cwd: String::new(),
+                env: BTreeMap::new(),
+                check: BootCheck::None,
+                required: false,
+                order: 0,
+                crash_restart: true,
+                log_path: dir.join("logs").join("s1.log").to_string_lossy().to_string(),
+            };
+            let manifest = BootManifest {
+                version: MANIFEST_VERSION,
+                generated_at: String::new(),
+                env: BTreeMap::new(),
+                services: vec![svc],
+            };
+            let mut runner = new_test_runner(&dir, manifest);
+            let t0 = 1_000_000u64;
+
+            // 正常结束：不重启
+            runner.handle_service_exit("s1", "svc", Some(0), t0, String::new(), t0 + 5_000);
+            assert_eq!(runner.state.services["s1"].phase, "exited");
+            assert!(runner.pending_restarts.is_empty(), "退出码 0 不该自动重启");
+
+            // 启动失败：运行 3 秒就退出，不重启
+            runner.handle_service_exit("s1", "svc", Some(1), t0 - 3_000, String::new(), t0);
+            assert_eq!(runner.state.services["s1"].phase, "failed");
+            assert!(runner.pending_restarts.is_empty(), "启动失败不得自动重启");
+
+            // 稳定运行 30 秒后崩溃：排期重启
+            runner.handle_service_exit("s1", "svc", Some(1), t0 + 60_000 - 30_000, String::new(), t0 + 60_000);
+            assert_eq!(runner.state.services["s1"].phase, "restarting");
+            assert!(runner.pending_restarts.contains_key("s1"), "稳定后崩溃应排期");
+
+            // 连续再崩 5 次：第 6 次（含首次）预算用尽，停止排期
+            let mut now = t0 + 60_000;
+            for i in 0..MAX_RESTARTS {
+                runner.pending_restarts.remove("s1"); // 模拟上一次已到点执行
+                now += 60_000;
+                runner.handle_service_exit("s1", "svc", Some(1), now - 30_000, String::new(), now);
+                if i < MAX_RESTARTS - 1 {
+                    assert!(runner.pending_restarts.contains_key("s1"), "第 {} 次应继续排期", i + 2);
+                }
+            }
+            assert!(!runner.pending_restarts.contains_key("s1"), "预算用尽后不得再排期");
+            assert_eq!(runner.state.services["s1"].phase, "failed");
+
+            // 服务设置里关掉开关：同样的稳定运行后崩溃也不再排期
+            runner.manifest.services[0].crash_restart = false;
+            let off_now = now + 60_000;
+            runner.handle_service_exit(
+                "s1", "svc", Some(1), off_now - 30_000, String::new(), off_now,
+            );
+            assert!(
+                !runner.pending_restarts.contains_key("s1"),
+                "关闭崩溃自动重启后不得排期"
+            );
+            assert_eq!(runner.state.services["s1"].phase, "failed");
+
+            // 显式停止必须撤销待执行的重启：否则用户刚停，到点又起来了
+            runner.pending_restarts.insert(
+                "s1".to_string(),
+                PendingRestart { due_at_ms: now + 10_000, attempt: 1 },
+            );
+            runner.stop_service("s1").expect("停止服务");
+            assert!(!runner.pending_restarts.contains_key("s1"), "显式停止必须取消待执行的自动重启");
+            assert!(!runner.restart_times.contains_key("s1"), "显式停止应重置崩溃预算");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// 到点的自动重启必须**真的拉起进程**（不是只改 state），并清掉待执行计划。
+        ///
+        /// 前一条测试只驱动决策；这条走 `process_due_restarts → start_service` 的真实
+        /// 路径（铁律 19：触碰进程/平台时序的部分要真跑一次）。
+        #[test]
+        fn test_process_due_restart_starts_real_process() {
+            let dir = std::env::temp_dir()
+                .join(format!("nexus_runner_due_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("建临时目录");
+            let svc = BootService {
+                id: "s1".into(),
+                project_id: "p1".into(),
+                name: "svc".into(),
+                // 约 4 秒后自然结束；断言期间它应一直在跑
+                command: "ping -n 5 127.0.0.1 > NUL".into(),
+                cwd: String::new(),
+                env: BTreeMap::new(),
+                check: BootCheck::None,
+                required: false,
+                order: 0,
+                crash_restart: true,
+                log_path: dir.join("logs").join("s1.log").to_string_lossy().to_string(),
+            };
+            let manifest = BootManifest {
+                version: MANIFEST_VERSION,
+                generated_at: String::new(),
+                env: BTreeMap::new(),
+                services: vec![svc],
+            };
+            let mut runner = new_test_runner(&dir, manifest);
+            runner.pending_restarts.insert(
+                "s1".to_string(),
+                PendingRestart { due_at_ms: 0, attempt: 1 },
+            );
+
+            runner.process_due_restarts();
+
+            assert!(
+                !runner.pending_restarts.contains_key("s1"),
+                "到点执行后应移除计划（否则下一拍会重复启动）"
+            );
+            let run = runner.running.get("s1").expect("到点必须真的拉起进程");
+            assert!(run.child.as_ref().map(|c| c.id() > 0).unwrap_or(false), "应有真实子进程");
+            assert_eq!(runner.state.services["s1"].phase, "ready", "无就绪检查时启动后即为 ready");
+            runner.stop_service("s1").expect("停止服务");
+            assert!(!runner.running.contains_key("s1"), "停止后应从运行表移除");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -262,6 +262,8 @@ fn write_project_duplicate(db: &crate::database::Database, id: &str) -> Result<P
                     ":boot_enabled": 0, ":boot_order": 0, ":boot_check": "", ":boot_required": 0,
                     ":boot_credential_mode": "s4u",
                     ":health_check": svc.health_check,
+                    // 崩溃自动重启是服务自身行为，随服务一起复制（与开机启动不同）
+                    ":crash_restart": if svc.crash_restart { 1 } else { 0 },
                 },
             ).map_err(|e| format!("复制服务配置失败: {}", e))?;
             // 打开工具绑定随服务一起复制：service_open_tools 以 service_id 为主键，
@@ -385,6 +387,8 @@ mod tests {
             ("boot_required", "1".to_string()),
             ("boot_credential_mode", "password".to_string()),
             ("health_check", r#"{"type":"tcp","host":"127.0.0.1","port":5432,"timeoutSecs":30}"#.to_string()),
+            // 关闭状态（非默认值 1）：副本必须原样复制这个开关
+            ("crash_restart", "0".to_string()),
         ]);
 
         let missing: Vec<String> = columns_of(conn, "services")

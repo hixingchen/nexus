@@ -73,6 +73,11 @@ pub struct Service {
     pub boot_credential_mode: String,
     /// 本地服务的就绪检查 JSON（空串 = 进程存活即就绪；与 boot_check 同形状）
     pub health_check: String,
+    /// 稳定运行后崩溃是否自动重启（默认开）。
+    ///
+    /// 本地服务由后端监督器执行，开机启动服务由 runner 执行；两者共用这一项。
+    /// 启动失败（运行不足 10 秒）始终不自动重启，与开关无关。
+    pub crash_restart: bool,
 }
 
 /// 服务模板：跨项目复用的服务配置（独立于项目，复制到项目时值拷贝）
@@ -95,6 +100,8 @@ pub struct ServiceTemplate {
     pub tool_commands: String,
     /// 模板携带的默认打开工具（从模板添加服务时复制为新服务的绑定）
     pub open_tool_id: String,
+    /// 从模板添加服务时一并复制的崩溃自动重启开关（默认开）
+    pub crash_restart: bool,
     pub created_at: String,
 }
 

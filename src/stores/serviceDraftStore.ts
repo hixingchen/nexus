@@ -45,6 +45,8 @@ export interface ServiceFormDraft {
   /** 本地服务的就绪检查（模板模式不使用） */
   healthCheckKind: BootCheckKind;
   healthCheckValue: string;
+  /** 崩溃后自动重启（模板模式不使用；模板不携带这个开关） */
+  crashRestart: boolean;
 }
 
 interface DraftState {

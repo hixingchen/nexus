@@ -156,7 +156,16 @@ pub struct BootService {
     pub required: bool,
     pub order: i32,
     pub log_path: String,
+    /// 稳定运行后崩溃是否自动重启（服务设置里的开关，默认开）。
+    ///
+    /// 旧 manifest 没有这个字段 → 默认 true，与开关上线前的行为一致。
+    #[serde(default = "default_crash_restart")]
+    pub crash_restart: bool,
 }
+
+/// serde 对旧 manifest 的默认值；同上：只被 serde 按路径调用。
+#[allow(dead_code)]
+fn default_crash_restart() -> bool { true }
 
 /// 环境快照白名单：只取“找得到工具/用户目录”的变量。
 ///
@@ -242,7 +251,7 @@ pub fn sync_manifest_to(
 ) -> Result<BootManifest, String> {
     let rows = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, name, command, cwd, env_vars, boot_check, boot_required, boot_order \
+            "SELECT id, project_id, name, command, cwd, env_vars, boot_check, boot_required, boot_order, crash_restart \
              FROM services WHERE boot_enabled=1 AND boot_credential_mode=?1 \
              ORDER BY boot_order, sort_index, name",
         ).map_err(|e| format!("查询开机启动服务失败: {}", e))?;
@@ -257,6 +266,7 @@ pub fn sync_manifest_to(
                 row.get::<_, String>("boot_check")?,
                 row.get::<_, i32>("boot_required")? != 0,
                 row.get::<_, i32>("boot_order")?,
+                row.get::<_, i32>("crash_restart")? != 0,
             ))
         }).map_err(|e| format!("读取开机启动服务失败: {}", e))?;
         let mut out = Vec::new();
@@ -271,7 +281,7 @@ pub fn sync_manifest_to(
     std::fs::create_dir_all(&logs_dir).map_err(|e| format!("创建开机启动日志目录失败: {}", e))?;
 
     let mut services = Vec::with_capacity(rows.len());
-    for (id, project_id, name, command, cwd, env_vars, boot_check, required, order) in rows {
+    for (id, project_id, name, command, cwd, env_vars, boot_check, required, order, crash_restart) in rows {
         let check = parse_check(&boot_check)
             .map_err(|e| format!("服务「{}」的{}", name, e))?;
         let mut env = snapshot.clone();
@@ -289,6 +299,7 @@ pub fn sync_manifest_to(
             check,
             required,
             order,
+            crash_restart,
         });
     }
 
@@ -342,7 +353,9 @@ pub struct BootRunnerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BootServiceState {
-    /// starting / ready / failed / exited / stopped / skipped
+    /// starting / ready / failed / exited / stopped / skipped / restarting
+    ///
+    /// `restarting` = 稳定运行后崩溃、正在退避等待自动重启（进程已退出，pid 为 None）。
     pub phase: String,
     pub pid: Option<u32>,
     pub process_started_at: Option<u64>,

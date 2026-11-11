@@ -83,6 +83,13 @@ export interface Service {
   boot_credential_mode: BootCredentialMode;
   /** 本地服务的就绪检查 JSON（空串/缺省 = 进程存活即就绪；与 boot_check 同形状） */
   health_check?: string;
+  /**
+   * 稳定运行后崩溃是否自动重启（默认开启；本地启动与开机启动的服务共用）。
+   *
+   * 旧后端/模板没有这个字段时按 true 处理（与开关上线前的行为一致）。
+   * 启动失败（运行不足 10 秒）始终不自动重启，与这个开关无关。
+   */
+  crash_restart?: boolean;
 }
 
 export type BootCredentialMode = 's4u' | 'password';
@@ -158,6 +165,8 @@ export interface ServiceTemplate {
   tool_commands: string;
   /** 模板携带的默认打开工具（从模板添加服务时复制为新服务绑定） */
   open_tool_id: string;
+  /** 从模板添加服务时复制的崩溃自动重启开关（默认开） */
+  crash_restart?: boolean;
   created_at: string;
 }
 
@@ -209,6 +218,8 @@ export const serviceApi = {
     bootCredentialMode?: BootCredentialMode;
     /** 本地服务就绪检查 JSON（空串/不传 = 进程存活即就绪） */
     healthCheck?: string;
+    /** 崩溃后自动重启；不传 = 默认开启 */
+    crashRestart?: boolean;
   }) => invoke<Service>('add_service', {
     params: {
       projectId: params.projectId,
@@ -231,6 +242,7 @@ export const serviceApi = {
       bootRequired: params.bootRequired,
       bootCredentialMode: params.bootCredentialMode,
       healthCheck: params.healthCheck,
+      crashRestart: params.crashRestart,
     }
   }),
 
@@ -263,6 +275,8 @@ export const serviceApi = {
     bootCredentialMode: BootCredentialMode;
     /** 本地服务就绪检查 JSON（空串 = 进程存活即就绪） */
     healthCheck: string;
+    /** 崩溃后自动重启；不传 = 保持原值 */
+    crashRestart?: boolean;
   }) => invoke<{ watch_refreshed: boolean; watch_error: string; boot_manifest_error: string }>('update_service', {
     params: {
       id: params.id,
@@ -285,6 +299,7 @@ export const serviceApi = {
       bootRequired: params.bootRequired,
       bootCredentialMode: params.bootCredentialMode,
       healthCheck: params.healthCheck,
+      crashRestart: params.crashRestart,
     }
   }),
 
@@ -322,6 +337,8 @@ export const serviceApi = {
     openPort: number;
     toolCommands: string;
     openToolId: string;
+    /** 崩溃后自动重启；不传 = 保持原值 */
+    crashRestart?: boolean;
   }) => invoke<void>('update_service_template', {
     params: {
       id: params.id,
@@ -339,6 +356,7 @@ export const serviceApi = {
       openPort: params.openPort,
       toolCommands: params.toolCommands,
       openToolId: params.openToolId,
+      crashRestart: params.crashRestart,
     }
   }),
 
@@ -361,6 +379,8 @@ export const serviceApi = {
     openPort: number;
     toolCommands: string;
     openToolId: string;
+    /** 崩溃后自动重启；不传 = 默认开启 */
+    crashRestart?: boolean;
   }) => invoke<ServiceTemplate>('create_service_template', { params }),
 
   /** 导出模板到 JSON 文件（ids 为空 = 全部），返回导出的模板数 */
@@ -465,6 +485,31 @@ export interface FailedService {
   source?: 'local' | 'boot';
   /** 日志里识别出的端口冲突（EADDRINUSE 等）；缺省 = 不是端口问题 */
   port_conflict?: PortConflict;
+  /**
+   * 本次运行存活了多久（毫秒）；spawn 失败/启动时刻不可知时缺省。
+   *
+   * 后端用它区分"启动失败"（<10 秒，不自动重启）与"稳定运行后崩溃"（自动重启）。
+   * 前端目前只做透传，展示上不依赖它。
+   */
+  uptime_ms?: number;
+  /** 失败发生时该服务是否开启了崩溃自动重启（服务设置里的开关快照） */
+  crash_restart?: boolean;
+}
+
+/**
+ * 崩溃自动重启事件（后端 `service-auto-restart`）。
+ *
+ * 只在"预算用尽"或"这次自动重启本身没成功"时发：成功的自动重启是静默的，
+ * 崩溃循环里每次弹一条提示会淹没界面。
+ */
+export interface AutoRestartNotice {
+  service_id: string;
+  service_name: string;
+  /** gave_up = 自动重启次数用尽；failed = 本次自动重启失败 */
+  status: 'gave_up' | 'failed';
+  attempts: number;
+  /** 失败原因（已写进该服务的日志，这里供提示展示） */
+  error: string;
 }
 
 /** 运行状态总览：运行中 + 意外失败 */

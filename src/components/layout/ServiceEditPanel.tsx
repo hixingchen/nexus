@@ -23,6 +23,21 @@ const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
 
+/**
+ * 崩溃自动重启的规则说明。
+ *
+ * 只放在开关行的悬浮提示里：这段文字是"看一次就够"的说明，常驻会占三行纵向空间，
+ * 而这个面板本来就长。`\n` 让 Windows/Chromium 的原生 tooltip 分行显示。
+ */
+const CRASH_RESTART_HINT =
+  '运行满 10 秒后意外退出才重启；启动失败（如代码改到一半）不会重启，避免反复拉起。\n'
+  + '10 分钟内最多 5 次，退避 2/5/15/30/60 秒。\n'
+  + '对本地启动和开机启动的服务都生效。';
+
+/** 模板模式多一句：这个开关在模板里只是"预制值"，真正生效是在从模板添加服务之后 */
+const CRASH_RESTART_HINT_TEMPLATE =
+  CRASH_RESTART_HINT + '\n模板：从模板添加服务时复制给新服务。';
+
 /** 配置面板输入框统一样式（配置表单与工具命令表单各有一份，逐字相同——改一处漏一处会出现两种输入框） */
 const INPUT_CLS = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
 
@@ -129,6 +144,12 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
   const [restartMode, setRestartMode] = useState(initialDraft?.restartMode ?? service.restart_mode);
   const [enabled, setEnabled] = useState(initialDraft?.enabled ?? service.enabled);
   const [showFileTree, setShowFileTree] = useState(initialDraft?.showFileTree ?? service.show_file_tree);
+  /** 崩溃后自动重启（服务级；本地启动与开机启动共用。默认开） */
+  const [crashRestart, setCrashRestart] = useState(
+    initialDraft?.crashRestart ?? service.crash_restart ?? true,
+  );
+  /** 模板与服务共用同一个开关；模板模式的提示多一句"从模板添加服务时复制" */
+  const crashRestartHint = mode === 'template' ? CRASH_RESTART_HINT_TEMPLATE : CRASH_RESTART_HINT;
   /** 卡片「打开」按钮：默认关；端口 0 = 自动（唯一监听端口时直接用它） */
   const [openEnabled, setOpenEnabled] = useState(initialDraft?.openEnabled ?? service.open_enabled ?? false);
   const [openPort, setOpenPort] = useState(String(initialDraft?.openPort ?? service.open_port ?? 0));
@@ -211,6 +232,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
     || watchExclude !== service.watch_exclude || envVars !== service.env_vars
     || restartMode !== service.restart_mode || enabled !== service.enabled
     || showFileTree !== service.show_file_tree
+    || crashRestart !== (service.crash_restart ?? true)
     || openEnabled !== (service.open_enabled ?? false)
     || openPortNum !== (service.open_port ?? 0)
     || bootEnabled !== (service.boot_enabled ?? false)
@@ -228,13 +250,13 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
   useEffect(() => {
     useServiceDraftStore.getState().setDraft(draftKey, formDirty ? {
       name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
-      restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
+      restartMode, enabled, showFileTree, crashRestart, openEnabled, openPort: openPortNum,
       toolCommands, tplToolId,
       bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
       healthCheckKind, healthCheckValue,
     } : null);
   }, [draftKey, formDirty, name, command, cwd, watchPaths, watchInclude, watchExclude, envVars,
-      restartMode, enabled, showFileTree, openEnabled, openPortNum, toolCommands, tplToolId,
+      restartMode, enabled, showFileTree, crashRestart, openEnabled, openPortNum, toolCommands, tplToolId,
       bootEnabled, bootOrder, bootCheckKind, bootCheckValue, bootRequired, bootCredentialMode,
       healthCheckKind, healthCheckValue]);
 
@@ -252,6 +274,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
     setRestartMode(service.restart_mode);
     setEnabled(service.enabled);
     setShowFileTree(service.show_file_tree);
+    setCrashRestart(service.crash_restart ?? true);
     setOpenEnabled(service.open_enabled ?? false);
     setOpenPort(String(service.open_port ?? 0));
     setBootEnabled(service.boot_enabled ?? false);
@@ -373,14 +396,14 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
       if (mode === 'template') {
         // 模板：默认打开工具随保存提交（从模板添加服务时复制为绑定）
         if (service.id) {
-          await serviceApi.updateTemplate({ ...basePayload, openToolId: tplToolId });
+          await serviceApi.updateTemplate({ ...basePayload, openToolId: tplToolId, crashRestart });
         } else {
           // id 为空 = 模板库里刚点「新建」出来的空壳，走 create（id 由后端生成）
           await serviceApi.createServiceTemplate({
             name: name.trim(), command, cwd, watchPaths, watchInclude, watchExclude,
             envVars, restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
             toolCommands: JSON.stringify(toolCommands),
-            openToolId: tplToolId,
+            openToolId: tplToolId, crashRestart,
           });
         }
       } else if (!service.id) {
@@ -398,7 +421,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
           envVars, restartMode, enabled, showFileTree, openEnabled, openPort: openPortNum,
           toolCommands: JSON.stringify(toolCommands),
           bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
-          healthCheck: health.json,
+          healthCheck: health.json, crashRestart,
         });
         // 保存拿到 id 之后才能绑：新建时选的打开工具在这里补上
         if (pendingToolId) {
@@ -413,7 +436,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
         const res = await serviceApi.update({
           ...basePayload,
           bootEnabled, bootOrder, bootCheck: boot.json, bootRequired, bootCredentialMode,
-          healthCheck: health.json,
+          healthCheck: health.json, crashRestart,
         });
         // 配置已落库，但文件监听没跟上必须说出来（CQ-35）：不说的话界面提示"已保存"，
         // 而用户改文件毫无反应——这正是 file_watcher.rs 把同类结论从 Ok(()) 改成 Err 的原因
@@ -660,6 +683,26 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
                 <Switch checked={item.checked} onChange={item.onChange} label={item.label} />
               </div>
             ))}
+
+            {/* 崩溃后自动重启：规则较长，常驻会占三行，收进悬浮提示；? 图标是入口。
+                点 ? 不切换开关（stopPropagation），否则"想看说明"会顺手改掉配置。
+                服务与模板共用：模板里存的是"预制值"，从模板添加服务时复制过去。 */}
+            <div
+              className="flex items-center gap-2.5 px-2 py-1.5 rounded hover:bg-nexus-hover/30 cursor-pointer transition-colors"
+              title={crashRestartHint}
+              onClick={() => setCrashRestart(v => !v)}
+            >
+              <span className="flex-1 flex items-center gap-1.5 text-[13px] text-nexus-text">
+                崩溃后自动重启
+                <span
+                  aria-label={crashRestartHint}
+                  title={crashRestartHint}
+                  onClick={e => e.stopPropagation()}
+                  className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full border border-nexus-muted/40 text-[9px] leading-none text-nexus-muted/70 cursor-help flex-shrink-0"
+                >?</span>
+              </span>
+              <Switch checked={crashRestart} onChange={setCrashRestart} label="崩溃后自动重启" />
+            </div>
 
             {/* 打开按钮：默认关闭。后端/数据库等服务只需要看监听端口，不需要浏览器打开。
                 模板也带这项：从模板添加服务时复制给新服务。 */}

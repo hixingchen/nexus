@@ -132,6 +132,10 @@ pub struct UpdateServiceParams {
     /// 这个新字段，缺省成空串会把用户配置静默清掉），空串 = 进程存活即就绪
     #[serde(default)]
     pub health_check: Option<String>,
+    /// 崩溃后自动重启；**不传 = 保持原值**（同 health_check：旧前端/MCP 全量更新
+    /// 不应把用户的关闭状态重置回开启）
+    #[serde(default)]
+    pub crash_restart: Option<bool>,
 }
 
 /// 服务添加参数
@@ -178,6 +182,9 @@ pub struct AddServiceParams {
     /// 本地服务的就绪检查 JSON；不传 = 进程存活即就绪
     #[serde(default)]
     pub health_check: Option<String>,
+    /// 崩溃后自动重启；不传 = 默认开启（与本次改动之前的行为一致）
+    #[serde(default)]
+    pub crash_restart: Option<bool>,
 }
 
 /// 获取某个项目下的所有服务
@@ -264,6 +271,8 @@ pub(crate) fn insert_service_row(
         let health_check = crate::core::health::normalize(
             params.health_check.as_deref().unwrap_or(""),
         )?;
+        // 不传 = 开启：这是本次改动之前所有服务的既有行为
+        let crash_restart = params.crash_restart.unwrap_or(true);
         conn.execute(
             &format!(
                 "INSERT INTO services ({}) VALUES ({})",
@@ -283,6 +292,7 @@ pub(crate) fn insert_service_row(
                 ":boot_check": boot_check, ":boot_required": boot_required,
                 ":boot_credential_mode": boot_credential_mode,
                 ":health_check": health_check,
+                ":crash_restart": if crash_restart { 1 } else { 0 },
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         Ok(Service {
@@ -293,6 +303,7 @@ pub(crate) fn insert_service_row(
             sort_index: max_sort + 1,
             tool_commands: tool_commands.to_string(),
             boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode, health_check,
+            crash_restart,
         })
     })
 }
@@ -339,6 +350,11 @@ pub async fn update_service(
             if params.boot_credential_mode.trim().is_empty() { "s4u" } else { &params.boot_credential_mode },
         )?;
         let project_id = write_service_update(&state.db, &params, &cwd, &tool_commands)?;
+        // 崩溃自动重启开关对**正在运行**的实例立即生效（不必等下次重启）。
+        // 不传（None）= 保持原值，此时也不该改动运行中的状态。
+        if let Some(enabled) = params.crash_restart {
+            state.process_mgr.set_crash_restart(&params.id, enabled);
+        }
         // 配置保存成功：若该服务正在被监听，用新配置热刷新（路径/排除/模式变更立即生效）。
         // 刷新失败**不阻塞保存**（配置已经落库，监听下次项目级启停时会自然重建），
         // 但也不吞掉结论——如实回传给界面，让它提示"已保存，但监听未生效"（CQ-35）
@@ -379,10 +395,10 @@ pub(crate) fn write_service_update(
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
         validate_open_port(params.open_port)?;
-        let old: (String, String, String, String) = conn.query_row(
-            "SELECT cwd, watch_paths, project_id, health_check FROM services WHERE id=?1",
+        let old: (String, String, String, String, i32) = conn.query_row(
+            "SELECT cwd, watch_paths, project_id, health_check, crash_restart FROM services WHERE id=?1",
             [&params.id],
-            |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?, r.get("health_check")?)),
+            |r| Ok((r.get("cwd")?, r.get("watch_paths")?, r.get("project_id")?, r.get("health_check")?, r.get("crash_restart")?)),
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         ensure_open_port_unique_in_project(
             conn, &old.2, params.open_enabled, params.open_port, Some(&params.id),
@@ -410,6 +426,8 @@ pub(crate) fn write_service_update(
             Some(raw) => crate::core::health::normalize(raw)?,
             None => old.3.clone(),
         };
+        // 不传 = 保持原值：旧前端/MCP 的全量更新不应把用户的关闭状态重置回开启
+        let crash_restart = params.crash_restart.unwrap_or(old.4 != 0);
         let affected = conn.execute(
             &format!(
                 "UPDATE services SET {} WHERE id=:id",
@@ -428,6 +446,7 @@ pub(crate) fn write_service_update(
                 ":boot_check": boot_check, ":boot_required": params.boot_required,
                 ":boot_credential_mode": boot_credential_mode,
                 ":health_check": health_check,
+                ":crash_restart": if crash_restart { 1 } else { 0 },
                 ":id": params.id,
             },
         ).map_err(|e| format!("更新服务失败: {}", e))?;
@@ -549,7 +568,7 @@ pub async fn delete_service(app: tauri::AppHandle, id: String) -> Result<DeleteR
 pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTemplate>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id, created_at
+            "SELECT id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id, crash_restart, created_at
              FROM service_templates ORDER BY sort_index, name"
         ).map_err(|e| format!("查询模板失败: {}", e))?;
         let rows = stmt.query_map([], |row| Ok(ServiceTemplate {
@@ -569,6 +588,7 @@ pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTempla
             open_port: row.get("open_port")?,
             tool_commands: row.get("tool_commands")?,
             open_tool_id: row.get("open_tool_id")?,
+            crash_restart: row.get::<_, i32>("crash_restart")? != 0,
             created_at: row.get("created_at")?,
         })).map_err(|e| format!("查询模板失败: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("查询模板失败: {}", e))
@@ -578,12 +598,17 @@ pub fn get_service_templates(state: State<AppState>) -> Result<Vec<ServiceTempla
 /// 把项目里的服务保存为模板（值拷贝，不关联原项目，可重复保存产生多个副本）
 #[tauri::command]
 pub fn save_service_as_template(state: State<AppState>, service_id: String) -> Result<ServiceTemplate, String> {
+    save_service_as_template_impl(&state.db, &service_id)
+}
+
+/// 核心逻辑（只依赖 `Database`，测试走这里）：服务 → 模板的值拷贝。
+pub(crate) fn save_service_as_template_impl(db: &Database, service_id: &str) -> Result<ServiceTemplate, String> {
     if service_id.trim().is_empty() { return Err("服务ID不能为空".into()); }
-    state.db.with_conn(|conn| {
+    db.with_conn(|conn| {
         let t = conn.query_row(
-            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands
+            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, crash_restart
              FROM services WHERE id=?1",
-            [&service_id],
+            [service_id],
             |row| Ok((
                 row.get::<_, String>("name")?,
                 row.get::<_, String>("command")?,
@@ -598,12 +623,13 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
                 row.get::<_, bool>("open_enabled")?,
                 row.get::<_, i32>("open_port")?,
                 row.get::<_, String>("tool_commands")?,
+                row.get::<_, i32>("crash_restart")? != 0,
             )),
         ).map_err(|e| format!("服务不存在: {}", e))?;
-        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands) = t;
+        let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, crash_restart) = t;
         // 模板随服务带走当前绑定的打开工具（从模板添加服务时复制为新服务绑定）
         let open_tool_id: String = conn.query_row(
-            "SELECT tool_id FROM service_open_tools WHERE service_id=?1", [&service_id],
+            "SELECT tool_id FROM service_open_tools WHERE service_id=?1", [service_id],
             |r| r.get("tool_id"),
         ).unwrap_or_default();
 
@@ -624,6 +650,7 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
                 ":open_enabled": if open_enabled { 1 } else { 0 }, ":open_port": open_port,
                 // 「另存为模板」固定落 0（模板库「新建」接在末尾，见那里的说明）
                 ":sort_index": 0, ":tool_commands": tool_commands, ":open_tool_id": open_tool_id,
+                ":crash_restart": if crash_restart { 1 } else { 0 },
             },
         ).map_err(|e| format!("保存模板失败: {}", e))?;
         // 回读真实创建时间（原实现返回空串，与查询接口的返回不一致）
@@ -633,7 +660,7 @@ pub fn save_service_as_template(state: State<AppState>, service_id: String) -> R
         Ok(ServiceTemplate {
             id, name, command, cwd, watch_paths, watch_include, watch_exclude,
             env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port,
-            tool_commands, open_tool_id,
+            tool_commands, open_tool_id, crash_restart,
             created_at,
         })
     })
@@ -668,7 +695,7 @@ fn add_service_from_template_impl(
     // 但驱动器根/系统目录一律拒绝——模板可能是从别处导入或被写坏的）
     let t = db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id
+            "SELECT name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id, crash_restart
              FROM service_templates WHERE id=?1",
             [template_id],
             |row| Ok((
@@ -686,10 +713,11 @@ fn add_service_from_template_impl(
                 row.get::<_, i32>("open_port")?,
                 row.get::<_, String>("tool_commands")?,
                 row.get::<_, String>("open_tool_id")?,
+                row.get::<_, i32>("crash_restart")? != 0,
             )),
         ).map_err(|e| format!("模板不存在: {}", e))
     })?;
-    let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id) = t;
+    let (name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, tool_commands, open_tool_id, crash_restart) = t;
     validate_open_port(open_port)?;
     validate_config_dirs(db, paths, &cwd, &watch_paths)?;
 
@@ -728,6 +756,8 @@ fn add_service_from_template_impl(
                 ":boot_credential_mode": "s4u",
                 // 模板暂不携带就绪检查；新服务从"进程存活即就绪"开始
                 ":health_check": "",
+                // 崩溃自动重启开关随模板复制（模板编辑面板可配置）
+                ":crash_restart": if crash_restart { 1 } else { 0 },
             },
         ).map_err(|e| format!("添加服务失败: {}", e))?;
         // 模板携带的默认打开工具 → 复制为新服务的绑定（工具已被删除时跳过，避免外键失败）
@@ -748,7 +778,7 @@ fn add_service_from_template_impl(
             env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port,
             sort_index: max_sort + 1, tool_commands,
             boot_enabled: false, boot_order: 0, boot_check: String::new(), boot_required: false,
-            boot_credential_mode: "s4u".into(), health_check: String::new(),
+            boot_credential_mode: "s4u".into(), health_check: String::new(), crash_restart,
         })
     })
 }
@@ -808,6 +838,9 @@ pub struct UpdateServiceTemplateParams {
     pub open_port: i32,
     pub tool_commands: String,
     pub open_tool_id: String,
+    /// 从模板添加服务时复制的崩溃自动重启开关；不传 = 保持原值
+    #[serde(default)]
+    pub crash_restart: Option<bool>,
 }
 
 /// 更新服务模板配置（编辑模板本身，不影响已从模板添加的项目服务）
@@ -828,9 +861,16 @@ pub fn update_service_template(
     state.db.with_conn(|conn| {
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
+        // 不传 = 保持原值（旧前端/旧调用点不该把用户的关闭状态重置回开启）
+        let crash_restart: i32 = match params.crash_restart {
+            Some(v) => if v { 1 } else { 0 },
+            None => conn
+                .query_row("SELECT crash_restart FROM service_templates WHERE id=?1", [&params.id], |r| r.get(0))
+                .unwrap_or(1),
+        };
         let affected = conn.execute(
-            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11, open_tool_id=?13, open_enabled=?14, open_port=?15 WHERE id=?12",
-            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id, params.open_tool_id, if params.open_enabled { 1 } else { 0 }, params.open_port],
+            "UPDATE service_templates SET name=?1, command=?2, cwd=?3, watch_paths=?4, watch_include=?5, watch_exclude=?6, env_vars=?7, restart_mode=?8, enabled=?9, show_file_tree=?10, tool_commands=?11, open_tool_id=?13, open_enabled=?14, open_port=?15, crash_restart=?16 WHERE id=?12",
+            rusqlite::params![params.name.trim(), params.command, cwd, params.watch_paths, params.watch_include, params.watch_exclude, params.env_vars, params.restart_mode, en, sft, tool_commands, params.id, params.open_tool_id, if params.open_enabled { 1 } else { 0 }, params.open_port, crash_restart],
         ).map_err(|e| format!("更新模板失败: {}", e))?;
         if affected == 0 { return Err("模板不存在".into()); }
         Ok(())
@@ -857,6 +897,9 @@ pub struct CreateServiceTemplateParams {
     pub open_port: i32,
     pub tool_commands: String,
     pub open_tool_id: String,
+    /// 从模板添加服务时复制的崩溃自动重启开关；不传 = 默认开启
+    #[serde(default)]
+    pub crash_restart: Option<bool>,
 }
 
 /// 在模板库里直接新建模板（不必先有服务再"另存为模板"）
@@ -891,6 +934,7 @@ pub fn create_service_template(
         let id = uuid::Uuid::new_v4().to_string();
         let en = if params.enabled { 1 } else { 0 };
         let sft = if params.show_file_tree { 1 } else { 0 };
+        let crash_restart = params.crash_restart.unwrap_or(true);
         // 接在排序末尾（视图是 ORDER BY sort_index, name）：新模板出现在列表最后。
         // 另存为模板走的是固定 0，两者位置能区分开——用户刚建的模板在末尾好找
         let next_sort: i32 = conn
@@ -910,6 +954,7 @@ pub fn create_service_template(
                 ":open_enabled": if params.open_enabled { 1 } else { 0 }, ":open_port": params.open_port,
                 ":sort_index": next_sort, ":tool_commands": tool_commands,
                 ":open_tool_id": params.open_tool_id,
+                ":crash_restart": if crash_restart { 1 } else { 0 },
             },
         ).map_err(|e| format!("新建模板失败: {}", e))?;
         let created_at: String = conn
@@ -931,6 +976,7 @@ pub fn create_service_template(
             open_port: params.open_port,
             tool_commands,
             open_tool_id: params.open_tool_id,
+            crash_restart,
             created_at,
         })
     })
@@ -975,6 +1021,7 @@ mod tests {
             boot_required: None,
             boot_credential_mode: None,
             health_check: None,
+            crash_restart: None,
         }
     }
 
@@ -1043,6 +1090,7 @@ mod tests {
             tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
             boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
             health_check: None,
+            crash_restart: None,
         };
         assert!(write_service_update(&db, &params, "C:/p", "[]").is_ok(), "更新自己不该报冲突");
 
@@ -1059,6 +1107,7 @@ mod tests {
             tool_commands: "[]".into(), boot_enabled: false, boot_order: 0,
             boot_check: String::new(), boot_required: false, boot_credential_mode: "s4u".into(),
             health_check: None,
+            crash_restart: None,
         };
         let err = write_service_update(&db, &update_b2, "C:/p", "[]")
             .expect_err("更新到与他人相同的端口必须被拒绝");
@@ -1084,6 +1133,7 @@ mod tests {
         assert_eq!(a.watch_paths, r#"["C:/p"]"#);
         assert!(a.enabled, "新建服务默认启用");
         assert!(!a.show_file_tree);
+        assert!(a.crash_restart, "崩溃自动重启默认开启（与开关上线前的行为一致）");
         assert_eq!(a.boot_credential_mode, "s4u", "不开机启动时模式默认 s4u");
         // 项目不存在时拒绝
         let mut p = add_params("c", "C:/p");
@@ -1118,6 +1168,7 @@ mod tests {
             boot_required: false,
             boot_credential_mode: "password".into(),
             health_check: None,
+            crash_restart: None,
         };
         let project_id = write_service_update(&db, &params, "C:/p/sub", "[]").unwrap();
         assert_eq!(project_id, "p1", "应回传所属项目，供调用方刷新监听");
@@ -1319,7 +1370,9 @@ mod tests {
         assert_eq!(left2, 0);
     }
 
-    /// 从模板添加服务：模板里的「打开」配置必须一起复制（返回结构 + 落库值都要对）
+    /// 从模板添加服务：模板里的「打开」配置与崩溃自动重启开关必须一起复制
+    /// （返回结构 + 落库值都要对）。后者是用户明确要求模板库可配置的字段，
+    /// 漏复制会让"另存为模板 → 从模板添加"把关闭状态静默重置回开启。
     #[test]
     fn test_add_service_from_template_copies_open_config() {
         let db = test_db();
@@ -1330,8 +1383,8 @@ mod tests {
         paths.set_project_root(Some(root.to_string_lossy().to_string())).unwrap();
         db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, open_tool_id)
-                 VALUES ('t1','tpl','npm run dev',?1,'[]','*','','',0,1,0,1,3000,0,'[]','')",
+                "INSERT INTO service_templates (id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, open_tool_id, crash_restart)
+                 VALUES ('t1','tpl','npm run dev',?1,'[]','*','','',0,1,0,1,3000,0,'[]','',0)",
                 [root.to_string_lossy().to_string()],
             ).map_err(|e| e.to_string())?;
             Ok(())
@@ -1340,15 +1393,39 @@ mod tests {
         let svc = add_service_from_template_impl(&db, &paths, "p1", "t1").expect("从模板添加服务");
         assert!(svc.open_enabled, "模板的打开开关应复制给新服务");
         assert_eq!(svc.open_port, 3000, "模板的指定端口应复制给新服务");
+        assert!(!svc.crash_restart, "模板关闭的崩溃自动重启必须复制给新服务");
 
         db.with_conn(|conn| {
-            let (oe, op): (i32, i32) = conn.query_row(
-                "SELECT open_enabled, open_port FROM services WHERE id=?1",
-                [&svc.id], |r| Ok((r.get(0)?, r.get(1)?)),
+            let (oe, op, cr): (i32, i32, i32) = conn.query_row(
+                "SELECT open_enabled, open_port, crash_restart FROM services WHERE id=?1",
+                [&svc.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             ).map_err(|e| e.to_string())?;
-            assert_eq!((oe, op), (1, 3000), "落库值也要与返回结构一致");
+            assert_eq!((oe, op, cr), (1, 3000, 0), "落库值也要与返回结构一致");
             Ok(())
         }).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 「另存为模板」必须把服务的崩溃自动重启开关一起写进模板。
+    ///
+    /// 与上一条合起来钉住完整往返：服务 → 模板 → 新服务。少了任一半，用户关掉的
+    /// 开关都会在模板环节被静默重置回默认值。
+    #[test]
+    fn test_save_service_as_template_copies_crash_restart() {
+        let db = test_db();
+        let mut p = add_params("a", "C:/p");
+        p.crash_restart = Some(false);
+        let svc = insert_service_row(&db, &p, "C:/p", "[]").expect("插入服务");
+        assert!(!svc.crash_restart);
+
+        let tpl = save_service_as_template_impl(&db, &svc.id).expect("另存为模板");
+        assert!(!tpl.crash_restart, "服务关闭的开关应写进模板");
+        let stored: i32 = db.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT crash_restart FROM service_templates WHERE id=?1",
+                [&tpl.id], |r| r.get(0),
+            ).unwrap())
+        }).unwrap();
+        assert_eq!(stored, 0, "落库值也要与返回结构一致");
     }
 }

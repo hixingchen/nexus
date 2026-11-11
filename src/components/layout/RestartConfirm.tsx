@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { processApi, type FileChangeEvent } from '../../services/service';
+import { processApi, type AutoRestartNotice, type FileChangeEvent } from '../../services/service';
 import { reportError } from '../../utils/error';
 import { notify } from '../../utils/notify';
 import { createAutoRestarter } from '../../utils/autoRestart';
@@ -78,6 +78,7 @@ export function RestartConfirm() {
 
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    let unlistenAutoRestart: (() => void) | null = null;
     listen<FileChangeEvent>('file-changed', (event) => {
       if (disposed) return;
       const { changes } = event.payload;
@@ -124,7 +125,33 @@ export function RestartConfirm() {
         description: '监听文件发生变化时将不再提示重启，请重启应用',
       });
     });
-    return () => { disposed = true; unlisten?.(); };
+
+    // 后端崩溃自动重启的通知：只处理"用尽/失败"两种（成功的重启静默进行）。
+    // 失败的输出已经写进该服务的日志；这里的提示负责让用户知道"它不会自己好了"。
+    listen<AutoRestartNotice>('service-auto-restart', (event) => {
+      if (disposed) return;
+      const p = event.payload;
+      notify({
+        variant: 'error',
+        title: p.status === 'gave_up'
+          ? `服务「${p.service_name}」自动重启已停止`
+          : `服务「${p.service_name}」自动重启失败`,
+        // 原因由后端给（窗口/次数与策略常量同源），前端不再写死 "10 分钟 / 5 次"
+        description: p.error,
+        duration: 12000,
+      });
+    }).then(fn => {
+      if (disposed) { fn(); return; }
+      unlistenAutoRestart = fn;
+    }).catch((e) => {
+      reportError('订阅 service-auto-restart 失败', e, { silent: true });
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+      unlistenAutoRestart?.();
+    };
   }, []);
 
   const handleRestart = useCallback(async (item: ConfirmItem) => {

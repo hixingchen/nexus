@@ -99,6 +99,14 @@ pub fn log_frontend(level: String, message: String) {
     crate::logger::log_frontend_message(&level, &message);
 }
 
+/// 应用是否正在退出。
+///
+/// 后台自动重启线程据此停止拉起新进程：退出流程的 `stop_all` 已经清空进程表，
+/// 这之后再根据残留的失败记录重启一个服务，等于"关不掉"。
+pub(crate) fn exit_in_progress() -> bool {
+    EXIT_STARTED.load(Ordering::SeqCst)
+}
+
 /// 发起退出：在**独立线程**里做资源清理，完成后再退出进程。
 ///
 /// 为什么异步：`cleanup_resources` → `stop_all()` 会对每个服务串行执行

@@ -201,6 +201,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
             boot_credential_mode TEXT NOT NULL DEFAULT 's4u',
             -- 本地服务的就绪检查（JSON，空串 = 进程存活即就绪）；与 boot_check 同形状
             health_check TEXT NOT NULL DEFAULT '',
+            -- 稳定运行后崩溃是否自动重启（默认开）；本地服务与开机启动器共用
+            crash_restart INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         -- 服务模板库：跨项目复用的服务配置（独立于项目，不随项目删除）
@@ -222,6 +224,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), String> {
             tool_commands TEXT NOT NULL DEFAULT '[]',
             -- 模板携带的默认打开工具（从模板添加服务时复制为服务绑定；工具被删时由命令清空）
             open_tool_id TEXT NOT NULL DEFAULT '',
+            -- 从模板添加服务时一并复制的崩溃自动重启开关（默认开）
+            crash_restart INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         -- 外部打开工具库（服务右键「用 XX 打开」）：executable 为可执行程序路径，
@@ -291,9 +295,11 @@ const MIGRATION_COLUMNS: &[(&str, &str, &str)] = &[
     ("services", "boot_required", "INTEGER NOT NULL DEFAULT 0"),
     ("services", "boot_credential_mode", "TEXT NOT NULL DEFAULT 's4u'"),
     ("services", "health_check", "TEXT NOT NULL DEFAULT ''"),
+    ("services", "crash_restart", "INTEGER NOT NULL DEFAULT 1"),
     ("open_tools", "executable", "TEXT NOT NULL DEFAULT ''"),
     ("open_tools", "args", "TEXT NOT NULL DEFAULT ''"),
     ("service_templates", "open_tool_id", "TEXT NOT NULL DEFAULT ''"),
+    ("service_templates", "crash_restart", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 /// 幂等加列：列已存在则跳过（pragma_table_info 表值函数）
@@ -322,13 +328,14 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
 pub const SERVICE_COLUMNS: &str =
     "id, project_id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
      restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, tool_commands, \
-     boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode, health_check";
+     boot_enabled, boot_order, boot_check, boot_required, boot_credential_mode, health_check, \
+     crash_restart";
 
 /// `UPDATE services` 允许改动的列（`id`/`project_id`/`sort_index` 不由更新命令改）。
 pub const SERVICE_UPDATABLE_COLUMNS: &str =
     "name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, restart_mode, \
      enabled, show_file_tree, open_enabled, open_port, tool_commands, boot_enabled, boot_order, \
-     boot_check, boot_required, boot_credential_mode, health_check";
+     boot_check, boot_required, boot_credential_mode, health_check, crash_restart";
 
 /// `service_templates` 的列清单——**唯一来源**（ARCH-20）。
 ///
@@ -339,7 +346,7 @@ pub const SERVICE_UPDATABLE_COLUMNS: &str =
 pub const SERVICE_TEMPLATE_COLUMNS: &str =
     "id, name, command, cwd, watch_paths, watch_include, watch_exclude, env_vars, \
      restart_mode, enabled, show_file_tree, open_enabled, open_port, sort_index, \
-     tool_commands, open_tool_id";
+     tool_commands, open_tool_id, crash_restart";
 
 /// 由列清单生成 `VALUES` 用的命名占位符（`:列名`，顺序与列清单一致）。
 ///
@@ -384,6 +391,7 @@ pub fn query_services_by_project(conn: &Connection, project_id: &str) -> Result<
             boot_required: row.get::<_, i32>("boot_required")? != 0,
             boot_credential_mode: row.get("boot_credential_mode")?,
             health_check: row.get("health_check")?,
+            crash_restart: row.get::<_, i32>("crash_restart")? != 0,
         })
     }).map_err(|e| format!("读取服务数据失败: {}", e))?;
     let mut services = Vec::new();

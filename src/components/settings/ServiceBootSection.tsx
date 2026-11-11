@@ -560,6 +560,14 @@ function servicePhase(s: BootServiceStatus): {
         textCls: s.exit_code != null && s.exit_code !== 0 ? 'text-nexus-error' : 'text-nexus-muted',
         dot: s.exit_code != null && s.exit_code !== 0 ? 'bg-nexus-error' : 'bg-nexus-muted/40',
       };
+    case 'restarting':
+      // 崩溃后的退避等待（2/5/15/30/60 秒）：进程已退出，但启动器会自行拉起。
+      // error 里有"第 N/5 次"与剩余秒数，下面的错误行会显示。
+      return {
+        text: '自动重启中',
+        textCls: 'text-nexus-warning',
+        dot: 'bg-nexus-warning',
+      };
     case 'stopped':
       return { text: '已停止', textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
     case 'skipped':

@@ -260,6 +260,7 @@ struct ServiceInfo {
     boot_enabled: bool,
     boot_credential_mode: String,
     health_check: String,
+    crash_restart: bool,
 }
 
 /// 解析服务配置里的就绪检查；非法值不阻断启动（按"进程存活即就绪"处理并留痕）。
@@ -279,7 +280,7 @@ fn get_service_info(
 ) -> Result<ServiceInfo, String> {
     db.with_conn(|conn| {
         conn.query_row(
-            "SELECT name, command, cwd, project_id, env_vars, boot_enabled, boot_credential_mode, health_check \
+            "SELECT name, command, cwd, project_id, env_vars, boot_enabled, boot_credential_mode, health_check, crash_restart \
              FROM services WHERE id=?1",
             [service_id],
             |row| Ok(ServiceInfo {
@@ -291,6 +292,7 @@ fn get_service_info(
                 boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
                 boot_credential_mode: row.get("boot_credential_mode")?,
                 health_check: row.get("health_check")?,
+                crash_restart: row.get::<_, i32>("crash_restart")? != 0,
             }),
         )
         .map_err(|e| format!("服务不存在: {}", e))
@@ -485,7 +487,7 @@ pub async fn start_service(app_handle: tauri::AppHandle, service_id: String) -> 
         state.process_mgr.start(crate::core::process::ServiceSpawn {
             project_id: &info.project_id, service_id: &service_id, name: &info.name,
             command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app_handle),
-            health_check,
+            health_check, crash_restart: info.crash_restart,
         }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("启动服务任务失败: {}", e))?
 }
@@ -545,6 +547,7 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
                     project_id: &info.project_id, service_id: &service_id, name: &info.name,
                     command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
                     health_check: parse_health(&info.health_check),
+                    crash_restart: info.crash_restart,
                 }).map_err(|e| format!("服务「{}」{}", info.name, e));
             }
         }
@@ -607,6 +610,7 @@ pub async fn restart_service(app: tauri::AppHandle, service_id: String) -> Resul
             project_id: &info.project_id, service_id: &service_id, name: &info.name,
             command: &info.command, cwd: &info.cwd, env_vars: &envs, log_sink: log_sink(&app),
             health_check: parse_health(&info.health_check),
+            crash_restart: info.crash_restart,
         }).map_err(|e| format!("服务「{}」{}", info.name, e))
     }).await.map_err(|e| format!("重启服务任务失败: {}", e))?
 }
@@ -621,6 +625,7 @@ struct ProjectStartRow {
     boot_enabled: bool,
     boot_credential_mode: String,
     health_check: String,
+    crash_restart: bool,
 }
 
 /// 就绪检查等待：只对**配置了检查**的服务生效（None 立即返回，不改变原有启动语义）。
@@ -679,7 +684,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         let state = app_handle.state::<AppState>();
         let services = state.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, command, cwd, env_vars, open_port, boot_enabled, boot_credential_mode, health_check \
+                "SELECT id, name, command, cwd, env_vars, open_port, boot_enabled, boot_credential_mode, health_check, crash_restart \
                  FROM services WHERE project_id=?1 AND enabled=1 ORDER BY sort_index"
             ).map_err(|e| format!("查询项目服务列表失败: {}", e))?;
             let rows = stmt.query_map([&project_id], |row| {
@@ -693,6 +698,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
                     boot_enabled: row.get::<_, i32>("boot_enabled")? != 0,
                     boot_credential_mode: row.get("boot_credential_mode")?,
                     health_check: row.get("health_check")?,
+                    crash_restart: row.get::<_, i32>("crash_restart")? != 0,
                 })
             }).map_err(|e| format!("读取项目服务数据失败: {}", e))?;
             let mut svcs = Vec::new();
@@ -711,7 +717,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
         for svc in &services {
             let ProjectStartRow {
                 id, name, command: cmd, cwd, env_vars, open_port, boot_enabled,
-                boot_credential_mode: boot_mode, health_check: health_raw,
+                boot_credential_mode: boot_mode, health_check: health_raw, crash_restart,
             } = svc;
             if boot_ids.contains(id) { continue; }
             // 本地已在运行：直接跳过（必须排在开机启动路由之前，否则本地实例 +
@@ -762,6 +768,7 @@ pub async fn start_project_services(app_handle: tauri::AppHandle, project_id: St
             match state.process_mgr.start(crate::core::process::ServiceSpawn {
                 project_id: &project_id, service_id: id, name, command: cmd, cwd,
                 env_vars: &envs, log_sink: log_sink(&app_handle), health_check: health.clone(),
+                crash_restart: *crash_restart,
             }) {
                 Ok(()) => {
                     // 配置了就绪检查才等待；这是“依赖等待”的落点：前一个服务没就绪，
@@ -980,6 +987,220 @@ pub async fn get_running(app: tauri::AppHandle) -> Result<ProcessStatus, String>
         }
         Ok(ProcessStatus { running, failed })
     }).await.map_err(|e| format!("获取运行状态任务失败: {}", e))?
+}
+
+// ─── 崩溃自动重启（本地服务）──────────────────────────────────
+//
+// 与文件监听自动重启（前端 autoRestart.ts）分工：文件变更归前端（它知道"代码还在变"），
+// 进程自己死了归这里。规则与预算在 core::restart_policy（开机启动器共用同一份）。
+
+/// 启动崩溃自动重启监督线程。
+///
+/// 为什么必须在后端：界面最小化/隐藏时 WebView2 会节流 setInterval（≥1 分钟），
+/// 崩溃判定与自动拉起不能依赖前端轮询。这个线程只做决策，真正重启走
+/// `ProcessManager::auto_restart`（生命周期锁内复核失败记录）。
+pub(crate) fn spawn_auto_restart_thread(app: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("nexus-auto-restart".into())
+        .spawn(move || {
+            let mut supervisor = crate::core::auto_restart::AutoRestartSupervisor::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(1000));
+                // 应用正在退出：不得再拉起新进程（stop_all 刚刚清空进程表）
+                if crate::commands::app::exit_in_progress() {
+                    break;
+                }
+                let Some(state) = app.try_state::<AppState>() else { break };
+                auto_restart_tick(&app, &state, &mut supervisor);
+            }
+        })
+        .map(|_| log::info!("[nexus] 崩溃自动重启监督线程已启动"))
+        .unwrap_or_else(|e| {
+            // 起不来时服务仍能手动启停，只是崩溃后停在失败态——必须留痕
+            log::warn!("[nexus] 崩溃自动重启监督线程启动失败（崩溃服务将只停留在失败态）: {}", e);
+        });
+}
+
+fn auto_restart_tick(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    supervisor: &mut crate::core::auto_restart::AutoRestartSupervisor,
+) {
+    // 退出流程已开始：stop_all 正在清场，绝不能再拉起新进程
+    if crate::commands::app::exit_in_progress() {
+        return;
+    }
+    // 兜底：生命周期心跳线程创建失败时（极罕见，会留一条 warn），崩溃判定没人推进。
+    // 这个线程不能因此变成"看得见失败表、但表永远是空的"——自己 tick 一拍。
+    if !crate::core::process::LIFECYCLE_TICKER_ALIVE
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state.process_mgr.tick();
+    }
+    let failed = state.process_mgr.failed();
+    // 运行表只取 (id, 启动时刻)：监督器用它判断服务是否已重新跑起来
+    let running: Vec<(String, u64)> = state
+        .process_mgr
+        .snapshot_running_detail()
+        .into_iter()
+        .map(|d| (d.service_id, d.started_at))
+        .collect();
+    let actions = supervisor.poll(
+        &failed,
+        &running,
+        crate::core::restart_policy::now_millis(),
+    );
+    for action in actions {
+        match action {
+            crate::core::auto_restart::AutoRestartAction::Restart(plan) => {
+                execute_auto_restart(app, state, plan)
+            }
+            crate::core::auto_restart::AutoRestartAction::GiveUp(plan) => {
+                report_auto_restart_give_up(app, state, plan)
+            }
+        }
+    }
+}
+
+fn execute_auto_restart(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    plan: crate::core::auto_restart::RestartPlan,
+) {
+    let service_id = plan.service_id;
+    let info = match get_service_info(&state.db, &service_id) {
+        Ok(info) => info,
+        Err(e) => {
+            // 服务被删/库损坏：没有可启动的配置，留在失败态即可
+            log::warn!("[nexus] 自动重启 {} 跳过：{}", service_id, e);
+            return;
+        }
+    };
+    // 开机启动器才是它的所有者：本地监督器拉起会出现第二份实例。
+    // （服务配置为 boot_enabled 但历史上在本地跑过时，也可能走到这里。）
+    if info.boot_enabled || crate::commands::boot::live_boot_service(&service_id).is_some() {
+        log::info!(
+            "[nexus] 自动重启 {} 跳过：服务由开机启动器管理（本地不重复拉起）",
+            service_id
+        );
+        return;
+    }
+    // 排期之后用户又关掉了开关：失败记录里存的是当时的值，必须在执行前再查一次库。
+    // （正在运行的实例由 update_service 即时同步；这里兜住"已失败、无进程表项"的情况。）
+    if !info.crash_restart {
+        log::info!("[nexus] 自动重启 {} 跳过：服务已关闭崩溃自动重启", service_id);
+        return;
+    }
+    let envs = match crate::core::process::parse_env_vars(&info.env_vars) {
+        Ok(envs) => envs,
+        Err(e) => {
+            log::warn!("[nexus] 自动重启 {} 跳过：环境变量解析失败: {}", service_id, e);
+            state
+                .process_mgr
+                .append_system_line(&service_id, format!("自动重启失败：{}", e));
+            emit_auto_restart_notice(app, &service_id, &info.name, "failed", plan.attempt, &e);
+            return;
+        }
+    };
+    let uptime_secs = plan.uptime_ms.unwrap_or(0) / 1000;
+    let code = plan.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+    let note = format!(
+        "自动重启（第 {} 次）：上次运行意外退出（退出码: {}，运行 {} 秒）；崩溃日志保留在下方",
+        plan.attempt, code, uptime_secs
+    );
+    log::info!(
+        "[nexus] 自动重启服务 {} ({})：第 {}/{} 次，上次退出码={:?}，运行 {:?}ms",
+        service_id, info.name, plan.attempt,
+        crate::core::restart_policy::MAX_RESTARTS, plan.exit_code, plan.uptime_ms
+    );
+    let started = state.process_mgr.auto_restart(
+        crate::core::process::ServiceSpawn {
+            project_id: &info.project_id,
+            service_id: &service_id,
+            name: &info.name,
+            command: &info.command,
+            cwd: &info.cwd,
+            env_vars: &envs,
+            log_sink: log_sink(app),
+            health_check: parse_health(&info.health_check),
+            crash_restart: info.crash_restart,
+        },
+        &plan.failure_timestamp,
+        note,
+    );
+    match started {
+        Ok(true) => {}
+        Ok(false) => log::info!(
+            "[nexus] 自动重启 {} 跳过：失败记录已被用户/文件监听抢先处理",
+            service_id
+        ),
+        Err(e) => {
+            // 两种失败形态：spawn 失败会由 start 写回一条新的失败记录（运行时长不可知 →
+            // 不会再次进入崩溃重启）；工作目录为空等早退则不会。统一补一条，保证卡片上
+            // 看得见"失败"，而不是服务凭空消失、只剩一条日志。
+            log::warn!("[nexus] 自动重启服务 {} 失败: {}", service_id, e);
+            state.process_mgr.record_auto_restart_failure(&service_id);
+            state
+                .process_mgr
+                .append_system_line(&service_id, format!("自动重启失败：{}", e));
+            emit_auto_restart_notice(app, &service_id, &info.name, "failed", plan.attempt, &e);
+        }
+    }
+}
+
+fn report_auto_restart_give_up(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    plan: crate::core::auto_restart::GiveUpPlan,
+) {
+    let name = get_service_info(&state.db, &plan.service_id)
+        .map(|info| info.name)
+        .unwrap_or_else(|_| plan.service_id.clone());
+    let note = format!(
+        "自动重启已用尽（{} 分钟内 {} 次），不再自动重启；日志保留下方，请检查后手动处理",
+        crate::core::restart_policy::WINDOW_MS / 60_000,
+        plan.attempts
+    );
+    state.process_mgr.append_system_line(&plan.service_id, note.clone());
+    log::warn!("[nexus] 服务 {} {}", plan.service_id, note);
+    emit_auto_restart_notice(app, &plan.service_id, &name, "gave_up", plan.attempts, &note);
+}
+
+/// 自动重启相关事件：前端只在"用尽/启动失败"时提示用户，成功的重启是静默的
+/// （崩溃循环里每次弹一条会淹没界面）。
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct AutoRestartNotice {
+    pub(crate) service_id: String,
+    pub(crate) service_name: String,
+    /// gave_up = 预算用尽；failed = 这次自动重启本身没成功
+    pub(crate) status: &'static str,
+    pub(crate) attempts: u32,
+    pub(crate) error: String,
+}
+
+fn emit_auto_restart_notice(
+    app: &tauri::AppHandle,
+    service_id: &str,
+    service_name: &str,
+    status: &'static str,
+    attempts: u32,
+    error: &str,
+) {
+    if let Err(e) = app.emit(
+        "service-auto-restart",
+        AutoRestartNotice {
+            service_id: service_id.to_string(),
+            service_name: service_name.to_string(),
+            status,
+            attempts,
+            error: error.to_string(),
+        },
+    ) {
+        log::warn!(
+            "[nexus] 自动重启事件发送失败（前端可能尚未注册监听）: {}",
+            e
+        );
+    }
 }
 
 /// 启动前检查端口冲突：优先用配置的 open_port；未配置时用该服务上次实际监听的端口。

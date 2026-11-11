@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod auto_restart;
 pub mod boot;
 pub mod classfile;
 pub mod decompiler;
@@ -14,6 +15,7 @@ pub mod logtext;
 pub mod ports;
 pub mod process;
 pub mod redact;
+pub mod restart_policy;
 pub mod runtime;
 pub mod textenc;
 pub mod winenv;

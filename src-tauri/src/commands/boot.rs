@@ -1032,6 +1032,10 @@ pub fn boot_failed_services() -> Vec<crate::core::process::FailedService> {
                 // 开机启动器的日志不在本地缓冲里；端口冲突信息由启动器自己的失败原因
                 // 承担，这里不硬凑（避免把别的进程误标成占用者）
                 port_conflict: None,
+                // 开机服务的崩溃重启由 runner 自己负责；本地监督器不看这个字段
+                uptime_ms: None,
+                // 展示层不区分；runner 侧的开关在 manifest 的 BootService 上
+                crash_restart: true,
             });
         }
     }
