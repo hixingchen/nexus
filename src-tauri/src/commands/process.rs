@@ -1004,6 +1004,12 @@ pub(crate) fn spawn_auto_restart_thread(app: tauri::AppHandle) {
         .name("nexus-auto-restart".into())
         .spawn(move || {
             let mut supervisor = crate::core::auto_restart::AutoRestartSupervisor::new();
+            // 已通知过的失败指纹（service_id → 失败时间戳）：同一条失败只弹一次系统通知。
+            // 放在线程里而不是 `core`：core 不认识 Tauri/系统通知。
+            let mut notified_failures: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut primed = false;
+            let mut ticks: u64 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(1000));
                 // 应用正在退出：不得再拉起新进程（stop_all 刚刚清空进程表）
@@ -1011,7 +1017,10 @@ pub(crate) fn spawn_auto_restart_thread(app: tauri::AppHandle) {
                     break;
                 }
                 let Some(state) = app.try_state::<AppState>() else { break };
-                auto_restart_tick(&app, &state, &mut supervisor);
+                auto_restart_tick(
+                    &app, &state, &mut supervisor, &mut notified_failures, &mut primed, ticks,
+                );
+                ticks = ticks.wrapping_add(1);
             }
         })
         .map(|_| log::info!("[nexus] 崩溃自动重启监督线程已启动"))
@@ -1021,23 +1030,82 @@ pub(crate) fn spawn_auto_restart_thread(app: tauri::AppHandle) {
         });
 }
 
+/// 这次失败是否值得发系统通知（纯函数，单测覆盖）。
+///
+/// 只在**最终失败**时通知，避免崩溃循环里每次重启都弹一条：
+/// - 开机启动服务的失败记录是最终态（runner 自动重启期间 phase 是 `restarting`）；
+/// - 本地服务只有关闭了崩溃自动重启时才是最终态；开着的话，重试用尽由
+///   `service-auto-restart` 事件负责。
+fn should_notify_failure(f: &crate::core::process::FailedService) -> bool {
+    f.source == "boot" || !f.crash_restart
+}
+
+/// 新失败 → 系统通知（窗口不在前台时才真的发；前台由应用内失败卡片承担）。
+///
+/// 只通知**最终失败**：
+/// - 开机启动服务进了失败表就是最终态（runner 自动重启期间 phase 是 `restarting`）；
+/// - 本地服务只在关闭了崩溃自动重启时才是最终态；开着的话，重试用尽由
+///   `service-auto-restart` 事件负责。
+///
+/// `notified_failures` 按 `(service_id, timestamp)` 去重：同一失败在后续轮询里补齐
+/// 端口冲突等字段不会重复弹。第一拍只做种子、不通知——应用启动时已存在的失败
+/// （例如开机服务上次就失败了）在界面上能看到，不该每次启动都弹一遍。
+fn notify_new_failures(
+    app: &tauri::AppHandle,
+    failed: &[crate::core::process::FailedService],
+    notified_failures: &mut std::collections::HashMap<String, String>,
+    primed: &mut bool,
+) {
+    let first_snapshot = !*primed;
+    for f in failed {
+        if notified_failures.get(&f.service_id).map(|t| t == &f.timestamp).unwrap_or(false) {
+            continue;
+        }
+        notified_failures.insert(f.service_id.clone(), f.timestamp.clone());
+        if first_snapshot {
+            continue;
+        }
+        if !should_notify_failure(f) {
+            continue;
+        }
+        let name = if f.service_name.is_empty() { &f.service_id } else { &f.service_name };
+        let code = f.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+        let title = format!("服务「{}」运行失败", name);
+        let body = format!("退出码 {}；失败输出已保留在应用内的日志面板。", code);
+        if let Err(e) = crate::commands::notify::notify_if_background(app, &title, &body) {
+            log::warn!("[nexus] 发送失败系统通知失败（{}）: {}", name, e);
+        }
+    }
+    *primed = true;
+}
+
 fn auto_restart_tick(
     app: &tauri::AppHandle,
     state: &AppState,
     supervisor: &mut crate::core::auto_restart::AutoRestartSupervisor,
+    notified_failures: &mut std::collections::HashMap<String, String>,
+    primed: &mut bool,
+    ticks: u64,
 ) {
     // 退出流程已开始：stop_all 正在清场，绝不能再拉起新进程
     if crate::commands::app::exit_in_progress() {
         return;
     }
-    // 兜底：生命周期心跳线程创建失败时（极罕见，会留一条 warn），崩溃判定没人推进。
-    // 这个线程不能因此变成"看得见失败表、但表永远是空的"——自己 tick 一拍。
-    if !crate::core::process::LIFECYCLE_TICKER_ALIVE
-        .load(std::sync::atomic::Ordering::Relaxed)
+    // 第一拍先 tick：把启动时已存在的失败捞出来做"已通知"种子，避免历史失败在启动后
+    // 被当成新失败弹一遍。之后仅在生命周期心跳线程创建失败时兜底 tick（会留 warn）。
+    if !*primed
+        || !crate::core::process::LIFECYCLE_TICKER_ALIVE
+            .load(std::sync::atomic::Ordering::Relaxed)
     {
         state.process_mgr.tick();
     }
-    let failed = state.process_mgr.failed();
+    let mut failed = state.process_mgr.failed();
+    // 开机启动服务的失败也在这里统一发通知：它的 state.json 只有 get_running
+    // （前端轮询，隐藏时会节流）会读。每 3 拍读一次，代价与前端 3 秒轮询同量级。
+    if ticks.is_multiple_of(3) {
+        failed.extend(crate::commands::boot::boot_failed_services());
+    }
+    notify_new_failures(app, &failed, notified_failures, primed);
     // 运行表只取 (id, 启动时刻)：监督器用它判断服务是否已重新跑起来
     let running: Vec<(String, u64)> = state
         .process_mgr
@@ -1139,11 +1207,15 @@ fn execute_auto_restart(
             // 不会再次进入崩溃重启）；工作目录为空等早退则不会。统一补一条，保证卡片上
             // 看得见"失败"，而不是服务凭空消失、只剩一条日志。
             log::warn!("[nexus] 自动重启服务 {} 失败: {}", service_id, e);
-            state.process_mgr.record_auto_restart_failure(&service_id);
+            state.process_mgr.record_auto_restart_failure(&service_id, &info.name);
             state
                 .process_mgr
                 .append_system_line(&service_id, format!("自动重启失败：{}", e));
             emit_auto_restart_notice(app, &service_id, &info.name, "failed", plan.attempt, &e);
+            let title = format!("服务「{}」自动重启失败", info.name);
+            if let Err(ne) = crate::commands::notify::notify_if_background(app, &title, &e) {
+                log::warn!("[nexus] 发送自动重启失败通知失败: {}", ne);
+            }
         }
     }
 }
@@ -1164,6 +1236,12 @@ fn report_auto_restart_give_up(
     state.process_mgr.append_system_line(&plan.service_id, note.clone());
     log::warn!("[nexus] 服务 {} {}", plan.service_id, note);
     emit_auto_restart_notice(app, &plan.service_id, &name, "gave_up", plan.attempts, &note);
+    // 通知由后端发：窗口隐藏时前端事件监听虽然通常还在，但 WebView 被节流/挂起时
+    // 不该让"重试用尽"这种关键事件跟着丢。
+    let title = format!("服务「{}」自动重启已停止", name);
+    if let Err(e) = crate::commands::notify::notify_if_background(app, &title, &note) {
+        log::warn!("[nexus] 发送自动重启停止通知失败: {}", e);
+    }
 }
 
 /// 自动重启相关事件：前端只在"用尽/启动失败"时提示用户，成功的重启是静默的
@@ -1710,6 +1788,29 @@ fn stop_tool_command_inner(table: &ToolCmdTable, run_id: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 系统通知只覆盖**最终失败**：本地开着崩溃自动重启时由放弃事件通知，
+    /// 开机启动服务的失败表本身就是最终态。
+    #[test]
+    fn test_should_notify_failure_only_for_final_failures() {
+        let make = |source: &str, crash_restart: bool| crate::core::process::FailedService {
+            service_id: "s".into(),
+            service_name: "svc".into(),
+            exit_code: Some(1),
+            timestamp: "t".into(),
+            source: source.into(),
+            port_conflict: None,
+            uptime_ms: Some(60_000),
+            crash_restart,
+        };
+        assert!(!should_notify_failure(&make("local", true)),
+            "本地自动重启开着：瞬态崩溃不通知，等放弃事件");
+        assert!(should_notify_failure(&make("local", false)),
+            "本地关闭自动重启：失败即最终态");
+        assert!(should_notify_failure(&make("boot", true)),
+            "开机服务进失败表即最终态");
+        assert!(should_notify_failure(&make("boot", false)));
+    }
 
     #[test]
     fn test_phase_grace_period() {

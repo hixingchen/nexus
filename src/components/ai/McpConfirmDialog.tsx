@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { aiService } from '../../services/aiService';
+import { notifySystem } from '../../services/system';
 import { Modal } from '../ui/Modal';
 import { reportError } from '../../utils/error';
 import { showNotification } from '../ui/Toast';
@@ -33,6 +34,8 @@ export function McpConfirmDialog() {
     void listen<ConfirmRequest>('mcp-confirm-request', (ev) => {
       if (!alive) return;
       setReq(ev.payload);
+      // 窗口不在前台时提醒用户：AI 的高危操作正等着确认（后端判断焦点，前台不打扰）
+      void notifySystem('AI 请求执行高危操作', ev.payload.title);
     })
       .then((fn) => {
         if (alive) unlisten = fn;

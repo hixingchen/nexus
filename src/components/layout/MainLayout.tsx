@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { TitleBar } from './TitleBar';
 import { StatusBar } from './StatusBar';
 import { ResizablePanel } from './ResizablePanel';
@@ -19,6 +20,10 @@ import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ToolCommandIndicator } from '../ui/ToolCommandIndicator';
 import { useToolCommandDialog } from '../../hooks/useToolCommandRunner';
 import { securityApi, projectApi } from '../../services/service';
+import { setTrayProject } from '../../services/system';
+import { useSvcCacheStore } from '../../stores/svcCacheStore';
+import { startProjectWithFeedback, stopProjectWithFeedback } from '../../stores/serviceActions';
+import { useExitIntentStore } from '../../stores/exitIntentStore';
 import { LAYOUT_KEYS, saveLayout as saveLayoutFn, useLayoutStore } from '../../stores/layoutStore';
 import { parseEditorFontSize } from '../../utils/editorFont';
 import { isLogViewerOpen, useLogStore } from '../../stores/logStore';
@@ -48,6 +53,12 @@ export function MainLayout() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
+  /**
+   * 托盘事件回调注册一次、活得比项目切换久，闭包里必须读**最新**的当前项目。
+   * （每次切换都重订阅也能做，但会平白多一轮 IPC 监听注册/注销。）
+   */
+  const selectedRef = useRef<{ id: string | null; name: string | null }>({ id: null, name: null });
+  selectedRef.current = { id: selectedProjectId, name: selectedProjectName };
   const [leftPanelWidth, setLeftPanelWidth] = useState(DEFAULT_LEFT_PANEL_WIDTH);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
@@ -270,6 +281,48 @@ export function MainLayout() {
     persistedLeftCollapsedRef.current = leftPanelCollapsed;
     saveLayout({ [LAYOUT_KEYS.leftPanelCollapsed]: leftPanelCollapsed ? '1' : '0' });
   }, [leftPanelCollapsed, ready, saveLayout]);
+
+  // 当前选中项目 → 托盘菜单（启动/停止项的文字与可用状态）
+  useEffect(() => {
+    void setTrayProject(selectedProjectName);
+  }, [selectedProjectName]);
+
+  // 托盘「启动/停止当前项目」：与界面上的按钮走同一套动作与反馈（含日志/监听/提示）。
+  // 窗口隐藏时前端仍存活，事件照常送达；失败反馈会再转成系统通知。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<string>('tray-action', (event) => {
+      if (disposed) return;
+      const { id, name } = selectedRef.current;
+      if (!id) return;
+      const display = name ?? '当前项目';
+      if (event.payload === 'start-project') {
+        void startProjectWithFeedback(id, display);
+      } else if (event.payload === 'stop-project') {
+        const services = useSvcCacheStore.getState().cache[id] ?? [];
+        void stopProjectWithFeedback(id, display, services);
+      }
+    }).then(fn => {
+      if (disposed) fn(); else unlisten = fn;
+    }).catch(e => reportError('订阅托盘操作失败', e, { silent: true }));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  // 托盘「退出」：标记一次性意图后走**同一条**关窗守卫（未保存草稿确认 → prepare_exit）。
+  // 后端在发事件前已把窗口显示出来，确认框不会出现在隐藏的窗口里。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen('tray-quit', () => {
+      if (disposed) return;
+      useExitIntentStore.getState().requestTrayQuit();
+      void getCurrentWindow().close().catch(e => reportError('托盘退出失败', e));
+    }).then(fn => {
+      if (disposed) fn(); else unlisten = fn;
+    }).catch(e => reportError('订阅托盘退出失败', e, { silent: true }));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
 
   // 文件监听由 ProjectDetail 统一管理（服务配置变更时需重启监听）
 

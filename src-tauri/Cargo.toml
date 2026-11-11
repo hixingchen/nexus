@@ -25,10 +25,12 @@ zstd = "0.14"
 # （tauri-codegen 与 wry 都依赖 sha2），这里只是把传递依赖提成直接依赖，
 # 不新增任何需要下载/审计的包——比手写一份 SHA-256 更不容易出错
 sha2 = "0.10"
-tauri = { version = "2.0", features = ["unstable"] }
+tauri = { version = "2.0", features = ["unstable", "tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2.0"
 tauri-plugin-dialog = "2.0"
+# 系统通知（托盘模式/窗口不在前台时的服务失败、自动重启放弃）
+tauri-plugin-notification = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # 只声明实际用到的 feature：fs（tokio::fs）/ time（超时）/ process（java 反编译）/ io-util（AsyncRead/Seek）

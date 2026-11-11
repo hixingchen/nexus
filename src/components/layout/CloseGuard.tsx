@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useEditorStore, saveAllDirtyTabs, unsavedDraftCount } from '../../stores/editor';
 import { useServiceDraftStore } from '../../stores/serviceDraftStore';
-import { prepareExit } from '../../services/system';
-import { flushLayoutWrites } from '../../stores/layoutStore';
+import { notifySystem, prepareExit } from '../../services/system';
+import { flushLayoutWrites, LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
+import { useExitIntentStore } from '../../stores/exitIntentStore';
+import { decideCloseAction } from '../../utils/closeDecision';
 import { reportError } from '../../utils/error';
 import { Modal } from '../ui/Modal';
 import { showNotification } from '../ui/Toast';
@@ -30,6 +32,8 @@ export function CloseGuard() {
   const [askClose, setAskClose] = useState(false);
   const [exiting, setExiting] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** 本次进程内只提示一次"已最小化到托盘"，避免每次关窗都弹系统通知 */
+  const hidToTrayNotice = useRef(false);
   /** 监听回调只注册一次，闭包里的 dirtyCount 会过期——用 ref 读最新值 */
   const dirtyRef = useRef(dirtyCount);
   dirtyRef.current = dirtyCount;
@@ -58,16 +62,52 @@ export function CloseGuard() {
     }
   }, []);
 
+  // 托盘相关的设置存在布局 KV 里；MainLayout 通常已加载，但 CloseGuard 不依赖加载顺序
+  useEffect(() => { void useLayoutStore.getState().ensureLoaded(); }, []);
+
   useEffect(() => {
     const appWindow = getCurrentWindow();
     let disposed = false;
     let unlisten: (() => void) | null = null;
     appWindow
       .onCloseRequested(event => {
-        // 一律拦下：由这里决定"弹确认"还是"直接退出"，否则窗口会立刻销毁（草稿丢失）
+        // 一律拦下：由这里决定"弹确认/隐藏/退出"，否则窗口会立刻销毁（草稿丢失）
         event.preventDefault();
-        if (freshDirtyCount() > 0) setAskClose(true);
-        else void beginExit();
+        // 托盘退出是一次性意图：必须在判断前消费，避免下一次普通关窗被误判成退出
+        // 直接从 store 读开关：`saveLayout` 同步更新内存值，比 ref 少一次"渲染后才生效"的窗口
+        const closeToTray = useLayoutStore.getState().values?.[LAYOUT_KEYS.closeToTray] === '1';
+        const action = decideCloseAction({
+          trayQuit: useExitIntentStore.getState().consumeTrayQuit(),
+          closeToTray,
+          dirtyCount: freshDirtyCount(),
+        });
+        if (action === 'hide') {
+          // 关闭到托盘：隐藏不销毁 WebView，草稿与运行中的服务都保留。
+          // 先 await hide 再发提示：通知的后端判据是"窗口不聚焦"，抢在 hide 之前
+          // 发会被判成前台而静默丢弃。
+          void (async () => {
+            try {
+              await appWindow.hide();
+            } catch (err) {
+              reportError('最小化到托盘失败', err);
+              return;
+            }
+            if (!hidToTrayNotice.current) {
+              hidToTrayNotice.current = true;
+              // 隐藏后窗口不在前台，后端会真的发出这条通知：第一次用托盘要知道怎么退出
+              await notifySystem(
+                'Nexus 已最小化到托盘',
+                '服务仍在后台运行；要退出请用托盘菜单「退出 Nexus」。',
+              );
+            }
+          })();
+          return;
+        }
+        if (action === 'ask') {
+          setAskClose(true);
+          return;
+        }
+        void beginExit();
       })
       .then(fn => { if (disposed) fn(); else unlisten = fn; })
       .catch(e => reportError('订阅窗口关闭请求失败', e, {

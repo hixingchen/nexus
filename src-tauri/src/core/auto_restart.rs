@@ -215,6 +215,7 @@ mod tests {
     fn failed(id: &str, ts: &str, code: Option<i32>, uptime_ms: Option<u64>) -> FailedService {
         FailedService {
             service_id: id.into(),
+            service_name: id.into(),
             exit_code: code,
             timestamp: ts.into(),
             source: "local".into(),

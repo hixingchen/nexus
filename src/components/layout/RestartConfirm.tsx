@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { processApi, type AutoRestartNotice, type FileChangeEvent } from '../../services/service';
+import { notifySystem } from '../../services/system';
 import { reportError } from '../../utils/error';
 import { notify } from '../../utils/notify';
 import { createAutoRestarter } from '../../utils/autoRestart';
@@ -64,14 +65,17 @@ export function RestartConfirm() {
       },
       sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
       onGiveUp: ({ serviceName, attempts }) => {
+        const description =
+          `已连续尝试 ${attempts} 次。失败那次的输出保留在日志面板里（点服务卡片上的「失败」），`
+          + `多半是端口没释放或代码当时还没写完——稍后手动重启一次通常就好了。`;
         notify({
           variant: 'error',
           title: `服务「${serviceName}」自动重启未成功`,
-          description:
-            `已连续尝试 ${attempts} 次。失败那次的输出保留在日志面板里（点服务卡片上的「失败」），`
-            + `多半是端口没释放或代码当时还没写完——稍后手动重启一次通常就好了。`,
+          description,
           duration: 12000,
         });
+        // 文件监听的重试状态机在前端，系统通知也只能由这里发；后端会按焦点决定是否真的弹
+        void notifySystem(`服务「${serviceName}」自动重启未成功`, description);
       },
       onError: (sid, e) => reportError(`自动重启服务失败（服务 ${sid}）`, e),
     });
@@ -131,15 +135,17 @@ export function RestartConfirm() {
     listen<AutoRestartNotice>('service-auto-restart', (event) => {
       if (disposed) return;
       const p = event.payload;
+      const title = p.status === 'gave_up'
+        ? `服务「${p.service_name}」自动重启已停止`
+        : `服务「${p.service_name}」自动重启失败`;
       notify({
         variant: 'error',
-        title: p.status === 'gave_up'
-          ? `服务「${p.service_name}」自动重启已停止`
-          : `服务「${p.service_name}」自动重启失败`,
+        title,
         // 原因由后端给（窗口/次数与策略常量同源），前端不再写死 "10 分钟 / 5 次"
         description: p.error,
         duration: 12000,
       });
+      // 系统通知由后端在同一处发出（窗口隐藏/WebView 被挂起也不丢），这里只负责应用内 toast
     }).then(fn => {
       if (disposed) { fn(); return; }
       unlistenAutoRestart = fn;

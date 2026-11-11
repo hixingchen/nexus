@@ -1,8 +1,9 @@
 import { processApi, watchApi, type Service } from '../services/service';
+import { notifySystem } from '../services/system';
 import { useLogStore } from './logStore';
 import { useRunningStore } from './runningStore';
 import { notify } from '../utils/notify';
-import { reportError } from '../utils/error';
+import { reportError, toMessage } from '../utils/error';
 
 /**
  * 服务启停的**共享动作层**（ARCH-7 ①）。
@@ -52,16 +53,22 @@ export async function startProjectWithFeedback(
   try {
     const errors = await startProjectServices(projectId);
     if (errors.length > 0) {
+      const description = errors.join(', ');
       notify({
         variant: 'error',
         title: `「${projectName}」部分服务启动失败`,
-        description: errors.join(', '),
+        description,
       });
+      // 托盘发起的启动时窗口通常是隐藏的：把失败原因送到系统通知
+      void notifySystem(`「${projectName}」部分服务启动失败`, description);
     } else {
       notify({ title: `「${projectName}」已启动`, description: '所有已启用的服务已启动' });
+      // 托盘发起的动作窗口通常隐藏：成功也要有反馈，否则用户不知道点没生效
+      void notifySystem(`「${projectName}」已启动`, '所有已启用的服务已启动');
     }
   } catch (e) {
     reportError(`启动「${projectName}」失败`, e);
+    void notifySystem(`「${projectName}」启动失败`, toMessage(e));
   }
 }
 
@@ -74,16 +81,20 @@ export async function stopProjectWithFeedback(
   try {
     const errors = await stopProjectServices(projectId, services);
     if (errors.length > 0) {
+      const description = errors.join(', ');
       notify({
         variant: 'error',
         title: `「${projectName}」部分服务停止失败`,
-        description: errors.join(', '),
+        description,
       });
+      void notifySystem(`「${projectName}」部分服务停止失败`, description);
     } else {
       notify({ variant: 'info', title: `「${projectName}」已停止`, description: '所有服务已停止' });
+      void notifySystem(`「${projectName}」已停止`, '所有服务已停止');
     }
   } catch (e) {
     reportError(`停止「${projectName}」失败`, e);
+    void notifySystem(`「${projectName}」停止失败`, toMessage(e));
   }
 }
 

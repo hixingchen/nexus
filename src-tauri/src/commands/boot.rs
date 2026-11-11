@@ -1026,6 +1026,7 @@ pub fn boot_failed_services() -> Vec<crate::core::process::FailedService> {
             if !failed || !seen.insert(id.clone()) { continue; }
             out.push(crate::core::process::FailedService {
                 service_id: id.clone(),
+                service_name: s.name.clone(),
                 exit_code: s.exit_code,
                 timestamp: s.ready_at.clone().or_else(|| s.started_at.clone()).unwrap_or_default(),
                 source: "boot".into(),

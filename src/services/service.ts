@@ -478,6 +478,8 @@ export interface PortConflict {
 /** 意外退出的服务（崩溃/秒退/spawn 失败）；主动停止不算失败 */
 export interface FailedService {
   service_id: string;
+  /** 服务显示名（系统通知/失败卡片直接用它，前端不必再查缓存；旧后端缺省） */
+  service_name?: string;
   /** spawn 失败（进程未启动）时为 null */
   exit_code: number | null;
   timestamp: string;

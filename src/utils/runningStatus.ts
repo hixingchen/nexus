@@ -57,7 +57,8 @@ export function sameRunningStatus(
     })
     && af.every((x, i) => {
       const y = bf[i];
-      return y && x.service_id === y.service_id && x.exit_code === y.exit_code
+      return y && x.service_id === y.service_id && x.service_name === y.service_name
+        && x.exit_code === y.exit_code
         && x.timestamp === y.timestamp && x.source === y.source
         && x.uptime_ms === y.uptime_ms
         && x.crash_restart === y.crash_restart

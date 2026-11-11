@@ -39,6 +39,8 @@ const MAX_SERVICES: usize = 50;
 #[derive(Clone, Serialize, Debug)]
 pub struct FailedService {
     pub service_id: String,
+    /// 服务显示名（系统通知与失败卡片直接用它，前端不必再查缓存）
+    pub service_name: String,
     /// spawn 失败（进程未启动）时为 None
     pub exit_code: Option<i32>,
     pub timestamp: String,
@@ -132,6 +134,8 @@ struct CleanupEntry {
 /// `pub(crate)`（ARCH-23）：`core::logfollow` 里的 `impl ProcessManager`（跟随相关方法）
 /// 与 `core::process` 同属一张表的读写方，字段可见性按它们用到的部分放开。
 pub(crate) struct ProcessInfo {
+    /// 服务显示名（失败记录与系统通知要用）
+    name: String,
     /// 直接子进程（cmd / sh）。认领游离进程后置 None（它已退出并被回收）
     child: Option<Child>,
     pid: u32,
@@ -391,6 +395,7 @@ impl ProcessManager {
                 if let Ok(mut failed) = self.failed.lock() {
                     failed.insert(key.to_string(), FailedService {
                         service_id: key.to_string(),
+                        service_name: name.to_string(),
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
@@ -423,6 +428,7 @@ impl ProcessManager {
                 if let Ok(mut failed) = self.failed.lock() {
                     failed.insert(key.to_string(), FailedService {
                         service_id: key.to_string(),
+                        service_name: name.to_string(),
                         exit_code: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         source: "local".into(),
@@ -534,6 +540,7 @@ impl ProcessManager {
         // 而这个分支紧随其后就会被 running() 判成"已退出"，不会留下长期影响
         let spawn_started_at = process_start_time_millis(pid).unwrap_or(0);
         procs.insert(key.to_string(), ProcessInfo {
+            name: name.to_string(),
             child: Some(child), pid, spawn_started_at, adopted: Vec::new(),
             cwd: cwd.to_string(), follow: None, health_check, health_unready: false,
             health_ready: false, crash_restart, log_probe: None,
@@ -748,14 +755,17 @@ impl ProcessManager {
 
     /// 自动重启**本身**失败（配置错误等、进程根本没起来）时补一条失败记录。
     ///
+    /// `name` 只用于展示（失败卡片/系统通知）；调用方从数据库配置里取。
+    ///
     /// 为什么需要它：`auto_restart` 的 stop 阶段已经清掉旧失败记录，而 `start_locked_with`
     /// 的早退（工作目录为空、已达并发上限）不会再写失败记录。不补的话，卡片上既不是
     /// 运行中也不是失败——服务凭空消失，只剩一条用户可能没看到的系统日志。
     /// `uptime_ms: None` 表示"启动就没成功"，监督器不会再为它排自动重启（避免配置错误循环）。
-    pub(crate) fn record_auto_restart_failure(&self, key: &str) {
+    pub(crate) fn record_auto_restart_failure(&self, key: &str, name: &str) {
         if let Ok(mut failed) = self.failed.lock() {
             failed.insert(key.to_string(), FailedService {
                 service_id: key.to_string(),
+                service_name: name.to_string(),
                 exit_code: None,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 source: "local".into(),
@@ -898,6 +908,8 @@ impl ProcessManager {
             stop_epoch: u64,
             /// 崩溃自动重启开关：随失败记录带给监督器
             crash_restart: bool,
+            /// 服务显示名（失败记录/系统通知用）
+            service_name: String,
         }
 
         // Phase 1（锁内，只做判定）：child 存活的跳过；child 已退出的记为候选；
@@ -921,6 +933,7 @@ impl ProcessManager {
                             check_survivors: true,
                             stop_epoch: self.stop_epoch(k),
                             crash_restart: info.crash_restart,
+                            service_name: info.name.clone(),
                         }),
                         Ok(None) => {} // 运行中
                         Err(e) => {
@@ -942,6 +955,7 @@ impl ProcessManager {
                                 check_survivors: false,
                                 stop_epoch: self.stop_epoch(k),
                                 crash_restart: info.crash_restart,
+                                service_name: info.name.clone(),
                             });
                         } else if info.follow.is_none() {
                             // 认领意味着 stdout 拿不到东西了：找找它在写哪个日志文件。
@@ -977,10 +991,10 @@ impl ProcessManager {
         // ① 把新 Child 的 wait() 放进全局 processes 锁里 → 整个进程管理假死；
         // ② 摘掉新实例并 taskkill → 刚重启的服务被杀；
         // ③ 对已被 stop 的 key 写“进程已退出”并插入 failed。
-        // (key, 退出码, 进程启动时刻, 摘表时的停止代际, 崩溃自动重启开关)：
+        // (key, 服务名, 退出码, 进程启动时刻, 摘表时的停止代际, 崩溃自动重启开关)：
         // 启动时刻用来在失败记录里带上运行时长（自动重启区分启动失败/崩溃）；
-        // 停止代际用于落表前复核；开关随失败记录交给监督器。
-        let mut exited: Vec<(String, Option<i32>, u64, u64, bool)> = Vec::new();
+        // 停止代际用于落表前复核；开关与名称随失败记录交给监督器/通知。
+        let mut exited: Vec<(String, String, Option<i32>, u64, u64, bool)> = Vec::new();
         let mut dead: Vec<CleanupEntry> = Vec::new();
         let mut adopted_logs: Vec<(String, String)> = Vec::new();
         // child.wait() 不能在锁内做：新启动的进程可能长期运行，持锁等待会冻结所有 IPC。
@@ -1001,7 +1015,10 @@ impl ProcessManager {
                         continue;
                     }
                     let Some(mut info) = procs.remove(&e.key) else { continue };
-                    exited.push((e.key.clone(), e.exit_code, e.started_at, e.stop_epoch, e.crash_restart));
+                    exited.push((
+                        e.key.clone(), e.service_name, e.exit_code,
+                        e.started_at, e.stop_epoch, e.crash_restart,
+                    ));
                     dead.push(take_cleanup_entry(e.key, &mut info));
                     continue;
                 };
@@ -1032,7 +1049,7 @@ impl ProcessManager {
         }
 
         // Phase 2.5（锁外）：写日志标记与失败状态（原实现在持锁期间做）
-        for (key, code, started_at, stop_epoch, crash_restart) in &exited {
+        for (key, service_name, code, started_at, stop_epoch, crash_restart) in &exited {
             let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             // 端口冲突要读日志（日志缓冲锁），放在进程锁之外算
             let port_conflict = self.bind_conflict_from_logs(key);
@@ -1058,6 +1075,7 @@ impl ProcessManager {
                     if let Ok(mut failed) = self.failed.lock() {
                         failed.insert(key.clone(), FailedService {
                             service_id: key.clone(),
+                            service_name: service_name.clone(),
                             exit_code: *code,
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             source: "local".into(),
@@ -1286,6 +1304,7 @@ impl ProcessManager {
         if let Ok(mut failed) = self.failed.lock() {
             failed.insert(key.to_string(), FailedService {
                 service_id: key.to_string(),
+                service_name: key.to_string(),
                 exit_code,
                 timestamp: "test".into(),
                 source: "local".into(),

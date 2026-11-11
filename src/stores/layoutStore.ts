@@ -65,6 +65,13 @@ export const LAYOUT_KEYS = {
    * 与字号同理，`reset_layout` 不清它（见 `commands/layout.rs` 的 `KEEP_ON_RESET`）。
    */
   updateSkippedVersion: 'update_skipped_version',
+  /**
+   * 关闭窗口时最小化到托盘：`'1'` = 隐藏到托盘，缺省/`'0'` = 直接退出（默认）。
+   *
+   * 与 AI 偏好同理：不是面板几何，`reset_layout` 的保留清单
+   * （`commands/layout.rs` 的 `KEEP_ON_RESET`）里必须带上它。
+   */
+  closeToTray: 'close_to_tray',
 } as const;
 
 export type LayoutKey = (typeof LAYOUT_KEYS)[keyof typeof LAYOUT_KEYS];

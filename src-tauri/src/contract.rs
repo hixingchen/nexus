@@ -516,19 +516,22 @@ fn test_response_dtos_are_snake_case() {
         "service_id", "project_id", "followed_log", "source", "phase", "health_note", "listening_ports",
     ]));
     let failed = FailedService {
-        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        service_id: "s".into(), service_name: "svc".into(), exit_code: Some(1),
+        timestamp: "t".into(), source: "local".into(),
         port_conflict: None, uptime_ms: None, crash_restart: true,
     };
     assert_eq!(keys_of(&failed), sorted(&[
-        "service_id", "exit_code", "timestamp", "source", "crash_restart",
+        "service_id", "service_name", "exit_code", "timestamp", "source", "crash_restart",
     ]));
     // 运行时长只在能算出来时出现（崩溃自动重启据此区分启动失败），None 时省略
     let failed_with_uptime = FailedService {
-        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        service_id: "s".into(), service_name: "svc".into(), exit_code: Some(1),
+        timestamp: "t".into(), source: "local".into(),
         port_conflict: None, uptime_ms: Some(30_000), crash_restart: true,
     };
     assert_eq!(keys_of(&failed_with_uptime), sorted(&[
-        "service_id", "exit_code", "timestamp", "source", "uptime_ms", "crash_restart",
+        "service_id", "service_name", "exit_code", "timestamp", "source",
+        "uptime_ms", "crash_restart",
     ]));
 
     // 端口冲突：失败卡片与启动前预检共用（前端按 port/occupants 渲染处置入口）
@@ -542,11 +545,13 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(keys_of(&conflict.occupants[0]), sorted(&["pid", "name", "path", "is_self"]));
     // Some 时 FailedService 必须带上该字段（None 时省略，旧字段契约不变）
     let failed_with_conflict = FailedService {
-        service_id: "s".into(), exit_code: Some(1), timestamp: "t".into(), source: "local".into(),
+        service_id: "s".into(), service_name: "svc".into(), exit_code: Some(1),
+        timestamp: "t".into(), source: "local".into(),
         port_conflict: Some(conflict), uptime_ms: None, crash_restart: true,
     };
     assert_eq!(keys_of(&failed_with_conflict), sorted(&[
-        "service_id", "exit_code", "timestamp", "source", "port_conflict", "crash_restart",
+        "service_id", "service_name", "exit_code", "timestamp", "source",
+        "port_conflict", "crash_restart",
     ]));
     // 崩溃自动重启通知（事件 service-auto-restart）：前端按 status 决定提示文案
     let notice = crate::commands::process::AutoRestartNotice {
@@ -1035,7 +1040,8 @@ fn test_nullable_fields_stay_nullable_and_typed() {
 
     // 失败服务：spawn 失败（进程没起来）时 exit_code 为 null
     let failed = FailedService {
-        service_id: "s1".into(), exit_code: None, timestamp: "t".into(), source: "local".into(),
+        service_id: "s1".into(), service_name: "svc".into(), exit_code: None,
+        timestamp: "t".into(), source: "local".into(),
         port_conflict: None, uptime_ms: None, crash_restart: true,
     };
     assert_eq!(types_of(&failed).iter().find(|(k, _)| k == "exit_code").unwrap().1, "null");

@@ -9,7 +9,12 @@ import {
   type AppDirKind,
   type AppPaths,
 } from '../../services/system';
-import { resetLayoutToDefaults } from '../../stores/layoutStore';
+import {
+  LAYOUT_KEYS,
+  resetLayoutToDefaults,
+  saveLayout,
+  useLayoutStore,
+} from '../../stores/layoutStore';
 import { Switch } from '../ui/Switch';
 import { notify } from '../../utils/notify';
 import { reportError, toMessage } from '../../utils/error';
@@ -39,6 +44,11 @@ export function GeneralSection() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState('');
   const [autostartBusy, setAutostartBusy] = useState(false);
+  /** 关闭窗口时最小化到托盘（默认关；存布局 KV，属于用户偏好而非几何） */
+  const closeToTray = useLayoutStore(s => s.values?.[LAYOUT_KEYS.closeToTray] === '1');
+
+  // 设置面板可能在布局尚未加载时被打开（直接点标题栏菜单）
+  useEffect(() => { void useLayoutStore.getState().ensureLoaded(); }, []);
 
   const loadPaths = useCallback(async () => {
     try {
@@ -179,6 +189,24 @@ export function GeneralSection() {
               onChange={(next) => void toggleAutostart(next)}
             />
           )}
+        </div>
+      </section>
+
+      <section>
+        <SectionTitle>窗口</SectionTitle>
+        <div className="flex items-start gap-3 px-3 py-2.5 rounded-md border border-nexus-border bg-nexus-bg/30">
+          <div className="flex-1 min-w-0">
+            <div className="text-[12px] text-nexus-text">关闭窗口时最小化到托盘</div>
+            <div className="text-[11px] text-nexus-muted mt-1 leading-relaxed">
+              开启后，点关闭按钮只隐藏窗口，服务继续运行，未保存的草稿也不会丢；
+              要退出请用托盘菜单「退出 Nexus」。默认关闭。
+            </div>
+          </div>
+          <Switch
+            checked={closeToTray}
+            label="关闭窗口时最小化到托盘"
+            onChange={(next) => saveLayout({ [LAYOUT_KEYS.closeToTray]: next ? '1' : '0' })}
+          />
         </div>
       </section>
 

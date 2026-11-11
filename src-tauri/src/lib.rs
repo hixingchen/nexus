@@ -5,6 +5,7 @@ pub mod logger;
 mod mcp;
 mod mcp_commands;
 mod models;
+mod tray;
 
 /// 登录前启动器入口（独立 `nexus-boot-runner.exe --manifest <path>`；
 /// `Nexus.exe --boot-runner` 分支保留用于旧任务/开发调试）。
@@ -356,6 +357,19 @@ pub fn run() {
         .plugin(NavigationGuard)
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        // 托盘与系统通知的**点击回调**必须在任何通知/菜单事件发生前注册。
+        // 两者失败都不阻塞应用启动：托盘不存在时用户仍能正常用主窗口，
+        // 系统通知发不出去时应用内 toast 照旧；只在日志里留可查的原因。
+        .setup(|app| {
+            if let Err(e) = crate::tray::init(app.handle()) {
+                log::warn!("[nexus] 系统托盘初始化失败（将没有托盘图标）: {}", e);
+            }
+            if let Err(e) = crate::commands::notify::init(app.handle()) {
+                log::warn!("[nexus] 系统通知点击处理器注册失败（通知将无法点回主窗口）: {}", e);
+            }
+            Ok(())
+        })
         // 剪贴板不走 tauri-plugin-clipboard-manager：文件列表粘贴只能由 Rust 侧
         // clipboard-win 写 CF_HDROP（见 commands/fileops.rs），插件只提供文本/图片 API，
         // 注册它等于多开一条用不到的 IPC 命令面（含 allow-write-text 等权限位）
@@ -457,6 +471,8 @@ pub fn run() {
             commands::ai::ai_panel_focus,
             // AI（MCP）高危操作的界面确认：返回用户是否允许（见 commands/mcp_confirm.rs）
             commands::mcp_confirm::mcp_confirm_response,
+            commands::notify::notify_system,
+            tray::set_tray_project,
             commands::app::prepare_exit,
             // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
             commands::autostart::get_autostart_enabled,

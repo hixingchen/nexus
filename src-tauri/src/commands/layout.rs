@@ -89,6 +89,8 @@ const KEEP_ON_RESET: &[&str] = &[
     KEY_NPM_REGISTRY,
     // 安全偏好，不是几何：用户明确关掉确认后，「恢复默认布局」不该悄悄把它打开
     KEY_MCP_CONFIRM,
+    // 窗口行为偏好（关闭到托盘），不是几何：重置布局不该改变"关窗是否退出"
+    "close_to_tray",
 ];
 
 /// 恢复默认布局的**纯逻辑**（单独成函数才测得到，`State<AppState>` 在单测里造不出来）：

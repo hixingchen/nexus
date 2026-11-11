@@ -273,3 +273,32 @@ setFrontendLogSink(logFrontend);
 export function prepareExit() {
   return invoke<void>('prepare_exit');
 }
+
+/**
+ * 系统通知（Windows toast）。
+ *
+ * 是否打扰由**后端**判断：主窗口可见且聚焦时直接返回 false，不重复弹一条与应用内
+ * toast 相同的内容。调用方只管"这件事值得通知"，不用判断焦点。
+ */
+export async function notifySystem(title: string, body: string): Promise<boolean> {
+  try {
+    return await invoke<boolean>('notify_system', { title, body });
+  } catch (e) {
+    // 通知是辅助通道：发不出去时应用内提示/log 仍在。只留控制台，不再弹窗刷屏
+    console.warn('[nexus] 系统通知发送失败:', e);
+    return false;
+  }
+}
+
+/**
+ * 把当前选中的项目同步给托盘菜单（启动/停止项的文字与可用状态）。
+ *
+ * 失败只留控制台：托盘初始化失败时主窗口仍可正常使用，不值得每次切项目弹一次错误。
+ */
+export async function setTrayProject(projectName: string | null): Promise<void> {
+  try {
+    await invoke('set_tray_project', { projectName });
+  } catch (e) {
+    console.warn('[nexus] 更新托盘菜单失败:', e);
+  }
+}
