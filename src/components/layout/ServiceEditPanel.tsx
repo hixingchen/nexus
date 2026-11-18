@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { arrayMove } from '@dnd-kit/sortable';
 import {
@@ -1109,6 +1109,15 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
               </svg>
             </button>
           </div>
+          {/* 新建表单贴在「+」按钮下方；编辑表单插在对应命令的下方（见列表内） */}
+          {showToolCmdForm && !editingToolCmd && (
+            <ToolCommandForm
+              key="tool-command-new"
+              initial={null}
+              onSave={handleSaveToolCommand}
+              onCancel={() => { setEditingToolCmd(null); setShowToolCmdForm(false); }}
+            />
+          )}
           {toolCommands.length === 0 ? (
             <div className="text-center py-3">
               <p className="text-[11px] text-nexus-muted/40">暂无工具命令</p>
@@ -1117,8 +1126,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
           ) : (
             <div className="space-y-1.5">
               {toolCommands.map((cmd, idx) => (
+                <Fragment key={cmd.id}>
                 <div
-                  key={cmd.id}
                   className={`group relative rounded-md border transition-all duration-150 ${
                     editingToolCmd?.id === cmd.id
                       ? 'border-nexus-accent/40 bg-nexus-accent/5 shadow-sm'
@@ -1186,20 +1195,21 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
                     )}
                   </div>
                 </div>
+                {/* 编辑表单紧跟对应命令；换一条命令时旧表单卸载、新表单带自己的初始值挂载 */}
+                {showToolCmdForm && editingToolCmd?.id === cmd.id && (
+                  <ToolCommandForm
+                    key={`tool-command-${cmd.id}`}
+                    initial={cmd}
+                    onSave={handleSaveToolCommand}
+                    onDelete={() => { handleDeleteToolCommand(cmd.id); setEditingToolCmd(null); setShowToolCmdForm(false); }}
+                    onCancel={() => { setEditingToolCmd(null); setShowToolCmdForm(false); }}
+                  />
+                )}
+                </Fragment>
               ))}
               {/* 顺序只在右键菜单里能看出来，这里写明一次，避免"排了不知道排的是什么" */}
               <p className="text-[10px] text-nexus-muted/30 mt-1.5">列表顺序 = 右键菜单里工具命令的顺序（保存后生效）</p>
             </div>
-          )}
-
-          {/* 工具命令表单 */}
-          {showToolCmdForm && (
-            <ToolCommandForm
-              initial={editingToolCmd}
-              onSave={handleSaveToolCommand}
-              onDelete={editingToolCmd ? () => { handleDeleteToolCommand(editingToolCmd.id); setEditingToolCmd(null); setShowToolCmdForm(false); } : undefined}
-              onCancel={() => { setEditingToolCmd(null); setShowToolCmdForm(false); }}
-            />
           )}
         </div>
 
