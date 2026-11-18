@@ -60,15 +60,15 @@ export async function startProjectWithFeedback(
         description,
       });
       // 托盘发起的启动时窗口通常是隐藏的：把失败原因送到系统通知
-      void notifySystem(`「${projectName}」部分服务启动失败`, description);
+      void notifySystem(`「${projectName}」部分服务启动失败`, description, 'error');
     } else {
       notify({ title: `「${projectName}」已启动`, description: '所有已启用的服务已启动' });
       // 托盘发起的动作窗口通常隐藏：成功也要有反馈，否则用户不知道点没生效
-      void notifySystem(`「${projectName}」已启动`, '所有已启用的服务已启动');
+      void notifySystem(`「${projectName}」已启动`, '所有已启用的服务已启动', 'success');
     }
   } catch (e) {
     reportError(`启动「${projectName}」失败`, e);
-    void notifySystem(`「${projectName}」启动失败`, toMessage(e));
+    void notifySystem(`「${projectName}」启动失败`, toMessage(e), 'error');
   }
 }
 
@@ -87,14 +87,14 @@ export async function stopProjectWithFeedback(
         title: `「${projectName}」部分服务停止失败`,
         description,
       });
-      void notifySystem(`「${projectName}」部分服务停止失败`, description);
+      void notifySystem(`「${projectName}」部分服务停止失败`, description, 'error');
     } else {
       notify({ variant: 'info', title: `「${projectName}」已停止`, description: '所有服务已停止' });
-      void notifySystem(`「${projectName}」已停止`, '所有服务已停止');
+      void notifySystem(`「${projectName}」已停止`, '所有服务已停止', 'success');
     }
   } catch (e) {
     reportError(`停止「${projectName}」失败`, e);
-    void notifySystem(`「${projectName}」停止失败`, toMessage(e));
+    void notifySystem(`「${projectName}」停止失败`, toMessage(e), 'error');
   }
 }
 

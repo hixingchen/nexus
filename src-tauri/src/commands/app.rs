@@ -12,6 +12,14 @@ use tauri_plugin_dialog::DialogExt;
 /// 退出流程是否已启动（幂等：前端按钮可能连点、RunEvent::Exit 也可能兜底再来一次）
 static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// 退出清理的**硬上限**：超过它就直接结束进程。
+///
+/// 清理里的外部等待（taskkill、开机启动器命令、reader 线程）都各自有超时，但
+/// 组合起来仍可能被一个病态进程拖到几十秒。开发工具必须**永远关得掉**：
+/// 到点后 `std::process::exit(0)`，残留子进程由 Job Object（KILL_ON_JOB_CLOSE）结束。
+/// 正常清理是秒级，20 秒只会在真正卡住时触发。
+const EXIT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// 当前应用版本号（"检查更新"拿它跟 GitHub 上的最新 release 比）。
 ///
 /// 为什么由后端答而不是前端读 `package.json`：那是 npm 侧的版本号，跟打包出来的
@@ -139,6 +147,23 @@ pub fn prepare_exit(app: AppHandle) -> Result<(), String> {
             EXIT_STARTED.store(false, Ordering::SeqCst);
             format!("启动退出线程失败: {}", e)
         })?;
+
+    // 看门狗：清理线程卡住时也必须能退出。正常情况进程会在几秒内自己结束，
+    // 这个线程随进程一起消失；只有卡住时它才执行硬退出。
+    if let Err(e) = std::thread::Builder::new()
+        .name("nexus-exit-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(EXIT_WATCHDOG_TIMEOUT);
+            log::error!(
+                "[nexus] 退出清理超过 {} 秒仍未完成，强制退出（本地子进程由 Job Object 结束；\
+                 开机启动服务由 runner 管理，不受本进程退出影响）",
+                EXIT_WATCHDOG_TIMEOUT.as_secs()
+            );
+            std::process::exit(0);
+        })
+    {
+        log::warn!("[nexus] 退出看门狗线程启动失败（清理卡住时将无法自动强制退出）: {}", e);
+    }
     Ok(())
 }
 

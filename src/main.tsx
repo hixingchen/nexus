@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { NoticeWindow } from './components/NoticeWindow';
 import './index.css';
 import { logToBackend } from './utils/logSink';
 import { isEditorContentTarget } from './utils/keyboard';
@@ -70,8 +71,21 @@ window.addEventListener('unhandledrejection', (e) => {
 const rootEl = document.getElementById('root');
 if (!rootEl) throw new Error('找不到 #root 挂载点（index.html 被修改？）');
 
+/**
+ * `index.html` 的 body 带 `bg-nexus-bg`；通知窗是透明无边框窗口，必须先去掉底色，
+ * 否则窗口四周会是一块深色矩形，而不是卡片本身。
+ */
+function makeTransparentWindowChrome() {
+  document.documentElement.style.background = 'transparent';
+  document.body.classList.remove('bg-nexus-bg', 'text-nexus-text', 'overflow-hidden');
+  document.body.style.background = 'transparent';
+}
+
+const notice = window.__NEXUS_NOTICE__;
+if (notice) makeTransparentWindowChrome();
+
 ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
-    <App />
+    {notice ? <NoticeWindow initial={notice} /> : <App />}
   </React.StrictMode>,
 );

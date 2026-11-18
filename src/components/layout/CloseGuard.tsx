@@ -98,6 +98,7 @@ export function CloseGuard() {
               await notifySystem(
                 'Nexus 已最小化到托盘',
                 '服务仍在后台运行；要退出请用托盘菜单「退出 Nexus」。',
+                'info',
               );
             }
           })();

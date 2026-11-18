@@ -9,6 +9,7 @@ import { LATEST_RELEASE_API, NEW_ISSUE_URL, REPO_URL } from '../../utils/links';
 import type { SettingsSection } from '../settings/SettingsModal';
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useClickOutside } from '../../hooks/useClickOutside';
+import { LAYOUT_KEYS, useLayoutStore } from '../../stores/layoutStore';
 
 // 设置/帮助弹窗体量大且只在用户点开时用：拆成按需 chunk，别拖慢首屏。
 const SettingsModal = lazy(() =>
@@ -44,6 +45,11 @@ export function TitleBar({ projectName }: TitleBarProps) {
    * 切项目都会）。
    */
   const appWindow = useMemo(() => getCurrentWindow(), []);
+  /**
+   * 开启「关闭窗口时最小化到托盘」后，✕ 是**隐藏**而不是退出。
+   * 按钮的 tooltip/aria 必须如实说明，否则用户会以为"关不掉"。
+   */
+  const closeToTray = useLayoutStore(s => s.values?.[LAYOUT_KEYS.closeToTray] === '1');
   const [isMaximized, setIsMaximized] = useState(false);
   /**
    * 当前展开的顶级菜单（null = 都关着）。
@@ -207,7 +213,14 @@ export function TitleBar({ projectName }: TitleBarProps) {
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
           )}
         </button>
-        <button className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-error hover:text-white" aria-label="关闭窗口" title="关闭窗口" onClick={() => appWindow.close()}>
+        <button
+          className="w-[46px] h-full flex items-center justify-center text-nexus-muted hover:bg-nexus-error hover:text-white"
+          aria-label={closeToTray ? '最小化到托盘' : '关闭窗口'}
+          title={closeToTray
+            ? '最小化到托盘（服务继续运行；退出请用托盘菜单「退出 Nexus」）'
+            : '关闭窗口'}
+          onClick={() => appWindow.close()}
+        >
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
         </button>
       </div>

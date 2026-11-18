@@ -35,7 +35,7 @@ export function McpConfirmDialog() {
       if (!alive) return;
       setReq(ev.payload);
       // 窗口不在前台时提醒用户：AI 的高危操作正等着确认（后端判断焦点，前台不打扰）
-      void notifySystem('AI 请求执行高危操作', ev.payload.title);
+      void notifySystem('AI 请求执行高危操作', ev.payload.title, 'warning');
     })
       .then((fn) => {
         if (alive) unlisten = fn;

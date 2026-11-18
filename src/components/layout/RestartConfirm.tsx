@@ -75,7 +75,7 @@ export function RestartConfirm() {
           duration: 12000,
         });
         // 文件监听的重试状态机在前端，系统通知也只能由这里发；后端会按焦点决定是否真的弹
-        void notifySystem(`服务「${serviceName}」自动重启未成功`, description);
+        void notifySystem(`服务「${serviceName}」自动重启未成功`, description, 'error');
       },
       onError: (sid, e) => reportError(`自动重启服务失败（服务 ${sid}）`, e),
     });

@@ -5,6 +5,25 @@ import { reportError } from '../utils/error';
 import { notify } from '../utils/notify';
 import { usePortConflictStore } from '../stores/portConflict';
 
+/**
+ * 停止动作的前端兜底超时。
+ *
+ * 后端本地停止正常在几秒内完成；开机启动器的 stop 命令最长 15 秒。超过 25 秒说明
+ * 后端卡住了（taskkill/启动器无响应），不能让卡片按钮**永久**停在 disabled 状态——
+ * 用户的感受是"整张卡点不动了"。超时只恢复 UI 并提示，不假装后端已经停掉。
+ */
+const STOP_TIMEOUT_MS = 25_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    p.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 /** 服务动作：卡片按钮与右键菜单共同的三档操作 */
 export type ServiceActionName = 'start' | 'stop' | 'restart';
 
@@ -60,16 +79,22 @@ export function useServiceActions(onDone: () => void) {
         // 共享动作层：启动进程 + 追加该服务的文件监听（口径与详情页一致）
         await startSingleService(service.project_id, service.id);
       } else if (action === 'stop') {
-        // 停止进程 + 移除监听 + 清日志（后端已清缓冲，前端缓存同步清）
-        await stopSingleService(service.project_id, service.id);
+        // 停止进程 + 移除监听 + 清日志（后端已清缓冲，前端缓存同步清）。
+        // 加前端超时：后端卡住时也要把按钮恢复，不能让整张卡永久 disabled。
+        await withTimeout(
+          stopSingleService(service.project_id, service.id),
+          STOP_TIMEOUT_MS,
+          '停止服务超过 25 秒未返回；后端可能仍在清理，按钮已恢复，请稍后刷新或重试',
+        );
       } else {
         await processApi.restart(service.id);
       }
       onDone();
     } catch (err: unknown) {
       reportError(`${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}服务失败`, err);
-      // 启动失败：后端已记失败状态（spawn 失败），刷新让卡片显示"失败"按钮
-      if (action === 'start') onDone();
+      // 任何失败都刷新：卡片要能显示后端此刻的真实状态（失败/仍在运行/已停止），
+      // 特别是停止超时——后端可能还在清理，下一次轮询会纠正显示
+      onDone();
     } finally {
       // **必须放 finally**：端口冲突弹框里点「取消」会从 try 里提前 return，
       // 放在 try/catch 之后的 mark(false) 会被跳过——按钮一直灰着，用户再也点不动

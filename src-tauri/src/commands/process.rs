@@ -501,10 +501,27 @@ pub async fn stop_service(app: tauri::AppHandle, service_id: String) -> Result<(
         // runner 可达 → 走命令队列；启动器失联但子进程还活着 → 按 PID 兜底结束，
         // 不让“启动器没响应”变成“这个服务再也停不掉”。
         // 本地进程表也收一次（历史上本地/开机启动双开过时，两边都要停）。
+        // 分阶段留痕：停止卡住时，nexus.log 里能直接看出卡在开机启动器还是本地收尸，
+        // 而不是只看到前端那条“超过 25 秒未返回”。
+        let started = std::time::Instant::now();
         let boot_result = crate::commands::boot::stop_boot_service(&service_id);
+        log::info!(
+            "[nexus] stop_service {}: 开机启动器阶段完成 ({:?})，结果={:?}",
+            service_id, started.elapsed(), boot_result
+        );
+        // **两段都要尝试**：启动器失败（不可达/超时）时，本地可能还残留同一服务的实例
+        // （历史上双开过）。原写法 `boot_result?` 会直接跳过后面的本地停止，与上面
+        // “两边都要停”的注释相反，用户看到的就是“点了停止，进程还在”。
         let local_result = state.process_mgr.stop(&service_id);
-        boot_result?;
-        local_result
+        log::info!(
+            "[nexus] stop_service {}: 本地进程阶段完成 ({:?})，结果={:?}",
+            service_id, started.elapsed(), local_result
+        );
+        match (boot_result, local_result) {
+            (Err(boot), Err(local)) => Err(format!("{}；{}", boot, local)),
+            (Err(boot), Ok(())) => Err(boot),
+            (Ok(_), local) => local,
+        }
     }).await.map_err(|e| format!("停止服务任务失败: {}", e))?
 }
 
@@ -1072,7 +1089,7 @@ fn notify_new_failures(
         let code = f.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
         let title = format!("服务「{}」运行失败", name);
         let body = format!("退出码 {}；失败输出已保留在应用内的日志面板。", code);
-        if let Err(e) = crate::commands::notify::notify_if_background(app, &title, &body) {
+        if let Err(e) = crate::commands::notify::notify_if_background(app, "error", &title, &body) {
             log::warn!("[nexus] 发送失败系统通知失败（{}）: {}", name, e);
         }
     }
@@ -1213,7 +1230,7 @@ fn execute_auto_restart(
                 .append_system_line(&service_id, format!("自动重启失败：{}", e));
             emit_auto_restart_notice(app, &service_id, &info.name, "failed", plan.attempt, &e);
             let title = format!("服务「{}」自动重启失败", info.name);
-            if let Err(ne) = crate::commands::notify::notify_if_background(app, &title, &e) {
+            if let Err(ne) = crate::commands::notify::notify_if_background(app, "error", &title, &e) {
                 log::warn!("[nexus] 发送自动重启失败通知失败: {}", ne);
             }
         }
@@ -1239,7 +1256,7 @@ fn report_auto_restart_give_up(
     // 通知由后端发：窗口隐藏时前端事件监听虽然通常还在，但 WebView 被节流/挂起时
     // 不该让"重试用尽"这种关键事件跟着丢。
     let title = format!("服务「{}」自动重启已停止", name);
-    if let Err(e) = crate::commands::notify::notify_if_background(app, &title, &note) {
+    if let Err(e) = crate::commands::notify::notify_if_background(app, "error", &title, &note) {
         log::warn!("[nexus] 发送自动重启停止通知失败: {}", e);
     }
 }

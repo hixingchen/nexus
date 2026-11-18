@@ -30,9 +30,23 @@ pub struct TrayState {
     stop_item: MenuItem<Wry>,
 }
 
+/// 取主窗口。
+///
+/// **不能用 `get_webview_window` 按 `main` 找主窗口**：AI 面板是挂在主窗口上的追加子 WebView，
+/// 而 Tauri 的 `Window::is_webview_window()` 要求所有 webview 的 label 都等于窗口 label；
+/// 多出 AI 子 WebView 后它返回 false，`get_webview_window` 便永远返回 None。实测后果：
+/// 托盘/单实例/通知点击都唤不回窗口（窗口其实还在，只是被 close-to-tray 隐藏），
+/// 日志刷「托盘: 找不到主窗口」；通知的前台判断也会失效。
+/// `get_window` 按窗口 label 查找，不受子 WebView 数量影响。
+pub(crate) fn main_window(app: &AppHandle) -> Option<tauri::Window> {
+    app.get_window("main")
+}
+
 /// 把主窗口显示出来并聚焦。托盘图标点击、通知点击、单实例唤醒都走这里。
 pub fn show_main_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
+    // 用户已经回到应用：挂着的通知卡片没有必要继续挡在屏幕上
+    crate::commands::notify::close_notice(app);
+    let Some(window) = main_window(app) else {
         log::warn!("[nexus] 托盘: 找不到主窗口");
         return;
     };
@@ -226,5 +240,26 @@ mod tests {
         assert_eq!(super::sanitize_project_name("   "), None);
         let long = "项".repeat(100);
         assert_eq!(super::sanitize_project_name(&long).unwrap().chars().count(), 64);
+    }
+
+    /// 源码扫描护栏：主窗口只能用 `get_window` 按窗口 label 查找。
+    ///
+    /// AI 面板是追加在主窗口上的子 WebView，Tauri 的 `is_webview_window()` 会因此返回
+    /// false，`get_webview_window` 对主窗口永远 None——托盘/单实例/通知点击唤不回窗口，
+    /// 且通知的前台判断失效。这个失败态需要真实 WebView2 才能复现，单测覆盖不到，
+    /// 用源码扫描挡住回退。needle 在运行时拼出，避免扫描到测试自身的源码。
+    #[test]
+    fn test_main_window_lookup_does_not_use_get_webview_window() {
+        let needle = ["get_webview_window(", "\"main\")"].concat();
+        for (name, src) in [
+            ("tray.rs", include_str!("tray.rs")),
+            ("commands/notify.rs", include_str!("commands/notify.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+        ] {
+            assert!(
+                !src.contains(&needle),
+                "{name} 不能再用 get_webview_window 按 main 找主窗口：AI 子 WebView 会让它返回 None"
+            );
+        }
     }
 }

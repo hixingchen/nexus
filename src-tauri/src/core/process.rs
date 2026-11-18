@@ -1196,17 +1196,37 @@ impl ProcessManager {
             }).collect()
         };
 
-        for entry in entries {
-            let (key, pid) = (entry.key.clone(), entry.pid);
-            let outcome = cleanup_process(entry, None);
-            // 退出路径没有"失败上报"的接收方（进程马上要结束），但仍要留痕：
-            // 残留进程会由 Job Object 在应用退出时兜底，而日志是唯一能解释
-            // "为什么退出后 taskmgr 里还有 java.exe"的地方
-            if !outcome.is_clean() {
-                log::warn!("[nexus]   清理 {} (pid={}) 未完全成功: {}", key, pid, outcome.describe());
-            } else {
-                log::debug!("[nexus]   已清理 {} (pid={})", key, pid);
-            }
+        // **并行收尸**：退出路径原先逐个串行清理，一个卡住的 taskkill/reader 会把后面
+        // 所有服务都拖住，用户看到的就是"软件关不掉"。各服务清理互不依赖（各自的 child/
+        // reader/句柄，进程表已 drain），并行后墙钟从"最坏值相加"降为"最坏值"；
+        // 单次 taskkill 自身也有 10 秒上限（见 kill_process_tree）。
+        // 快照取在杀任何东西之前：后代链按原始进程树判定，也省掉每个服务枚举一次全系统。
+        if !entries.is_empty() {
+            let snapshot = super::winproc::snapshot_processes();
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let key = entry.key.clone();
+                        let pid = entry.pid;
+                        let snap: &[super::winproc::ProcEntry] = &snapshot;
+                        scope.spawn(move || {
+                            let outcome = cleanup_process(entry, Some(snap));
+                            // 退出路径没有"失败上报"的接收方（进程马上要结束），但仍要留痕：
+                            // 残留进程会由 Job Object 在应用退出时兜底，而日志是唯一能解释
+                            // "为什么退出后 taskmgr 里还有 java.exe"的地方
+                            if !outcome.is_clean() {
+                                log::warn!("[nexus]   清理 {} (pid={}) 未完全成功: {}", key, pid, outcome.describe());
+                            } else {
+                                log::debug!("[nexus]   已清理 {} (pid={})", key, pid);
+                            }
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    let _ = handle.join();
+                }
+            });
         }
 
         if let Ok(mut buffers) = self.log_buffers.lock() {
@@ -1888,7 +1908,7 @@ pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let child = Command::new("taskkill")
+        let mut child = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             // 跳过"当前目录优先"搜索（SEC-14，与 `build_internal_command` 同口径）：
             // taskkill 是我们自己拉起的系统工具、不承载用户 shell，关掉这一级没有副作用，
@@ -1900,18 +1920,37 @@ pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("启动 taskkill 失败 (pid={}): {}", pid, e))?;
-        let out = child
-            .wait_with_output()
+        // taskkill 是外部命令，**必须给它超时**：目标进程处于不可终止状态、被安全软件
+        // 拦截、或 taskkill 自己挂住时，无超时的 wait_with_output 会让 stop / 退出清理
+        // 永久卡在这里（持有该服务的生命周期锁，后面所有 stop/restart 都排队）。
+        // 10 秒后放弃等待并如实报错；调用方仍会复核存活（CleanupOutcome），
+        // 最终由 Job Object 在应用退出时兜底。
+        let exited = wait_with_timeout(&mut child, Duration::from_secs(10));
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "taskkill 超过 10 秒未返回 (pid={})，已放弃等待（进程可能仍在运行）",
+                pid
+            ));
+        }
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut stderr);
+        }
+        let status = child
+            .wait()
             .map_err(|e| format!("等待 taskkill 失败 (pid={}): {}", pid, e))?;
-        if !out.status.success() {
+        if !status.success() {
             // 注意：进程本来就不存在时 taskkill 也返回非零。**这不代表收尸失败**——
             // 判"有没有收干净"的是调用方对存活状态的复核（见 `CleanupOutcome`），
             // 这里的返回值只用于把原因带到错误信息里
             return Err(format!(
                 "taskkill 退出码 {:?} (pid={}): {}",
-                out.status.code(),
+                status.code(),
                 pid,
-                String::from_utf8_lossy(&out.stderr).trim()
+                stderr.trim()
             ));
         }
         Ok(())
@@ -2202,6 +2241,32 @@ mod tests {
     use super::test_support::test_sink;
     #[cfg(windows)]
     use super::test_support::{wait_for_adoption, write_detach_bat};
+
+    /// 停止/退出收尸最终都走 `wait_with_timeout`：活着的进程必须在超时后返回 false，
+    /// 不能把停止命令或退出清理无限挂住（taskkill 超时保护依赖这个性质）。
+    #[cfg(windows)]
+    #[test]
+    fn test_wait_with_timeout_gives_up_on_live_child() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 20 127.0.0.1"])
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .expect("起测试进程");
+        let started = Instant::now();
+        assert!(
+            !wait_with_timeout(&mut child, Duration::from_millis(200)),
+            "活着的进程不能判成已退出"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "超时等待时间失控（可能没有真的超时返回）"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn test_kill_process_tree_invalid_pid() {

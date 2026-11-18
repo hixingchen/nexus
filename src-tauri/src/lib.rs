@@ -341,7 +341,9 @@ pub fn run() {
         // 用户双击图标什么都没发生**，而此前三处 `let _ =` 与 None 分支一行日志都没有
         // （CQ-37），现场只剩"打不开"。与仓库其余位置的惯例一致（Job Object 降级、
         // logger 禁用都会留痕），这里把每一处失败都说出来。
-        match app.get_webview_window("main") {
+        // 用 tray::main_window（get_window）而不是 get_webview_window：AI 面板子 WebView
+        // 会让后者对主窗口永远返回 None（详见 tray::main_window 注释）。
+        match crate::tray::main_window(app) {
             Some(window) => {
                 if let Err(e) = window.unminimize() { log::warn!("[nexus] 单实例唤醒：取消最小化失败: {}", e); }
                 if let Err(e) = window.show() { log::warn!("[nexus] 单实例唤醒：显示窗口失败: {}", e); }
@@ -357,16 +359,11 @@ pub fn run() {
         .plugin(NavigationGuard)
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
-        // 托盘与系统通知的**点击回调**必须在任何通知/菜单事件发生前注册。
-        // 两者失败都不阻塞应用启动：托盘不存在时用户仍能正常用主窗口，
-        // 系统通知发不出去时应用内 toast 照旧；只在日志里留可查的原因。
+        // 托盘初始化失败不阻塞应用启动：托盘不存在时用户仍能正常用主窗口，
+        // 通知小窗仍由后端按需创建；只在日志里留可查的原因。
         .setup(|app| {
             if let Err(e) = crate::tray::init(app.handle()) {
                 log::warn!("[nexus] 系统托盘初始化失败（将没有托盘图标）: {}", e);
-            }
-            if let Err(e) = crate::commands::notify::init(app.handle()) {
-                log::warn!("[nexus] 系统通知点击处理器注册失败（通知将无法点回主窗口）: {}", e);
             }
             Ok(())
         })
@@ -472,6 +469,8 @@ pub fn run() {
             // AI（MCP）高危操作的界面确认：返回用户是否允许（见 commands/mcp_confirm.rs）
             commands::mcp_confirm::mcp_confirm_response,
             commands::notify::notify_system,
+            commands::notify::notice_ready,
+            commands::notify::notice_clicked,
             tray::set_tray_project,
             commands::app::prepare_exit,
             // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
@@ -506,8 +505,21 @@ pub fn run() {
             commands::node::uninstall_node_version,
             commands::node::use_node_version,
         ])
-        .on_window_event(move |_window, event| {
+        .on_window_event(move |window, event| {
+            // 主窗口一获得焦点就收起通知小窗：用户已经回到应用，置顶卡片没有理由
+            // 继续挡在界面上（否则它覆盖的区域会截获点击，看起来像"按钮点不动"）。
+            if let tauri::WindowEvent::Focused(true) = event {
+                if window.label() == "main" {
+                    crate::commands::notify::close_notice(window.app_handle());
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // 通知小窗是后端自己创建的临时窗口：没有前端关窗守卫，关闭即关闭，
+                // 不能套用主窗口的"交前端确认"日志（会让排障时误以为有东西在拦它）。
+                if window.label() != "main" {
+                    return;
+                }
                 // 这里**不做**清理：前端注册了 tauri://close-requested 监听后，Tauri 会自动
                 // prevent_close 并把决定权交给前端（未保存草稿确认，见 src/components/layout/CloseGuard.tsx）。
                 // 用户取消时窗口继续存在——此时停掉所有服务是错的。

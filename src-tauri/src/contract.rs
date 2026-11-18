@@ -561,6 +561,11 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(keys_of(&notice), sorted(&[
         "service_id", "service_name", "status", "attempts", "error",
     ]));
+    // 自制通知小窗的载荷：前端 NoticeWindow 按这些字段渲染
+    let notice_payload = crate::commands::notify::NoticePayload {
+        title: "t".into(), body: "b".into(), level: "error".into(),
+    };
+    assert_eq!(keys_of(&notice_payload), sorted(&["title", "body", "level"]));
     let ps = ProcessStatus { running: vec![], failed: vec![] };
     assert_eq!(keys_of(&ps), sorted(&["running", "failed"]));
     // 删除结果：删除成功但停止进程失败时必须能把原因带回前端
@@ -909,6 +914,8 @@ const COVERED_RESPONSE: &[&str] = &[
         "LogLine", "FailedService", "ServiceLogBatchPayload",
         // 崩溃自动重启通知（`service-auto-restart` 事件）
         "AutoRestartNotice",
+        // 自制通知小窗的初始化脚本/更新事件载荷
+        "NoticePayload",
         "Project", "ToolCommand", "OpenTool", "ServiceOpenToolBinding",
         "DetectedToolsResult",
         "Service", "ServiceTemplate", "ProjectDetail",

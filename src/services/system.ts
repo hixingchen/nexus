@@ -274,18 +274,25 @@ export function prepareExit() {
   return invoke<void>('prepare_exit');
 }
 
+/** 通知小窗的语义级别（只影响图标与颜色） */
+export type NoticeLevel = 'error' | 'warning' | 'success' | 'info';
+
 /**
- * 系统通知（Windows toast）。
+ * 窗口不在前台时弹**自制通知小窗**（由后端创建置顶卡片，不依赖 Windows toast）。
  *
- * 是否打扰由**后端**判断：主窗口可见且聚焦时直接返回 false，不重复弹一条与应用内
+ * 是否打扰由后端判断：主窗口可见且聚焦时直接返回 false，不重复弹一条与应用内
  * toast 相同的内容。调用方只管"这件事值得通知"，不用判断焦点。
  */
-export async function notifySystem(title: string, body: string): Promise<boolean> {
+export async function notifySystem(
+  title: string,
+  body: string,
+  level: NoticeLevel = 'info',
+): Promise<boolean> {
   try {
-    return await invoke<boolean>('notify_system', { title, body });
+    return await invoke<boolean>('notify_system', { title, body, level });
   } catch (e) {
     // 通知是辅助通道：发不出去时应用内提示/log 仍在。只留控制台，不再弹窗刷屏
-    console.warn('[nexus] 系统通知发送失败:', e);
+    console.warn('[nexus] 通知发送失败:', e);
     return false;
   }
 }
@@ -301,4 +308,17 @@ export async function setTrayProject(projectName: string | null): Promise<void> 
   } catch (e) {
     console.warn('[nexus] 更新托盘菜单失败:', e);
   }
+}
+
+/**
+ * 通知小窗渲染完成：把按内容量出的尺寸交给后端，后端调整窗口并显示
+ * （窗口创建时是隐藏的，避免白底闪一下）。
+ */
+export function noticeReady(width: number, height: number): Promise<void> {
+  return invoke<void>('notice_ready', { width, height });
+}
+
+/** 点击通知小窗：后端显示主窗口并关闭小窗 */
+export function noticeClicked(): Promise<void> {
+  return invoke<void>('notice_clicked');
 }
