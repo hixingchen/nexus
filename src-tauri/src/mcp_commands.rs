@@ -84,15 +84,17 @@ pub fn catalog() -> Value {
             "watchInclude": "string?", "watchExclude": "string?", "enabled": "bool?",
             "showFileTree": "bool?", "openEnabled": "bool?", "openPort": 0,
             "bootEnabled": "bool?", "bootOrder": 0, "bootCheck": "string?",
-            "bootRequired": "bool?", "bootCredentialMode": "s4u?"
+            "bootRequired": "bool?", "bootCredentialMode": "s4u?",
+            "healthCheck": "string?", "crashRestart": true
         }), false),
-        c("update_service", "更新服务配置（全量字段）", json!({
+        c("update_service", "更新服务配置（全量字段；healthCheck/crashRestart 省略时保持原值）", json!({
             "id": "string", "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string", "watchInclude": "string", "watchExclude": "string",
             "envVars": "string", "restartMode": 0, "enabled": true, "showFileTree": false,
             "toolCommands": "string", "openEnabled": false, "openPort": 0,
             "bootEnabled": false, "bootOrder": 0, "bootCheck": "",
-            "bootRequired": false, "bootCredentialMode": "s4u"
+            "bootRequired": false, "bootCredentialMode": "s4u",
+            "healthCheck": "string", "crashRestart": true
         }), false),
         c("delete_service", "删除服务（不可逆）", json!({ "id": "string", "confirm": true }), true),
         c("reorder_services", "调整服务顺序", json!({ "projectId": "string", "orderedIds": ["string"] }), false),
@@ -104,31 +106,39 @@ pub fn catalog() -> Value {
             "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string", "watchInclude": "*", "watchExclude": "",
             "envVars": "", "restartMode": 0, "enabled": true, "showFileTree": false,
-            "openEnabled": false, "openPort": 0, "toolCommands": "[]", "openToolId": ""
+            "openEnabled": false, "openPort": 0, "toolCommands": "[]", "openToolId": "",
+            "crashRestart": true
         }), false),
         c("update_service_template", "修改模板", json!({
             "id": "string", "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string", "watchInclude": "string", "watchExclude": "string",
             "envVars": "string", "restartMode": 0, "enabled": true, "showFileTree": false,
-            "openEnabled": false, "openPort": 0, "toolCommands": "string", "openToolId": ""
+            "openEnabled": false, "openPort": 0, "toolCommands": "string", "openToolId": "",
+            "crashRestart": true
         }), false),
         c("delete_service_template", "删除模板（不可逆）", json!({ "id": "string", "confirm": true }), true),
         c("reorder_service_templates", "调整模板顺序", json!({ "orderedIds": ["string"] }), false),
         c("export_service_templates", "导出模板到文件", json!({ "path": "string", "ids": ["string"] }), false),
         c("import_service_templates", "从文件导入模板", json!({ "path": "string" }), false),
         // ── 进程 ──────────────────────────────────────────────
-        c("start_service", "启动单个服务", json!({ "serviceId": "string" }), false),
+        c("start_service", "启动单个服务（启动后自动挂该服务的文件监听）", json!({ "serviceId": "string" }), false),
         c("stop_service", "停止单个服务", json!({ "serviceId": "string" }), false),
         c("restart_service", "重启单个服务", json!({ "serviceId": "string" }), false),
-        c("start_project_services", "启动项目全部已启用服务", json!({ "projectId": "string" }), false),
+        c("start_project_services", "启动项目全部已启用服务（启动后自动挂项目级文件监听）", json!({ "projectId": "string" }), false),
         c("stop_project_services", "停止项目全部服务", json!({ "projectId": "string" }), false),
         c("get_running", "当前运行/失败状态", json!({}), false),
         c("get_service_logs", "读取服务日志快照", json!({ "serviceKey": "string" }), false),
-        c("run_tool_command", "执行服务配置里的工具命令（可能长时间运行）", json!({
+        c("run_tool_command", "执行服务配置里的工具命令（会阻塞到命令结束并返回输出/退出码；长任务注意 MCP 客户端超时）", json!({
             "serviceId": "string", "commandId": "string", "runId": "string"
         }), false),
         c("stop_tool_command", "停止正在运行的工具命令", json!({ "runId": "string" }), false),
         c("unfollow_service_log", "取消跟随服务日志文件", json!({ "serviceId": "string" }), false),
+        c("start_watching", "启动文件监听（serviceId 省略 = 整个项目；只监听 restart_mode>0 的服务）", json!({
+            "projectId": "string", "serviceId": "string?"
+        }), false),
+        c("stop_watching", "停止文件监听（serviceId 省略 = 整个项目）", json!({
+            "projectId": "string", "serviceId": "string?"
+        }), false),
         // ── Node ──────────────────────────────────────────────
         c("get_node_runtime", "当前 Node 运行时状态", json!({}), false),
         c("list_node_versions", "已安装/可安装的 Node 版本", json!({}), false),
@@ -252,6 +262,8 @@ fn target_project_id(
         | "add_service_from_template"
         | "start_project_services"
         | "stop_project_services"
+        | "start_watching"
+        | "stop_watching"
         | "list_service_open_tool_bindings" => Some(need("projectId")?),
         // 项目 id 在 `id` 里
         "update_project" | "delete_project" | "duplicate_project" | "toggle_pin_project" => {
@@ -578,8 +590,19 @@ pub async fn invoke(
                     c.port, who
                 ));
             }
-            crate::commands::process::start_service(app.clone(), sid).await?;
-            Ok(json!({ "ok": true }))
+            crate::commands::process::start_service(app.clone(), sid.clone()).await?;
+            // 与 UI 的 startSingleService 同口径：启动成功后挂上该服务的文件监听。
+            // 监听失败不回滚启动，把原因带回给调用方（模型据此提示用户）。
+            let watch_error = match service_project_id(&state, &sid) {
+                Some(pid) => crate::commands::watcher::start_watching(
+                    app.clone(), pid, Some(sid.clone()),
+                ).await.err(),
+                None => Some(format!("找不到服务所属项目: {}", sid)),
+            };
+            if let Some(e) = &watch_error {
+                log::warn!("[mcp] 启动服务 {} 后挂文件监听失败: {}", sid, e);
+            }
+            Ok(json!({ "ok": true, "watch_error": watch_error }))
         }
         "stop_service" => {
             crate::commands::process::stop_service(app.clone(), s("serviceId")?).await?;
@@ -589,9 +612,18 @@ pub async fn invoke(
             crate::commands::process::restart_service(app.clone(), s("serviceId")?).await?;
             Ok(json!({ "ok": true }))
         }
-        "start_project_services" => to_value(
-            crate::commands::process::start_project_services(app.clone(), s("projectId")?).await?,
-        ),
+        "start_project_services" => {
+            let pid = s("projectId")?;
+            let errors = crate::commands::process::start_project_services(
+                app.clone(), pid.clone(),
+            ).await?;
+            // 与 UI 的 startProjectServices 同口径：项目启动后启动项目级文件监听。
+            // 启动本身已经成功；监听失败只留痕（语义工具会把它作为 watch_error 返回）。
+            if let Err(e) = crate::commands::watcher::start_watching(app.clone(), pid, None).await {
+                log::warn!("[mcp] 启动项目后挂文件监听失败: {}", e);
+            }
+            to_value(errors)
+        }
         "stop_project_services" => to_value(
             crate::commands::process::stop_project_services(app.clone(), s("projectId")?).await?,
         ),
@@ -615,6 +647,18 @@ pub async fn invoke(
         }
         "unfollow_service_log" => {
             to_value(crate::commands::process::unfollow_service_log(app.clone(), s("serviceId")?).await?)
+        }
+        "start_watching" => {
+            crate::commands::watcher::start_watching(
+                app.clone(), s("projectId")?, opt_s("serviceId"),
+            ).await?;
+            Ok(json!({ "ok": true }))
+        }
+        "stop_watching" => {
+            crate::commands::watcher::stop_watching(
+                app.clone(), s("projectId")?, opt_s("serviceId"),
+            ).await?;
+            Ok(json!({ "ok": true }))
         }
         // ── Node ──
         "get_node_runtime" => to_value(crate::commands::node::get_node_runtime()),
@@ -850,6 +894,48 @@ mod tests {
                 "目录里有命令 {}，但 invoke 没有对应分支",
                 name
             );
+        }
+    }
+
+    /// 近期新增的能力必须出现在目录里：文件监听命令、服务的就绪检查/崩溃自动重启、
+    /// 模板的崩溃自动重启。模型只通过 `nexus_commands` 发现能力，漏列等于没实现。
+    #[test]
+    fn catalog_lists_watcher_and_new_config_fields() {
+        let cat = catalog();
+        let commands = cat["commands"].as_array().expect("commands 是数组");
+        let find = |name: &str| {
+            commands
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("目录缺少命令 {name}"))
+        };
+        for name in ["start_watching", "stop_watching"] {
+            find(name);
+        }
+        for name in ["add_service", "update_service"] {
+            let params = &find(name)["params"];
+            assert!(params.get("healthCheck").is_some(), "{name} 未列出 healthCheck");
+            assert!(params.get("crashRestart").is_some(), "{name} 未列出 crashRestart");
+        }
+        for name in ["create_service_template", "update_service_template"] {
+            assert!(
+                find(name)["params"].get("crashRestart").is_some(),
+                "{name} 未列出 crashRestart"
+            );
+        }
+    }
+
+    /// 文件监听命令必须按绑定项目校验，不能借通用桥操作其它项目
+    #[test]
+    fn watcher_commands_are_project_bound() {
+        for command in ["start_watching", "stop_watching"] {
+            let target = target_project_id(
+                command,
+                &json!({ "projectId": "p1", "serviceId": "s1" }),
+                |_| None,
+            )
+            .expect("解析目标项目");
+            assert_eq!(target.as_deref(), Some("p1"), "{command} 必须绑定项目");
         }
     }
 

@@ -369,6 +369,12 @@ struct UpdateServiceArgs {
     watch_exclude: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    #[serde(default)]
+    restart_mode: Option<i32>,
+    #[serde(default)]
+    crash_restart: Option<bool>,
+    #[serde(default)]
+    health_check: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -498,7 +504,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "start_service",
-                "启动当前项目中的某个服务（直接执行，无需确认）。启动前会检查端口占用：被占用时**不会启动**，直接返回占用进程（PID/进程名/路径）与 port_conflict。启动后应调用 wait_for_ready；失败时自动附带最近日志。",
+                "启动当前项目中的某个服务（直接执行，无需确认）。启动前会检查端口占用：被占用时**不会启动**，直接返回占用进程（PID/进程名/路径）与 port_conflict。启动成功后会自动挂上该服务的文件监听（只对 restart_mode>0 的服务生效；watch_error 表示监听启动失败）。启动后应调用 wait_for_ready；失败时自动附带最近日志。",
                 service_arg_schema("要启动的服务 id 或名称"),
             ),
             Tool::new(
@@ -513,7 +519,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "update_service",
-                "修改当前项目中某个服务的启动配置（命令、工作目录、环境变量、监听路径、启用状态），直接生效。只修改传入的字段；修改后正在运行的进程不会自动重启，需要调用 restart_service。",
+                "修改当前项目中某个服务的启动配置（命令、工作目录、环境变量、监听路径、启用状态、监听/重启模式、崩溃自动重启、就绪检查），直接生效。只修改传入的字段；修改后正在运行的进程不会自动重启，需要调用 restart_service。",
                 schema(json!({
                     "type": "object",
                     "properties": {
@@ -534,7 +540,15 @@ impl NexusMcpServer {
                         "watch_paths": { "type": "string", "description": "监听路径 JSON 数组字符串；省略则保持不变" },
                         "watch_include": { "type": "string", "description": "监听包含 glob；省略则保持不变" },
                         "watch_exclude": { "type": "string", "description": "监听排除 glob（每行一个）；省略则保持不变" },
-                        "enabled": { "type": "boolean", "description": "是否启用（影响 start_project 是否会启动它）" }
+                        "enabled": { "type": "boolean", "description": "是否启用（影响 start_project 是否会启动它）" },
+                        "restart_mode": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2,
+                            "description": "监听/重启模式：0=关闭监听，1=确认后重启，2=自动重启；省略则保持不变"
+                        },
+                        "crash_restart": { "type": "boolean", "description": "崩溃后是否自动重启；省略则保持不变" },
+                        "health_check": { "type": "string", "description": "本地服务就绪检查 JSON；空串=进程存活即就绪；省略则保持不变" }
                     },
                     "required": ["service"],
                     "additionalProperties": false
@@ -542,7 +556,7 @@ impl NexusMcpServer {
             ),
             Tool::new(
                 "start_project",
-                "启动当前项目的全部已启用服务（已在运行的服务会跳过；直接执行，无需确认）。启动前会逐个检查端口占用，被占用的服务会跳过并在 errors 中写明占用进程。启动后应调用 wait_for_ready；部分失败时会自动附带失败服务的最近日志。",
+                "启动当前项目的全部已启用服务（已在运行的服务会跳过；直接执行，无需确认）。启动前会逐个检查端口占用，被占用的服务会跳过并在 errors 中写明占用进程。启动后会自动挂项目级文件监听（watch_error 表示监听启动失败）。启动后应调用 wait_for_ready；部分失败时会自动附带失败服务的最近日志。",
                 schema(json!({
                     "type": "object",
                     "properties": {},
@@ -938,10 +952,22 @@ impl NexusMcpServer {
                 "note": "启动失败，已自动附带该服务最近日志",
             }));
         }
+        // 与 UI 的 startSingleService 同口径：启动成功后挂上该服务的文件监听
+        // （restart_mode>0 且配置了监听路径才真正生效）。监听失败不回滚启动。
+        let watch_error = match crate::commands::watcher::start_watching(
+            self.app.clone(), service.project_id.clone(), Some(service.id.clone()),
+        ).await {
+            Ok(()) => None,
+            Err(e) => {
+                log::warn!("[mcp] 启动服务 {} 后挂文件监听失败: {}", service.name, e);
+                Some(e)
+            }
+        };
         log::info!("[mcp] 已启动服务 {} ({})", service.name, service.id);
         Ok(json!({
             "ok": true,
             "service": { "id": service.id, "name": service.name },
+            "watch_error": watch_error,
             "note": "启动已发起；请调用 wait_for_ready 等待就绪；若失败，日志会自动附带",
         }))
     }
@@ -993,6 +1019,9 @@ impl NexusMcpServer {
             || args.watch_include.is_some()
             || args.watch_exclude.is_some()
             || args.enabled.is_some()
+            || args.restart_mode.is_some()
+            || args.crash_restart.is_some()
+            || args.health_check.is_some()
             || args.env_set.as_ref().is_some_and(|m| !m.is_empty())
             || args.env_unset.as_ref().is_some_and(|v| !v.is_empty());
         if !has_change {
@@ -1024,6 +1053,13 @@ impl NexusMcpServer {
         let watch_include = args.watch_include.unwrap_or_else(|| current.watch_include.clone());
         let watch_exclude = args.watch_exclude.unwrap_or_else(|| current.watch_exclude.clone());
         let enabled = args.enabled.unwrap_or(current.enabled);
+        let restart_mode = match args.restart_mode {
+            Some(v) if (0..=2).contains(&v) => v,
+            Some(_) => return Err("restart_mode 只能是 0（关闭监听）、1（确认重启）或 2（自动重启）".into()),
+            None => current.restart_mode,
+        };
+        let crash_restart = args.crash_restart.unwrap_or(current.crash_restart);
+        let health_check = args.health_check.unwrap_or_else(|| current.health_check.clone());
 
         let mut env = crate::core::process::parse_env_vars(&current.env_vars)?;
         if let Some(set) = args.env_set {
@@ -1070,7 +1106,7 @@ impl NexusMcpServer {
             watch_include,
             watch_exclude,
             env_vars,
-            restart_mode: current.restart_mode,
+            restart_mode,
             enabled,
             show_file_tree: current.show_file_tree,
             open_enabled: current.open_enabled,
@@ -1081,10 +1117,9 @@ impl NexusMcpServer {
             boot_check: current.boot_check.clone(),
             boot_required: current.boot_required,
             boot_credential_mode: current.boot_credential_mode.clone(),
-            health_check: Some(current.health_check.clone()),
-            // AI 只改命令/环境变量等字段，不碰这个开关；显式带原值防"全量更新"
-            // 把用户关掉的崩溃自动重启又打开
-            crash_restart: Some(current.crash_restart),
+            health_check: Some(health_check),
+            // 省略时显式带原值：全量更新不能把用户关掉的崩溃自动重启又打开
+            crash_restart: Some(crash_restart),
         };
         let result = crate::commands::service::update_service(self.app.clone(), params).await?;
         // 界面同步：AI 改了配置，服务卡片/编辑面板的数据必须跟着刷新
@@ -1112,6 +1147,17 @@ impl NexusMcpServer {
         }
         let errors =
             crate::commands::process::start_project_services(self.app.clone(), project.id.clone()).await?;
+        // 与 UI 的 startProjectServices 同口径：项目启动后启动项目级文件监听。
+        // 启动本身已发起；监听失败只通过 watch_error 返回，不回滚。
+        let watch_error = match crate::commands::watcher::start_watching(
+            self.app.clone(), project.id.clone(), None,
+        ).await {
+            Ok(()) => None,
+            Err(e) => {
+                log::warn!("[mcp] 启动项目 {} 后挂文件监听失败: {}", project.name, e);
+                Some(e)
+            }
+        };
         // 失败时自动附带日志，覆盖两种失败形态：
         // - spawn 失败：不会进 running/failed 表，只能从 errors 的服务名前缀定位；
         // - 启动后立刻崩溃：此时可能在 get_running 的 failed 表里。
@@ -1149,6 +1195,7 @@ impl NexusMcpServer {
             "project": { "id": project.id, "name": project.name },
             "errors": errors,
             "failed_logs": failed_logs,
+            "watch_error": watch_error,
             "note": if ok {
                 "启动已发起；请调用 wait_for_ready 等待就绪"
             } else {
