@@ -41,6 +41,77 @@ const CRASH_RESTART_HINT_TEMPLATE =
 /** 配置面板输入框统一样式（配置表单与工具命令表单各有一份，逐字相同——改一处漏一处会出现两种输入框） */
 const INPUT_CLS = "w-full mt-1 px-2.5 py-1.5 text-[13px] bg-nexus-bg border border-nexus-border rounded-md text-nexus-text placeholder:text-nexus-muted/50 focus:outline-none focus:border-nexus-accent transition-colors";
 
+/**
+ * 可纵向拖拽的 textarea（启动命令 / 工具命令共用）。
+ *
+ * 为什么不用原生 `resize-y`：Chromium 的拖拽角画在输入框右下角，而内容溢出时
+ * 竖向滚动条也在右侧——两个控件叠在同一个角上，看起来像坏了（实测用户反馈）。
+ * 这里把拖拽条移到输入框下方：滚动条留在框内右侧，拖拽条独立，互不遮挡。
+ * 高度只影响本次面板展示，不落库；重新打开面板回到 rows=2 的初始高度。
+ */
+function ResizableTextarea({
+  id, value, onChange, placeholder,
+}: {
+  id: string;
+  value: string;
+  onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  placeholder?: string;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const [height, setHeight] = useState<number | null>(null);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const el = ref.current;
+    if (!el) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = el.offsetHeight;
+    const minHeight = 40;
+    const maxHeight = Math.max(minHeight, Math.floor(window.innerHeight * 0.6));
+    const onMove = (ev: PointerEvent) => {
+      setHeight(Math.min(maxHeight, Math.max(minHeight, startHeight + ev.clientY - startY)));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    document.body.style.cursor = 'ns-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  return (
+    <>
+      <textarea
+        ref={ref}
+        id={id}
+        rows={2}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        style={height == null ? undefined : { height }}
+        className={`${INPUT_CLS} font-mono resize-none`}
+      />
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="上下拖拽调整输入框高度"
+        title="上下拖拽调整高度"
+        onPointerDown={onPointerDown}
+        className="group mt-0.5 flex h-2 cursor-ns-resize items-center justify-center"
+      >
+        <span className="h-0.5 w-9 rounded-full bg-nexus-border group-hover:bg-nexus-muted/60" />
+      </div>
+    </>
+  );
+}
+
 /** 就绪检查分段控件的短标签（完整名称见 BOOT_CHECK_KIND_LABEL，作为 title 提示） */
 const BOOT_CHECK_KIND_SHORT: Record<BootCheckKind, string> = {
   none: '进程存活',
@@ -598,7 +669,8 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
             </div>
             <div>
               <label htmlFor={`${uid}-command`} className={labelCls}>启动命令</label>
-              <textarea id={`${uid}-command`} className={`${INPUT_CLS} font-mono resize-none`} rows={2} value={command}
+              {/* 长命令（多参数 / 串联命令）可上下拖拽展开；拖拽条在框下方，避开滚动条 */}
+              <ResizableTextarea id={`${uid}-command`} value={command}
                 onChange={e => setCommand(e.target.value)} placeholder="npm run dev" />
             </div>
             <div>
@@ -1065,7 +1137,7 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
                     {/* 命令信息 */}
                     <div className="flex-1 min-w-0 flex items-baseline gap-2 overflow-hidden">
                       <span className="text-[12px] text-nexus-text font-medium flex-shrink-0 leading-none">{cmd.name}</span>
-                      <span className="text-[11px] text-nexus-muted/60 font-mono truncate leading-none">{cmd.command}</span>
+                      <span title={cmd.command} className="text-[11px] text-nexus-muted/60 font-mono truncate leading-none">{cmd.command}</span>
                     </div>
 
                     {/* 操作按钮 */}
@@ -1344,9 +1416,9 @@ function ToolCommandForm({ initial, onSave, onDelete, onCancel }: ToolCommandFor
       </div>
       <div>
         <label htmlFor={`${uid}-cmd-command`} className="text-[11px] text-nexus-muted">命令</label>
-        <input
+        {/* 与启动命令同口径：工具命令也可能很长，拖拽条在框下方，避开滚动条 */}
+        <ResizableTextarea
           id={`${uid}-cmd-command`}
-          className={`${INPUT_CLS} font-mono`}
           value={cmd}
           onChange={e => setCmd(e.target.value)}
           placeholder="mvn clean"
