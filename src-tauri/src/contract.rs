@@ -17,7 +17,7 @@ use crate::core::runtime::{
     RuntimeExportResult, RuntimeFailure, RuntimeProgress, RuntimeSource, RuntimeTransferProgress,
     TransferKind,
 };
-use crate::commands::app::AppPaths;
+use crate::commands::app::{AppPaths, OpenProjectsResult, OpenedProject};
 use crate::commands::boot::{BootRunnerStatus, BootServiceStatus, BootToggleResult};
 use crate::commands::editor::{FileEntry, HexPage, JarEntryContent, ReadFileResponse};
 use crate::commands::fileops::{ConflictPolicy, PasteConflict, PasteFilesResult, PasteResponse};
@@ -444,6 +444,21 @@ fn test_response_dtos_are_snake_case() {
     assert_eq!(keys_of(&proj), sorted(&["id", "name", "path", "pinned", "sort_index"]));
     let detail = ProjectDetail { project: proj, services: vec![] };
     assert_eq!(keys_of(&detail), sorted(&["project", "services"]));
+
+    // 拖入文件夹/快捷方式参数后的消费结果：前端按 created 区分「已创建」还是「已定位」
+    let opened = OpenedProject {
+        project: Project {
+            id: "p2".into(),
+            name: "n2".into(),
+            path: "D:/p2".into(),
+            pinned: false,
+            sort_index: 0,
+        },
+        created: true,
+    };
+    assert_eq!(keys_of(&opened), sorted(&["project", "created"]));
+    let open_result = OpenProjectsResult { projects: vec![opened], errors: vec![] };
+    assert_eq!(keys_of(&open_result), sorted(&["projects", "errors"]));
 
     // 工具命令与打开工具/绑定/服务模板
     //
@@ -886,6 +901,8 @@ fn scan_ipc_structs() -> IpcStructs {
 /// `Project`/…）两个方向都 derive，请求侧清单里不必重列一遍。
 const COVERED_RESPONSE: &[&str] = &[
         "AiStatus", "AiMcpStatus", "DshVersionInfo", "AppPaths",
+        // 文件夹拖入/快捷方式参数 → 创建或定位项目（`take_pending_projects` 返回值）
+        "OpenedProject", "OpenProjectsResult",
         "ServiceDraftPayload", "NexusDataChanged", "ConfirmRequest",
         // AI 私有运行时：状态走 invoke，进度走 `ai-runtime-progress` 事件，失败体是
         // `ai_runtime_install` 的 Err 载荷——三条都出前端，字段名都得钉住

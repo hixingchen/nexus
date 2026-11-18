@@ -57,6 +57,10 @@ pub struct AppState {
     /// 工具服务起不来**不能阻塞 dsh 启动**（仍可正常聊天），但也不能静默：
     /// 前端按这个原因显示「AI 操作能力不可用」。
     pub mcp_error: std::sync::Mutex<Option<String>>,
+    /// 通过快捷方式/文件夹拖入打开、等待前端消费的目录。
+    ///
+    /// 路径只由后端采集（OS 拖放事件 / argv），前端只能消费，不能传任意路径。
+    pub pending_open_paths: std::sync::Mutex<Vec<String>>,
 }
 
 /// 统一的资源清理逻辑
@@ -336,7 +340,10 @@ pub fn run() {
     // 回调在第一实例主线程执行，window 操作安全；无需往第二进程传参（无协议关联）。
     // debug（tauri dev）不注册：开发阶段不做单实例限制，也不会与已运行的打包版互相拦截。
     #[cfg(not(debug_assertions))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        // 第二实例可能是「把文件夹拖到快捷方式」拉起的：把其中的目录交给第一实例
+        // 消费（创建或定位项目）。没有目录时保持原来的纯唤醒行为。
+        crate::commands::app::queue_open_paths_from_args(app, &args);
         // 第二进程已被拦截退出，这里唯一的任务就是把第一实例唤到前台——**它失败就等于
         // 用户双击图标什么都没发生**，而此前三处 `let _ =` 与 None 分支一行日志都没有
         // （CQ-37），现场只剩"打不开"。与仓库其余位置的惯例一致（Job Object 降级、
@@ -380,6 +387,10 @@ pub fn run() {
             ai_epoch: std::sync::atomic::AtomicU64::new(0),
             mcp_error: std::sync::Mutex::new(None),
             search_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // 冷启动（快捷方式/桌面拖入）：文件夹作为 argv 传入，前端 ready 后消费
+            pending_open_paths: std::sync::Mutex::new(crate::commands::app::dirs_from_args(
+                std::env::args().skip(1),
+            )),
         })
         .invoke_handler(tauri::generate_handler![
             commands::editor::read_file,
@@ -473,6 +484,7 @@ pub fn run() {
             commands::notify::notice_clicked,
             tray::set_tray_project,
             commands::app::prepare_exit,
+            commands::app::take_pending_projects,
             // 开机自启（设置 > 通用）：只写当前用户 Run 键，默认关闭；路径由后端取
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
@@ -526,6 +538,33 @@ pub fn run() {
                 // 真正的清理由 commands::app::prepare_exit 在独立线程执行（不冻结窗口），
                 // RunEvent::Exit 仍是最后兜底（幂等）。
                 log::info!("[nexus] CloseRequested → 交前端确认（未保存草稿）");
+            }
+        })
+        // 拖入文件夹（快捷方式/桌面入口在 argv 处）：路径只在后端采集，前端判断落点并消费。
+        //
+        // 为什么是 on_webview_event 而不是 on_window_event：Cargo.toml 启用了 tauri 的
+        // `unstable` feature（AI 面板追加子 WebView 需要），此时主窗口的 WebView 是
+        // `WindowChild` 而不是 `WindowContent`；tauri-runtime-wry 只对 WindowContent
+        // 合成 WindowEvent，WindowChild 的拖放走 WebviewEvent。放进 window handler 会
+        // 永远收不到（实测用户拖入文件夹无反应）。
+        .on_webview_event(|webview, event| {
+            if webview.label() != "main" {
+                return;
+            }
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+                let dirs: Vec<std::path::PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
+                if dirs.is_empty() {
+                    return;
+                }
+                log::info!("[nexus] 主窗口拖入目录 {} 个", dirs.len());
+                let window = webview.window();
+                let scale = window.scale_factor().unwrap_or(1.0);
+                crate::commands::app::queue_open_paths_from_drop(
+                    window.app_handle(),
+                    dirs,
+                    position.x / scale,
+                    position.y / scale,
+                );
             }
         })
         .build(tauri::generate_context!());

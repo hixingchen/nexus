@@ -1,5 +1,7 @@
-import { Fragment, useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import type { Project } from '../../services/service';
+import type { NexusDataChanged } from '../../services/aiService';
 import { useRunningStore } from '../../stores/runningStore';
 import { useProjectActions } from '../../hooks/useProjectActions';
 import { cachedProjects, fetchProjects } from '../../hooks/useProjectList';
@@ -25,8 +27,10 @@ import { needsFavoriteDivider } from '../../utils/projectList';
  * 用「首字符方块 + 运行小圆点」而不是服务列那种纯圆点：服务列表属于单个项目、条目少且
  * 有顺序可依；项目列表可能很长，纯圆点无法区分是哪个项目，首字符至少可辨认。
  */
-export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }: {
+export function ProjectRail({ selectedId, focusProjectSeq = 0, onSelect, onExpand, onExpandProject }: {
   selectedId: string | null;
+  /** 按路径打开项目时递增：选中的还是同一个项目也要重新滚动到它 */
+  focusProjectSeq?: number;
   onSelect: (project: Project) => void;
   onExpand: () => void;
   /** 双击项目：展开项目列表**并**展开这个项目（与列表里双击项目的语义一致） */
@@ -59,6 +63,29 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
     return () => { alive = false; };
   }, [reloadKey]);
 
+  // 项目列收起时也会通过拖入文件夹/AI 创建项目：与完整列表同样订阅数据变更，
+  // 否则窄轨停在旧列表上，新项目只有重新展开面板才看得到
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void listen<NexusDataChanged>('nexus-data-changed', (ev) => {
+      if (alive && ev.payload.kind === 'projects') reload();
+    }).then((fn) => {
+      if (alive) unlisten = fn; else fn();
+    }).catch((e) => reportError('订阅项目列表变更失败', e, { silent: true }));
+    return () => { alive = false; unlisten?.(); };
+  }, [reload]);
+
+  // 选中项滚入视野（与完整列表同口径）：拖入创建的项目可能在窄轨可视区外
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const projectIdsKey = projects.map(p => p.id).join('|');
+  useEffect(() => {
+    if (!selectedId) return;
+    const items = railRef.current?.querySelectorAll<HTMLElement>('[data-project-id]');
+    const el = items && Array.from(items).find(e => e.dataset.projectId === selectedId);
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [selectedId, projectIdsKey, focusProjectSeq]);
+
   const isRunning = (id: string) => running.some(r => r.project_id === id);
 
   // 菜单的状态现查、不快照：菜单可能开着好几秒，期间列表会重新加载（比如刚刚收藏完）
@@ -76,7 +103,7 @@ export function ProjectRail({ selectedId, onSelect, onExpand, onExpandProject }:
         </button>
       </div>
 
-      <div className="flex-1 flex flex-col items-center gap-1 overflow-y-auto py-2">
+      <div ref={railRef} className="flex-1 flex flex-col items-center gap-1 overflow-y-auto py-2">
         {projects.map((p, i) => {
           const active = isRunning(p.id);
           const selected = selectedId === p.id;

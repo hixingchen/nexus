@@ -2,10 +2,11 @@
 //!
 //! 为什么单独一个模块：这两件事都牵涉应用级时序/授权语义，集中在这里便于说明。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::{AppHandle, Manager};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 
@@ -362,6 +363,198 @@ pub async fn pick_open_file(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
+// ── 文件夹拖入 / 快捷方式参数 → 创建或定位项目 ──────────────────────
+//
+// 两条入口共用这一套：
+// - 窗口内拖放：lib.rs 的 WindowEvent::DragDrop 把目录放进 pending；
+// - 快捷方式/桌面拖入：冷启动参数或 release 单实例回调参数放进 pending。
+// 路径只在后端采集；前端只能消费 pending，不能传任意路径——否则等于绕过
+// 原生目录选择器的白名单（见 commands/paths.rs 的路径收口）。
+
+/// 通知前端「有待消费的打开请求」的事件名。
+pub(crate) const OPEN_PATHS_EVENT: &str = "nexus-open-paths";
+
+#[derive(Clone, Serialize)]
+pub struct OpenedProject {
+    pub project: crate::models::Project,
+    pub created: bool,
+}
+
+#[derive(Default, Serialize)]
+pub struct OpenProjectsResult {
+    pub projects: Vec<OpenedProject>,
+    pub errors: Vec<String>,
+}
+
+/// 仓库内项目路径以正斜杠存储；拖放/命令行给的反斜杠、尾部斜杠、Windows 大小写差异
+/// 都要能匹配回同一个项目，避免同一目录被建两次。
+pub(crate) fn normalize_project_path(raw: &str) -> String {
+    raw.trim().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn same_project_path(a: &str, b: &str) -> bool {
+    normalize_project_path(a).eq_ignore_ascii_case(&normalize_project_path(b))
+}
+
+fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() == 2 && bytes[1] == b':') || (bytes.len() == 1 && bytes[0] == b'/')
+}
+
+/// 从命令行参数里挑出**存在的目录**：Windows 把拖到快捷方式上的文件夹作为 argv 传入。
+pub(crate) fn dirs_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .filter(|arg| !arg.starts_with('-') && Path::new(arg).is_dir())
+        .collect()
+}
+
+fn queue_paths(app: &AppHandle, paths: Vec<String>, kind: &str, x: Option<f64>, y: Option<f64>) {
+    let dirs: Vec<String> = paths
+        .into_iter()
+        .filter(|path| Path::new(path).is_dir())
+        .filter(|path| !normalize_project_path(path).is_empty())
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    let Some(state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    {
+        let mut pending = state
+            .pending_open_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in dirs {
+            if !pending.iter().any(|existing| same_project_path(existing, &path)) {
+                pending.push(path);
+            }
+        }
+    }
+    // 冷启动时前端可能还没注册监听；pending 会在前端 ready 后主动 take，这里丢了也不影响。
+    let _ = app.emit(
+        OPEN_PATHS_EVENT,
+        serde_json::json!({ "kind": kind, "x": x, "y": y }),
+    );
+}
+
+/// 接入快捷方式/桌面拖入（release 单实例回调；冷启动 argv 在 AppState 初始化时直接入队）。
+///
+/// debug 不注册单实例 → 这个函数在 dev/clippy 下没有调用者；只对 debug 豁免死代码检查，
+/// release 的调用点就在 lib.rs 的单实例回调里。
+#[cfg_attr(debug_assertions, allow(dead_code))]
+pub(crate) fn queue_open_paths_from_args(app: &AppHandle, args: &[String]) {
+    queue_paths(app, dirs_from_args(args.iter().cloned()), "args", None, None);
+}
+
+/// 接入窗口内拖放（坐标已换算为 CSS/逻辑像素，供前端判断落点）。
+pub(crate) fn queue_open_paths_from_drop(
+    app: &AppHandle,
+    paths: Vec<PathBuf>,
+    x: f64,
+    y: f64,
+) {
+    let paths = paths
+        .into_iter()
+        .filter_map(|path| path.to_str().map(str::to_string))
+        .collect();
+    queue_paths(app, paths, "drop", Some(x), Some(y));
+}
+
+fn resolve_or_create_project(
+    app: &AppHandle,
+    raw: &str,
+) -> Result<(crate::models::Project, bool), String> {
+    let normalized = normalize_project_path(raw);
+    if normalized.is_empty() {
+        return Err("路径为空".into());
+    }
+    if is_drive_root(&normalized) {
+        return Err("不能把盘符根目录作为项目".into());
+    }
+    let projects = crate::commands::project::get_projects(app.state::<crate::AppState>())?;
+    if let Some(project) = projects
+        .iter()
+        .find(|project| same_project_path(&project.path, &normalized))
+    {
+        return Ok((project.clone(), false));
+    }
+    let dir = Path::new(&normalized);
+    if !dir.is_dir() {
+        return Err("不是文件夹或路径不存在".into());
+    }
+    let base_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("新项目")
+        .to_string();
+    let mut name = base_name.clone();
+    let mut index = 2;
+    while projects.iter().any(|project| project.name == name) {
+        name = format!("{} ({})", base_name, index);
+        index += 1;
+        if index > 1000 {
+            return Err(format!("无法为「{}」生成唯一项目名", base_name));
+        }
+    }
+    // 这个路径来自 OS 拖放/快捷方式参数，等价于用户经原生目录选择器确认过；
+    // 仍然走 add_project 的敏感目录/路径校验，不能借这个入口把系统目录加进白名单。
+    app.state::<crate::AppState>()
+        .paths
+        .remember_confirmed_dir(dir);
+    let project = crate::commands::project::add_project(
+        app.state::<crate::AppState>(),
+        name,
+        normalized,
+    )?;
+    Ok((project, true))
+}
+
+/// 前端消费最近一次拖入/快捷方式参数：已有项目直接返回，没有则创建。
+///
+/// `accept = false` 用于拖放落点不在项目列表区域时丢弃 pending（不建项目）。
+#[tauri::command]
+pub fn take_pending_projects(
+    webview: tauri::Webview,
+    app: AppHandle,
+    accept: bool,
+) -> Result<OpenProjectsResult, String> {
+    if webview.label() != "main" {
+        return Err("打开项目只允许主窗口调用".into());
+    }
+    let paths = {
+        let state = app.state::<crate::AppState>();
+        let mut pending = state
+            .pending_open_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *pending)
+    };
+    if !accept || paths.is_empty() {
+        return Ok(OpenProjectsResult::default());
+    }
+
+    let mut projects = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let key = normalize_project_path(&path).to_ascii_lowercase();
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        match resolve_or_create_project(&app, &path) {
+            Ok((project, created)) => projects.push(OpenedProject { project, created }),
+            Err(e) => errors.push(format!("{}: {}", path, e)),
+        }
+    }
+    if projects.iter().any(|opened| opened.created) {
+        crate::mcp_commands::emit_changed(&app, "projects", None, Vec::new());
+    }
+    Ok(OpenProjectsResult { projects, errors })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +653,45 @@ mod tests {
         assert!(p.log_dir.ends_with("logs"));
         assert!(p.log_file.starts_with(&p.log_dir));
         assert!(p.log_file.ends_with("nexus.log"));
+    }
+
+    /// 拖入/快捷方式给的路径与仓库里存的路径要能对上：反斜杠、尾部斜杠、
+    /// Windows 大小写差异都不能让同一个目录被建两次项目。
+    #[test]
+    fn test_normalize_project_paths_for_drop() {
+        assert_eq!(normalize_project_path(" D:\\work\\p\\ "), "D:/work/p");
+        assert_eq!(normalize_project_path("D:/work/p///"), "D:/work/p");
+        assert!(same_project_path("D:\\Work\\P", "d:/work/p/"));
+        assert!(!same_project_path("D:/work/p", "D:/work/q"));
+    }
+
+    /// 快捷方式参数里只有**存在的目录**才是待打开项目；文件、开关参数一律忽略。
+    #[test]
+    fn test_dirs_from_args_only_keeps_existing_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "nexus_open_paths_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dir = base.join("dir");
+        let file = base.join("file.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "x").unwrap();
+
+        let kept = dirs_from_args(vec![
+            file.to_string_lossy().to_string(),
+            dir.to_string_lossy().to_string(),
+            "--flag".to_string(),
+        ]);
+        assert_eq!(kept.len(), 1, "只应保留目录: {:?}", kept);
+        assert_eq!(
+            normalize_project_path(&kept[0]),
+            normalize_project_path(&dir.to_string_lossy())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

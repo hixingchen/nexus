@@ -3,6 +3,7 @@ import { reportError } from '../utils/error';
 import { setFrontendLogSink, type FrontendLogLevel } from '../utils/logSink';
 import type { ConflictPolicy, PasteResponse } from '../utils/pasteResult';
 import type { FileEntry } from '../types/file';
+import type { Project } from './service';
 
 /**
  * 系统级调用封装（原生对话框 / 外部程序 / 剪贴板文件）。
@@ -321,4 +322,31 @@ export function noticeReady(width: number, height: number): Promise<void> {
 /** 点击通知小窗：后端显示主窗口并关闭小窗 */
 export function noticeClicked(): Promise<void> {
   return invoke<void>('notice_clicked');
+}
+
+// ── 文件夹拖入 / 快捷方式参数 → 创建或定位项目 ──────────────────────
+
+export interface OpenedProject {
+  project: Project;
+  created: boolean;
+}
+
+export interface OpenProjectsResult {
+  projects: OpenedProject[];
+  errors: string[];
+}
+
+/** 后端 `nexus-open-paths` 事件载荷（drop 时带落点，args 时没有） */
+export interface OpenPathsEventPayload {
+  kind: 'args' | 'drop' | string;
+  x?: number | null;
+  y?: number | null;
+}
+
+/**
+ * 消费后端采集到的「打开路径」请求：已有项目直接返回，没有则创建。
+ * `accept = false` 用于拖放落点不在项目列表区域时丢弃请求（不建项目）。
+ */
+export function takePendingProjects(accept: boolean): Promise<OpenProjectsResult> {
+  return invoke<OpenProjectsResult>('take_pending_projects', { accept });
 }

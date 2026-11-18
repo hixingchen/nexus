@@ -10,6 +10,8 @@ import { needsFavoriteDivider } from '../../utils/projectList';
 
 interface Props {
   selectedId: string | null;
+  /** 按路径打开项目时递增：选中的还是同一个项目也要重新滚动到它 */
+  focusProjectSeq?: number;
   onSelect: (id: string | null) => void;
   onProjectName?: (name: string) => void;
   onProjectPath?: (path: string) => void;
@@ -31,7 +33,7 @@ interface Props {
  */
 const NO_DOM_EVENT = { stopPropagation: () => {} };
 
-export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath, onCollapse, expandProjectId, onExpandHandled }: Props) {
+export function ProjectList({ selectedId, focusProjectSeq = 0, onSelect, onProjectName, onProjectPath, onCollapse, expandProjectId, onExpandHandled }: Props) {
   const {
     projects, search, setSearch,
     expanded, expandedSvc, svcCache, expandingId,
@@ -60,14 +62,22 @@ export function ProjectList({ selectedId, onSelect, onProjectName, onProjectPath
    * 此前列表不做任何滚动：新建项目（`onCreated` 里会选中它）或从别处选中时，
    * 只要它在视野之外，用户就"选中了却看不见"——收藏多的时候尤其明显。
    * `block: 'nearest'`：只滚必要的那点距离，不打断用户当前的浏览位置。
+   *
+   * **依赖里必须有列表内容**：拖入文件夹创建项目时，选中先发生，新项目要等
+   * `nexus-data-changed` 刷新列表后才进入 DOM；只依赖 `selectedId` 会在行还不存在时
+   * 跑一次然后不再重跑，表现就是"高亮对了但没滚过去"。
+   *
+   * **`focusProjectSeq`**：同一个项目重复拖入时 `selectedId` 不变，React 不会重渲，
+   * 序号变化专门打破这种情况，强制再滚一次。
    */
   const listRef = useRef<HTMLDivElement | null>(null);
+  const projectIdsKey = filtered.map(p => p.id).join('|');
   useEffect(() => {
     if (!selectedId) return;
     const items = listRef.current?.querySelectorAll<HTMLElement>('[data-project-id]');
     const el = items && Array.from(items).find(e => e.dataset.projectId === selectedId);
     el?.scrollIntoView({ block: 'nearest' });
-  }, [selectedId]);
+  }, [selectedId, projectIdsKey, focusProjectSeq]);
 
   /**
    * 右键菜单里那两个"按状态改文案"的条目（启动/停止、收藏/取消收藏）需要目标项目的当前状态。

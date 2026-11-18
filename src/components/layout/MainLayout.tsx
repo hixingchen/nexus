@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { TitleBar } from './TitleBar';
 import { StatusBar } from './StatusBar';
@@ -20,7 +21,8 @@ import { ToolCommandResultDialog } from '../ui/ToolCommandResultDialog';
 import { ToolCommandIndicator } from '../ui/ToolCommandIndicator';
 import { useToolCommandDialog } from '../../hooks/useToolCommandRunner';
 import { securityApi, projectApi } from '../../services/service';
-import { setTrayProject } from '../../services/system';
+import { setTrayProject, takePendingProjects, type OpenPathsEventPayload } from '../../services/system';
+import { showNotification } from '../ui/Toast';
 import { useSvcCacheStore } from '../../stores/svcCacheStore';
 import { startProjectWithFeedback, stopProjectWithFeedback } from '../../stores/serviceActions';
 import { useExitIntentStore } from '../../stores/exitIntentStore';
@@ -63,6 +65,11 @@ export function MainLayout() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [servicePanelCollapsed, setServicePanelCollapsed] = useState(false);
   const [ready, setReady] = useState(false);
+  /** 拖动文件夹进入项目列时的落区高亮（仅视觉；路径仍由后端采集） */
+  const [dragOverProjectZone, setDragOverProjectZone] = useState(false);
+  const dragOverProjectZoneRef = useRef(false);
+  /** 每次「按路径打开项目」+1：即使选中的还是同一个项目，也强制列表重新滚到它 */
+  const [focusProjectSeq, setFocusProjectSeq] = useState(0);
   /**
    * 已落库的值。持久化 effect 只在“当前值 ≠ 已落库值”时写。
    *
@@ -145,6 +152,75 @@ export function MainLayout() {
   const saveLayout = useCallback((patch: Parameters<typeof saveLayoutFn>[0]) => {
     saveLayoutFn(patch);
   }, []);
+
+  // ── 文件夹拖入 / 快捷方式参数 → 创建或定位项目 ──────────────────────
+  // 路径由后端采集（OS 拖放事件 / argv），前端只消费；拖放时还要判断落点是否在项目列。
+  const openPathsBusyRef = useRef(false);
+  const openPathsQueuedRef = useRef(false);
+  const pendingOpenPathsRef = useRef<OpenPathsEventPayload | null>(null);
+  const applyOpenPathsRef = useRef<(payload?: OpenPathsEventPayload) => void>(() => {});
+
+  const applyOpenPaths = useCallback(async (payload?: OpenPathsEventPayload) => {
+    if (!ready) {
+      // 冷启动参数可能在前端 ready 前到达；ready 后统一消费
+      pendingOpenPathsRef.current = payload ?? { kind: 'startup' };
+      return;
+    }
+    if (openPathsBusyRef.current) {
+      // 消费期间又来了一次（例如连续两次拖放）：记下来，结束后再取一次
+      openPathsQueuedRef.current = true;
+      pendingOpenPathsRef.current = payload ?? { kind: 'startup' };
+      return;
+    }
+    openPathsBusyRef.current = true;
+    try {
+      let accept = true;
+      if (payload?.kind === 'drop') {
+        const { x, y } = payload;
+        const el = typeof x === 'number' && typeof y === 'number'
+          ? document.elementFromPoint(x, y)
+          : null;
+        // 只有落在项目列/窄轨上才建项目；窗口其它位置拖入不处理
+        accept = !!el?.closest('[data-project-drop-zone]');
+      }
+      const res = await takePendingProjects(accept);
+      if (!accept) return;
+      if (res.projects.length > 0) {
+        const latest = res.projects[res.projects.length - 1];
+        setSelectedProjectId(latest.project.id);
+        setSelectedProjectName(latest.project.name);
+        setSelectedProjectPath(latest.project.path);
+        // 同一项目重复拖入时 selectedId 不变，React 不会重渲；用序号强制列表再滚动一次
+        setFocusProjectSeq(seq => seq + 1);
+        showNotification({
+          title: latest.created
+            ? `已创建项目「${latest.project.name}」`
+            : `已定位到项目「${latest.project.name}」`,
+          description: latest.created ? latest.project.path : undefined,
+          duration: latest.created ? 3500 : 2500,
+        });
+      }
+      if (res.errors.length > 0) {
+        showNotification({
+          variant: 'warning',
+          title: '部分路径未能打开',
+          description: res.errors.join('；'),
+          duration: 8000,
+        });
+      }
+    } catch (e) {
+      reportError('打开拖入的项目失败', e);
+    } finally {
+      openPathsBusyRef.current = false;
+      if (openPathsQueuedRef.current) {
+        openPathsQueuedRef.current = false;
+        const queued = pendingOpenPathsRef.current;
+        pendingOpenPathsRef.current = null;
+        applyOpenPathsRef.current(queued ?? { kind: 'startup' });
+      }
+    }
+  }, [ready, setSelectedProjectId, setSelectedProjectName, setSelectedProjectPath]);
+  applyOpenPathsRef.current = applyOpenPaths;
 
   /**
    * AI 增删改项目后同步当前选择：
@@ -282,6 +358,55 @@ export function MainLayout() {
     saveLayout({ [LAYOUT_KEYS.leftPanelCollapsed]: leftPanelCollapsed ? '1' : '0' });
   }, [leftPanelCollapsed, ready, saveLayout]);
 
+  // 后端采集到拖入/快捷方式目录后通知前端消费；冷启动参数没有事件，ready 后主动取一次。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen<OpenPathsEventPayload>('nexus-open-paths', (ev) => {
+      if (disposed) return;
+      void applyOpenPaths(ev.payload);
+    }).then((fn) => {
+      if (disposed) fn(); else unlisten = fn;
+    }).catch((e) => reportError('订阅项目打开请求失败', e, { silent: true }));
+    return () => { disposed = true; unlisten?.(); };
+  }, [applyOpenPaths]);
+
+  useEffect(() => {
+    if (!ready) return;
+    const pending = pendingOpenPathsRef.current;
+    pendingOpenPathsRef.current = null;
+    void applyOpenPaths(pending ?? { kind: 'startup' });
+  }, [ready, applyOpenPaths]);
+
+  // 拖动经过项目列时的视觉反馈。只读 drag-over 坐标做高亮；真正打开仍走后端
+  // `nexus-open-paths`（前端不把拖入路径当可信输入）。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void getCurrentWebview().onDragDropEvent((event) => {
+      if (disposed) return;
+      const payload = event.payload;
+      if (payload.type === 'leave' || payload.type === 'drop') {
+        if (dragOverProjectZoneRef.current) {
+          dragOverProjectZoneRef.current = false;
+          setDragOverProjectZone(false);
+        }
+        return;
+      }
+      // WebView2 给的是物理像素；elementFromPoint 用 CSS 像素
+      const dpr = window.devicePixelRatio || 1;
+      const el = document.elementFromPoint(payload.position.x / dpr, payload.position.y / dpr);
+      const inside = !!el?.closest?.('[data-project-drop-zone]');
+      if (inside !== dragOverProjectZoneRef.current) {
+        dragOverProjectZoneRef.current = inside;
+        setDragOverProjectZone(inside);
+      }
+    }).then((fn) => {
+      if (disposed) fn(); else unlisten = fn;
+    }).catch((e) => reportError('订阅拖放状态失败', e, { silent: true }));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
   // 当前选中项目 → 托盘菜单（启动/停止项的文字与可用状态）
   useEffect(() => {
     void setTrayProject(selectedProjectName);
@@ -342,6 +467,7 @@ export function MainLayout() {
   const leftPanel = (
     <ProjectList
       selectedId={selectedProjectId}
+      focusProjectSeq={focusProjectSeq}
       onSelect={(id) => { setSelectedProjectId(id); if (!id) { setSelectedProjectName(null); setSelectedProjectPath(null); } }}
       onProjectName={setSelectedProjectName}
       onProjectPath={setSelectedProjectPath}
@@ -355,6 +481,7 @@ export function MainLayout() {
   const leftRail = (
     <ProjectRail
       selectedId={selectedProjectId}
+      focusProjectSeq={focusProjectSeq}
       onSelect={(p) => { setSelectedProjectId(p.id); setSelectedProjectName(p.name); setSelectedProjectPath(p.path); }}
       onExpand={() => setLeftPanelCollapsed(false)}
       onExpandProject={(p) => {
@@ -362,6 +489,37 @@ export function MainLayout() {
         setLeftPanelCollapsed(false); // 与顶部箭头同一入口（持久化由下面那个 effect 统一处理）
       }}
     />
+  );
+
+  /** 项目列（含收起后的窄轨）是窗口内拖放的落区；属性供 elementFromPoint 判断 */
+  const projectDropZone = (
+    <div
+      data-project-drop-zone
+      className={`relative h-full min-h-0 transition-shadow ${
+        dragOverProjectZone ? 'ring-2 ring-inset ring-nexus-accent/60' : ''
+      }`}
+    >
+      {leftPanelCollapsed ? leftRail : leftPanel}
+      {dragOverProjectZone && (
+        <div className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-lg border-2 border-dashed border-nexus-accent/55 bg-nexus-accent/[0.07] animate-[fadeIn_120ms_ease-out]">
+          <div className="flex flex-col items-center gap-1.5 px-2 text-center">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4"
+              strokeLinecap="round" strokeLinejoin="round" className="text-nexus-accent">
+              <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              <line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/>
+            </svg>
+            {!leftPanelCollapsed && (
+              <>
+                <span className="text-[12px] font-medium text-nexus-accent">松开以打开项目</span>
+                <span className="text-[10px] leading-snug text-nexus-muted">
+                  已有项目直接定位<br />没有则自动创建
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 
   const detailPanel = selectedProjectId ? (
@@ -392,7 +550,7 @@ export function MainLayout() {
    */
   const mainContent = (
     <ResizablePanel
-      left={leftPanelCollapsed ? leftRail : leftPanel}
+      left={projectDropZone}
       right={detailPanel}
       collapsed={leftPanelCollapsed}
       // 收起态不复用 `leftPanelWidth`：分隔条已消失，拖出来的宽度无处可去，
