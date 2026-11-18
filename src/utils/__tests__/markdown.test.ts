@@ -30,6 +30,13 @@ test('外链只放行 http/https/mailto，其余协议一律忽略', () => {
 
 test('锚点留在预览内滚动', () => {
   assert.deepEqual(resolveMdLink('#安装', 'D:/p/README.md'), { kind: 'anchor', id: '安装' });
+  // marked 会把中文锚点编码进 href；解析时必须解码，否则标题 id 永远对不上
+  assert.deepEqual(
+    resolveMdLink('#1-%E9%A1%B9%E7%9B%AE%E6%80%BB%E8%A7%88', 'D:/p/README.md'),
+    { kind: 'anchor', id: '1-项目总览' },
+  );
+  // 裸 % 不是合法转义：保留原样，不能让点击抛异常
+  assert.deepEqual(resolveMdLink('#100%', 'D:/p/README.md'), { kind: 'anchor', id: '100%' });
   assert.equal(resolveMdLink('#', 'D:/p/README.md'), null);
 });
 
@@ -46,6 +53,11 @@ test('相对链接按"md 文件所在目录"解析成绝对路径', () => {
     resolveMdLink('img/a.png', 'D:/work/p/README.md'),
     { kind: 'local', path: 'D:/work/p/img/a.png' },
     '裸相对路径同样按所在目录解析',
+  );
+  assert.deepEqual(
+    resolveMdLink('./%E4%B8%AD%E6%96%87%E7%9B%AE%E5%BD%95/%E8%AF%B4%E6%98%8E.md', 'D:/p/README.md'),
+    { kind: 'local', path: 'D:/p/中文目录/说明.md' },
+    'marked 编码过的中文路径要先解码再拼',
   );
 });
 
@@ -78,6 +90,7 @@ test('图片：data:image 直接用，相对路径读盘，其余交给 CSP/忽�
 
 test('标题 id 近似 GitHub 规则（中文保留、标点去掉、空格转连字符）', () => {
   assert.equal(headingSlug('安装步骤'), '安装步骤', '中文标题原样保留');
+  assert.equal(headingSlug('1. 项目总览'), '1-项目总览', '编号后的点去掉、空格转连字符');
   assert.equal(headingSlug('Step 1: Setup'), 'step-1-setup', '大写转小写、冒号去掉、空格转连字符');
   assert.equal(headingSlug('  Hello   World  '), 'hello-world', '连续空格合并、首尾空白忽略');
   assert.equal(headingSlug('中文 (English)'), '中文-english', '括号等标点去掉');

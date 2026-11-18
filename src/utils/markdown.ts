@@ -41,6 +41,23 @@ export type MdLinkTarget =
   | { kind: 'anchor'; id: string };
 
 /**
+ * 安全解码 URL 片段（marked 会把非 ASCII / 空格按 `encodeURI` 编码进 href）。
+ *
+ * 为什么必须解码：`[项目总览](#1-项目总览)` 渲染出来是
+ * `href="#1-%E9%A1%B9%E7%9B%AE%E6%80%BB%E8%A7%88"`，而标题 id 是未编码的
+ * `1-项目总览`——不解码就永远查不到目标，中文锚点/中文文件名全部点不动。
+ * 裸 `%`（如 `#100%`）不是合法编码序列，decodeURI* 会抛错；此时保留原串，
+ * 不能让一次点击抛异常。
+ */
+function decodeUrlPart(raw: string, component: boolean): string {
+  try {
+    return component ? decodeURIComponent(raw) : decodeURI(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
  * 解析预览里点击的链接。
  *
  * 为什么要自己解析而不是让浏览器导航：预览是 `dangerouslySetInnerHTML` 渲染的，
@@ -52,7 +69,7 @@ export function resolveMdLink(href: string, mdFilePath: string): MdLinkTarget | 
   const raw = href.trim();
   if (!raw) return null;
   if (raw.startsWith('#')) {
-    const id = raw.slice(1).trim();
+    const id = decodeUrlPart(raw.slice(1).trim(), true);
     return id ? { kind: 'anchor', id } : null;
   }
   // 显式协议：只有这几个放行；javascript: / data: / file: 等一律忽略
@@ -63,7 +80,9 @@ export function resolveMdLink(href: string, mdFilePath: string): MdLinkTarget | 
       : null;
   }
   // 无协议 = 相对路径（含 ./ ../ 与裸文件名）。去掉 ?query 与 #fragment
-  const pathPart = raw.split('#')[0].split('?')[0];
+  // 路径先解码再拼：marked 把中文目录/文件名编码成 %E4%B8%AD...，直接用编码串
+  // 去找文件会 404。decodeURI 不解开 %2F/%23 等保留字符，路径分段不会被改写。
+  const pathPart = decodeUrlPart(raw.split('#')[0].split('?')[0], false);
   if (!pathPart || pathPart.startsWith('//')) return null; // 协议相对 URL 交给浏览器处理不了，忽略
   const dir = mdFilePath.replace(/[\\/][^\\/]*$/, '');
   const sep = mdFilePath.includes('\\') ? '\\' : '/';
