@@ -92,9 +92,67 @@ struct BoundProject {
     path: String,
 }
 
+/// dsh 插件在回合结束时上报的改动文件。
+#[derive(Deserialize)]
+struct AiEditedPayload {
+    #[serde(alias = "changedFiles")]
+    changed_files: Vec<String>,
+    /// 来源标记（默认 dsh-turn），只用于日志
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// `POST /ai/edited`：dsh 回合结束钩子的入口。
+///
+/// 与 MCP 工具 `restart_services_after_edit` 走同一个重启函数——插件只是把
+/// "模型忘了调工具"的那一轮补上，匹配/重启/跳过规则不分叉。
+async fn ai_edited_handler(
+    axum::extract::State((app, project)): axum::extract::State<(tauri::AppHandle, Option<BoundProject>)>,
+    axum::Json(payload): axum::Json<AiEditedPayload>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(project) = project else {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({ "ok": false, "error": "当前 AI 会话没有绑定项目" })),
+        )
+            .into_response();
+    };
+    let source = payload.source.unwrap_or_else(|| "dsh-turn".to_string());
+    log::info!(
+        "[mcp] 回合结束收到 {} 个改动文件（{}）",
+        payload.changed_files.len(),
+        source
+    );
+    // 立即 202，重启在后台跑：插件是 fire-and-forget，不能被"停服务+启动"的耗时
+    // 拖住；客户端即使断开，后台任务也不会被 axum 取消掉。
+    let files = payload.changed_files;
+    let source_for_task = source.clone();
+    tauri::async_runtime::spawn(async move {
+        match restart_services_for_changed_files(&app, &project, &files, &source_for_task).await {
+            Ok(value) => {
+                log::info!(
+                    "[mcp] 回合结束重启结果: restarted={} skipped={} failed={}",
+                    value.get("restarted").and_then(Value::as_array).map_or(0, |a| a.len()),
+                    value.get("skipped").and_then(Value::as_array).map_or(0, |a| a.len()),
+                    value.get("failed").and_then(Value::as_array).map_or(0, |a| a.len()),
+                );
+            }
+            Err(e) => log::warn!("[mcp] 回合结束自动重启失败: {}", e),
+        }
+    });
+    (
+        axum::http::StatusCode::ACCEPTED,
+        axum::Json(json!({ "ok": true, "accepted": true })),
+    )
+        .into_response()
+}
+
 /// MCP 服务句柄：随 `AiSession` 存放，drop 即收尾。
 pub struct McpHandle {
     patch_path: PathBuf,
+    /// 会话级 dsh 插件文件（回合结束上报改动），与 patch 一起清理
+    plugin_path: PathBuf,
     cancel: CancellationToken,
 }
 
@@ -108,14 +166,16 @@ impl McpHandle {
 impl Drop for McpHandle {
     fn drop(&mut self) {
         self.cancel.cancel();
-        match std::fs::remove_file(&self.patch_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!(
-                "[mcp] 清理会话 patch 文件失败（{}）: {}",
-                self.patch_path.display(),
-                e
-            ),
+        for path in [&self.patch_path, &self.plugin_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!(
+                    "[mcp] 清理会话文件失败（{}）: {}",
+                    path.display(),
+                    e
+                ),
+            }
         }
     }
 }
@@ -145,7 +205,7 @@ pub(crate) fn start_session(
         .local_addr()
         .map_err(|e| format!("读取 MCP 服务端口失败: {}", e))?
         .port();
-    let patch_path = write_patch_file(port, &token)?;
+    let (patch_path, plugin_path) = write_patch_file(port, &token, cwd)?;
 
     let cancel = CancellationToken::new();
     let server_app = app.clone();
@@ -167,14 +227,22 @@ pub(crate) fn start_session(
         // non_exhaustive：不能写结构体字面量，只能在 Default 上改公开字段
         let mut config = StreamableHttpServerConfig::default();
         config.cancellation_token = server_cancel.clone();
+        // MCP 客户端工厂与 AI 回合结束端点各拿一份克隆：两者都必须存活到会话结束。
+        let service_app = server_app.clone();
+        let service_project = server_project.clone();
         let service: StreamableHttpService<NexusMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
-                move || Ok(NexusMcpServer::new(server_app.clone(), server_project.clone())),
+                move || Ok(NexusMcpServer::new(service_app.clone(), service_project.clone())),
                 Default::default(),
                 config,
             );
+        let ai_state = (server_app.clone(), server_project.clone());
         let router = axum::Router::new()
             .nest_service("/mcp", service)
+            // dsh 插件在 `agent/turn-stopping` 时调用：AI 改完代码、回合关闭前，
+            // 由 Nexus 按改动文件重启 mode=3 服务。同一 Bearer token，只对本会话生效。
+            .route("/ai/edited", axum::routing::post(ai_edited_handler))
+            .with_state(ai_state)
             // Bearer 校验：端口在回环上，本机其它进程理论上可访问；token 每次会话随机，
             // 且只写进 dsh 的会话级 patch 文件。失败一律 401，不暴露任何服务信息。
             .layer(axum::middleware::from_fn(
@@ -192,7 +260,10 @@ pub(crate) fn start_session(
                     }
                 },
             ));
-        log::info!("[mcp] 工具服务已启动: http://127.0.0.1:{}/mcp", port);
+        log::info!(
+            "[mcp] 工具服务已启动: http://127.0.0.1:{}/mcp（回合结束钩子: /ai/edited）",
+            port
+        );
         if let Err(e) = axum::serve(listener, router)
             .with_graceful_shutdown(async move { server_cancel.cancelled().await })
             .await
@@ -211,25 +282,19 @@ pub(crate) fn start_session(
     );
     Ok(McpHandle {
         patch_path,
+        plugin_path,
         cancel,
     })
 }
 
-/// 生成 dsh 的会话级 patch（`--patch` 覆盖层）。
+/// 生成 dsh 会话 patch 的内容（MCP 客户端 + 回合结束插件）。
 ///
-/// 文件名带 pid + 随机后缀：`patchReload: live` 下固定文件名会被后启动的实例
-/// 覆盖（安装版与 dev 版并存是实测过的场景），导致旧会话热重载到新端口。
-fn write_patch_file(port: u16, token: &str) -> Result<PathBuf, String> {
-    let dir = crate::data_dir().join("ai");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("创建 MCP 配置目录失败（{}）: {}", dir.display(), e))?;
-    let path = dir.join(format!(
-        "nexus-mcp-{}-{}.yml",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let body = format!(
-        "# Nexus 生成（会话级 MCP 工具入口）：dsh 停止时自动删除，请勿手改。\n\
+/// 抽成纯函数便于单测；Cordis patch 的 `- insert:` 语法是硬要求，
+/// 少一层缩进/写错 entry 会让整个会话启动失败。
+fn build_patch_body(port: u16, token: &str, plugin_url: &str, cwd: &str) -> String {
+    let yaml = |s: &str| s.replace('\'', "''");
+    format!(
+        "# Nexus 生成（会话级 MCP 工具入口 + 回合结束重启钩子）：dsh 停止时自动删除，请勿手改。\n\
          - insert:\n\
          \x20   - id: mcp-nexus\n\
          \x20     name: '@deepseek-ai/dsh-mcp-client'\n\
@@ -240,11 +305,53 @@ fn write_patch_file(port: u16, token: &str) -> Result<PathBuf, String> {
          \x20       headers:\n\
          \x20         Authorization: 'Bearer {token}'\n\
          \x20       toolCallTimeoutMs: 600000\n\
-         \x20       failOnStartupError: false\n"
+         \x20       failOnStartupError: false\n\
+         \x20   - id: nexus-ai-restart\n\
+         \x20     name: '{plugin_url}'\n\
+         \x20     config:\n\
+         \x20       url: http://127.0.0.1:{port}/ai/edited\n\
+         \x20       token: '{token}'\n\
+         \x20       cwd: '{cwd}'\n",
+        plugin_url = yaml(plugin_url),
+        cwd = yaml(cwd),
+    )
+}
+
+/// 生成 dsh 的会话级 patch（`--patch` 覆盖层）与会话插件文件。
+///
+/// 文件名带 pid + 随机后缀：`patchReload: live` 下固定文件名会被后启动的实例
+/// 覆盖（安装版与 dev 版并存是实测过的场景），导致旧会话热重载到新端口。
+fn write_patch_file(
+    port: u16,
+    token: &str,
+    cwd: Option<&str>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let dir = crate::data_dir().join("ai");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建 MCP 配置目录失败（{}）: {}", dir.display(), e))?;
+    let nonce = uuid::Uuid::new_v4().simple();
+    let plugin_path = dir.join(format!("nexus-ai-restart-{}-{}.js", std::process::id(), nonce));
+    let path = dir.join(format!("nexus-mcp-{}-{}.yml", std::process::id(), nonce));
+
+    std::fs::write(&plugin_path, include_str!("scripts/nexus_ai_restart.js"))
+        .map_err(|e| format!("写入会话插件失败（{}）: {}", plugin_path.display(), e))?;
+
+    // Windows 路径 → file URL。插件内容里没有 import，Cordis 用原生 ESM 直接加载。
+    let plugin_url = format!(
+        "file:///{}",
+        plugin_path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .replace(' ', "%20")
     );
-    std::fs::write(&path, body)
-        .map_err(|e| format!("写入 MCP patch 文件失败（{}）: {}", path.display(), e))?;
-    Ok(path)
+    let cwd = cwd.unwrap_or("").replace('\\', "/");
+    let body = build_patch_body(port, token, &plugin_url, &cwd);
+    if let Err(e) = std::fs::write(&path, body) {
+        // patch 没写成，插件文件不能留下（否则下次启动清理前会多一个孤儿文件）
+        let _ = std::fs::remove_file(&plugin_path);
+        return Err(format!("写入 MCP patch 文件失败（{}）: {}", path.display(), e));
+    }
+    Ok((path, plugin_path))
 }
 
 /// 清理上次进程遗留的 MCP patch 文件（内含一次性 Bearer token）。
@@ -260,8 +367,11 @@ pub(crate) fn cleanup_stale_patch_files() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix("nexus-mcp-") else { continue };
-        if !name.ends_with(".yml") { continue; }
+        let Some(rest) = name
+            .strip_prefix("nexus-mcp-")
+            .or_else(|| name.strip_prefix("nexus-ai-restart-"))
+        else { continue };
+        if !(name.ends_with(".yml") || name.ends_with(".js")) { continue; }
         let Some(pid) = rest.split('-').next().and_then(|s| s.parse::<u32>().ok()) else { continue };
         // 句柄身份不受 pid 复用影响；查不到（进程已退出/无权限）按"已退出"处理。
         // 这些文件只在启动时被读一次，误删活实例的文件的唯一后果是它本次 MCP 不可用
@@ -272,9 +382,9 @@ pub(crate) fn cleanup_stale_patch_files() {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
-            Ok(()) => log::info!("[mcp] 已清理遗留 patch 文件: {}", name),
+            Ok(()) => log::info!("[mcp] 已清理遗留会话文件: {}", name),
             Err(e) => log::warn!(
-                "[mcp] 清理遗留 patch 文件失败（{}）: {}",
+                "[mcp] 清理遗留会话文件失败（{}）: {}",
                 entry.path().display(),
                 e
             ),
@@ -356,6 +466,160 @@ fn affected_files_for_watch_config(
         .filter(|p| cfg.matches_path(p))
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .collect())
+}
+
+/// 把改动文件映射到 mode=3 的服务并逐个重启。
+///
+/// MCP 工具 `restart_services_after_edit` 与 dsh 回合结束钩子（`/ai/edited`）共用：
+/// 匹配/跳过/重启规则只有一份。`source` 只用于日志区分是谁触发的。
+async fn restart_services_for_changed_files(
+    app: &tauri::AppHandle,
+    project: &BoundProject,
+    changed_files: &[String],
+    source: &str,
+) -> Result<Value, String> {
+    if changed_files.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "restarted": [],
+            "skipped": [],
+            "failed": [],
+            "note": "没有传入改动文件，未重启任何服务",
+        }));
+    }
+    if changed_files.len() > RESTART_AFTER_EDIT_MAX_FILES {
+        return Err(format!(
+            "changed_files 最多 {} 个（本次 {} 个）；请只传本轮实际修改的文件",
+            RESTART_AFTER_EDIT_MAX_FILES,
+            changed_files.len()
+        ));
+    }
+
+    // 绝对路径原样使用；相对路径按项目根目录解析。去重按统一分隔符的字符串。
+    let mut changed: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in changed_files {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() { continue; }
+        let path = PathBuf::from(trimmed);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            Path::new(&project.path).join(path)
+        };
+        let key = path.to_string_lossy().replace('\\', "/");
+        if seen.insert(key) {
+            changed.push(path);
+        }
+    }
+    if changed.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "restarted": [],
+            "skipped": [],
+            "failed": [],
+            "note": "changed_files 里没有有效路径，未重启任何服务",
+        }));
+    }
+
+    let state = app.state::<AppState>();
+    let services = state.db.with_conn(|conn| {
+        crate::database::query_services_by_project(conn, &project.id)
+    })?;
+    let status = crate::commands::process::get_running(app.clone()).await?;
+    // starting 的服务可能正在构建；重启会杀掉构建，跳过等它先落定。
+    let phases: HashMap<String, String> = status
+        .running
+        .iter()
+        .filter(|r| r.project_id == project.id)
+        .map(|r| (r.service_id.clone(), r.phase.clone()))
+        .collect();
+
+    let mut restarted = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+
+    for svc in services.into_iter().filter(|s| s.enabled && s.restart_mode == 3) {
+        let matched = match affected_files_for_watch_config(
+            &svc.watch_paths, &svc.watch_include, &svc.watch_exclude, &changed,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                skipped.push(json!({
+                    "id": svc.id, "name": svc.name,
+                    "reason": e,
+                }));
+                continue;
+            }
+        };
+        if matched.is_empty() { continue; }
+        let sample: Vec<String> = matched.iter()
+            .take(RESTART_AFTER_EDIT_SAMPLE_FILES).cloned().collect();
+
+        match phases.get(&svc.id).map(String::as_str) {
+            None => {
+                skipped.push(json!({
+                    "id": svc.id, "name": svc.name,
+                    "reason": "未运行（本工具只重启正在运行的服务；若刚修复了它的启动失败，请调用 restart_service）",
+                    "matched_count": matched.len(),
+                    "matched_files": sample,
+                }));
+                continue;
+            }
+            Some("starting") => {
+                skipped.push(json!({
+                    "id": svc.id, "name": svc.name,
+                    "reason": "仍在启动/构建中，已跳过以避免打断构建；可稍后再次调用",
+                    "matched_count": matched.len(),
+                    "matched_files": sample,
+                }));
+                continue;
+            }
+            Some(_) => {}
+        }
+
+        match crate::commands::process::restart_service(app.clone(), svc.id.clone()).await {
+            Ok(()) => {
+                log::info!(
+                    "[mcp] {} 重启服务 {} ({})，命中 {} 个文件（样例 {}）",
+                    source, svc.name, svc.id, matched.len(),
+                    matched.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                );
+                restarted.push(json!({
+                    "id": svc.id, "name": svc.name,
+                    "matched_count": matched.len(),
+                    "matched_files": sample,
+                }));
+            }
+            Err(e) => {
+                log::warn!("[mcp] {} 重启服务 {} ({}) 失败: {}", source, svc.name, svc.id, e);
+                failed.push(json!({
+                    "id": svc.id, "name": svc.name,
+                    "error": e,
+                    "matched_count": matched.len(),
+                }));
+            }
+        }
+    }
+
+    let note = if !failed.is_empty() {
+        "部分服务重启失败，详见 failed；可查看日志后修复并调用 restart_service 重试"
+    } else if !restarted.is_empty() {
+        "重启已发起；构建可能需要时间，需要确认时调用 wait_for_ready"
+    } else if !skipped.is_empty() {
+        "命中的服务都没有实际重启；详见 skipped"
+    } else {
+        "传入的文件没有命中任何开启「AI 修改后重启」的服务（检查服务的监听路径）"
+    };
+    Ok(json!({
+        "ok": failed.is_empty(),
+        "project": { "id": project.id, "name": project.name },
+        "changed_files": changed.len(),
+        "restarted": restarted,
+        "skipped": skipped,
+        "failed": failed,
+        "note": note,
+    }))
 }
 
 // ── MCP server ────────────────────────────────────────────────
@@ -1226,145 +1490,7 @@ impl NexusMcpServer {
     async fn tool_restart_services_after_edit(&self, args: Option<JsonObject>) -> Result<Value, String> {
         let args: RestartAfterEditArgs = parse_args(args)?;
         let project = self.require_project()?.clone();
-        if args.changed_files.is_empty() {
-            return Ok(json!({
-                "ok": true,
-                "restarted": [],
-                "skipped": [],
-                "failed": [],
-                "note": "没有传入改动文件，未重启任何服务",
-            }));
-        }
-        if args.changed_files.len() > RESTART_AFTER_EDIT_MAX_FILES {
-            return Err(format!(
-                "changed_files 最多 {} 个（本次 {} 个）；请只传本轮实际修改的文件",
-                RESTART_AFTER_EDIT_MAX_FILES,
-                args.changed_files.len()
-            ));
-        }
-
-        // 绝对路径原样使用；相对路径按项目根目录解析。去重按统一分隔符的字符串。
-        let mut changed: Vec<PathBuf> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for raw in &args.changed_files {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() { continue; }
-            let path = PathBuf::from(trimmed);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                Path::new(&project.path).join(path)
-            };
-            let key = path.to_string_lossy().replace('\\', "/");
-            if seen.insert(key) {
-                changed.push(path);
-            }
-        }
-        if changed.is_empty() {
-            return Ok(json!({
-                "ok": true,
-                "restarted": [],
-                "skipped": [],
-                "failed": [],
-                "note": "changed_files 里没有有效路径，未重启任何服务",
-            }));
-        }
-
-        let (_, services, _) = self.project_services()?;
-        let status = crate::commands::process::get_running(self.app.clone()).await?;
-        // starting 的服务可能正在构建；重启会杀掉构建，跳过等它先落定。
-        let phases: HashMap<String, String> = status
-            .running
-            .iter()
-            .filter(|r| r.project_id == project.id)
-            .map(|r| (r.service_id.clone(), r.phase.clone()))
-            .collect();
-
-        let mut restarted = Vec::new();
-        let mut skipped = Vec::new();
-        let mut failed = Vec::new();
-
-        for svc in services.into_iter().filter(|s| s.enabled && s.restart_mode == 3) {
-            let matched = match affected_files_for_watch_config(
-                &svc.watch_paths, &svc.watch_include, &svc.watch_exclude, &changed,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    skipped.push(json!({
-                        "id": svc.id, "name": svc.name,
-                        "reason": e,
-                    }));
-                    continue;
-                }
-            };
-            if matched.is_empty() { continue; }
-            let sample: Vec<String> = matched.iter()
-                .take(RESTART_AFTER_EDIT_SAMPLE_FILES).cloned().collect();
-
-            match phases.get(&svc.id).map(String::as_str) {
-                None => {
-                    skipped.push(json!({
-                        "id": svc.id, "name": svc.name,
-                        "reason": "未运行（本工具只重启正在运行的服务；若刚修复了它的启动失败，请调用 restart_service）",
-                        "matched_count": matched.len(),
-                        "matched_files": sample,
-                    }));
-                    continue;
-                }
-                Some("starting") => {
-                    skipped.push(json!({
-                        "id": svc.id, "name": svc.name,
-                        "reason": "仍在启动/构建中，已跳过以避免打断构建；可稍后再次调用",
-                        "matched_count": matched.len(),
-                        "matched_files": sample,
-                    }));
-                    continue;
-                }
-                Some(_) => {}
-            }
-
-            match crate::commands::process::restart_service(self.app.clone(), svc.id.clone()).await {
-                Ok(()) => {
-                    log::info!(
-                        "[mcp] AI 修改后重启服务 {} ({})，命中 {} 个文件（样例 {}）",
-                        svc.name, svc.id, matched.len(),
-                        matched.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
-                    );
-                    restarted.push(json!({
-                        "id": svc.id, "name": svc.name,
-                        "matched_count": matched.len(),
-                        "matched_files": sample,
-                    }));
-                }
-                Err(e) => {
-                    log::warn!("[mcp] AI 修改后重启服务 {} ({}) 失败: {}", svc.name, svc.id, e);
-                    failed.push(json!({
-                        "id": svc.id, "name": svc.name,
-                        "error": e,
-                        "matched_count": matched.len(),
-                    }));
-                }
-            }
-        }
-
-        let note = if !failed.is_empty() {
-            "部分服务重启失败，详见 failed；可查看日志后修复并调用 restart_service 重试"
-        } else if !restarted.is_empty() {
-            "重启已发起；构建可能需要时间，需要确认时调用 wait_for_ready"
-        } else if !skipped.is_empty() {
-            "命中的服务都没有实际重启；详见 skipped"
-        } else {
-            "传入的文件没有命中任何开启「AI 修改后重启」的服务（检查服务的监听路径）"
-        };
-        Ok(json!({
-            "ok": failed.is_empty(),
-            "project": { "id": project.id, "name": project.name },
-            "changed_files": changed.len(),
-            "restarted": restarted,
-            "skipped": skipped,
-            "failed": failed,
-            "note": note,
-        }))
+        restart_services_for_changed_files(&self.app, &project, &args.changed_files, "mcp").await
     }
 
     /// 修改既有服务的启动配置（AI 修复启动失败的主要手段）。
@@ -2083,6 +2209,41 @@ mod tests {
         assert_eq!(normalize_path("C:/Work/Demo/"), "c:\\work\\demo");
         assert_eq!(normalize_path("C:\\Work\\Demo"), "c:\\work\\demo");
         assert_eq!(normalize_path("C:\\"), "c:\\");
+    }
+
+    /// dsh 会话 patch 必须同时包含 MCP 客户端和回合结束插件；少一个 entry 就等于
+    /// 阶段 2 没挂上（或整个会话起不来）。
+    #[test]
+    fn patch_body_contains_mcp_and_turn_end_hook() {
+        let body = build_patch_body(
+            12345,
+            "tok",
+            "file:///C:/tmp/nexus-ai-restart.js",
+            "C:/work/project",
+        );
+        assert!(body.contains("- id: mcp-nexus"), "{}", body);
+        assert!(body.contains("- id: nexus-ai-restart"), "{}", body);
+        assert!(body.contains("url: http://127.0.0.1:12345/mcp"), "{}", body);
+        assert!(body.contains("url: http://127.0.0.1:12345/ai/edited"), "{}", body);
+        assert!(body.contains("name: 'file:///C:/tmp/nexus-ai-restart.js'"), "{}", body);
+        assert!(body.contains("cwd: 'C:/work/project'"), "{}", body);
+    }
+
+    /// 插件上报的 JSON 形状（snake_case 与 camelCase 都接受）必须能进端点。
+    #[test]
+    fn ai_edited_payload_accepts_plugin_shape() {
+        let payload: AiEditedPayload = serde_json::from_value(json!({
+            "changed_files": ["C:/p/src/a.ts"],
+            "source": "dsh-turn"
+        })).expect("插件载荷应能反序列化");
+        assert_eq!(payload.changed_files, vec!["C:/p/src/a.ts"]);
+        assert_eq!(payload.source.as_deref(), Some("dsh-turn"));
+
+        let camel: AiEditedPayload = serde_json::from_value(json!({
+            "changedFiles": ["C:/p/src/b.ts"]
+        })).expect("camelCase 也应接受");
+        assert_eq!(camel.changed_files, vec!["C:/p/src/b.ts"]);
+        assert!(camel.source.is_none());
     }
 
     /// `restart_services_after_edit` 的匹配必须与文件监听同语义（前缀 + include/exclude）。

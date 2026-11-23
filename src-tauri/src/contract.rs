@@ -1012,8 +1012,11 @@ fn test_every_deserializable_struct_is_covered() {
         // - `LogsArgs` / `ServiceArgs` / `PrepareAddServiceArgs` / `UpdateServiceArgs` /
         //   `RestartAfterEditArgs` / `WaitArgs`：MCP 工具的 JSON-RPC 参数（不经 Tauri IPC，
         //   字段名由工具 schema 定义，不是 Tauri 的 camelCase 请求约定）
+        // - `AiEditedPayload`：dsh 会话插件调 `/ai/edited` 的内部 HTTP 载荷（不经 Tauri IPC，
+        //   字段名由插件与端点共同约定；前端永远不构造它）
         "ConflictPolicy", "ToolCommand", "Entry", "RunnerLockInfo", "LogsArgs", "ServiceArgs",
-        "PrepareAddServiceArgs", "UpdateServiceArgs", "RestartAfterEditArgs", "WaitArgs", "InvokeArgs",
+        "PrepareAddServiceArgs", "UpdateServiceArgs", "RestartAfterEditArgs", "AiEditedPayload",
+        "WaitArgs", "InvokeArgs",
     ];
 
     let found = scan_ipc_structs();
