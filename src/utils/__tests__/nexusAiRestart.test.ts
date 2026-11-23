@@ -29,7 +29,7 @@ function harness(): Harness {
       logger: { warn: () => {} },
       on: (event: string, fn: Handler) => { handlers[event] = fn; },
     },
-    { url: 'http://127.0.0.1:9/ai/edited', token: 'tok', cwd: 'C:/proj' },
+    { url: 'http://127.0.0.1:9/ai/edited', token: 'tok', cwd: CWD },
   );
 
   return {
@@ -47,14 +47,19 @@ function harness(): Harness {
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+// `C:/proj` 在 POSIX 上不是绝对路径；fixture 必须按平台给绝对路径，
+// 否则 path.resolve 会把 runner 的工作目录拼到前面（CI 的 Ubuntu runner 曾因此失败）。
+const CWD = process.platform === 'win32' ? 'C:/proj' : '/proj';
+const abs = (rel: string) => `${CWD}/${rel}`;
+
 test('回合结束只上报未处理的写文件（write/edit/apply_patch，view 与失败忽略）', async () => {
   const h = harness();
   try {
-    h.result('write', 'a', { file_path: 'C:/proj/src/a.ts' }, { path: 'C:/proj/src/a.ts' });
-    h.result('edit', 'a', { file_path: 'src/b.ts' }, { path: 'C:/proj/src/b.ts' });
+    h.result('write', 'a', { file_path: abs('src/a.ts') }, { path: abs('src/a.ts') });
+    h.result('edit', 'a', { file_path: 'src/b.ts' }, { path: abs('src/b.ts') });
     h.result('apply_patch', 'a', { input: '*** Begin Patch\n*** Update File: src/c.ts\n*** End Patch' }, {});
-    h.result('str_replace_editor', 'a', { command: 'view', path: 'C:/proj/x.ts' }, {});
-    h.result('edit', 'a', { file_path: 'C:/proj/fail.ts' }, {}, true);
+    h.result('str_replace_editor', 'a', { command: 'view', path: abs('x.ts') }, {});
+    h.result('edit', 'a', { file_path: abs('fail.ts') }, {}, true);
     h.stop('a');
     await tick();
 
@@ -62,10 +67,10 @@ test('回合结束只上报未处理的写文件（write/edit/apply_patch，view
     const init = h.calls[0].init;
     const body = JSON.parse(String(init.body)) as { changed_files: string[]; source: string };
     assert.deepEqual(body.changed_files.sort(), [
-      'C:/proj/src/a.ts',
-      'C:/proj/src/b.ts',
-      'C:/proj/src/c.ts',
-    ]);
+      abs('src/a.ts'),
+      abs('src/b.ts'),
+      abs('src/c.ts'),
+    ].sort());
     assert.equal(body.source, 'dsh-turn');
     assert.equal((init.headers as Record<string, string>).authorization, 'Bearer tok');
   } finally {
@@ -76,21 +81,21 @@ test('回合结束只上报未处理的写文件（write/edit/apply_patch，view
 test('模型已调 restart_services_after_edit 时只补发它没传的文件', async () => {
   const h = harness();
   try {
-    h.result('write', 'b', { file_path: 'C:/proj/src/a.ts' }, { path: 'C:/proj/src/a.ts' });
-    h.result('write', 'b', { file_path: 'C:/proj/src/b.ts' }, { path: 'C:/proj/src/b.ts' });
+    h.result('write', 'b', { file_path: abs('src/a.ts') }, { path: abs('src/a.ts') });
+    h.result('write', 'b', { file_path: abs('src/b.ts') }, { path: abs('src/b.ts') });
     h.result(
       'mcp__nexus__restart_services_after_edit',
       'b',
-      { changed_files: ['C:/proj/src/a.ts'] },
+      { changed_files: [abs('src/a.ts')] },
       { ok: true },
     );
-    h.result('write', 'b', { file_path: 'C:/proj/src/c.ts' }, { path: 'C:/proj/src/c.ts' });
+    h.result('write', 'b', { file_path: abs('src/c.ts') }, { path: abs('src/c.ts') });
     h.stop('b');
     await tick();
 
     assert.equal(h.calls.length, 1);
     const body = JSON.parse(String(h.calls[0].init.body)) as { changed_files: string[] };
-    assert.deepEqual(body.changed_files.sort(), ['C:/proj/src/b.ts', 'C:/proj/src/c.ts']);
+    assert.deepEqual(body.changed_files.sort(), [abs('src/b.ts'), abs('src/c.ts')]);
   } finally {
     h.restore();
   }
@@ -100,11 +105,11 @@ test('没有改动 / 工具失败时不误发', async () => {
   const h = harness();
   try {
     h.stop('empty');
-    h.result('write', 'd', { file_path: 'C:/proj/src/d.ts' }, { path: 'C:/proj/src/d.ts' });
+    h.result('write', 'd', { file_path: abs('src/d.ts') }, { path: abs('src/d.ts') });
     h.result(
       'restart_services_after_edit',
       'd',
-      { changed_files: ['C:/proj/src/d.ts'] },
+      { changed_files: [abs('src/d.ts')] },
       { ok: false },
       true,
     );
@@ -113,7 +118,7 @@ test('没有改动 / 工具失败时不误发', async () => {
 
     assert.equal(h.calls.length, 1, '空回合不发；工具失败时文件仍会补发');
     const body = JSON.parse(String(h.calls[0].init.body)) as { changed_files: string[] };
-    assert.deepEqual(body.changed_files, ['C:/proj/src/d.ts']);
+    assert.deepEqual(body.changed_files, [abs('src/d.ts')]);
   } finally {
     h.restore();
   }
