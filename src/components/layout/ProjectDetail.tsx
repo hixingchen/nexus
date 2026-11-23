@@ -348,7 +348,9 @@ export function ProjectDetail({ projectId, servicePanelCollapsed, onToggleServic
       setEditingService({
         id: '', project_id: d.project_id, name: d.name, command: d.command, cwd: d.cwd,
         watch_paths: d.watch_paths, watch_include: d.watch_include, watch_exclude: d.watch_exclude,
-        env_vars: d.env_vars, restart_mode: 0, enabled: true, show_file_tree: false,
+        // AI 按服务判断后下发；旧后端没有这些字段时按安全默认（不重启/不开浏览器）
+        env_vars: d.env_vars, restart_mode: d.restart_mode ?? 0, enabled: true, show_file_tree: false,
+        open_enabled: d.open_enabled ?? false, open_port: d.open_port ?? 0,
         sort_index: 0, tool_commands: '[]',
         boot_enabled: false, boot_order: 0, boot_check: '', boot_required: false,
         boot_credential_mode: 's4u',

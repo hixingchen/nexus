@@ -20,7 +20,8 @@ import { reportError, toMessage } from '../utils/error';
 /** 启动项目：返回逐服务失败清单（空数组 = 全部成功） */
 export async function startProjectServices(projectId: string): Promise<string[]> {
   const errors = await processApi.startProject(projectId);
-  // 启动项目级文件监听（所有 restart_mode>0 且启用的服务）；监听失败不影响"启动成功"结论，
+  // 启动项目级文件监听（所有 restart_mode 为 1/2 且启用的服务；3=仅 AI 修改后重启不挂监听）；
+  // 监听失败不影响"启动成功"结论，
   // 但要留痕——自动重启是这套工具的主要卖点，静默失败会表现为"改了代码没反应"
   watchApi.start(projectId).catch((e) => reportError('启动文件监听失败', e, { silent: true }));
   await useRunningStore.getState().refresh();

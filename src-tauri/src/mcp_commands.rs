@@ -68,26 +68,26 @@ const DESTRUCTIVE: &[&str] = &[
 pub fn catalog() -> Value {
     let entries = vec![
         // ── 项目 ──────────────────────────────────────────────
-        c("get_projects", "列出全部项目", json!({}), false),
-        c("get_project_detail", "项目详情（含服务与模板）", json!({ "projectId": "string" }), false),
-        c("add_project", "新建项目", json!({ "name": "string", "path": "string" }), false),
-        c("update_project", "修改项目名称/路径", json!({ "id": "string", "name": "string", "path": "string" }), false),
-        c("delete_project", "删除项目（含其服务，不可逆）", json!({ "id": "string", "confirm": true }), true),
-        c("duplicate_project", "复制项目", json!({ "id": "string" }), false),
-        c("toggle_pin_project", "切换项目置顶", json!({ "id": "string" }), false),
+        c("get_projects", "列出全部项目（id/名称/路径/收藏/排序）", json!({}), false),
+        c("get_project_detail", "项目详情（项目 + 全部服务；不含模板）。服务里含环境变量值，不要把密钥回显到回复/日志", json!({ "projectId": "string" }), false),
+        c("add_project", "新建项目。名称唯一；path 必须是已存在的目录且作为工作区根", json!({ "name": "string", "path": "string" }), false),
+        c("update_project", "修改项目名称/路径。path 必须存在；只改项目记录，不移动文件，也不会自动改服务的 cwd/watch_paths——改路径后要逐个检查服务", json!({ "id": "string", "name": "string", "path": "string" }), false),
+        c("delete_project", "删除项目及其服务记录（先停进程；不删文件；不可逆）", json!({ "id": "string", "confirm": true }), true),
+        c("duplicate_project", "复制项目：同一 path 下复制全部服务和打开工具绑定，名称加 _copy；用于同仓库多套配置", json!({ "id": "string" }), false),
+        c("toggle_pin_project", "切换项目收藏（只影响排序）", json!({ "id": "string" }), false),
         // ── 服务 ──────────────────────────────────────────────
-        c("get_services", "列出项目下的服务", json!({ "projectId": "string" }), false),
-        c("add_service", "直接新建服务（不再需要用户保存面板）", json!({
+        c("get_services", "列出项目下的服务（含完整字段与环境变量值；不要把密钥回显到回复/日志；修改优先用语义 update_service）", json!({ "projectId": "string" }), false),
+        c("add_service", "直接新建服务（不再需要用户保存面板）。用户要求启动但服务不在列表时用它把服务纳入 Nexus 管理，创建后再 start_service；不要用终端直接跑。两个开关必须按服务类型判断，不要一律打开：restartMode 必填，代码会被 AI 修改且需要重启的服务传 3，中间件/基础设施/不需要重启的传 0；openEnabled 只有浏览器可访问的前端/门户才传 true，后端 API/中间件保持 false（省略=false），openPort 0=自动", json!({
             "projectId": "string", "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string(JSON数组)", "envVars": "string(dotenv或JSON)",
-            "restartMode": 0, "toolCommands": "string(JSON数组)",
+            "restartMode": 3, "toolCommands": "string(JSON数组)",
             "watchInclude": "string?", "watchExclude": "string?", "enabled": "bool?",
-            "showFileTree": "bool?", "openEnabled": "bool?", "openPort": 0,
+            "showFileTree": "bool?", "openEnabled": false, "openPort": 0,
             "bootEnabled": "bool?", "bootOrder": 0, "bootCheck": "string?",
             "bootRequired": "bool?", "bootCredentialMode": "s4u?",
             "healthCheck": "string?", "crashRestart": true
         }), false),
-        c("update_service", "更新服务配置（全量字段；healthCheck/crashRestart 省略时保持原值）", json!({
+        c("update_service", "更新服务配置（全量字段；healthCheck/crashRestart 省略时保持原值；restartMode 0=关闭/1=确认重启/2=自动重启/3=仅 AI 修改后重启；openEnabled/openPort 控制浏览器打开）", json!({
             "id": "string", "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string", "watchInclude": "string", "watchExclude": "string",
             "envVars": "string", "restartMode": 0, "enabled": true, "showFileTree": false,
@@ -96,12 +96,15 @@ pub fn catalog() -> Value {
             "bootRequired": false, "bootCredentialMode": "s4u",
             "healthCheck": "string", "crashRestart": true
         }), false),
-        c("delete_service", "删除服务（不可逆）", json!({ "id": "string", "confirm": true }), true),
-        c("reorder_services", "调整服务顺序", json!({ "projectId": "string", "orderedIds": ["string"] }), false),
+        c("delete_service", "删除服务（先停进程；只删 Nexus 记录，不删文件；不可逆）。优先用语义 delete_service（会弹用户确认）；测试/诊断临时添加的服务在测试完成后清理", json!({ "id": "string", "confirm": true }), true),
+        c("reorder_services", "调整服务顺序（即 start_project 的启动顺序和界面顺序）", json!({ "projectId": "string", "orderedIds": ["string"] }), false),
         // ── 服务模板 ──────────────────────────────────────────
-        c("get_service_templates", "列出服务模板", json!({}), false),
+        c("get_service_templates", "列出服务模板（含环境变量值；不要把密钥回显到回复/日志）", json!({}), false),
         c("save_service_as_template", "把服务另存为模板", json!({ "serviceId": "string" }), false),
-        c("add_service_from_template", "从模板添加服务", json!({ "projectId": "string", "templateId": "string" }), false),
+        c("add_service_from_template", "从模板添加服务。可选 restartMode/openEnabled/openPort，省略 = 沿用模板；需要改时显式传（代码服务常传 restartMode=3；后端/中间件不要因为模板开了浏览器打开就保留，传 openEnabled=false）", json!({
+            "projectId": "string", "templateId": "string",
+            "restartMode": "number?", "openEnabled": "bool?", "openPort": "number?"
+        }), false),
         c("create_service_template", "新建模板", json!({
             "name": "string", "command": "string", "cwd": "string",
             "watchPaths": "string", "watchInclude": "*", "watchExclude": "",
@@ -121,19 +124,19 @@ pub fn catalog() -> Value {
         c("export_service_templates", "导出模板到文件", json!({ "path": "string", "ids": ["string"] }), false),
         c("import_service_templates", "从文件导入模板", json!({ "path": "string" }), false),
         // ── 进程 ──────────────────────────────────────────────
-        c("start_service", "启动单个服务（启动后自动挂该服务的文件监听）", json!({ "serviceId": "string" }), false),
-        c("stop_service", "停止单个服务", json!({ "serviceId": "string" }), false),
-        c("restart_service", "重启单个服务", json!({ "serviceId": "string" }), false),
-        c("start_project_services", "启动项目全部已启用服务（启动后自动挂项目级文件监听）", json!({ "projectId": "string" }), false),
-        c("stop_project_services", "停止项目全部服务", json!({ "projectId": "string" }), false),
-        c("get_running", "当前运行/失败状态", json!({}), false),
-        c("get_service_logs", "读取服务日志快照", json!({ "serviceKey": "string" }), false),
-        c("run_tool_command", "执行服务配置里的工具命令（会阻塞到命令结束并返回输出/退出码；长任务注意 MCP 客户端超时）", json!({
+        c("start_service", "启动单个服务。先检查端口占用；1/2 模式启动后挂文件监听（3 模式不挂）。启动后必须 wait_for_ready 并读日志；项目还有其他已启用未运行服务时，如果用户要的是整个项目请改用 start_project。服务不在列表时先通过 add_service 创建，不要用终端直接跑", json!({ "serviceId": "string" }), false),
+        c("stop_service", "停止单个服务（含进程树）", json!({ "serviceId": "string" }), false),
+        c("restart_service", "重启单个服务（先停再启动，先释放 jar/端口；3 模式也适用）", json!({ "serviceId": "string" }), false),
+        c("start_project_services", "启动项目全部已启用服务，按 sort_index 顺序；配了 health_check 会等就绪再起下一个；端口冲突跳过；1/2 模式挂监听，3 模式不挂。未启用的不会启动（语义工具会回 not_enabled）；启动后必须 wait_for_ready 并检查 failed/failed_logs。应有服务不在列表时先通过 add_service 创建，不要用终端直接跑", json!({ "projectId": "string" }), false),
+        c("stop_project_services", "停止项目全部服务（含进程树与监听）", json!({ "projectId": "string" }), false),
+        c("get_running", "当前运行/失败状态（含监听端口与失败日志）", json!({}), false),
+        c("get_service_logs", "读取服务日志快照（启动后用它检查连接拒绝/端口/找不到依赖等错误）", json!({ "serviceKey": "string" }), false),
+        c("run_tool_command", "执行服务配置里的工具命令（只跑已配置的构建/清理/安装等命令，不用于启动临时服务）。runId 每次唯一（如 uuid）；会阻塞到命令结束并返回输出/退出码；长任务注意 MCP 客户端超时", json!({
             "serviceId": "string", "commandId": "string", "runId": "string"
         }), false),
-        c("stop_tool_command", "停止正在运行的工具命令", json!({ "runId": "string" }), false),
+        c("stop_tool_command", "停止正在运行的工具命令（用 run_tool_command 的 runId）", json!({ "runId": "string" }), false),
         c("unfollow_service_log", "取消跟随服务日志文件", json!({ "serviceId": "string" }), false),
-        c("start_watching", "启动文件监听（serviceId 省略 = 整个项目；只监听 restart_mode>0 的服务）", json!({
+        c("start_watching", "启动文件监听（serviceId 省略 = 整个项目；只监听 restart_mode 为 1/2 的服务，3=仅 AI 修改后重启不挂监听）", json!({
             "projectId": "string", "serviceId": "string?"
         }), false),
         c("stop_watching", "停止文件监听（serviceId 省略 = 整个项目）", json!({
@@ -210,6 +213,9 @@ const NEEDS_USER_CONFIRM: &[&str] = &[
     // （import/update_service_template 不弹窗），不能成为绕过 add_service 闸门的后门
     "add_service_from_template",
     "update_service",
+    // 删除不可逆，且会停进程：语义 delete_service 已单独弹确认，这里兜住通用桥的入口
+    "delete_service",
+    "delete_project",
     "save_open_tool",
     "open_service_with_tool",
     "run_tool_command",
@@ -337,11 +343,13 @@ fn confirm_prompt(
     };
     let detail = match command {
         "add_service" => format!(
-            "新建服务（服务启动时会执行下面这条命令）\n名称：{}\n命令：{}\n工作目录：{}\n环境变量：{} 项（值不展开）{}",
+            "新建服务（服务启动时会执行下面这条命令）\n名称：{}\n命令：{}\n工作目录：{}\n环境变量：{} 项（值不展开）\n重启模式：{}\n浏览器打开：{}{}",
             s("name"),
             s("command"),
             s("cwd"),
             env_count("envVars"),
+            params.get("restartMode").and_then(Value::as_i64).map(restart_mode_label).unwrap_or("未指定（必须指定）"),
+            open_setting_text(params, "未指定（默认关）"),
             extra_risk_notes(params)
         ),
         "update_service" => format!(
@@ -356,8 +364,10 @@ fn confirm_prompt(
             let template_id = s("templateId");
             match template_of(template_id) {
                 Some((name, command, cwd)) => format!(
-                    "从模板新建服务（启动时会执行模板里的命令）\n模板：{}\n命令：{}\n工作目录：{}\n目标项目：{}",
-                    name, command, cwd, s("projectId")
+                    "从模板新建服务（启动时会执行模板里的命令）\n模板：{}\n命令：{}\n工作目录：{}\n目标项目：{}\n重启模式：{}\n浏览器打开：{}",
+                    name, command, cwd, s("projectId"),
+                    params.get("restartMode").and_then(Value::as_i64).map(restart_mode_label).unwrap_or("沿用模板"),
+                    open_setting_text(params, "沿用模板")
                 ),
                 None => format!(
                     "从模板新建服务\n模板 id：{}\n目标项目：{}\n\n（读取模板内容失败；执行分支会再校验一次）",
@@ -365,6 +375,14 @@ fn confirm_prompt(
                 ),
             }
         }
+        "delete_service" => format!(
+            "删除服务（不可逆）\n服务 id：{}\n\n会先停止它的运行实例，再删除 Nexus 记录；不删除文件。",
+            s("id")
+        ),
+        "delete_project" => format!(
+            "删除项目（不可逆）\n项目 id：{}\n\n会先停止项目服务，再删除 Nexus 记录；不删除文件。",
+            s("id")
+        ),
         "save_open_tool" => format!(
             "保存外部打开工具\n名称：{}\n可执行文件：{}\n参数：{}\n\n保存后，用该工具打开服务时会启动这个程序。",
             s("name"), s("executable"), s("args")
@@ -414,6 +432,70 @@ fn confirm_prompt(
     )
 }
 
+/// 读取 MCP 创建服务的重启策略；缺省 = None。
+///
+/// `add_service` 必须显式传（代码服务 3，中间件/基础设施 0）；模板创建省略 = 沿用模板。
+/// 界面自己的新建服务不经过这里。
+fn optional_restart_mode(params: &Value, command: &str) -> Result<Option<i32>, String> {
+    match params.get("restartMode") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .filter(|m| (0..=3).contains(m))
+            .map(|m| Some(m as i32))
+            .ok_or_else(|| format!("{command} 的 restartMode 只能是 0/1/2/3")),
+    }
+}
+
+/// 读取 MCP 创建服务的浏览器打开设置；缺省 = None（沿用模板 / 后端默认关闭）。
+fn optional_open_settings(
+    params: &Value,
+    command: &str,
+) -> Result<(Option<bool>, Option<i32>), String> {
+    let enabled = match params.get("openEnabled") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("{command} 的 openEnabled 必须是布尔值"))?,
+        ),
+    };
+    let port = match params.get("openPort") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let p = v
+                .as_i64()
+                .ok_or_else(|| format!("{command} 的 openPort 必须是整数"))?;
+            if !(0..=65535).contains(&p) {
+                return Err(format!("{command} 的 openPort 必须在 0-65535 之间（0 = 自动）"));
+            }
+            Some(p as i32)
+        }
+    };
+    Ok((enabled, port))
+}
+
+fn restart_mode_label(mode: i64) -> &'static str {
+    match mode {
+        0 => "0（关闭监听）",
+        1 => "1（确认重启）",
+        2 => "2（自动重启）",
+        3 => "3（仅 AI 修改后重启）",
+        _ => "无效值",
+    }
+}
+
+/// 确认框里的浏览器打开设置；省略时按调用方给的口径（新建默认关 / 模板沿用）。
+fn open_setting_text(params: &Value, inherit_if_absent: &str) -> String {
+    match params.get("openEnabled").and_then(Value::as_bool) {
+        Some(true) => format!(
+            "开（端口 {}）",
+            params.get("openPort").and_then(Value::as_i64).unwrap_or(0)
+        ),
+        Some(false) => "关".to_string(),
+        None => inherit_if_absent.to_string(),
+    }
+}
+
 /// 执行一条 Nexus 用户命令。
 ///
 /// `bound_project` = 本次 AI 会话绑定的项目 id（见 `mcp.rs::BoundProject`）：
@@ -445,6 +527,22 @@ pub async fn invoke(
                 "权限边界：当前 AI 会话只允许操作绑定项目（{bound}），已拒绝操作其它项目（{target}）。如需操作其它项目，请在 Nexus 里切换到该项目后重新打开 AI 面板。"
             ));
         }
+    }
+
+    // 创建服务的两个判断先校验：非法值不该先弹确认框再报错。
+    // add_service 必须显式给出 restartMode（不能无脑默认 3）；模板可省略（沿用模板）。
+    if command == "add_service" {
+        if optional_restart_mode(params, command)?.is_none() {
+            return Err(
+                "add_service 必须传 restartMode：需要 AI 修改代码后重启的服务传 3，\
+                 中间件/基础设施/不需要重启的传 0"
+                    .into(),
+            );
+        }
+        optional_open_settings(params, command)?;
+    } else if command == "add_service_from_template" {
+        optional_restart_mode(params, command)?;
+        optional_open_settings(params, command)?;
     }
 
     // ② 能执行代码 / 改系统级持久化的命令：必须用户在界面点「允许一次」
@@ -530,7 +628,10 @@ pub async fn invoke(
         "toggle_pin_project" => to_value(crate::commands::project::toggle_pin_project(state, s("id")?)?),
         // ── 服务 ──
         "get_services" => to_value(crate::commands::service::get_services(state, s("projectId")?)?),
-        "add_service" => to_value(crate::commands::service::add_service(state, from_params(params)?)?),
+        "add_service" => to_value(crate::commands::service::add_service(
+            state,
+            from_params(params)?,
+        )?),
         "update_service" => {
             to_value(crate::commands::service::update_service(app.clone(), from_params(params)?).await?)
         }
@@ -547,11 +648,32 @@ pub async fn invoke(
         "save_service_as_template" => {
             to_value(crate::commands::service::save_service_as_template(state, s("serviceId")?)?)
         }
-        "add_service_from_template" => to_value(crate::commands::service::add_service_from_template(
-            state,
-            s("projectId")?,
-            s("templateId")?,
-        )?),
+        "add_service_from_template" => {
+            let mode = optional_restart_mode(params, command)?;
+            let (open_enabled, open_port) = optional_open_settings(params, command)?;
+            let mut svc = crate::commands::service::add_service_from_template(
+                state.clone(),
+                s("projectId")?,
+                s("templateId")?,
+            )?;
+            // 省略 = 沿用模板；显式传了才覆盖。AI 需要按服务类型判断，而不是一律套 3。
+            if let Some(mode) = mode {
+                if svc.restart_mode != mode {
+                    crate::commands::service::set_service_restart_mode(&state.db, &svc.id, mode)?;
+                    svc.restart_mode = mode;
+                }
+            }
+            if open_enabled.is_some() || open_port.is_some() {
+                let enabled = open_enabled.unwrap_or(svc.open_enabled);
+                let port = open_port.unwrap_or(svc.open_port);
+                crate::commands::service::set_service_open_settings(
+                    &state.db, &svc.id, enabled, port,
+                )?;
+                svc.open_enabled = enabled;
+                svc.open_port = port;
+            }
+            to_value(svc)
+        }
         "create_service_template" => {
             to_value(crate::commands::service::create_service_template(state, from_params(params)?)?)
         }
@@ -996,18 +1118,23 @@ mod tests {
             "envVars": "SECRET=x",
             "bootEnabled": true,
             "bootCredentialMode": "password",
-            "toolCommands": "[{\"name\":\"run\",\"command\":\"yarn build\"}]"
+            "toolCommands": "[{\"name\":\"run\",\"command\":\"yarn build\"}]",
+            "restartMode": 3,
+            "openEnabled": true,
+            "openPort": 8080
         });
         let (_, detail) = confirm_prompt("add_service", &params, |_| None);
         assert!(detail.contains("开机启动：开（password）"), "{}", detail);
         assert!(detail.contains("yarn build"), "工具命令也要展示: {}", detail);
         assert!(!detail.contains("SECRET"), "环境变量值不能进确认框: {}", detail);
+        assert!(detail.contains("重启模式：3（仅 AI 修改后重启）"), "{}", detail);
+        assert!(detail.contains("浏览器打开：开（端口 8080）"), "{}", detail);
     }
 
     /// 从模板建服务同样是被执行的命令：确认框必须展示模板里的实际命令
     #[test]
     fn confirm_prompt_for_template_shows_the_command() {
-        let params = json!({ "projectId": "p", "templateId": "t1" });
+        let params = json!({ "projectId": "p", "templateId": "t1", "restartMode": 3, "openEnabled": false });
         let (_, detail) = confirm_prompt("add_service_from_template", &params, |id| {
             (id == "t1").then(|| {
                 (
@@ -1023,6 +1150,37 @@ mod tests {
             "批准的是将要执行的命令，不能藏起来: {}",
             detail
         );
+        assert!(
+            detail.contains("3（仅 AI 修改后重启）"),
+            "显式传入的重启模式要写进确认框: {}",
+            detail
+        );
+    }
+
+    /// MCP 创建服务不替 AI 做决定：缺省 = None（add_service 由调用方要求必填），越界拒绝。
+    #[test]
+    fn mcp_creation_restart_and_open_settings_are_explicit() {
+        assert_eq!(optional_restart_mode(&json!({}), "add_service").unwrap(), None);
+        assert_eq!(
+            optional_restart_mode(&json!({ "restartMode": 3 }), "add_service").unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            optional_restart_mode(&json!({ "restartMode": 2 }), "add_service_from_template").unwrap(),
+            Some(2)
+        );
+        assert!(optional_restart_mode(&json!({ "restartMode": 4 }), "add_service").is_err());
+        assert!(optional_restart_mode(&json!({ "restartMode": "3" }), "add_service").is_err());
+
+        // 浏览器打开：缺省 = None（沿用模板/默认关）；类型与端口都要校验
+        assert_eq!(optional_open_settings(&json!({}), "add_service").unwrap(), (None, None));
+        assert_eq!(
+            optional_open_settings(&json!({ "openEnabled": true, "openPort": 3000 }), "add_service")
+                .unwrap(),
+            (Some(true), Some(3000))
+        );
+        assert!(optional_open_settings(&json!({ "openEnabled": "true" }), "add_service").is_err());
+        assert!(optional_open_settings(&json!({ "openPort": 70000 }), "add_service").is_err());
     }
 
     /// 项目边界：直接带 projectId / 项目 id / 服务 id 三类都要解析出目标项目；

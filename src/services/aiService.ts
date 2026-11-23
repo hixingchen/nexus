@@ -46,6 +46,12 @@ export interface ServiceDraftPayload {
   watch_include: string;
   watch_exclude: string;
   env_vars: string;
+  /** AI 按服务判断后下发（代码服务 3，中间件/基础设施 0）；面板里可改 */
+  restart_mode: number;
+  /** AI 按服务判断：只有浏览器可访问的前端/门户才为 true */
+  open_enabled: boolean;
+  /** 浏览器打开端口；0 = 自动 */
+  open_port: number;
 }
 
 /** 会话状态快照（字段与后端 AiStatus 同名：响应 DTO 一律 snake_case） */

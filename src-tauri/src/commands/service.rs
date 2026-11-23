@@ -308,6 +308,71 @@ pub(crate) fn insert_service_row(
     })
 }
 
+/// MCP 创建服务后的重启策略覆盖（模板路径）。
+///
+/// 只改 `restart_mode`：服务刚创建，尚未启动/挂监听，不需要走 `update_service` 的
+/// 全量校验、manifest 同步与监听热刷新。界面创建路径不经过这里。
+pub(crate) fn set_service_restart_mode(
+    db: &Database,
+    service_id: &str,
+    mode: i32,
+) -> Result<(), String> {
+    if !(0..=3).contains(&mode) {
+        return Err(
+            "restart_mode 只能是 0（关闭）、1（确认重启）、2（自动重启）或 3（仅 AI 修改后重启）"
+                .into(),
+        );
+    }
+    db.with_conn(|conn| {
+        let affected = conn
+            .execute(
+                "UPDATE services SET restart_mode=?1 WHERE id=?2",
+                rusqlite::params![mode, service_id],
+            )
+            .map_err(|e| format!("更新服务重启策略失败: {}", e))?;
+        if affected == 0 {
+            return Err("服务不存在".into());
+        }
+        Ok(())
+    })
+}
+
+/// MCP 创建服务后的浏览器打开设置覆盖（模板路径）。
+///
+/// 只改 `open_enabled/open_port`：服务刚创建，尚未启动/挂监听；仍走端口合法性与
+/// 项目内唯一性校验，避免 AI 把错误端口写进库。界面创建路径不经过这里。
+pub(crate) fn set_service_open_settings(
+    db: &Database,
+    service_id: &str,
+    enabled: bool,
+    port: i32,
+) -> Result<(), String> {
+    validate_open_port(port)?;
+    db.with_conn(|conn| {
+        let project_id: String = conn
+            .query_row(
+                "SELECT project_id FROM services WHERE id=?1",
+                [service_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => "服务不存在".to_string(),
+                other => format!("读取服务所属项目失败: {}", other),
+            })?;
+        ensure_open_port_unique_in_project(conn, &project_id, enabled, port, Some(service_id))?;
+        let affected = conn
+            .execute(
+                "UPDATE services SET open_enabled=?1, open_port=?2 WHERE id=?3",
+                rusqlite::params![if enabled { 1 } else { 0 }, port, service_id],
+            )
+            .map_err(|e| format!("更新服务浏览器打开设置失败: {}", e))?;
+        if affected == 0 {
+            return Err("服务不存在".into());
+        }
+        Ok(())
+    })
+}
+
 /// `update_service` 的结果：保存本身已经成功，附带"文件监听热刷新"的真实结果。
 ///
 /// 为什么要一个结构体而不是 `Ok(())`：热刷新失败是**部分成功**——配置已经落库，
@@ -1023,6 +1088,53 @@ mod tests {
             health_check: None,
             crash_restart: None,
         }
+    }
+
+    /// MCP 从模板创建服务后覆盖 restart_mode：只改这一列，且拒绝越界值。
+    #[test]
+    fn set_service_restart_mode_updates_row_and_rejects_invalid() {
+        let db = test_db();
+        let svc = insert_service_row(&db, &add_params("S", "C:/s"), "C:/s", "[]")
+            .expect("插入服务");
+        assert_eq!(svc.restart_mode, 1);
+
+        set_service_restart_mode(&db, &svc.id, 3).expect("更新为 3");
+        let got = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT restart_mode FROM services WHERE id=?1",
+                [&svc.id],
+                |r| r.get::<_, i32>(0),
+            )
+            .map_err(|e| e.to_string())
+        }).expect("读回");
+        assert_eq!(got, 3);
+
+        assert!(set_service_restart_mode(&db, &svc.id, 4).is_err(), "越界值必须拒绝");
+        assert!(set_service_restart_mode(&db, "missing", 3).is_err(), "服务不存在必须报错");
+    }
+
+    /// MCP 从模板创建服务后覆盖浏览器打开设置：校验端口并写回。
+    #[test]
+    fn set_service_open_settings_updates_row_and_validates_port() {
+        let db = test_db();
+        let svc = insert_service_row(&db, &add_params("S", "C:/s"), "C:/s", "[]")
+            .expect("插入服务");
+        assert!(!svc.open_enabled);
+        assert_eq!(svc.open_port, 0);
+
+        set_service_open_settings(&db, &svc.id, true, 3000).expect("更新");
+        let got = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT open_enabled, open_port FROM services WHERE id=?1",
+                [&svc.id],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, i32>(1)?)),
+            )
+            .map_err(|e| e.to_string())
+        }).expect("读回");
+        assert_eq!(got, (1, 3000));
+
+        assert!(set_service_open_settings(&db, &svc.id, true, 70000).is_err(), "越界端口必须拒绝");
+        assert!(set_service_open_settings(&db, "missing", true, 3000).is_err(), "服务不存在必须报错");
     }
 
     /// 传了监听规则与两个展示开关时按传的走（不传才用默认）。

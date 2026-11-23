@@ -48,14 +48,15 @@ fn emit_file_changed(app: &AppHandle, event: FileChangeEvent) {
 
 /// 从数据库读取单个服务的监听配置
 ///
-/// restart_mode=0（关闭监听）的服务不返回——与项目级加载（restart_mode>0）语义一致：
-/// 任何入口都不得让"关闭监听"的服务实际监听文件。
+/// 只有 restart_mode 为 1（确认重启）/ 2（自动重启）的服务才返回：
+/// 0=关闭监听、3=仅 AI 修改后重启（不挂文件监听，由 MCP 工具显式触发），
+/// 任何入口都不得让这两种模式实际监听文件。
 /// 同时限定 project_id：服务 id 全局唯一，但监听是项目维度资源，
 /// 跨项目绑定会让 stop/refresh 落在错误的项目监听上。
 fn load_service_watch_config(db: &crate::database::Database, project_id: &str, service_id: &str) -> Result<Option<ServiceWatchConfig>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1 AND project_id=?2 AND restart_mode>0"
+            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE id=?1 AND project_id=?2 AND restart_mode IN (1,2)"
         ).map_err(|e| format!("查询服务失败: {}", e))?;
         let mut rows = stmt.query_map(rusqlite::params![service_id, project_id], |row| {
             Ok((
@@ -92,12 +93,13 @@ fn load_service_watch_config(db: &crate::database::Database, project_id: &str, s
 
 /// 从数据库读取项目所有启用监听的服务
 ///
-/// 条件 restart_mode>0 AND enabled=1：监听集合 = 项目启动实际会拉起的服务中开了
-/// 监听模式的子集——不跟随项目启动（enabled=0）的服务若被手动启动，由单服务入口另行监听。
+/// 条件 restart_mode IN (1,2) AND enabled=1：监听集合 = 项目启动实际会拉起的服务中
+/// 开了文件监听模式的子集（3=仅 AI 修改后重启不在此列）——不跟随项目启动
+/// （enabled=0）的服务若被手动启动，由单服务入口另行监听。
 fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) -> Result<Vec<ServiceWatchConfig>, String> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE project_id=?1 AND restart_mode>0 AND enabled=1"
+            "SELECT id, name, watch_paths, watch_include, watch_exclude, restart_mode FROM services WHERE project_id=?1 AND restart_mode IN (1,2) AND enabled=1"
         ).map_err(|e| format!("查询文件监听服务列表失败: {}", e))?;
         let rows = stmt.query_map([project_id], |row| {
             Ok((
@@ -134,7 +136,7 @@ fn load_project_watch_configs(db: &crate::database::Database, project_id: &str) 
 
 /// 启动文件监听
 ///
-/// - `service_id` 为空：启动项目级监听（所有 restart_mode>0 的服务）
+/// - `service_id` 为空：启动项目级监听（所有 restart_mode 为 1/2 的服务）
 /// - `service_id` 非空：追加该服务到监听（与已有监听合并）
 ///
 /// 异步 + spawn_blocking：内部 `start_watching` 会先 `stop_watching`（**join 监听线程**，
@@ -222,7 +224,7 @@ pub(crate) fn remove_service_watch(
 /// 服务配置保存后刷新其监听（配置热更新）
 ///
 /// 仅当该服务当前正在被监听时生效：用数据库新配置替换旧条目并重建 watcher；
-/// 新配置 restart_mode=0 或无监听路径 → 从监听中摘除该服务。
+/// 新配置 restart_mode 不是 1/2（0=关闭、3=仅 AI 修改后重启）或无监听路径 → 从监听中摘除该服务。
 /// 服务不在监听中 → no-op（下次启动时自然读新配置）。
 pub(crate) fn refresh_service_watch(
     app: AppHandle,
@@ -309,6 +311,19 @@ mod tests {
         insert_service(&db, "s-off", "p1", "关监听", r#"["./src"]"#, 0);
         let got = load_service_watch_config(&db, "p1", "s-off").expect("查询应成功");
         assert!(got.is_none(), "restart_mode=0 的服务不该返回监听配置");
+    }
+
+    #[test]
+    fn test_watch_config_skips_ai_only_mode() {
+        let db = test_db();
+        // 3 = 仅 AI 修改后重启：不挂文件监听，只由 MCP 工具显式触发
+        insert_service(&db, "s-ai", "p1", "仅 AI", r#"["./src"]"#, 3);
+        let got = load_service_watch_config(&db, "p1", "s-ai").expect("查询应成功");
+        assert!(got.is_none(), "restart_mode=3 的服务不该进入文件监听");
+        assert!(
+            load_project_watch_configs(&db, "p1").expect("查询应成功").is_empty(),
+            "项目级监听同样不能包含 3"
+        );
     }
 
     #[test]

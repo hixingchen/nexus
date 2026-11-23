@@ -22,6 +22,8 @@ import {
 const WATCH_MODE_OFF = 0;
 const WATCH_MODE_CONFIRM = 1;
 const WATCH_MODE_AUTO = 2;
+/** 仅 AI 修改后重启：不挂文件监听，由 MCP 的 restart_services_after_edit 显式触发 */
+const WATCH_MODE_AI = 3;
 
 /**
  * 崩溃自动重启的规则说明。
@@ -693,18 +695,19 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
           </div>
         </div>
 
-        {/* ── 文件监听卡片 ── */}
+        {/* ── 变更后重启卡片 ── */}
         <div className={cardCls}>
-          <span className={`${labelCls} block mb-2.5`}>文件监听</span>
-          {/* 三段式选择 */}
+          <span className={`${labelCls} block mb-2.5`}>变更后重启</span>
+          {/* 四段式选择 */}
           <div className="flex bg-nexus-bg rounded-md p-0.5 mb-3">
             {[
               { v: WATCH_MODE_OFF, label: '关闭' },
               { v: WATCH_MODE_CONFIRM, label: '确认重启' },
               { v: WATCH_MODE_AUTO, label: '自动重启' },
+              { v: WATCH_MODE_AI, label: 'AI 修改后' },
             ].map(opt => (
               <button key={opt.v}
-                className={`flex-1 py-1.5 text-[12px] rounded transition-colors ${
+                className={`flex-1 py-1.5 text-[11px] rounded transition-colors ${
                   restartMode === opt.v
                     ? 'bg-nexus-surface text-nexus-text font-medium shadow-sm'
                     : 'text-nexus-muted hover:text-nexus-text'
@@ -713,10 +716,17 @@ export function ServiceEditPanel({ service, onSave, mode = 'service', title, pro
               >{opt.label}</button>
             ))}
           </div>
+          {restartMode === WATCH_MODE_AI && (
+            <p className="text-[11px] text-nexus-muted leading-relaxed mb-3">
+              不监听文件；AI 修改代码后通过 MCP 工具重启本服务。人工改动请手动重启。
+            </p>
+          )}
           {restartMode > WATCH_MODE_OFF && (
             <div className="space-y-3">
               <div>
-                <label htmlFor={`${uid}-watch-paths`} className={labelCls}>监听路径</label>
+                <label htmlFor={`${uid}-watch-paths`} className={labelCls}>
+                  {restartMode === WATCH_MODE_AI ? '匹配路径' : '监听路径'}
+                </label>
                 <input id={`${uid}-watch-paths`} className={`${INPUT_CLS} font-mono mt-1`} value={watchPaths}
                   // 手动编辑过 = 明确意图：之后改工作目录不再自动重置（见 watchPathsTouchedRef）
                   onChange={e => { watchPathsTouchedRef.current = true; setWatchPaths(e.target.value); }}

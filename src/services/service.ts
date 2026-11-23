@@ -62,7 +62,8 @@ export interface Service {
   watch_include: string;  // glob patterns, one per line
   watch_exclude: string;  // patterns to exclude, one per line
   env_vars: string;       // KEY=VALUE dotenv format
-  restart_mode: number;  // 0=关闭监听, 1=确认重启, 2=自动重启
+  /** 0=关闭监听, 1=确认重启, 2=自动重启, 3=仅 AI 修改后重启（不挂文件监听） */
+  restart_mode: number;
   enabled: boolean;
   show_file_tree: boolean;
   /** 是否显示卡片上的「打开」按钮（默认关；旧后端缺省按 false 处理） */
@@ -581,7 +582,7 @@ export interface FileChange {
   service_name: string;
   service_id: string;
   kind: string;
-  /** 0=关闭监听, 1=确认重启, 2=自动重启 */
+  /** 0=关闭监听, 1=确认重启, 2=自动重启；3 不会出现在文件变更事件里（不挂监听） */
   restart_mode: number;
 }
 
@@ -619,7 +620,7 @@ export const securityApi = {
 // ─── Watcher API ───────────────────────────────────────────
 
 export const watchApi = {
-  /** 启动文件监听：serviceId 为空=项目级（所有服务），非空=单服务追加 */
+  /** 启动文件监听：serviceId 为空=项目级（所有 1/2 模式的服务），非空=单服务追加 */
   start: (projectId: string, serviceId?: string) =>
     invoke<void>('start_watching', { projectId, serviceId: serviceId ?? null }),
 

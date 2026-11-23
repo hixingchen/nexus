@@ -124,6 +124,9 @@ fn test_response_dtos_are_snake_case() {
         watch_include: "*".into(),
         watch_exclude: "".into(),
         env_vars: "".into(),
+        restart_mode: 3,
+        open_enabled: false,
+        open_port: 0,
     };
     assert_eq!(
         keys_of(&draft),
@@ -135,7 +138,10 @@ fn test_response_dtos_are_snake_case() {
             "watch_paths",
             "watch_include",
             "watch_exclude",
-            "env_vars"
+            "env_vars",
+            "restart_mode",
+            "open_enabled",
+            "open_port"
         ])
     );
 
@@ -1004,10 +1010,10 @@ fn test_every_deserializable_struct_is_covered() {
         //   nodejs.org 版本索引 JSON——外部文件格式，字段名由对方决定，我们无权改
         // - `RunnerLockInfo`：runner 的单实例锁文件（pid + 启动时刻），只在磁盘上读写
         // - `LogsArgs` / `ServiceArgs` / `PrepareAddServiceArgs` / `UpdateServiceArgs` /
-        //   `WaitArgs`：MCP 工具的 JSON-RPC 参数（不经 Tauri IPC，字段名由工具 schema
-        //   定义，不是 Tauri 的 camelCase 请求约定）
+        //   `RestartAfterEditArgs` / `WaitArgs`：MCP 工具的 JSON-RPC 参数（不经 Tauri IPC，
+        //   字段名由工具 schema 定义，不是 Tauri 的 camelCase 请求约定）
         "ConflictPolicy", "ToolCommand", "Entry", "RunnerLockInfo", "LogsArgs", "ServiceArgs",
-        "PrepareAddServiceArgs", "UpdateServiceArgs", "WaitArgs", "InvokeArgs",
+        "PrepareAddServiceArgs", "UpdateServiceArgs", "RestartAfterEditArgs", "WaitArgs", "InvokeArgs",
     ];
 
     let found = scan_ipc_structs();

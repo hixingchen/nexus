@@ -37,7 +37,8 @@ pub struct ServiceWatchConfig {
     pub paths_norm: Vec<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
-    /// 0=关闭监听, 1=确认重启, 2=自动重启（随事件透传给前端）
+    /// 0=关闭监听, 1=确认重启, 2=自动重启（随事件透传给前端）；
+    /// 3=仅 AI 修改后重启（**不挂文件监听**，由 MCP 工具按 `watch_paths` 匹配后显式重启）
     pub restart_mode: i32,
 }
 
@@ -54,6 +55,22 @@ impl ServiceWatchConfig {
         let paths_norm = paths.iter().map(|p| normalize_prefix(p)).collect();
         Self { id, name, paths, paths_norm, include, exclude, restart_mode }
     }
+
+    /// 路径是否归属本服务：在监听路径内**且**通过包含/排除规则。
+    ///
+    /// 与文件监听共用同一套判据（`matching_service_indices` 也走这里）。
+    /// MCP 的「AI 修改后重启」用它把改动文件映射到服务——不要在 MCP 侧另写一套
+    /// 前缀/glob 匹配，否则两条路径的语义迟早漂移。
+    pub fn matches_path(&self, path: &Path) -> bool {
+        let path_str = normalize(&path.to_string_lossy());
+        let components: Vec<&str> = path_str.split('/').collect();
+        self.accepts_normalized(&path_str, &components)
+    }
+
+    fn accepts_normalized(&self, path_str: &str, components: &[&str]) -> bool {
+        self.paths_norm.iter().any(|wp| path_str.starts_with(wp))
+            && service_accepts(self, path_str, components)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,7 +86,8 @@ pub struct FileChange {
     pub service_name: String,
     pub service_id: String,
     pub kind: String,
-    /// 0=关闭监听, 1=确认重启, 2=自动重启（前端据此决定是否直接重启）
+    /// 0=关闭监听, 1=确认重启, 2=自动重启（前端据此决定是否直接重启）。
+    /// 3=仅 AI 修改后重启：不会出现在文件变更事件里（该模式不挂文件监听）。
     pub restart_mode: i32,
 }
 
@@ -444,10 +462,7 @@ fn matching_service_indices(path: &Path, services: &[ServiceWatchConfig]) -> Vec
     let path_str = normalize(&path.to_string_lossy());
     let components: Vec<&str> = path_str.split('/').collect();
     services.iter().enumerate()
-        .filter(|(_, svc)| {
-            let in_watch = svc.paths_norm.iter().any(|wp| path_str.starts_with(wp));
-            in_watch && service_accepts(svc, &path_str, &components)
-        })
+        .filter(|(_, svc)| svc.accepts_normalized(&path_str, &components))
         .map(|(i, _)| i)
         .collect()
 }
@@ -670,6 +685,21 @@ mod tests {
     fn test_needed_git_directory() {
         let svc = make_svc("s1", vec!["/project"], vec![".git"], vec!["*"]);
         assert!(!path_needed_by_any(Path::new("/project/.git/config"), &[svc]));
+    }
+
+    /// `matches_path` 是 MCP「AI 修改后重启」的映射判据，必须与文件监听同语义：
+    /// 监听路径前缀 + 包含/排除规则，一处变化两边同时生效。
+    #[test]
+    fn test_matches_path_shares_watcher_rules() {
+        let svc = make_svc("s1", vec!["/project"], vec!["node_modules", "*.log"], vec!["*"]);
+        assert!(svc.matches_path(Path::new("/project/src/index.ts")));
+        assert!(!svc.matches_path(Path::new("/project/node_modules/express/index.js")));
+        assert!(!svc.matches_path(Path::new("/project/debug.log")));
+        assert!(!svc.matches_path(Path::new("/other/src/index.ts")), "监听路径外不归属");
+
+        let include_only = make_svc("s2", vec!["/project"], vec![], vec!["*.rs"]);
+        assert!(include_only.matches_path(Path::new("/project/src/main.rs")));
+        assert!(!include_only.matches_path(Path::new("/project/src/main.ts")));
     }
 
     // ── should_queue_event（回归：入队方向，取反会让正常文件全部丢失）──

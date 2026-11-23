@@ -52,7 +52,8 @@ pub struct Service {
     pub watch_include: String,  // glob patterns, one per line, e.g. *\n*.ts
     pub watch_exclude: String,  // patterns to exclude, one per line
     pub env_vars: String,       // KEY=VALUE per line (dotenv format)
-    pub restart_mode: i32,  // 0=关闭监听, 1=确认重启, 2=自动重启
+    /// 0=关闭监听, 1=确认重启, 2=自动重启, 3=仅 AI 修改后重启（不挂文件监听）
+    pub restart_mode: i32,
     pub enabled: bool,
     pub show_file_tree: bool,
     /// 是否在服务卡片上显示「打开」按钮。默认关：后端/数据库等服务不需要浏览器打开。

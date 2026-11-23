@@ -88,8 +88,9 @@ export function RestartConfirm() {
       const { changes } = event.payload;
       for (const c of changes) {
         if (c.service_name === '(project)' || !c.service_id) continue;
-        // 0=关闭监听：后端已不为其生成事件（此处兜底旧 watcher 残留/异常事件）
-        if (c.restart_mode === 0) continue;
+        // 只有 1=确认重启 / 2=自动重启会产生文件变更事件。
+        // 0=关闭监听、3=仅 AI 修改后重启（不挂文件监听）在这里兜底旧 watcher 残留/异常事件。
+        if (c.restart_mode !== 1 && c.restart_mode !== 2) continue;
         const name = c.service_name;
         const sid = c.service_id;
 
