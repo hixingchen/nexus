@@ -91,59 +91,38 @@ sudo loginctl enable-linger "$USER"
 
 ## 5. 五分钟快速开始
 
-假设：
+假设项目目录 `/srv/app` 已存在，启动命令 `npm run start`。
 
-- 项目目录 `/srv/app` 已存在
-- 服务名 `web`
-- 启动命令 `npm run start`（只测试时可以换成 `sleep 3600`）
-
-### 第 1 步：加服务（项目不存在时自动创建）
+### 第 1 步：加服务（一行）
 
 ```bash
-sudo nexusctl service add \
-  -p app -n web \
-  -c "npm run start" \
-  --project-path /srv/app \
-  --boot \
-  --order 10 \
-  --ready tcp:127.0.0.1:3000
+sudo nexusctl add /srv/app -c "npm run start" --boot
 ```
 
-四个必填：
+- `/srv/app`：项目目录。项目名默认取目录名（这里是 `app`），服务名默认与项目名相同（`app`）。
+- `-c`：启动命令。
+- `--boot`：开机自启；runner 正在运行时**立即启动**。
+- 同一个项目加第二个服务：加 `--name worker`。
+- 要等端口就绪：加 `--ready tcp:127.0.0.1:3000`；不写就是进程存活即就绪。
 
-| 选项 | 全称 | 含义 |
-|---|---|---|
-| `-p` | `--project` | 项目名，后面 start/stop/list 都用它 |
-| `-n` | `--name` | 服务名；可以与项目名不同 |
-| `-c` | `--command` | 启动命令，由 `sh -c` 在工作目录执行 |
-| `--project-path` | — | 项目不存在时用这个目录自动创建（已创建可省略） |
+加完后用 `nexusctl status` 看实际项目名/服务名；下面的命令就用显示出来的名字。
 
-常用可选项：
-
-| 选项 | 含义 |
-|---|---|
-| `--boot` | runner 启动时自动拉起；**runner 正在运行时，本命令会立即启动它** |
-| `--order N` | 启动顺序，小的先启动 |
-| `--ready <检查>` | `tcp:127.0.0.1:3000` / `log:关键字` / `wait:5`；不写＝进程存活即就绪 |
-| `--required` | 未就绪时阻断后续开机服务 |
-| `--env K=V` | 服务环境变量；可重复 |
-| `--workdir <目录>` | 工作目录；默认项目路径 |
-| `--no-crash-restart` | 关闭稳定运行后的崩溃自动重启 |
-
-只测试命令本身、不接真实项目时：
+只测试命令本身：
 
 ```bash
-sudo nexusctl service add -p app -n demo -c "sleep 3600" --project-path /srv/app --boot
+sudo nexusctl add /srv/app -c "sleep 3600" --boot
 ```
+
+需要工作目录、环境变量、启动顺序、未就绪阻断等进阶选项时，再用完整写法（见 5.2）。
 
 ### 第 2 步：查看状态/日志
 
 ```bash
 sudo nexusctl status                  # 总览：unit、runner、全部服务
 sudo nexusctl service list -p app     # 只看 app 项目
-sudo nexusctl service show app web    # 启动命令/目录/env/状态/日志路径
-sudo nexusctl logs app web            # 最后 200 行
-sudo nexusctl logs app web -f         # 持续跟踪（Ctrl-C 退出）
+sudo nexusctl service show app app    # 启动命令/目录/env/状态/日志路径
+sudo nexusctl logs app app            # 最后 200 行
+sudo nexusctl logs app app -f         # 持续跟踪（Ctrl-C 退出）
 sudo nexusctl logs --runner -f        # 看 runner 自己的日志
 ```
 
@@ -156,7 +135,8 @@ enabled: yes（开机自启）
 runner:  pid=1234 mode=system ... reachable
 服务: 2 个（ready 1 / stopped 1）
 PROJECT  SERVICE  BOOT  ORDER  STATUS   PID   READY
-app      web      yes   10     ready    1234  TCP 127.0.0.1:3000
+app      app      yes   10     ready    1234  TCP 127.0.0.1:3000
+app      worker   no    0      stopped  -     进程存活即可
 ```
 
 加 `--json` 可输出结构化数据。
@@ -165,22 +145,23 @@ app      web      yes   10     ready    1234  TCP 127.0.0.1:3000
 
 ```bash
 # 单个服务
-sudo nexusctl start app web
-sudo nexusctl stop app web
-sudo nexusctl restart app web
+sudo nexusctl start app app
+sudo nexusctl stop app app
+sudo nexusctl restart app app
 
-# 整个项目（按 order 启动、逆序停止）
+# 整个项目（按 order 启动、逆序停止；单服务项目用这个就够）
 sudo nexusctl start app
 sudo nexusctl stop app
 sudo nexusctl restart app
 ```
 
 这些是**立即操作**，不会改变 `--boot` 标记。它们要求 runner 在运行（安装脚本已经启动）。
-`service add --boot` 在 runner 运行时也会立即启动服务；不加 `--boot` 的服务加完后用 `start`。
+`add --boot` 在 runner 运行时也会立即启动服务；不加 `--boot` 的服务加完后用 `start`。
 
 ### 第 4 步：开机自启
 
-装机时已经执行过 `boot install`，并为 unit 设置了 `User=<运行用户>`，所以**不需要每个服务再安装一次**：
+装机时已经执行过 `boot install`，systemd unit 已启用；不写 `--run-as` 时以 root 运行，
+写了则按 unit 里的 `User=` 降权。**不需要每个服务再安装一次**：
 只要服务带 `--boot`，下次开机会自动拉起。可以随时确认：
 
 ```bash
@@ -191,8 +172,8 @@ systemctl is-enabled nexus-boot-runner.service
 ### 第 5 步：删除
 
 ```bash
-sudo nexusctl stop app web
-sudo nexusctl service remove app web
+sudo nexusctl stop app app
+sudo nexusctl service remove app app
 sudo nexusctl project remove app
 ```
 
@@ -212,20 +193,20 @@ sudo nexusctl project remove app
 
 ```bash
 # 服务在自己的子目录
-nexusctl service set app web --workdir /srv/app/web
+nexusctl service set app app --workdir /srv/app/web
 
 # 等端口起来才算就绪
-nexusctl service set app web --ready tcp:127.0.0.1:3000
+nexusctl service set app app --ready tcp:127.0.0.1:3000
 
 # 多服务顺序 + 未就绪阻断
 nexusctl service set app db --order 10 --required
 nexusctl service set app api --order 20 --required
 
 # 加环境变量
-nexusctl service set app web --env NODE_ENV=production
+nexusctl service set app app --env NODE_ENV=production
 
 # 关闭崩溃自动重启
-nexusctl service set app web --no-crash-restart
+nexusctl service set app app --no-crash-restart
 
 # 非开机服务：不写 --boot，之后手动启动
 nexusctl service add -p app -n tools -c "sleep 3600"
@@ -316,6 +297,7 @@ nexusctl --config /path/nexus.toml --data-dir /path/data ...
 | 操作 | 命令 |
 |---|---|
 | 总览 | `nexusctl`（不写子命令）或 `status [--json]` |
+| 快速加服务 | `add <项目目录> -c <命令> [--name <服务>] [--boot]` |
 | 看项目 | `project list` / `project show <项目>` |
 | 建/删项目 | `project add <路径> --name <项目>` / `project remove <项目>` |
 | 看服务 | `service list [-p <项目>]` / `service show <项目> <服务>` |
@@ -357,6 +339,10 @@ nexusctl project restart <项目>       # 先停后启
 
 ```bash
 nexusctl status [--json]                     # 总览：unit/runner/服务状态
+
+# 快速加服务：项目名/服务名默认取目录名；runner 在跑时 --boot 会立即启动
+nexusctl add <项目目录> -c <命令> [--name <服务>] [--boot] [--ready tcp:host:port]
+
 nexusctl service list [-p <项目>] [--json]   # -p 只看某个项目
 nexusctl service show <项目> <服务> [--json]  # 详情：启动命令/目录/env/状态
 nexusctl logs <项目> <服务> [--lines 200] [--follow]
@@ -635,8 +621,9 @@ nexusctl service add -p app -n web -c "..." --boot --order 30 --ready tcp:127.0.
 
 **能只看状态机数据吗？** `nexusctl status --json`、`project list --json`、`service list --json`。
 
-**怎么立即启动？** 单个服务 `nexusctl start app web`，整个项目 `nexusctl start app`；都要求 runner 已在运行。
-**怎么查看启动命令/日志？** `nexusctl service show app web` 看命令/目录/env/状态，`nexusctl logs app web -f` 看日志。
+**怎么立即启动？** 单个服务 `nexusctl start app app`，整个项目 `nexusctl start app`；都要求 runner 已在运行。
+**怎么查看启动命令/日志？** `nexusctl service show app app` 看命令/目录/env/状态，`nexusctl logs app app -f` 看日志。
+**最快加一个服务？** `sudo nexusctl add /srv/app -c "npm run start" --boot`。
 **boot install、boot start、boot enable 有什么区别？** install 安装+启用+启动；start 只启动已安装 unit；enable 只设开机自启。
 **系统级和用户级怎么选？** 无桌面服务器只装系统级，命令默认就是它；桌面才用 `--user`。
 

@@ -146,6 +146,7 @@ jobs:
 
             - **无桌面服务器默认系统级**：`nexusctl` 默认读写 `/etc/nexus`、`/var/lib/nexus`，日常命令不再需要 `--system`；桌面场景显式加 `--user`。旧脚本的 `--system` 继续兼容。
             - **更简单的日常命令**：`nexusctl`（无子命令直接显示状态）、`nexusctl status`、`nexusctl start/stop/restart <项目> [服务]`、`nexusctl logs <项目> <服务> -f`、`nexusctl logs --runner -f`。
+            - **快速加服务**：`sudo nexusctl add /srv/app -c "npm run start" --boot` 一行完成；项目名/服务名默认取目录名，runner 在跑时立即启动。需要工作目录/env/顺序等再使用完整 `service add`。
             - **加服务一步到位**：`service add --project-path <目录>` 自动创建项目；带 `--boot` 且 runner 在运行时立即启动新服务。
             - **一条命令安装**：`sudo ./install.sh --system` 安装二进制、写入 unit、启用开机自启并启动 runner；不写 `--run-as` 时以 root 运行，推荐加 `--run-as <非 root 用户>` 降权。升级时自动从已有 unit 读取 `User=`。
             - **内存安全与日志体验**：日志只读末尾最多 8MB，`--follow` 单次最多 64 KiB，不会整份进内存；文件轮转/截断后自动重开；目录 chown 改为显式栈并只改符号链接本身；用户查询改用 `getpwnam_r`。
@@ -197,8 +198,8 @@ jobs:
             # 推荐降权：sudo ./install.sh --system --run-as <运行用户>
             ```
 
-            之后用 `nexusctl status`、`nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <目录> --boot`
-            与 `nexusctl logs <项目> <服务> -f` 管理；详见包内 `share/README.md`。
+            之后用 `nexusctl add <项目目录> -c '<命令>' --boot`、`nexusctl status`、
+            `nexusctl logs <项目> <服务> -f` 管理；详见包内 `share/README.md`。
             无桌面服务器只需要系统级，不需要 linger。
 
             ## 首次使用

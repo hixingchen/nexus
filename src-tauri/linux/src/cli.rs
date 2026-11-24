@@ -64,6 +64,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// 快速添加服务：项目名/服务名默认取目录名
+    Add {
+        /// 项目目录（必须已存在）
+        path: PathBuf,
+        /// 启动命令
+        #[arg(short = 'c', long)]
+        command: String,
+        /// 服务名（默认与项目名相同；加第二个服务时用它区分）
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        /// 开机自动启动；runner 正在运行时立即启动
+        #[arg(long)]
+        boot: bool,
+        /// 可选就绪检查：tcp:127.0.0.1:3000 / log:关键字 / wait:5
+        #[arg(long)]
+        ready: Option<String>,
+    },
     /// 总览：runner、开机自启、全部服务状态
     Status {
         #[arg(long)]
@@ -326,6 +343,13 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Cmd::Service { cmd } => service_cmd(&layout, cmd),
         Cmd::Boot { cmd } => boot_cmd(&layout, cli.runner, cmd),
         Cmd::Config { cmd } => config_cmd(&layout, cmd),
+        Cmd::Add {
+            path,
+            command,
+            name,
+            boot,
+            ready,
+        } => quick_add(&layout, path, command, name, boot, ready),
         Cmd::Status { json } => boot_status(&layout, json),
         Cmd::Start { project, service } => {
             simple_action(&layout, &project, service.as_deref(), ProjectAction::Start)
@@ -344,6 +368,73 @@ pub fn run(cli: Cli) -> Result<(), String> {
             lines,
         } => logs_cmd(&layout, project, name, runner_log, follow, lines),
     }
+}
+
+// ─── 快速添加 ──────────────────────────────────────────────
+
+/// `nexusctl add <目录> -c <命令> [--name <服务>] [--boot]`。
+///
+/// 面向“一个项目一个服务”的常见情况：项目名和服务名默认取目录名，
+/// 工作目录默认项目目录，顺序 0，就绪检查为进程存活。
+fn quick_add(
+    layout: &Layout,
+    path: PathBuf,
+    command: String,
+    name: Option<String>,
+    boot: bool,
+    ready: Option<String>,
+) -> Result<(), String> {
+    let canonical = canonical_dir(&path, "项目路径")?;
+    let dir_name = canonical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app");
+    let project = default_name(dir_name);
+    let service = name.unwrap_or_else(|| project.clone());
+
+    let cfg = Config::load_or_default(&layout.config_path)?;
+    if let Some(existing) = cfg.find_project(&project) {
+        if Path::new(&existing.path) != canonical {
+            return Err(format!(
+                "项目名 {} 已存在，但路径是 {}（不是 {}）。请用 service add -p <项目> 指定已有项目",
+                project,
+                existing.path,
+                canonical.display()
+            ));
+        }
+    }
+
+    service_cmd(
+        layout,
+        ServiceCmd::Add {
+            project,
+            name: service,
+            command,
+            project_path: Some(canonical),
+            workdir: None,
+            env: Vec::new(),
+            boot,
+            order: None,
+            ready,
+            required: false,
+            no_crash_restart: false,
+        },
+    )
+}
+
+/// 目录名 → 合法的项目名：非法字符替换为 `-`，并去掉首尾的 `-`。
+fn default_name(dir: &str) -> String {
+    let mut out = String::new();
+    for ch in dir.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    let name: String = trimmed.chars().take(64).collect();
+    if name.is_empty() { "app".to_string() } else { name }
 }
 
 // ─── 项目 ──────────────────────────────────────────────────
@@ -1561,6 +1652,43 @@ mod tests {
     fn cli_user_flag_opts_into_desktop_mode() {
         let cli = Cli::try_parse_from(["nexusctl", "--user", "status"]).expect("解析 --user");
         assert!(cli.user);
+    }
+
+    #[test]
+    fn cli_add_parses_short_form() {
+        let cli = Cli::try_parse_from([
+            "nexusctl",
+            "add",
+            "/srv/app",
+            "-c",
+            "npm run start",
+            "--boot",
+        ])
+        .expect("解析 add");
+        match cli.command {
+            Some(Cmd::Add {
+                path,
+                command,
+                name,
+                boot,
+                ready,
+            }) => {
+                assert_eq!(path, PathBuf::from("/srv/app"));
+                assert_eq!(command, "npm run start");
+                assert!(name.is_none());
+                assert!(boot);
+                assert!(ready.is_none());
+            }
+            _ => panic!("应解析为 add"),
+        }
+    }
+
+    #[test]
+    fn default_name_sanitizes_directory_name() {
+        assert_eq!(default_name("app"), "app");
+        assert_eq!(default_name("apache-tomcat-9.0.73"), "apache-tomcat-9-0-73");
+        assert_eq!(default_name("a..b"), "a-b");
+        assert_eq!(default_name("中文 项目"), "app");
     }
 
     #[test]
