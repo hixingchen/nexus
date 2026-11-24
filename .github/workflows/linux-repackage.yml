@@ -1,0 +1,98 @@
+name: Linux Repackage
+
+# 只重建 Linux 包并覆盖已有 Release 的同名资产；不重建 Windows、不改版本号。
+# 用于“源码已修/文档已更新，但只换 Linux 包”的快速重发。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '目标 Release tag（例如 v2.3.0）'
+        required: true
+      source_ref:
+        description: '构建源码 ref（默认 main；版本号必须与 tag 一致）'
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 aarch64 交叉链接器
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: 构建并组装
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/linux/Cargo.toml | head -n1)
+          [ -n "$VERSION" ] || { echo "无法解析版本号" >&2; exit 1; }
+          [ "v$VERSION" = "$TAG" ] || { echo "版本 $VERSION 与 tag $TAG 不一致" >&2; exit 1; }
+
+          (cd src-tauri && cargo build --release --target "${{ matrix.target }}" \
+            -p nexus-linux --bin nexusctl --bin nexus-boot-runner)
+
+          STAGE_NAME="nexus-$VERSION-linux-${{ matrix.arch }}"
+          OUT="src-tauri/target/linux-package"
+          STAGE="$OUT/$STAGE_NAME"
+          RELEASE="src-tauri/target/${{ matrix.target }}/release"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/bin" "$STAGE/share"
+
+          cp "$RELEASE/nexusctl" "$RELEASE/nexus-boot-runner" "$STAGE/bin/"
+          chmod +x "$STAGE/bin/"*
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            STRIP=aarch64-linux-gnu-strip
+          else
+            STRIP=strip
+          fi
+          "$STRIP" "$STAGE/bin/nexusctl" "$STAGE/bin/nexus-boot-runner" 2>/dev/null || true
+
+          cp packaging/linux/nexus.example.toml "$STAGE/share/"
+          cp packaging/linux/README.md "$STAGE/share/"
+          cp packaging/linux/install.sh "$STAGE/install.sh"
+          cp packaging/linux/uninstall.sh "$STAGE/uninstall.sh"
+          chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
+
+          (cd "$STAGE" && sha256sum bin/nexusctl bin/nexus-boot-runner > SHA256SUMS)
+          tar -C "$OUT" -czf "$OUT/$STAGE_NAME.tar.gz" "$STAGE_NAME"
+          (cd "$OUT" && sha256sum "$STAGE_NAME.tar.gz" > "$STAGE_NAME.tar.gz.sha256")
+
+          echo "TARBALL=$OUT/$STAGE_NAME.tar.gz" >> "$GITHUB_ENV"
+          echo "SHA=$OUT/$STAGE_NAME.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: 覆盖同名 Release 资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          gh release upload "$TAG" "$TARBALL" "$SHA" --clobber
