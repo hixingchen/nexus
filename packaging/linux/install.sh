@@ -77,8 +77,8 @@ if [ "$MODE" = "system" ]; then
     "$BIN_DIR/nexusctl" boot install
   fi
   echo "[nexus] 完成。后续命令不需要 --system："
+  echo "  nexusctl add <项目目录> -c '<启动命令>' --boot   # 一行加服务"
   echo "  nexusctl status"
-  echo "  nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <项目目录> --boot"
   echo "  systemctl status nexus-boot-runner"
 else
   BIN_DIR="${HOME}/.local/bin"
