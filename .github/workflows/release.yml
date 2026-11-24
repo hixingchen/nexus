@@ -140,6 +140,15 @@ jobs:
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
 
+            ## 2.7.0 · Linux 服务端版
+
+            ### 停止语义 P1：覆盖 double-fork / reparent
+
+            - **实例环境标记**：每次启动注入唯一的 `NEXUS_SERVICE_INSTANCE`；停止、认领、存活检测会扫描 `/proc/*/environ` 找回 `setsid` / double-fork 后父进程已退出、已脱离原进程组的后代。
+            - 直接子进程退出后，如果有带实例标记的进程仍在运行，服务保持运行状态，不会误报 exited；停止时这些进程也会收到 TERM/KILL。
+            - 限制：服务自己用 `env -i` 清空环境时标记会丢失；更彻底的 cgroup v2 仍留作后续。
+            - Windows 继续使用 `taskkill /T /F`；per-service Job Object 和优雅阶段尚未在本期落地。
+
             ## 2.6.0 · Linux 服务端版
 
             ### 停止语义（P0）

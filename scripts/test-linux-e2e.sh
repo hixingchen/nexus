@@ -80,7 +80,20 @@ if pgrep -f "sleep 300" >/dev/null 2>&1; then
 fi
 "${CTL[@]}" service remove app setsid >/dev/null
 
-"${CTL[@]}" service add -p app -n term -c "trap '' TERM; sleep 30" --order 5 --stop-timeout 1 >/dev/null
+# double-fork：父进程先退出，setsid 子进程靠实例环境标记找回
+"${CTL[@]}" service add -p app -n daemon -c "setsid sh -c 'sleep 300' >/dev/null 2>&1 &" --order 5 --stop-timeout 2 >/dev/null
+"${CTL[@]}" start app daemon
+sleep 0.6
+"${CTL[@]}" service show app daemon | grep -q '运行状态:   ready'
+"${CTL[@]}" stop app daemon
+if pgrep -f "sleep 300" >/dev/null 2>&1; then
+  echo "[linux-e2e] double-fork 子进程未被停止：" >&2
+  pgrep -af "sleep 300" >&2 || true
+  exit 1
+fi
+"${CTL[@]}" service remove app daemon >/dev/null
+
+"${CTL[@]}" service add -p app -n term -c "trap '' TERM; sleep 30" --order 6 --stop-timeout 1 >/dev/null
 "${CTL[@]}" start app term
 "${CTL[@]}" stop app term
 "${CTL[@]}" service remove app term >/dev/null

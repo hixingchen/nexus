@@ -423,6 +423,49 @@ pub fn alive_stop_targets(targets: &[StopTarget]) -> Vec<StopTarget> {
         .collect()
 }
 
+/// 按每次启动注入的环境标记找存活进程。
+///
+/// 这是 P1 的“脱离进程树”兜底：`setsid`/double-fork 后 ppid 可能变成 1，
+/// 但环境变量仍然继承（除非服务自己 `env -i` 清空）。
+#[cfg(target_os = "linux")]
+pub fn find_instance_pids(tag: &str) -> Vec<u32> {
+    if tag.is_empty() {
+        return Vec::new();
+    }
+    let needle = format!("NEXUS_SERVICE_INSTANCE={}", tag).into_bytes();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else { continue };
+        if pid == std::process::id() {
+            continue;
+        }
+        let path = format!("/proc/{}/environ", pid);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        // 环境变量不可能有这么大；异常大直接跳过，避免读进恶意/损坏数据。
+        if meta.len() > 1024 * 1024 {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if bytes.split(|b| *b == 0).any(|entry| entry == needle.as_slice()) {
+            out.push(pid);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn find_instance_pids(_tag: &str) -> Vec<u32> {
+    Vec::new()
+}
+
 // ─── 终止 ────────────────────────────────────────────────────
 
 /// 终止进程树/进程组。
@@ -569,6 +612,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(gone, "进程组里不应还有成员");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_instance_pids_finds_marked_child() {
+        let tag = format!("nexus-test-{}", std::process::id());
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .env("NEXUS_SERVICE_INSTANCE", &tag)
+            .spawn()
+            .expect("起测试进程");
+        std::thread::sleep(Duration::from_millis(100));
+        let pids = find_instance_pids(&tag);
+        assert!(pids.contains(&child.id()), "应找到带实例标记的进程: {:?}", pids);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]

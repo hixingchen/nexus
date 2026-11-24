@@ -517,6 +517,7 @@ nexusctl boot uninstall      # 停 runner、disable、删除 unit；配置/日�
 - 日志读取有 8MB 上限（只读末尾），日志再大也不会整份进内存。
 - 状态阶段：`pending` / `starting` / `ready` / `failed` / `exited` / `stopping` / `stopped` / `skipped` / `restarting`。
 - 停止语义：先对服务及后代发 TERM，等 `stop_timeout_secs`（默认 10s）；到点仍未退出才 KILL。正常退出会提前返回，不等满宽限。
+- Linux 每次启动会注入内部环境变量 `NEXUS_SERVICE_INSTANCE`；停止/认领时扫描 `/proc/*/environ`，可找回 `setsid`/double-fork 后父进程已退出的后代。服务自己用 `env -i` 清空环境时该标记会丢失。
 - 服务日志只包含命令的 stdout/stderr；如果服务自己另写日志（如 Tomcat 的 `logs/catalina.out`），
   需要看它自己的文件，或者用前台模式启动让输出进入 Nexus 日志。
 
@@ -614,7 +615,7 @@ nexusctl service add -p app -n web -c "..." --boot --order 30 --ready tcp:127.0.
 | 就绪超时 | 端口/关键字不对，或启动慢；用 JSON 就绪检查把 `timeoutSecs` 调大 |
 | 端口被占用 | `ss -ltnp \| grep :<端口>`；先停掉旧进程或改端口 |
 | 权限错误 | 系统级 unit 用 `--run-as <用户>`；该用户要能写工作目录/日志目录 |
-| 停止后服务仍显示失败 | 有进程组 survivor；看日志与 `ps`；`setsid` 逃逸的守护进程需要 systemd cgroup 兜底 |
+| 停止后服务仍显示失败 | 有进程组/标记 survivor；看 `service show` 的残留 pid、runner.log 的 `[stop]` 行；`env -i` 清空环境后再 double-fork 的进程需要在 2.8 cgroup 兜底 |
 | 服务没有输出 | 命令自己转后台了（如 `startup.sh`）；改用前台命令（如 `catalina.sh run`） |
 | `systemd` 显示 degraded | 可能是其它 unit 失败（如 logrotate）；`systemctl --failed` 单独排查 |
 | 配置改了没生效 | CLI 修改会自动同步；手改 TOML 后执行 `nexusctl boot sync` |
@@ -649,7 +650,7 @@ nexusctl service add -p app -n web -c "..." --boot --order 30 --ready tcp:127.0.
 `service start` 是立即启动。`enable-boot` 不会立刻启动。
 
 **能优雅停止吗？** 停止会结束整个进程组：先 TERM，很快再 KILL，不保证服务完成优雅关机。
-对忽略 TERM 的进程会被强制结束；`setsid` 逃逸的进程不在进程组内，unit 停止时由 systemd cgroup 兜底。
+对忽略 TERM 的进程会被强制结束；`setsid`/double-fork 的进程通过实例环境标记找回；只有服务用 `env -i` 清空环境时才需要 cgroup 兜底。
 
 **崩溃会自动重启吗？** 稳定运行满 10 秒后崩溃才重启，10 分钟内最多 5 次；
 启动失败不会自动重试（避免“改了半截代码 → 无限重启”）。

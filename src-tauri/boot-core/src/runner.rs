@@ -89,6 +89,8 @@ mod imp {
         child_started_at: u64,
         /// 直接子进程退出后接管的存活后代
         adopted: Vec<crate::process_exec::AdoptedChild>,
+        /// 本次启动注入的实例标记；用于找回 setsid/double-fork 到新会话的后代。
+        instance_tag: String,
         name: String,
         log_path: String,
         /// 本次启动时日志文件的长度（含表头）。日志检查只看这之后的**新增**内容，
@@ -397,7 +399,7 @@ mod imp {
                         let alive = matches!(child.try_wait(), Ok(None));
                         (alive, alive.then_some((child.id(), run.child_started_at)))
                     } else {
-                        let leader = run
+                        let adopted_leader = run
                             .adopted
                             .iter()
                             .find(|a| a.handle.is_alive())
@@ -408,6 +410,17 @@ mod imp {
                                         .unwrap_or(0),
                                 )
                             });
+                        let leader = adopted_leader.or_else(|| {
+                            crate::process_exec::find_instance_pids(&run.instance_tag)
+                                .first()
+                                .map(|&pid| {
+                                    (
+                                        pid,
+                                        crate::process_exec::process_start_time_millis(pid)
+                                            .unwrap_or(0),
+                                    )
+                                })
+                        });
                         (leader.is_some(), leader)
                     }
                 };
@@ -474,6 +487,10 @@ mod imp {
             if !svc.env.is_empty() {
                 cmd.envs(svc.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             }
+            let instance_tag = uuid::Uuid::new_v4().to_string();
+            // 只注入 Linux：Windows 通过 Job/父链，不扫描环境。
+            #[cfg(target_os = "linux")]
+            cmd.env("NEXUS_SERVICE_INSTANCE", &instance_tag);
             let stdout = log_file.try_clone().map_err(|e| format!("复制日志句柄失败: {}", e))?;
             let stderr = log_file.try_clone().map_err(|e| format!("复制日志句柄失败: {}", e))?;
             let child = cmd
@@ -499,6 +516,7 @@ mod imp {
                 child: Some(child),
                 child_started_at: process_started_at,
                 adopted: Vec::new(),
+                instance_tag,
                 name: svc.name.clone(),
                 log_path: svc.log_path.clone(),
                 log_start,
@@ -595,13 +613,14 @@ mod imp {
 
         /// 直接子进程已退出时认领仍存活的后代；返回 true = 服务应继续算运行中。
         fn adopt_if_survivors(&mut self, id: &str) -> bool {
-            let (pid, started, name) = {
+            let (pid, started, name, tag) = {
                 let Some(run) = self.running.get(id) else { return false };
                 let Some(child) = run.child.as_ref() else { return false };
-                (child.id(), run.child_started_at, run.name.clone())
+                (child.id(), run.child_started_at, run.name.clone(), run.instance_tag.clone())
             };
             let adopted = crate::process_exec::adopt_survivors(pid, started);
-            if adopted.is_empty() {
+            let marked = crate::process_exec::find_instance_pids(&tag);
+            if adopted.is_empty() && marked.is_empty() {
                 return false;
             }
             let who = adopted
@@ -614,10 +633,24 @@ mod imp {
                 run.child = None;
                 run.adopted = adopted;
             }
-            self.log.info(&format!(
-                "服务「{}」直接子进程已退出，已接管 {} 个仍在运行的进程：{}；按仍在运行处理",
-                name, count, who,
-            ));
+            if count > 0 {
+                self.log.info(&format!(
+                    "服务「{}」直接子进程已退出，已接管 {} 个仍在运行的进程：{}；按仍在运行处理",
+                    name, count, who,
+                ));
+            }
+            if !marked.is_empty() {
+                self.log.info(&format!(
+                    "服务「{}」直接子进程已退出，按实例标记找回 {} 个进程：{}；按仍在运行处理",
+                    name,
+                    marked.len(),
+                    marked
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             self.sync_state_pid(id);
             true
         }
@@ -630,10 +663,26 @@ mod imp {
                 if let Some(child) = run.child.as_ref() {
                     Some((child.id(), run.child_started_at))
                 } else {
-                    run.adopted
+                    let adopted_leader = run
+                        .adopted
                         .iter()
                         .find(|a| a.handle.is_alive())
-                        .map(|a| (a.pid, crate::process_exec::process_start_time_millis(a.pid).unwrap_or(0)))
+                        .map(|a| {
+                            (
+                                a.pid,
+                                crate::process_exec::process_start_time_millis(a.pid).unwrap_or(0),
+                            )
+                        });
+                    adopted_leader.or_else(|| {
+                        crate::process_exec::find_instance_pids(&run.instance_tag)
+                            .first()
+                            .map(|&pid| {
+                                (
+                                    pid,
+                                    crate::process_exec::process_start_time_millis(pid).unwrap_or(0),
+                                )
+                            })
+                    })
                 }
             };
             let Some((pid, started_at)) = leader else { return };
@@ -665,9 +714,12 @@ mod imp {
                         Ok(None) => {}
                         Err(e) => poll_errors.push(format!("查询服务「{}」状态失败: {}", run.name, e)),
                     },
-                    // 直接子进程已退出：接管的进程全退才算服务退出
+                    // 直接子进程已退出：接管的进程/实例标记进程全退才算服务退出
                     None => {
-                        if !run.adopted.iter().any(|a| a.handle.is_alive()) {
+                        if !run.adopted.iter().any(|a| a.handle.is_alive())
+                            && crate::process_exec::find_instance_pids(&run.instance_tag)
+                                .is_empty()
+                        {
                             let code = run.adopted.iter().find_map(|a| a.handle.exit_code());
                             exited.push((id.clone(), code, started_at_ms));
                         }
@@ -690,7 +742,11 @@ mod imp {
             }
             // 接管后代表进程可能换了（原 leader 退出、其余仍活）：同步 state.pid
             let adopted_ids: Vec<String> = self.running.iter()
-                .filter(|(_, r)| r.child.is_none() && !r.adopted.is_empty())
+                .filter(|(_, r)| {
+                    r.child.is_none()
+                        && (!r.adopted.is_empty()
+                            || !crate::process_exec::find_instance_pids(&r.instance_tag).is_empty())
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in adopted_ids {
@@ -986,6 +1042,8 @@ mod imp {
                         groups.push(a.pid);
                     }
                 }
+                // 覆盖父进程先退出后 setsid/double-fork 到新会话的进程。
+                roots.extend(crate::process_exec::find_instance_pids(&run.instance_tag));
                 groups.sort_unstable();
                 groups.dedup();
 
