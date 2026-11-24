@@ -53,7 +53,7 @@ pub fn phase_color(phase: &str) -> Option<Color> {
     match phase {
         "ready" => Some(Color::Green),
         "failed" => Some(Color::Red),
-        "starting" | "restarting" | "pending" => Some(Color::Yellow),
+        "starting" | "restarting" | "pending" | "stopping" => Some(Color::Yellow),
         "stopped" | "exited" | "skipped" => Some(Color::Dim),
         _ => None,
     }

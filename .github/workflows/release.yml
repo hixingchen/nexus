@@ -140,6 +140,18 @@ jobs:
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
 
+            ## 2.6.0 · Linux 服务端版
+
+            ### 停止语义（P0）
+
+            - **可配置停止宽限**：`[settings] stop_timeout_secs`（默认 10 秒）+ 单服务 `stop_timeout_secs` 覆盖；`0` = 直接强杀。CLI `service add/set --stop-timeout`、`--reset-stop-timeout`；`service show/list` 显示生效值。
+            - **Linux 停止范围**：发信号前先快照服务直接子进程、进程组成员和 ppid 后代；`setsid` 但父进程仍在的子进程（如 ffmpeg）也会被 TERM/KILL。
+            - **等待语义**：TERM → 轮询并回收直接子进程 → 到宽限仍未退出才 KILL；正常退出立即返回，不等满。停止期间继续写心跳，CLI 不会误判 runner 失联。
+            - **超时同步**：`service stop`、`project stop`、`boot stop/shutdown` 的 CLI 等待时间按服务宽限放大；unit 增加 `TimeoutStopSec=300`。
+            - **可观测**：新增 `stopping` 阶段，以及 `stop_result` / 耗时 / 强杀数 / 残留 pid；`nexusctl status` 显示为黄色。
+            - **限制**：P0 覆盖“主进程仍在”的 setsid 后代；父进程先退出后的 double-fork/reparent 留给 2.7 的 cgroup。
+            - **Windows**：保持 `taskkill /T /F` 强杀语义（不做优雅阶段），仅做新 manifest/state 兼容和界面 `stopping` 显示。
+
             ## 2.5.0 · Linux 服务端版
 
             ### 安全加固

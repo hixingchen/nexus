@@ -1,6 +1,6 @@
 [package]
 name = "nexus-linux"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2021"
 description = "Nexus Linux 服务端：配置管理 CLI + systemd 启动器"
 publish = false
