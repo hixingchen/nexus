@@ -45,14 +45,18 @@ impl Layout {
             )
         };
 
-        // `run_as` 只有安装/状态展示才需要；`project list --system` 之类的命令
+        // `run_as` 只有安装/状态展示才需要；`project list` 之类的命令
         // 不应该因为没给 --run-as 就失败。真需要的地方（install）会给出明确错误。
+        //
+        // 已经有 unit 时从里面读 `User=`：升级/查状态不用每次重复 --run-as。
         let run_as = if system {
-            run_as.or_else(|| {
-                std::env::var("SUDO_USER")
-                    .ok()
-                    .filter(|u| !u.trim().is_empty() && u != "root")
-            })
+            run_as
+                .or_else(|| {
+                    std::env::var("SUDO_USER")
+                        .ok()
+                        .filter(|u| !u.trim().is_empty() && u != "root")
+                })
+                .or_else(|| unit_user(&unit_path))
         } else {
             None
         };
@@ -149,6 +153,16 @@ impl Layout {
     }
 }
 
+/// 从已安装的 unit 里读 `User=`（升级时免去重复 --run-as）。
+fn unit_user(unit_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(unit_path).ok()?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("User="))
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
+        .map(str::to_string)
+}
+
 /// 路径是否位于 `base` 之下（用于日志/状态的测试与防御）。
 pub fn is_under(path: &Path, base: &Path) -> bool {
     path.starts_with(base)
@@ -180,5 +194,20 @@ mod tests {
         assert!(l.config_path.ends_with("nexus.toml"));
         assert!(l.data_dir.ends_with(".nexus"));
         assert!(l.unit_path.ends_with("nexus-boot-runner.service"));
+    }
+
+    #[test]
+    fn unit_user_is_read_from_existing_unit() {
+        let dir = std::env::temp_dir().join(format!("nexus-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let unit = dir.join("nexus-boot-runner.service");
+        std::fs::write(
+            &unit,
+            "[Service]\nUser=deploy\nExecStart=/usr/local/bin/nexus-boot-runner\n",
+        )
+        .expect("写 unit");
+        assert_eq!(unit_user(&unit).as_deref(), Some("deploy"));
+        assert_eq!(unit_user(&dir.join("missing.service")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

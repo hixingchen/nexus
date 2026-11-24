@@ -65,6 +65,17 @@ echo "=== 详情/配置/日志 ==="
 "${CTL[@]}" config path
 "${CTL[@]}" config validate
 "${CTL[@]}" service logs app bootsvc --lines 20 | grep -q 'bootsvc-started'
+"${CTL[@]}" status
+"${CTL[@]}" status --json | grep -q '"unit"'
+
+echo "=== 新增 --boot 服务自动启动 ==="
+"${CTL[@]}" service add -p app -n autoboot -c "echo autoboot-started; sleep 30" --boot --order 3
+"${CTL[@]}" service show app autoboot | grep -q '运行状态:   ready'
+"${CTL[@]}" logs app autoboot --lines 20 | grep -q 'autoboot-started'
+
+echo "=== 快捷启停 ==="
+"${CTL[@]}" stop app autoboot
+"${CTL[@]}" start app autoboot
 
 echo "=== 项目启停 ==="
 "${CTL[@]}" project start app

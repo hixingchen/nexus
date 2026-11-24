@@ -16,10 +16,21 @@ pub fn state(layout: &Layout) -> Option<BootRunnerState> {
 /// 要求 runner 可达；不可达时给出 systemd 操作提示。
 pub fn require_runner(layout: &Layout) -> Result<BootRunnerState, String> {
     let Some(st) = state(layout) else {
+        let how = if layout.system {
+            format!(
+                "sudo nexusctl --run-as <用户> boot install，或 systemctl start {}",
+                layout.unit_name()
+            )
+        } else {
+            format!(
+                "nexusctl --user boot install，或 systemctl --user start {}",
+                layout.unit_name()
+            )
+        };
         return Err(format!(
-            "启动器未运行（没有 {}）。先执行 `nexusctl boot install`，或 `systemctl --user start {}`",
+            "启动器未运行（没有 {}）。先执行：{}",
             layout.state_path().display(),
-            layout.unit_name()
+            how
         ));
     };
     if !runner_reachable(&st) {

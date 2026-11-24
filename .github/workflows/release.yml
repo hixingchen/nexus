@@ -140,6 +140,17 @@ jobs:
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
 
+            ## 2.4.0 · Linux 服务端版
+
+            ### 新增 / 调整
+
+            - **无桌面服务器默认系统级**：`nexusctl` 默认读写 `/etc/nexus`、`/var/lib/nexus`，日常命令不再需要 `--system`；桌面场景显式加 `--user`。旧脚本的 `--system` 继续兼容。
+            - **更简单的日常命令**：`nexusctl`（无子命令直接显示状态）、`nexusctl status`、`nexusctl start/stop/restart <项目> [服务]`、`nexusctl logs <项目> <服务> -f`、`nexusctl logs --runner -f`。
+            - **加服务一步到位**：`service add --project-path <目录>` 自动创建项目；带 `--boot` 且 runner 在运行时立即启动新服务。
+            - **一条命令安装**：`sudo ./install.sh --system --run-as <用户>` 安装二进制、写入 unit、启用开机自启并启动 runner；升级时自动从已有 unit 读取 `User=`。
+            - **内存安全与日志体验**：日志只读末尾最多 8MB，`--follow` 单次最多 64 KiB，不会整份进内存；文件轮转/截断后自动重开；目录 chown 改为显式栈并只改符号链接本身；用户查询改用 `getpwnam_r`。
+            - **状态更完整**：`status` 显示 unit 是否安装、active、enabled、runner 心跳与服务汇总；runner 失联时明确提示状态是最后一次记录。
+
             ## 2.3.0 · Linux 服务端版
 
             ### 新增
@@ -179,10 +190,15 @@ jobs:
 
             按服务器架构下载 **`nexus-<版本>-linux-x86_64.tar.gz`** 或
             **`nexus-<版本>-linux-aarch64.tar.gz`**（用 `uname -m` 确认；不需要 WebView/Node/数据库）。
-            解压后执行 `./install.sh`，用 `nexusctl project add` / `service add` / `boot install`
-            管理项目与服务；详见包内 `share/README.md`。
+            解压后一条命令安装并启用开机自启：
 
-            支持 systemd user unit + linger（无人登录也启动）或 `--system` 系统级 unit。
+            ```bash
+            sudo ./install.sh --system --run-as <运行用户>
+            ```
+
+            之后用 `nexusctl status`、`nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <目录> --boot`
+            与 `nexusctl logs <项目> <服务> -f` 管理；详见包内 `share/README.md`。
+            无桌面服务器只需要系统级，不需要 linger。
 
             ## 首次使用
 

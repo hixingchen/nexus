@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '目标 Release tag（例如 v2.3.0）'
+        description: '目标 Release tag（例如 v2.4.0）'
         required: true
       source_ref:
         description: '可选：构建源码 ref（默认使用 tag 本身；补发历史 tag 且 main 源码一致时可填 main）'
@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # 默认 checkout 目标 tag（源码与 Release 一致）。
-          # workflow_dispatch 可显式用 source_ref 覆盖（v2.3.0 补发时用 main，
+          # workflow_dispatch 可显式用 source_ref 覆盖（v2.4.0 补发时用 main，
           # 因为 main 与 tag 的 Rust 源码一致，只多了 aarch64 文档）。
           ref: ${{ inputs.source_ref || inputs.tag || github.ref_name }}
 

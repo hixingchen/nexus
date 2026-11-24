@@ -1,6 +1,6 @@
 [package]
 name = "boot-core"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 description = "Nexus 服务开机启动共享核心（无 Tauri）"
 publish = false

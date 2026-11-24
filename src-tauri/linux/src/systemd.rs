@@ -13,6 +13,8 @@ use crate::layout::Layout;
 pub struct Status {
     /// None = 查不了（systemctl 不存在 / 无 user bus）
     pub active: Option<bool>,
+    /// 是否开机启用（`systemctl is-enabled`）；None = 查不了
+    pub enabled: Option<bool>,
     /// user 模式：linger 是否开启（None = 查不了）
     pub linger: Option<bool>,
     /// 实际使用的用户名（system 模式是 run_as）
@@ -160,7 +162,7 @@ pub struct InstallReport {
 pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> {
     if layout.system {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("system 模式需要 root（请用 sudo nexusctl --system boot install ...）".into());
+            return Err("system 模式需要 root（请用 sudo nexusctl boot install ...）".into());
         }
     } else if std::env::var("SUDO_USER").is_ok() {
         return Err(
@@ -258,6 +260,7 @@ pub fn uninstall(_layout: &Layout) -> Result<Vec<String>, String> {
 #[cfg(unix)]
 pub fn status(layout: &Layout) -> Status {
     let active = systemctl_active(layout);
+    let enabled = systemctl_enabled(layout);
     let user = if layout.system {
         layout.run_as.clone()
     } else {
@@ -268,7 +271,7 @@ pub fn status(layout: &Layout) -> Status {
     } else {
         user.as_deref().and_then(linger_enabled)
     };
-    Status { active, linger, user }
+    Status { active, enabled, linger, user }
 }
 
 #[cfg(not(unix))]
@@ -297,6 +300,28 @@ fn systemctl_active(layout: &Layout) -> Option<bool> {
         .output()
         .ok()?;
     is_active_state(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 解析 `systemctl is-enabled` 的 stdout。
+///
+/// 和 `is-active` 一样：disabled/not-found 会返回非零退出码，但 stdout 仍有值。
+#[cfg(unix)]
+fn enabled_state(stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "enabled" | "enabled-runtime" => Some(true),
+        "disabled" | "masked" | "masked-runtime" | "not-found" | "static" | "indirect"
+        | "generated" | "transient" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn systemctl_enabled(layout: &Layout) -> Option<bool> {
+    let out = systemctl_command(layout)
+        .args(["is-enabled", layout.unit_name()])
+        .output()
+        .ok()?;
+    enabled_state(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `loginctl show-user <user> -p Linger` → `Linger=yes|no`。
@@ -351,45 +376,114 @@ fn systemctl_command(layout: &Layout) -> Command {
 }
 
 /// 递归 chown（system 模式下 root 写出的 manifest/logs 必须归服务用户）。
+///
+/// 用显式栈而不是递归：目录树再深也不会把 CLI 栈打爆。
+/// 数据目录内部遇到符号链接只改链接本身，不跟随到目录外。
 #[cfg(unix)]
 fn chown_tree(path: &Path, user: &str) -> Result<(), String> {
     let (uid, gid) = user_ids(user)?;
-    fn walk(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| format!("路径含 NUL: {}", path.display()))?;
-        if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
-            return Err(format!(
-                "chown {} 失败: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        if path.is_dir() {
-            for entry in std::fs::read_dir(path)
-                .map_err(|e| format!("读取目录失败 {}: {}", path.display(), e))?
-            {
-                let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
-                walk(&entry.path(), uid, gid)?;
-            }
-        }
-        Ok(())
-    }
-    if !path.exists() {
+    let root_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("读取数据目录失败 {}: {}", path.display(), e)),
+    };
+    // 根目录可以是指向数据盘的符号链接：跟随它，否则目标目录里的文件不会改属主。
+    chown_path(path, uid, gid, true)?;
+    if !root_meta.is_dir() {
         return Ok(());
     }
-    walk(path, uid, gid)
+
+    let mut stack = Vec::new();
+    for entry in
+        std::fs::read_dir(path).map_err(|e| format!("读取目录失败 {}: {}", path.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        stack.push(entry.path());
+    }
+    while let Some(p) = stack.pop() {
+        let meta = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("读取目录项失败 {}: {}", p.display(), e)),
+        };
+        if meta.file_type().is_symlink() {
+            // 只改链接本身；不读它的目标，也不继续向下遍历。
+            chown_path(&p, uid, gid, false)?;
+            continue;
+        }
+        chown_path(&p, uid, gid, true)?;
+        if meta.is_dir() {
+            for entry in
+                std::fs::read_dir(&p).map_err(|e| format!("读取目录失败 {}: {}", p.display(), e))?
+            {
+                let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
+#[cfg(unix)]
+fn chown_path(path: &Path, uid: u32, gid: u32, follow: bool) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("路径含 NUL: {}", path.display()))?;
+    let rc = unsafe {
+        if follow {
+            libc::chown(c.as_ptr(), uid, gid)
+        } else {
+            libc::lchown(c.as_ptr(), uid, gid)
+        }
+    };
+    if rc != 0 {
+        return Err(format!(
+            "chown {} 失败: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// 用 `getpwnam_r` 查 uid/gid：避免 `getpwnam` 的静态缓冲区（多线程下不安全）。
 #[cfg(unix)]
 fn user_ids(name: &str) -> Result<(u32, u32), String> {
     use std::ffi::CString;
     let c = CString::new(name).map_err(|_| format!("用户名含 NUL: {}", name))?;
-    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
-    if pw.is_null() {
-        return Err(format!("用户不存在: {}", name));
+    let mut buf_len = 16 * 1024;
+    loop {
+        let mut buf = vec![0u8; buf_len];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                c.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 {
+            if result.is_null() {
+                return Err(format!("用户不存在: {}", name));
+            }
+            return Ok((pwd.pw_uid, pwd.pw_gid));
+        }
+        if rc == libc::EINTR {
+            continue;
+        }
+        if rc == libc::ERANGE && buf_len < 1024 * 1024 {
+            buf_len *= 2;
+            continue;
+        }
+        return Err(format!(
+            "查询用户 {} 失败: {}",
+            name,
+            std::io::Error::from_raw_os_error(rc)
+        ));
     }
-    unsafe { Ok(((*pw).pw_uid, (*pw).pw_gid)) }
 }
 
 #[cfg(test)]
@@ -434,7 +528,8 @@ mod tests {
 
     #[test]
     fn system_unit_sets_user_and_multi_user_target() {
-        let unit = render_unit(&layout(true), Path::new("/usr/local/bin/nexus-boot-runner")).unwrap();
+        let unit =
+            render_unit(&layout(true), Path::new("/usr/local/bin/nexus-boot-runner")).unwrap();
         assert!(unit.contains("User=deploy"));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(unit.contains("--mode system"));
@@ -455,5 +550,15 @@ mod tests {
         assert_eq!(is_active_state("inactive\n"), Some(false));
         assert_eq!(is_active_state("failed\n"), Some(false));
         assert_eq!(is_active_state(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabled_state_understands_systemd_output() {
+        assert_eq!(enabled_state("enabled\n"), Some(true));
+        assert_eq!(enabled_state("enabled-runtime\n"), Some(true));
+        assert_eq!(enabled_state("disabled\n"), Some(false));
+        assert_eq!(enabled_state("not-found\n"), Some(false));
+        assert_eq!(enabled_state(""), None);
     }
 }

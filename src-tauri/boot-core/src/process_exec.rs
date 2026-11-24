@@ -283,10 +283,19 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
-        if pid == 0 || pid > i32::MAX as u32 {
+        if pid <= 1 || pid > i32::MAX as u32 {
             return Err(format!("无效 pid: {}", pid));
         }
         let pgid = pid as i32;
+        // 服务组 id 应该等于直接子进程 pid。万一调用方传错（例如传了 runner 自己的
+        // pid），kill(-pgid) 会把 runner 所在的整个组一起杀掉；这里直接拒绝。
+        let own_group = unsafe { libc::getpgrp() };
+        if pgid == own_group {
+            return Err(format!(
+                "拒绝终止当前进程组 (pgid={})：服务应在独立进程组中启动",
+                pgid
+            ));
+        }
 
         // 只对**进程组**发信号：pgid 在组内还有成员时不会被系统回收，
         // 而单个 pid 可能已被复用——对着 pid 补刀会误杀无关进程。

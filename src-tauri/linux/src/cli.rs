@@ -8,7 +8,6 @@ use clap::{Parser, Subcommand};
 use boot_core::boot::{
     runner_reachable, service_alive_in, service_log_path_in, BootRunnerState,
 };
-use boot_core::textenc::decode_to_string;
 
 use crate::client;
 use crate::config::{describe_ready, parse_env_arg, parse_ready, Config, Project, Service};
@@ -18,25 +17,29 @@ use crate::output;
 use crate::systemd;
 
 #[derive(Parser)]
-#[command(name = "nexusctl", version, about = "Nexus Linux 服务端管理 CLI")]
+#[command(name = "nexusctl", version, about = "Nexus Linux 服务端管理 CLI（默认系统级）")]
 pub struct Cli {
-    /// 安装/管理系统级服务（/etc/nexus、/var/lib/nexus，需要 root）
+    /// 以当前用户运行（桌面场景）；服务器默认就是系统级，不需要额外参数
     #[arg(long, global = true)]
+    user: bool,
+    /// 兼容旧用法：系统级现在是默认，保留该参数不报错
+    #[arg(long, global = true, hide = true)]
     system: bool,
-    /// system 模式下服务进程的运行用户（默认 SUDO_USER）
+    /// 系统级 unit 的服务运行用户（默认 SUDO_USER；安装时必填）
     #[arg(long, global = true)]
     run_as: Option<String>,
-    /// 配置文件路径（默认 ~/.config/nexus/nexus.toml 或 /etc/nexus/nexus.toml）
+    /// 配置文件路径（默认 /etc/nexus/nexus.toml；--user 时 ~/.config/nexus/nexus.toml）
     #[arg(long, global = true, env = "NEXUS_CONFIG")]
     config: Option<PathBuf>,
-    /// 数据目录（默认 ~/.nexus 或 /var/lib/nexus）
+    /// 数据目录（默认 /var/lib/nexus；--user 时 ~/.nexus）
     #[arg(long, global = true, env = "NEXUS_DATA_DIR")]
     data_dir: Option<PathBuf>,
-    /// 覆盖 nexus-boot-runner 路径（默认与 nexusctl 同目录）
-    #[arg(long, global = true)]
+    /// 覆盖 nexus-boot-runner 路径（默认与 nexusctl 同目录；放在子命令前）
+    #[arg(long)]
     runner: Option<PathBuf>,
+    /// 不写子命令时默认显示 status
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -60,6 +63,41 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+    /// 总览：runner、开机自启、全部服务状态
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 启动项目（只给项目）或单个服务（项目 + 服务）
+    Start {
+        project: String,
+        service: Option<String>,
+    },
+    /// 停止项目（只给项目）或单个服务（项目 + 服务）
+    Stop {
+        project: String,
+        service: Option<String>,
+    },
+    /// 重启项目（只给项目）或单个服务（项目 + 服务）
+    Restart {
+        project: String,
+        service: Option<String>,
+    },
+    /// 查看日志：logs <项目> <服务>，或 logs --runner
+    Logs {
+        /// 项目名（--runner 时省略）
+        project: Option<String>,
+        /// 服务名（--runner 时省略）
+        name: Option<String>,
+        /// 查看 runner 自身日志
+        #[arg(long = "runner")]
+        runner_log: bool,
+        /// 持续跟踪新增日志（类似 tail -f，Ctrl-C 退出）
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
     },
 }
 
@@ -130,12 +168,15 @@ enum ServiceCmd {
         project: String,
         /// 服务名
         name: String,
+        /// 持续跟踪新增日志（Ctrl-C 退出）
+        #[arg(short = 'f', long)]
+        follow: bool,
         #[arg(long, default_value_t = 200)]
         lines: usize,
     },
     /// 添加服务
     Add {
-        /// 所属项目名（需先用 project add 创建）
+        /// 所属项目名
         #[arg(short = 'p', long)]
         project: String,
         /// 服务名（用于 start/stop/logs；可与项目名不同）
@@ -144,6 +185,9 @@ enum ServiceCmd {
         /// 启动命令（由 sh -c 在工作目录执行）
         #[arg(short = 'c', long)]
         command: String,
+        /// 项目不存在时，用这个目录创建项目（省去先 project add）
+        #[arg(long = "project-path")]
+        project_path: Option<PathBuf>,
         /// 工作目录（默认项目路径）
         #[arg(short = 'w', long)]
         workdir: Option<String>,
@@ -236,6 +280,9 @@ enum BootCmd {
     Disable,
     /// 查看 runner 自身日志尾部
     RunnerLog {
+        /// 持续跟踪新增日志（Ctrl-C 退出）
+        #[arg(short = 'f', long)]
+        follow: bool,
         #[arg(long, default_value_t = 200)]
         lines: usize,
     },
@@ -250,28 +297,52 @@ enum BootCmd {
     Logs {
         project: String,
         name: String,
+        /// 持续跟踪新增日志（Ctrl-C 退出）
+        #[arg(short = 'f', long)]
+        follow: bool,
         #[arg(long, default_value_t = 200)]
         lines: usize,
     },
 }
 
 pub fn run(cli: Cli) -> Result<(), String> {
-    if cli.run_as.is_some() && !cli.system {
-        return Err("--run-as 只在 --system 模式下有效".into());
+    if cli.user && cli.system {
+        return Err("--user 与 --system 不能同时使用".into());
     }
-    if !cli.system && std::env::var("SUDO_USER").is_ok() {
-        return Err(
-            "user 模式不要用 sudo：请以目标用户身份运行。\
-             服务器级安装请改用 `nexusctl --system --run-as <用户> ...`"
-                .into(),
-        );
+    // 无桌面服务器是主场景：默认系统级；桌面用户显式加 --user。
+    let system = !cli.user;
+    if cli.run_as.is_some() && !system {
+        return Err("--run-as 只在系统级模式下有效".into());
     }
-    let layout = Layout::resolve(cli.system, cli.config, cli.data_dir, cli.run_as)?;
-    match cli.command {
+    if !system && std::env::var("SUDO_USER").is_ok() {
+        return Err("--user 模式不要用 sudo：请以目标用户身份运行。\
+             服务器级安装请直接用 `sudo nexusctl --run-as <用户> ...`"
+            .into());
+    }
+    let layout = Layout::resolve(system, cli.config, cli.data_dir, cli.run_as)?;
+    let command = cli.command.unwrap_or(Cmd::Status { json: false });
+    match command {
         Cmd::Project { cmd } => project_cmd(&layout, cmd),
         Cmd::Service { cmd } => service_cmd(&layout, cmd),
         Cmd::Boot { cmd } => boot_cmd(&layout, cli.runner, cmd),
         Cmd::Config { cmd } => config_cmd(&layout, cmd),
+        Cmd::Status { json } => boot_status(&layout, json),
+        Cmd::Start { project, service } => {
+            simple_action(&layout, &project, service.as_deref(), ProjectAction::Start)
+        }
+        Cmd::Stop { project, service } => {
+            simple_action(&layout, &project, service.as_deref(), ProjectAction::Stop)
+        }
+        Cmd::Restart { project, service } => {
+            simple_action(&layout, &project, service.as_deref(), ProjectAction::Restart)
+        }
+        Cmd::Logs {
+            project,
+            name,
+            runner_log,
+            follow,
+            lines,
+        } => logs_cmd(&layout, project, name, runner_log, follow, lines),
     }
 }
 
@@ -393,7 +464,9 @@ fn show_project(layout: &Layout, name: &str, json: bool) -> Result<(), String> {
     }
     let table_rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
     output::table(
-        &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
+        &[
+            "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
+        ],
         &table_rows,
     );
     Ok(())
@@ -522,6 +595,33 @@ fn project_action(layout: &Layout, project: &str, action: ProjectAction) -> Resu
     }
 }
 
+/// 顶层 `start/stop/restart`：只给项目就操作整个项目，再给服务就只操作该服务。
+fn simple_action(
+    layout: &Layout,
+    project: &str,
+    service: Option<&str>,
+    action: ProjectAction,
+) -> Result<(), String> {
+    let Some(name) = service else {
+        return project_action(layout, project, action);
+    };
+    ensure_service(layout, project, name)?;
+    let id = format!("{}.{}", project, name);
+    let op = match action {
+        ProjectAction::Start => "start",
+        ProjectAction::Stop => "stop",
+        ProjectAction::Restart => "restart",
+    };
+    let timeout = if matches!(action, ProjectAction::Stop) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(180)
+    };
+    send_op(layout, op, &id, timeout)?;
+    println!("已{} {}", action.verb(), id);
+    Ok(())
+}
+
 fn send_project_op(
     layout: &Layout,
     op: &str,
@@ -555,12 +655,14 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
         ServiceCmd::Logs {
             project,
             name,
+            follow,
             lines,
-        } => show_service_log(layout, &project, &name, lines),
+        } => show_service_log(layout, &project, &name, lines, follow),
         ServiceCmd::Add {
             project,
             name,
             command,
+            project_path,
             workdir,
             env,
             boot,
@@ -571,7 +673,18 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
         } => {
             let mut cfg = Config::load_or_default(&layout.config_path)?;
             if cfg.find_project(&project).is_none() {
-                return Err(format!("项目不存在: {}（先 nexusctl project add）", project));
+                let Some(path) = project_path else {
+                    return Err(format!(
+                        "项目不存在: {}（先 nexusctl project add，或加 --project-path <目录> 自动创建）",
+                        project
+                    ));
+                };
+                let path = canonical_dir(&path, "项目路径")?;
+                cfg.projects.push(Project {
+                    name: project.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                });
+                println!("已创建项目 {}（{}）", project, path.display());
             }
             if cfg.find_service(&project, &name).is_some() {
                 return Err(format!("服务已存在: {}.{}", project, name));
@@ -585,6 +698,9 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             let ready = ready.unwrap_or_default();
             parse_ready(&ready)?;
             let env = parse_envs(&env)?;
+            let id = format!("{}.{}", project, name);
+            let project_name = project.clone();
+            let service_name = name.clone();
             cfg.services.push(Service {
                 project,
                 name,
@@ -599,12 +715,31 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             });
             let reloaded = save_and_sync(layout, &cfg)?;
             println!(
-                "已添加服务 {}.{}；manifest 已更新{}",
-                cfg.services.last().map(|s| s.project.as_str()).unwrap_or(""),
-                cfg.services.last().map(|s| s.name.as_str()).unwrap_or(""),
-                if reloaded { "（runner 已 reload）" } else { "（runner 未运行）" }
+                "已添加服务 {}；manifest 已更新{}",
+                id,
+                if reloaded {
+                    "（runner 已 reload）"
+                } else {
+                    "（runner 未运行）"
+                }
             );
-            println!("启动：nexusctl service start <project> <name>；开机启动：--boot");
+            // `--boot` 的服务如果 runner 在跑，立即拉起：否则用户会以为加完就在运行，
+            // 实际要等下一次开机/重启。启动失败不回滚配置，但必须把原因报出来。
+            if boot && reloaded {
+                match client::send(layout, "start", Some(&id), Duration::from_secs(180)) {
+                    Ok(r) if r.ok => println!("已启动 {}", id),
+                    Ok(r) => {
+                        return Err(format!("服务 {} 已添加，但立即启动失败: {}", id, r.error));
+                    }
+                    Err(e) => {
+                        return Err(format!("服务 {} 已添加，但立即启动失败: {}", id, e));
+                    }
+                }
+            } else if boot {
+                println!("开机自启：已记录；runner 启动后会自动拉起");
+            } else {
+                println!("现在启动：nexusctl start {} {}", project_name, service_name);
+            }
             Ok(())
         }
         ServiceCmd::Set {
@@ -633,9 +768,11 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
                 return Err("--crash-restart 与 --no-crash-restart 不能同时使用".into());
             }
             let workdir = match workdir {
-                Some(w) if !w.trim().is_empty() => {
-                    Some(canonical_dir(Path::new(&w), "工作目录")?.to_string_lossy().into_owned())
-                }
+                Some(w) if !w.trim().is_empty() => Some(
+                    canonical_dir(Path::new(&w), "工作目录")?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 Some(_) => Some(String::new()),
                 None => None,
             };
@@ -688,7 +825,11 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
                 "已更新服务 {}.{}；manifest 已更新{}",
                 project,
                 name,
-                if reloaded { "（runner 已 reload）" } else { "（runner 未运行）" }
+                if reloaded {
+                    "（runner 已 reload）"
+                } else {
+                    "（runner 未运行）"
+                }
             );
             Ok(())
         }
@@ -703,7 +844,8 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
                 }
             }
             let before = cfg.services.len();
-            cfg.services.retain(|s| !(s.project == project && s.name == name));
+            cfg.services
+                .retain(|s| !(s.project == project && s.name == name));
             if cfg.services.len() == before {
                 return Err(format!("服务不存在: {}", id));
             }
@@ -711,7 +853,11 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             println!(
                 "已删除服务 {}；manifest 已更新{}",
                 id,
-                if reloaded { "（runner 已 reload）" } else { "（runner 未运行）" }
+                if reloaded {
+                    "（runner 已 reload）"
+                } else {
+                    "（runner 未运行）"
+                }
             );
             Ok(())
         }
@@ -763,6 +909,7 @@ fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(
         }
     }
     let state = client::state(layout);
+    let reachable = state.as_ref().map(runner_reachable).unwrap_or(false);
     let rows_all = service_rows(&cfg, state.as_ref(), project);
     if json {
         let services = rows_all
@@ -771,21 +918,35 @@ fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "services": services }))
-                .map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "runner_reachable": reachable,
+                "services": services,
+            }))
+            .map_err(|e| e.to_string())?
         );
         return Ok(());
+    }
+    if !reachable {
+        eprintln!(
+            "[nexusctl] 提示：runner 未运行或心跳过期，STATUS/PID 是最后一次记录（用 `nexusctl status` 查看）"
+        );
     }
     if rows_all.is_empty() {
         println!(
             "{}",
-            if project.is_some() { "（该项目下没有服务）" } else { "（没有服务）" }
+            if project.is_some() {
+                "（该项目下没有服务）"
+            } else {
+                "（没有服务）"
+            }
         );
         return Ok(());
     }
     let rows: Vec<Vec<String>> = rows_all.into_iter().map(|(_, row)| row).collect();
     output::table(
-        &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
+        &[
+            "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
+        ],
         &rows,
     );
     Ok(())
@@ -798,6 +959,7 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
         .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
     let id = svc.id();
     let state = client::state(layout);
+    let runner_ok = state.as_ref().map(runner_reachable).unwrap_or(false);
     let st = state.as_ref().and_then(|s| s.services.get(&id));
     let log_path = st
         .map(|s| s.log_path.clone())
@@ -839,6 +1001,7 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
                 "crash_restart": svc.crash_restart,
                 "status": status,
                 "log_path": log_path,
+                "runner_reachable": runner_ok,
             }))
             .map_err(|e| e.to_string())?
         );
@@ -862,7 +1025,10 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
         }
     );
     println!("未就绪阻断: {}", if svc.required { "yes" } else { "no" });
-    println!("崩溃重启:   {}", if svc.crash_restart { "yes" } else { "no" });
+    println!(
+        "崩溃重启:   {}",
+        if svc.crash_restart { "yes" } else { "no" }
+    );
     if svc.env.is_empty() {
         println!("环境变量:   （无）");
     } else {
@@ -880,6 +1046,9 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
             );
             if !s.error.is_empty() {
                 println!("最近错误:   {}", s.error);
+            }
+            if !runner_ok {
+                println!("状态来源:   最后一次记录（runner 未运行或心跳过期）");
             }
         }
         None => println!("运行状态:   无（runner 未运行或还没有状态）"),
@@ -1031,7 +1200,10 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
             for w in warnings {
                 eprintln!("[nexusctl] 警告: {}", w);
             }
-            println!("已卸载 systemd unit；配置与日志保留在 {}", layout.data_dir.display());
+            println!(
+                "已卸载 systemd unit；配置与日志保留在 {}",
+                layout.data_dir.display()
+            );
             Ok(())
         }
         BootCmd::Unit => {
@@ -1045,8 +1217,8 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
         BootCmd::Restart => boot_restart(layout),
         BootCmd::Enable => boot_enable(layout, true),
         BootCmd::Disable => boot_enable(layout, false),
-        BootCmd::RunnerLog { lines } => {
-            print_log_tail(&layout.runner_log(), lines, "runner 日志")
+        BootCmd::RunnerLog { follow, lines } => {
+            show_log_file(&layout.runner_log(), lines, follow, "runner 日志")
         }
         BootCmd::Sync => {
             let cfg = Config::load(&layout.config_path)?;
@@ -1056,15 +1228,56 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
             println!(
                 "manifest 已更新：{}{}",
                 layout.manifest_path().display(),
-                if reloaded { "（runner 已 reload）" } else { "（runner 未运行）" }
+                if reloaded {
+                    "（runner 已 reload）"
+                } else {
+                    "（runner 未运行）"
+                }
             );
             Ok(())
         }
         BootCmd::Status { json } => boot_status(layout, json),
-        BootCmd::Logs { project, name, lines } => {
-            show_service_log(layout, &project, &name, lines)
-        }
+        BootCmd::Logs {
+            project,
+            name,
+            follow,
+            lines,
+        } => show_service_log(layout, &project, &name, lines, follow),
     }
+}
+
+fn logs_cmd(
+    layout: &Layout,
+    project: Option<String>,
+    name: Option<String>,
+    runner: bool,
+    follow: bool,
+    lines: usize,
+) -> Result<(), String> {
+    if runner {
+        if project.is_some() || name.is_some() {
+            return Err("--runner 不能同时指定项目/服务".into());
+        }
+        return show_log_file(&layout.runner_log(), lines, follow, "runner 日志");
+    }
+    match (project, name) {
+        (Some(project), Some(name)) => show_service_log(layout, &project, &name, lines, follow),
+        _ => Err("用法: nexusctl logs <项目> <服务> [--follow]，或 nexusctl logs --runner".into()),
+    }
+}
+
+fn service_log_path(layout: &Layout, project: &str, name: &str) -> Result<PathBuf, String> {
+    let cfg = Config::load(&layout.config_path)?;
+    cfg.find_service(project, name)
+        .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
+    let id = format!("{}.{}", project, name);
+    let state = client::state(layout);
+    Ok(state
+        .as_ref()
+        .and_then(|s| s.services.get(&id))
+        .map(|s| PathBuf::from(&s.log_path))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| service_log_path_in(&layout.logs_dir(), &id)))
 }
 
 fn show_service_log(
@@ -1072,23 +1285,17 @@ fn show_service_log(
     project: &str,
     name: &str,
     lines: usize,
+    follow: bool,
 ) -> Result<(), String> {
-    let cfg = Config::load(&layout.config_path)?;
-    cfg.find_service(project, name)
-        .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
-    let id = format!("{}.{}", project, name);
-    let state = client::state(layout);
-    let path = state
-        .as_ref()
-        .and_then(|s| s.services.get(&id))
-        .map(|s| PathBuf::from(&s.log_path))
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| service_log_path_in(&layout.logs_dir(), &id));
-    print_log_tail(&path, lines, "服务日志")
+    let path = service_log_path(layout, project, name)?;
+    show_log_file(&path, lines, follow, "服务日志")
 }
 
-fn print_log_tail(path: &Path, lines: usize, what: &str) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| {
+fn show_log_file(path: &Path, lines: usize, follow: bool, what: &str) -> Result<(), String> {
+    if follow {
+        return output::follow_file(path, lines);
+    }
+    let tail = output::read_tail(path, lines).map_err(|e| {
         format!(
             "读取日志失败 {}: {}（{}，可能还没生成）",
             path.display(),
@@ -1096,8 +1303,6 @@ fn print_log_tail(path: &Path, lines: usize, what: &str) -> Result<(), String> {
             what
         )
     })?;
-    let text = decode_to_string(&bytes);
-    let tail = output::tail(&text, lines);
     if tail.is_empty() {
         println!("（{}为空）", what);
     } else {
@@ -1182,12 +1387,17 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
     let state = client::state(layout);
     let reachable = state.as_ref().map(runner_reachable).unwrap_or(false);
     let unit = systemd::status(layout);
+    let unit_exists = systemd::unit_exists(layout);
+    // 配置不存在是正常状态（刚装完还没加服务）；存在但读不出来必须显示出来。
+    let cfg_result = if layout.config_path.exists() {
+        Some(Config::load(&layout.config_path))
+    } else {
+        None
+    };
 
     if json {
-        let cfg = Config::load(&layout.config_path).ok();
-        let services = cfg
-            .as_ref()
-            .map(|cfg| {
+        let (services, config_error) = match &cfg_result {
+            Some(Ok(cfg)) => (
                 service_rows(cfg, state.as_ref(), None)
                     .into_iter()
                     .map(|(s, row)| {
@@ -1199,14 +1409,19 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
                             "pid": row[5].clone(),
                         })
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            Some(Err(e)) => (Vec::new(), Some(e.clone())),
+            None => (Vec::new(), None),
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "unit": {
+                    "exists": unit_exists,
                     "active": unit.active,
+                    "enabled": unit.enabled,
                     "linger": unit.linger,
                     "user": unit.user,
                     "path": layout.unit_path.display().to_string(),
@@ -1218,18 +1433,31 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
                     "reachable": reachable,
                 })),
                 "services": services,
+                "config_error": config_error,
             }))
             .map_err(|e| e.to_string())?
         );
         return Ok(());
     }
 
-    println!("unit:    {}", layout.unit_path.display());
+    println!(
+        "unit:    {} {}",
+        layout.unit_path.display(),
+        if unit_exists { "" } else { "（未安装）" }
+    );
     println!(
         "active:  {}",
         match unit.active {
             Some(true) => "active",
             Some(false) => "inactive",
+            None => "unknown",
+        }
+    );
+    println!(
+        "enabled: {}",
+        match unit.enabled {
+            Some(true) => "yes（开机自启）",
+            Some(false) => "no",
             None => "unknown",
         }
     );
@@ -1249,23 +1477,41 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
             s.runner_pid,
             s.mode,
             s.heartbeat_at,
-            if reachable { "reachable" } else { "unreachable" }
+            if reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            }
         ),
         None => println!("runner:  未运行（没有 state.json）"),
     }
 
-    if let Ok(cfg) = Config::load(&layout.config_path) {
-        if !cfg.services.is_empty() {
-            println!();
-            let rows: Vec<Vec<String>> = service_rows(&cfg, state.as_ref(), None)
-                .into_iter()
-                .map(|(_, row)| row)
-                .collect();
-            output::table(
-                &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
-                &rows,
-            );
+    match cfg_result {
+        Some(Ok(cfg)) => {
+            if !cfg.services.is_empty() {
+                println!();
+                let rows = service_rows(&cfg, state.as_ref(), None);
+                let mut counts = std::collections::BTreeMap::new();
+                for (_, row) in &rows {
+                    *counts.entry(row[4].clone()).or_insert(0usize) += 1;
+                }
+                let summary = counts
+                    .iter()
+                    .map(|(phase, n)| format!("{} {}", phase, n))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                println!("服务: {} 个（{}）", rows.len(), summary);
+                let table_rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
+                output::table(
+                    &[
+                        "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
+                    ],
+                    &table_rows,
+                );
+            }
         }
+        Some(Err(e)) => println!("配置:   {}", e),
+        None => {}
     }
     Ok(())
 }
@@ -1302,6 +1548,20 @@ fn canonical_dir(path: &Path, what: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_defaults_to_system_and_status() {
+        let cli = Cli::try_parse_from(["nexusctl"]).expect("无子命令也能解析");
+        assert!(!cli.user);
+        assert!(!cli.system);
+        assert!(cli.command.is_none(), "不写子命令时由 run() 回落为 status");
+    }
+
+    #[test]
+    fn cli_user_flag_opts_into_desktop_mode() {
+        let cli = Cli::try_parse_from(["nexusctl", "--user", "status"]).expect("解析 --user");
+        assert!(cli.user);
+    }
 
     #[test]
     fn parse_env_arg_rejects_missing_equals() {
