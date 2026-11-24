@@ -1,0 +1,104 @@
+name: Linux ARM64 Package
+
+# Linux aarch64 包：x86_64 的 release-linux 之外单独构建。
+# - workflow_dispatch：为已有 Release 补发/重发 aarch64 资产
+# - push tags：未来 tag 自动构建；Windows job 先建 Release，这里等待后上传
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '目标 Release tag（例如 v2.3.0）'
+        required: true
+      source_ref:
+        description: '可选：构建源码 ref（默认使用 tag 本身；补发历史 tag 且 main 源码一致时可填 main）'
+        required: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 默认 checkout 目标 tag（源码与 Release 一致）。
+          # workflow_dispatch 可显式用 source_ref 覆盖（v2.3.0 补发时用 main，
+          # 因为 main 与 tag 的 Rust 源码一致，只多了 aarch64 文档）。
+          ref: ${{ inputs.source_ref || inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 aarch64 交叉链接器
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: 构建并组装 aarch64 包
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/linux/Cargo.toml | head -n1)
+          [ -n "$VERSION" ] || { echo "无法解析版本号" >&2; exit 1; }
+          [ "v$VERSION" = "$TAG" ] || { echo "版本 $VERSION 与 tag $TAG 不一致" >&2; exit 1; }
+
+          (cd src-tauri && cargo build --release --target aarch64-unknown-linux-gnu \
+            -p nexus-linux --bin nexusctl --bin nexus-boot-runner)
+
+          STAGE_NAME="nexus-$VERSION-linux-aarch64"
+          OUT="src-tauri/target/linux-package"
+          STAGE="$OUT/$STAGE_NAME"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/bin" "$STAGE/share"
+
+          cp "src-tauri/target/aarch64-unknown-linux-gnu/release/nexusctl" "$STAGE/bin/"
+          cp "src-tauri/target/aarch64-unknown-linux-gnu/release/nexus-boot-runner" "$STAGE/bin/"
+          chmod +x "$STAGE/bin/"*
+          aarch64-linux-gnu-strip "$STAGE/bin/nexusctl" "$STAGE/bin/nexus-boot-runner" 2>/dev/null || true
+
+          cp packaging/linux/nexus.example.toml "$STAGE/share/"
+          cp packaging/linux/README.md "$STAGE/share/"
+          cp packaging/linux/install.sh "$STAGE/install.sh"
+          cp packaging/linux/uninstall.sh "$STAGE/uninstall.sh"
+          chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
+
+          (cd "$STAGE" && sha256sum bin/nexusctl bin/nexus-boot-runner > SHA256SUMS)
+          tar -C "$OUT" -czf "$OUT/$STAGE_NAME.tar.gz" "$STAGE_NAME"
+          (cd "$OUT" && sha256sum "$STAGE_NAME.tar.gz" > "$STAGE_NAME.tar.gz.sha256")
+
+          echo "AARCH64_TARBALL=$OUT/$STAGE_NAME.tar.gz" >> "$GITHUB_ENV"
+          echo "AARCH64_SHA=$OUT/$STAGE_NAME.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: 等待 Release 出现（tag 触发时 Windows job 先建 Release）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          for i in $(seq 1 150); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release $TAG 已存在"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "等待 release $TAG 超时" >&2
+          exit 1
+
+      - name: 上传 aarch64 资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" "$AARCH64_TARBALL" "$AARCH64_SHA" --clobber

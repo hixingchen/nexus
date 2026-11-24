@@ -10,7 +10,8 @@ manifest / 就绪检查 / 崩溃重启语义。适用场景：在 Linux 服务�
 开机按顺序拉起并做就绪阻断。
 
 - 安装与用法：[`packaging/linux/README.md`](packaging/linux/README.md)
-- 打包/发布：与 Windows 桌面版同 tag、同一个 GitHub Release 的**两组独立资产**
+- 打包/发布：与 Windows 桌面版同 tag、同一个 GitHub Release 的**两组独立资产**；
+  Linux 资产同时提供 `x86_64` 与 `aarch64`（按 `uname -m` 选择）
 - 不包含：GUI、编辑器、文件树、AI 面板、数据库
 
 ## 功能特性

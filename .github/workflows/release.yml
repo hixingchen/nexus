@@ -177,7 +177,8 @@ jobs:
 
             ### Linux 服务端版（无界面）
 
-            下载 **`nexus-<版本>-linux-x86_64.tar.gz`**（不需要 WebView/Node/数据库）。
+            按服务器架构下载 **`nexus-<版本>-linux-x86_64.tar.gz`** 或
+            **`nexus-<版本>-linux-aarch64.tar.gz`**（用 `uname -m` 确认；不需要 WebView/Node/数据库）。
             解压后执行 `./install.sh`，用 `nexusctl project add` / `service add` / `boot install`
             管理项目与服务；详见包内 `share/README.md`。
 

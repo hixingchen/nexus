@@ -5,15 +5,16 @@
 
 ## 环境要求
 
-- Linux x86_64（在 Ubuntu 22.04 上构建，glibc ≥ 2.35）
+- Linux **x86_64 或 aarch64**（用 `uname -m` 确认；在 Ubuntu 22.04 上构建/交叉构建，glibc ≥ 2.35）
 - systemd（user 或 system 模式）
 - 不需要 WebKitGTK、Node、数据库
 
 ## 安装
 
 ```bash
-tar xzf nexus-<版本>-linux-x86_64.tar.gz
-cd nexus-<版本>-linux-x86_64
+# 资产名里的架构按服务器 uname -m 选择：x86_64 / aarch64
+tar xzf nexus-<版本>-linux-<架构>.tar.gz
+cd nexus-<版本>-linux-<架构>
 
 # 用户级（默认）：装到 ~/.local/bin，配置 ~/.config/nexus/nexus.toml
 ./install.sh
