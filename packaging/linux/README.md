@@ -147,6 +147,7 @@ sudo nexusctl --system service add -p app -n demo -c "sleep 3600" --boot
 sudo nexusctl --system service list          # 所有项目
 sudo nexusctl --system service list -p app   # 只看 app 项目
 sudo nexusctl --system service show app web  # 看 web 的启动命令/目录/env/状态
+sudo nexusctl --system config path           # 当前用的是哪套配置/数据/unit
 ```
 
 输出列：`PROJECT SERVICE BOOT ORDER STATUS PID READY`。
@@ -185,13 +186,17 @@ sudo nexusctl --system --run-as admin boot install
 ```bash
 sudo nexusctl --system boot status
 sudo nexusctl --system service list -p app
-sudo nexusctl --system boot logs app web --lines 100
+sudo nexusctl --system service logs app web --lines 100
 
 sudo nexusctl --system service stop app web
 sudo nexusctl --system service start app web
+
+sudo nexusctl --system project start app   # 整个项目：按 order 启动
+sudo nexusctl --system project stop app    # 整个项目：逆序停止
 ```
 
-`service stop/start` 是立即操作，不会改变 `--boot` 标记。
+`service stop/start` 和 `project start/stop` 都是立即操作，不会改变 `--boot` 标记。
+它们要求 runner 已经在运行；首次先执行 `boot install`（见第 4 步）。
 
 ### 第 6 步：删除
 
@@ -239,6 +244,30 @@ nexusctl --system service start app tools
 
 Tomcat / Java / Python 等完整示例见第 10 节。
 
+### 5.3 立即启动一个服务 / 整个项目
+
+```bash
+# 单个服务
+sudo nexusctl --system service start app web
+
+# 整个项目（按 order 顺序；已在运行的服务会跳过）
+sudo nexusctl --system project start app
+
+# 停止整个项目（逆序）
+sudo nexusctl --system project stop app
+
+# 重启整个项目（先逆序停，再正序启）
+sudo nexusctl --system project restart app
+```
+
+前提：runner 必须在运行。第一次使用先执行：
+
+```bash
+sudo nexusctl --system --run-as admin boot install
+```
+
+`--boot` 决定 runner 启动时是否自动拉起；`service/project start` 是**立即启动**，不改这个标记。
+
 ## 6. 配置
 
 ### 6.1 配置位置
@@ -247,6 +276,13 @@ Tomcat / Java / Python 等完整示例见第 10 节。
 |---|---|---|
 | 用户级 | `~/.config/nexus/nexus.toml` | `~/.nexus/` |
 | 系统级 | `/etc/nexus/nexus.toml` | `/var/lib/nexus/` |
+
+不确定当前用的是哪套：
+
+```bash
+nexusctl --system config path   # 系统级
+nexusctl config path            # 用户级
+```
 
 也支持覆盖：
 
@@ -309,6 +345,24 @@ nexusctl --config /path/nexus.toml --data-dir /path/data ...
 
 ## 7. 命令参考
 
+### 7.0 命令总览
+
+| 操作 | 命令 |
+|---|---|
+| 看项目 | `project list` / `project show <项目>` |
+| 建/删项目 | `project add <路径> --name <项目>` / `project remove <项目>` |
+| 启停项目 | `project start/stop/restart <项目>` |
+| 看服务 | `service list [-p <项目>]` / `service show <项目> <服务>` |
+| 建/改/删服务 | `service add` / `service set` / `service remove` |
+| 启停服务 | `service start/stop/restart <项目> <服务>` |
+| 服务日志 | `service logs <项目> <服务>` |
+| 开机标记 | `service enable-boot/disable-boot <项目> <服务>` |
+| 安装/管理启动器 | `boot install/uninstall/status` |
+| 启停启动器 | `boot start/stop/restart/shutdown` |
+| 开机启用/禁用 | `boot enable/disable` |
+| 启动器日志 | `boot runner-log` |
+| 配置诊断 | `config path/show/validate` |
+
 ### 7.1 全局参数
 
 ```text
@@ -323,8 +377,12 @@ nexusctl --config /path/nexus.toml --data-dir /path/data ...
 
 ```bash
 nexusctl project list [--json]
+nexusctl project show <项目> [--json]  # 路径 + 服务列表/状态
 nexusctl project add <路径> [--name <名字>]
 nexusctl project remove <名字>        # 项目下必须没有服务
+nexusctl project start <项目>         # 立即启动项目下全部服务
+nexusctl project stop <项目>          # 停止项目下全部服务
+nexusctl project restart <项目>       # 先停后启
 ```
 
 ### 7.3 服务
@@ -332,6 +390,7 @@ nexusctl project remove <名字>        # 项目下必须没有服务
 ```bash
 nexusctl service list [-p <项目>] [--json]   # -p 只看某个项目
 nexusctl service show <项目> <服务> [--json]  # 详情：启动命令/目录/env/状态
+nexusctl service logs <项目> <服务> [--lines 200]
 # 必填只有 -p / -n / -c；下面方括号里的都是可选项
 nexusctl service add -p <项目> -n <服务> -c <命令> \
   [--workdir <目录>] [--env K=V]... \
@@ -353,14 +412,38 @@ nexusctl service enable-boot|disable-boot <项目> <服务>
 ### 7.4 开机启动 / systemd
 
 ```bash
-nexusctl boot install      # 生成 manifest、写 unit、enable --now
+nexusctl boot install      # 生成 manifest、写 unit、enable --now（首次用）
+nexusctl boot start        # 启动已安装的 unit（不重新安装）
+nexusctl boot stop         # 停 runner/服务；unit 保留且仍保持开机启用
+nexusctl boot restart      # 重启 runner（会重启其管理的服务）
+nexusctl boot enable       # 只启用开机自启（不启动 runner）
+nexusctl boot disable      # 只禁用开机自启（不停止正在运行的 runner）
+nexusctl boot shutdown     # 兼容旧名：停 runner/服务（unit 保留）
 nexusctl boot status [--json]
 nexusctl boot sync         # 配置改了以后重新生成 manifest 并 reload
-nexusctl boot logs <项目> <服务> [--lines 200]
+nexusctl boot logs <项目> <服务> [--lines 200]  # 兼容旧名，等价 service logs
+nexusctl boot runner-log [--lines 200]          # runner 自身日志
 nexusctl boot unit         # 只打印将写入的 unit（检查/调试，不安装）
-nexusctl boot shutdown     # 停 runner 与其管理的全部服务（unit 保留）
 nexusctl boot uninstall    # 停用并删除 unit（保留配置与数据）
 ```
+
+`boot install / start / enable` 的区别：
+
+- `install`：首次安装 unit + 生成 manifest + `enable --now`（启用并启动）；
+- `start`：unit 已安装，只是启动它；
+- `enable`：只设置开机自启，不启动；
+- `stop`：停 runner/服务，但保留 unit 和开机启用；
+- `uninstall`：停用并删除 unit。
+
+### 7.5 配置诊断
+
+```bash
+nexusctl config path       # 当前模式使用的 config/data/unit 路径
+nexusctl config show       # 打印配置原文
+nexusctl config validate   # 校验配置
+```
+
+系统级安装记得加 `--system`，例如 `nexusctl --system config path`。
 
 ## 8. 开机启动生命周期
 
@@ -564,6 +647,11 @@ nexusctl service add -p app -n web -c "..." --boot --order 30 --ready tcp:127.0.
 **日志能看多少？** 服务日志单文件 5MB 轮转，runner 日志 2MB；`boot logs` 默认尾部 200 行。
 
 **能只看状态机数据吗？** `project list --json`、`service list --json`、`boot status --json`。
+
+**怎么立即启动？** 单个服务 `service start`，整个项目 `project start`；两者都要求 runner 已在运行。
+**怎么查看启动命令/日志？** `service show` 看命令/目录/env/状态，`service logs` 看日志。
+**boot install、boot start、boot enable 有什么区别？** install 安装+启用+启动；start 只启动已安装 unit；enable 只设开机自启。
+**怎么知道当前用的是哪套配置？** `config path`（系统级加 `--system`）。
 
 **怎么确认 systemd unit 写法？** `nexusctl boot unit` 只打印不安装；可配合 `systemd-analyze verify`。
 

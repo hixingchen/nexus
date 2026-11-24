@@ -56,12 +56,34 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BootCmd,
     },
+    /// 查看当前使用的是哪套配置/数据/unit
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// 打印当前模式使用的配置、数据、unit 路径
+    Path,
+    /// 打印配置文件原文
+    Show,
+    /// 校验配置文件
+    Validate,
 }
 
 #[derive(Subcommand)]
 enum ProjectCmd {
     /// 列出项目
     List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查看项目详情（路径、服务列表与状态）
+    Show {
+        /// 项目名
+        name: String,
         #[arg(long)]
         json: bool,
     },
@@ -75,6 +97,12 @@ enum ProjectCmd {
     },
     /// 删除项目（必须没有服务）
     Remove { name: String },
+    /// 启动项目下全部服务（按 order 顺序）
+    Start { name: String },
+    /// 停止项目下全部服务（逆序）
+    Stop { name: String },
+    /// 重启项目下全部服务（先逆序停，再正序启）
+    Restart { name: String },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +123,15 @@ enum ServiceCmd {
         name: String,
         #[arg(long)]
         json: bool,
+    },
+    /// 查看服务日志尾部
+    Logs {
+        /// 项目名
+        project: String,
+        /// 服务名
+        name: String,
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
     },
     /// 添加服务
     Add {
@@ -184,6 +221,21 @@ enum BootCmd {
     Unit,
     /// 停止 runner 及其管理的全部服务（unit 保留；下次开机/手动启动会再拉起）
     Shutdown,
+    /// 启动已安装的 runner（不重新安装）
+    Start,
+    /// 停止 runner 与其管理的服务（unit 保留，仍保持开机启用）
+    Stop,
+    /// 重启 runner（会重启它管理的服务）
+    Restart,
+    /// 启用开机自启（不启动 runner）
+    Enable,
+    /// 禁用开机自启（不停止正在运行的 runner）
+    Disable,
+    /// 查看 runner 自身日志尾部
+    RunnerLog {
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+    },
     /// 重新生成 manifest 并通知 runner reload
     Sync,
     /// 启动器、unit、linger 与服务状态
@@ -216,6 +268,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Cmd::Project { cmd } => project_cmd(&layout, cmd),
         Cmd::Service { cmd } => service_cmd(&layout, cmd),
         Cmd::Boot { cmd } => boot_cmd(&layout, cli.runner, cmd),
+        Cmd::Config { cmd } => config_cmd(&layout, cmd),
     }
 }
 
@@ -261,6 +314,7 @@ fn project_cmd(layout: &Layout, cmd: ProjectCmd) -> Result<(), String> {
             output::table(&["NAME", "PATH", "SERVICES"], &rows);
             Ok(())
         }
+        ProjectCmd::Show { name, json } => show_project(layout, &name, json),
         ProjectCmd::Add { path, name } => {
             let canonical = canonical_dir(&path, "项目路径")?;
             let name = name.unwrap_or_else(|| {
@@ -296,6 +350,194 @@ fn project_cmd(layout: &Layout, cmd: ProjectCmd) -> Result<(), String> {
             println!("已删除项目 {}", name);
             Ok(())
         }
+        ProjectCmd::Start { name } => project_action(layout, &name, ProjectAction::Start),
+        ProjectCmd::Stop { name } => project_action(layout, &name, ProjectAction::Stop),
+        ProjectCmd::Restart { name } => project_action(layout, &name, ProjectAction::Restart),
+    }
+}
+
+fn show_project(layout: &Layout, name: &str, json: bool) -> Result<(), String> {
+    let cfg = Config::load(&layout.config_path)?;
+    let project = cfg
+        .find_project(name)
+        .ok_or_else(|| format!("项目不存在: {}", name))?;
+    let state = client::state(layout);
+    let rows = service_rows(&cfg, state.as_ref(), Some(name));
+    if json {
+        let services = rows
+            .iter()
+            .map(|(s, row)| service_json(&cfg, s, row))
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "project": {
+                    "name": project.name.clone(),
+                    "path": project.path.clone(),
+                    "services": services,
+                }
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    println!("项目: {}", project.name);
+    println!("路径: {}", project.path);
+    println!("服务: {}", rows.len());
+    if rows.is_empty() {
+        println!("（该项目下没有服务）");
+        return Ok(());
+    }
+    let table_rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
+    output::table(
+        &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
+        &table_rows,
+    );
+    Ok(())
+}
+
+fn config_cmd(layout: &Layout, cmd: ConfigCmd) -> Result<(), String> {
+    match cmd {
+        ConfigCmd::Path => {
+            println!("mode:   {}", if layout.system { "system" } else { "user" });
+            println!("config: {}", layout.config_path.display());
+            println!("data:   {}", layout.data_dir.display());
+            println!("unit:   {}", layout.unit_path.display());
+            Ok(())
+        }
+        ConfigCmd::Show => {
+            let text = std::fs::read_to_string(&layout.config_path).map_err(|e| {
+                format!("读取配置失败 {}: {}", layout.config_path.display(), e)
+            })?;
+            print!("{}", text);
+            if !text.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+        ConfigCmd::Validate => {
+            let cfg = Config::load(&layout.config_path)?;
+            println!(
+                "配置有效：{}（{} 个项目，{} 个服务）",
+                layout.config_path.display(),
+                cfg.projects.len(),
+                cfg.services.len()
+            );
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ProjectAction {
+    fn verb(self) -> &'static str {
+        match self {
+            ProjectAction::Start => "启动",
+            ProjectAction::Stop => "停止",
+            ProjectAction::Restart => "重启",
+        }
+    }
+}
+
+fn project_services<'a>(cfg: &'a Config, project: &str) -> Vec<&'a Service> {
+    let mut services: Vec<&Service> = cfg
+        .services
+        .iter()
+        .filter(|s| s.project == project)
+        .collect();
+    services.sort_by(|a, b| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    services
+}
+
+fn project_action(layout: &Layout, project: &str, action: ProjectAction) -> Result<(), String> {
+    let cfg = Config::load(&layout.config_path)?;
+    if cfg.find_project(project).is_none() {
+        return Err(format!("项目不存在: {}", project));
+    }
+    let services = project_services(&cfg, project);
+    if services.is_empty() {
+        return Err(format!("项目「{}」下没有服务", project));
+    }
+    // 先确认 runner 在跑：它才是服务的唯一拥有者；没装/没启动时给出明确提示
+    let state = client::require_runner(layout)?;
+    let mut failures = 0usize;
+    match action {
+        ProjectAction::Start => {
+            for s in &services {
+                let id = s.id();
+                if state
+                    .services
+                    .get(&id)
+                    .map(|st| service_alive_in(&state, st))
+                    .unwrap_or(false)
+                {
+                    println!("跳过 {}（已在运行）", id);
+                    continue;
+                }
+                send_project_op(layout, "start", s, Duration::from_secs(180), &mut failures);
+            }
+        }
+        ProjectAction::Stop => {
+            for s in services.iter().rev() {
+                send_project_op(layout, "stop", s, Duration::from_secs(30), &mut failures);
+            }
+        }
+        ProjectAction::Restart => {
+            for s in services.iter().rev() {
+                send_project_op(layout, "stop", s, Duration::from_secs(30), &mut failures);
+            }
+            for s in &services {
+                send_project_op(layout, "start", s, Duration::from_secs(180), &mut failures);
+            }
+        }
+    }
+    if failures > 0 {
+        Err(format!(
+            "项目 {} {}完成，但有 {} 个服务操作失败",
+            project,
+            action.verb(),
+            failures
+        ))
+    } else {
+        println!(
+            "项目 {} 已{}（{} 个服务）",
+            project,
+            action.verb(),
+            services.len()
+        );
+        Ok(())
+    }
+}
+
+fn send_project_op(
+    layout: &Layout,
+    op: &str,
+    svc: &Service,
+    timeout: Duration,
+    failures: &mut usize,
+) {
+    let id = svc.id();
+    let verb = if op == "start" { "启动" } else { "停止" };
+    match client::send(layout, op, Some(&id), timeout) {
+        Ok(r) if r.ok => println!("{} {} ... ok", verb, id),
+        Ok(r) => {
+            println!("{} {} ... 失败: {}", verb, id, r.error);
+            *failures += 1;
+        }
+        Err(e) => {
+            println!("{} {} ... 失败: {}", verb, id, e);
+            *failures += 1;
+        }
     }
 }
 
@@ -307,6 +549,11 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
         ServiceCmd::Show { project, name, json } => {
             show_service(layout, &project, &name, json)
         }
+        ServiceCmd::Logs {
+            project,
+            name,
+            lines,
+        } => show_service_log(layout, &project, &name, lines),
         ServiceCmd::Add {
             project,
             name,
@@ -517,20 +764,7 @@ fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(
     if json {
         let services = rows_all
             .into_iter()
-            .map(|(s, row)| {
-                serde_json::json!({
-                    "project": s.project.clone(),
-                    "name": s.name.clone(),
-                    "id": s.id(),
-                    "boot": s.boot,
-                    "order": s.order,
-                    "ready": s.ready.clone(),
-                    "command": s.command.clone(),
-                    "workdir": cfg.workdir_of(s),
-                    "status": row[4].clone(),
-                    "pid": row[5].clone(),
-                })
-            })
+            .map(|(s, row)| service_json(&cfg, s, &row))
             .collect::<Vec<_>>();
         println!(
             "{}",
@@ -692,6 +926,21 @@ fn service_rows<'a>(
         .collect()
 }
 
+fn service_json(cfg: &Config, s: &Service, row: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "project": s.project.clone(),
+        "name": s.name.clone(),
+        "id": s.id(),
+        "boot": s.boot,
+        "order": s.order,
+        "ready": s.ready.clone(),
+        "command": s.command.clone(),
+        "workdir": cfg.workdir_of(s),
+        "status": row[4].clone(),
+        "pid": row[5].clone(),
+    })
+}
+
 fn ensure_service(layout: &Layout, project: &str, name: &str) -> Result<(), String> {
     let cfg = Config::load(&layout.config_path)?;
     cfg.find_service(project, name)
@@ -787,18 +1036,14 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
             print!("{}", systemd::render_unit(layout, &runner)?);
             Ok(())
         }
-        BootCmd::Shutdown => {
-            match client::state(layout) {
-                Some(st) if runner_reachable(&st) => {
-                    let result = client::send(layout, "shutdown", None, Duration::from_secs(10))?;
-                    if !result.ok {
-                        return Err(result.error);
-                    }
-                    println!("已通知 runner 退出（它管理的服务会随之停止；unit 保留）");
-                }
-                _ => println!("runner 未运行"),
-            }
-            Ok(())
+        BootCmd::Shutdown => stop_runner(layout, false),
+        BootCmd::Start => boot_start(layout),
+        BootCmd::Stop => stop_runner(layout, true),
+        BootCmd::Restart => boot_restart(layout),
+        BootCmd::Enable => boot_enable(layout, true),
+        BootCmd::Disable => boot_enable(layout, false),
+        BootCmd::RunnerLog { lines } => {
+            print_log_tail(&layout.runner_log(), lines, "runner 日志")
         }
         BootCmd::Sync => {
             let cfg = Config::load(&layout.config_path)?;
@@ -814,34 +1059,120 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
         }
         BootCmd::Status { json } => boot_status(layout, json),
         BootCmd::Logs { project, name, lines } => {
-            let cfg = Config::load(&layout.config_path)?;
-            cfg.find_service(&project, &name)
-                .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
-            let id = format!("{}.{}", project, name);
-            let state = client::state(layout);
-            let path = state
-                .as_ref()
-                .and_then(|s| s.services.get(&id))
-                .map(|s| PathBuf::from(&s.log_path))
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| service_log_path_in(&layout.logs_dir(), &id));
-            let bytes = std::fs::read(&path).map_err(|e| {
-                format!(
-                    "读取日志失败 {}: {}（服务可能还没启动过）",
-                    path.display(),
-                    e
-                )
-            })?;
-            let text = decode_to_string(&bytes);
-            let tail = output::tail(&text, lines);
-            if tail.is_empty() {
-                println!("（日志为空）");
-            } else {
-                print!("{}", tail);
-            }
-            Ok(())
+            show_service_log(layout, &project, &name, lines)
         }
     }
+}
+
+fn show_service_log(
+    layout: &Layout,
+    project: &str,
+    name: &str,
+    lines: usize,
+) -> Result<(), String> {
+    let cfg = Config::load(&layout.config_path)?;
+    cfg.find_service(project, name)
+        .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
+    let id = format!("{}.{}", project, name);
+    let state = client::state(layout);
+    let path = state
+        .as_ref()
+        .and_then(|s| s.services.get(&id))
+        .map(|s| PathBuf::from(&s.log_path))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| service_log_path_in(&layout.logs_dir(), &id));
+    print_log_tail(&path, lines, "服务日志")
+}
+
+fn print_log_tail(path: &Path, lines: usize, what: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        format!(
+            "读取日志失败 {}: {}（{}，可能还没生成）",
+            path.display(),
+            e,
+            what
+        )
+    })?;
+    let text = decode_to_string(&bytes);
+    let tail = output::tail(&text, lines);
+    if tail.is_empty() {
+        println!("（{}为空）", what);
+    } else {
+        print!("{}", tail);
+    }
+    Ok(())
+}
+
+fn stop_runner(layout: &Layout, stop_unit: bool) -> Result<(), String> {
+    let mut stopped = false;
+    if let Some(st) = client::state(layout) {
+        if runner_reachable(&st) {
+            let result = client::send(layout, "shutdown", None, Duration::from_secs(10))?;
+            if !result.ok {
+                return Err(result.error);
+            }
+            for _ in 0..50 {
+                match client::state(layout) {
+                    Some(s) if s.runner_pid != 0 && runner_reachable(&s) => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    _ => break,
+                }
+            }
+            stopped = true;
+        }
+    }
+    if stop_unit && systemd::unit_exists(layout) {
+        systemd::stop_unit(layout)?;
+        stopped = true;
+    }
+    if stopped {
+        println!("已停止 runner 与其管理的服务（unit 保留）");
+    } else {
+        println!("runner 未运行");
+    }
+    Ok(())
+}
+
+fn boot_start(layout: &Layout) -> Result<(), String> {
+    if !systemd::unit_exists(layout) {
+        return Err(format!(
+            "unit 未安装（{}）。先执行 nexusctl boot install",
+            layout.unit_path.display()
+        ));
+    }
+    systemd::start_unit(layout)?;
+    println!("已启动 runner");
+    Ok(())
+}
+
+fn boot_restart(layout: &Layout) -> Result<(), String> {
+    if !systemd::unit_exists(layout) {
+        return Err(format!(
+            "unit 未安装（{}）。先执行 nexusctl boot install",
+            layout.unit_path.display()
+        ));
+    }
+    systemd::restart_unit(layout)?;
+    println!("已重启 runner（其管理的服务会随之重启）");
+    Ok(())
+}
+
+fn boot_enable(layout: &Layout, enable: bool) -> Result<(), String> {
+    if !systemd::unit_exists(layout) {
+        return Err(format!(
+            "unit 未安装（{}）。先执行 nexusctl boot install",
+            layout.unit_path.display()
+        ));
+    }
+    if enable {
+        systemd::enable_unit(layout)?;
+        println!("已启用开机自启（未启动 runner；用 boot start 启动）");
+    } else {
+        systemd::disable_unit(layout)?;
+        println!("已禁用开机自启（正在运行的 runner 不受影响）");
+    }
+    Ok(())
 }
 
 fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
@@ -986,6 +1317,40 @@ mod tests {
     fn canonical_dir_rejects_missing() {
         let p = std::env::temp_dir().join("nexus-does-not-exist-xyz");
         assert!(canonical_dir(&p, "目录").is_err());
+    }
+
+    #[test]
+    fn project_services_filters_and_sorts() {
+        let mut cfg = Config::default();
+        cfg.projects.push(Project {
+            name: "p".into(),
+            path: "/tmp/p".into(),
+        });
+        cfg.projects.push(Project {
+            name: "q".into(),
+            path: "/tmp/q".into(),
+        });
+        let svc = |project: &str, name: &str, order: i32| Service {
+            project: project.into(),
+            name: name.into(),
+            command: "true".into(),
+            workdir: String::new(),
+            env: Default::default(),
+            boot: false,
+            order,
+            ready: String::new(),
+            required: false,
+            crash_restart: true,
+        };
+        cfg.services.push(svc("p", "b", 20));
+        cfg.services.push(svc("p", "a", 10));
+        cfg.services.push(svc("q", "c", 0));
+
+        let got = project_services(&cfg, "p");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "a");
+        assert_eq!(got[1].name, "b");
+        assert!(project_services(&cfg, "missing").is_empty());
     }
 
     #[test]

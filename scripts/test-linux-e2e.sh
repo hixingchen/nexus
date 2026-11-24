@@ -33,7 +33,7 @@ CTL=("$BIN/nexusctl" --config "$TMP/nexus.toml" --data-dir "$TMP/data")
 
 "${CTL[@]}" project add "$TMP/app" --name app >/dev/null
 # 开机服务：应自动启动到 ready
-"${CTL[@]}" service add -p app -n bootsvc -c "sleep 30" --boot --order 1 >/dev/null
+"${CTL[@]}" service add -p app -n bootsvc -c "echo bootsvc-started; sleep 30" --boot --order 1 >/dev/null
 # 非开机服务：纳入 runner 管理，但启动时只应为 stopped
 "${CTL[@]}" service add -p app -n ondemand -c "sleep 30" --order 2 >/dev/null
 "${CTL[@]}" boot sync >/dev/null
@@ -59,8 +59,19 @@ grep -q '"phase": "stopped"' "$STATE" || {
   exit 1
 }
 
-"${CTL[@]}" service start app ondemand >/dev/null
-"${CTL[@]}" service stop app bootsvc >/dev/null
+echo "=== 详情/配置/日志 ==="
+"${CTL[@]}" project show app
+"${CTL[@]}" service show app bootsvc
+"${CTL[@]}" config path
+"${CTL[@]}" config validate
+"${CTL[@]}" service logs app bootsvc --lines 20 | grep -q 'bootsvc-started'
+
+echo "=== 项目启停 ==="
+"${CTL[@]}" project start app
+"${CTL[@]}" service list
+"${CTL[@]}" project stop app
+"${CTL[@]}" service list
+"${CTL[@]}" project start app
 "${CTL[@]}" service list
 
 "${CTL[@]}" boot shutdown >/dev/null

@@ -92,6 +92,61 @@ pub fn unit_quote(s: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// unit 文件是否存在（不查询 systemd 是否加载）。
+pub fn unit_exists(layout: &Layout) -> bool {
+    layout.unit_path.exists()
+}
+
+#[cfg(unix)]
+pub fn start_unit(layout: &Layout) -> Result<(), String> {
+    run_systemctl(layout, &["start", layout.unit_name()]).map(|_| ())
+}
+
+#[cfg(not(unix))]
+pub fn start_unit(_layout: &Layout) -> Result<(), String> {
+    Err("systemd 仅 Linux 支持".into())
+}
+
+#[cfg(unix)]
+pub fn stop_unit(layout: &Layout) -> Result<(), String> {
+    run_systemctl(layout, &["stop", layout.unit_name()]).map(|_| ())
+}
+
+#[cfg(not(unix))]
+pub fn stop_unit(_layout: &Layout) -> Result<(), String> {
+    Err("systemd 仅 Linux 支持".into())
+}
+
+#[cfg(unix)]
+pub fn restart_unit(layout: &Layout) -> Result<(), String> {
+    run_systemctl(layout, &["restart", layout.unit_name()]).map(|_| ())
+}
+
+#[cfg(not(unix))]
+pub fn restart_unit(_layout: &Layout) -> Result<(), String> {
+    Err("systemd 仅 Linux 支持".into())
+}
+
+#[cfg(unix)]
+pub fn enable_unit(layout: &Layout) -> Result<(), String> {
+    run_systemctl(layout, &["enable", layout.unit_name()]).map(|_| ())
+}
+
+#[cfg(not(unix))]
+pub fn enable_unit(_layout: &Layout) -> Result<(), String> {
+    Err("systemd 仅 Linux 支持".into())
+}
+
+#[cfg(unix)]
+pub fn disable_unit(layout: &Layout) -> Result<(), String> {
+    run_systemctl(layout, &["disable", layout.unit_name()]).map(|_| ())
+}
+
+#[cfg(not(unix))]
+pub fn disable_unit(_layout: &Layout) -> Result<(), String> {
+    Err("systemd 仅 Linux 支持".into())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallReport {
     pub linger: Option<bool>,
