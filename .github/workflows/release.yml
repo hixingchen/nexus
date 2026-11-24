@@ -122,7 +122,7 @@ jobs:
           releaseDraft: false
           prerelease: false
           releaseBody: |
-            **面向 Windows 的开发环境管理平台**：把多个项目的多个服务集中在一处启停、看日志、改配置、翻代码。
+            **开发环境管理平台（Windows 桌面版 + Linux 服务端版）**：把多个项目的多个服务集中在一处启停、看日志、改配置、翻代码；Linux 服务器上可用无界面版管理并开机启动服务。
 
             ## 主要功能
 
@@ -139,6 +139,17 @@ jobs:
             - **设置与帮助**：标题栏左上角两个菜单——「设置」分「通用」（数据与日志路径，一键在资源管理器中打开；「恢复默认布局」只复位面板尺寸与折叠状态，不关标签页、不拆 AI 会话）、「编辑器」（**文本字号 12–20px**，代码视图 / Markdown 预览 / 日志面板同时跟随，带两处实时预览）、「Node 版本」、「AI 运行时」、「服务开机启动」；「帮助」里有内嵌的仓库 README、关于 Nexus（版本 / 许可 / 第三方组件）、报告问题（直接打开 issue 页）与检查更新。右侧的 `Node x.y.z` 按钮与「设置 > Node 版本」是同一个面板的两个入口
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
+
+            ## 2.3.0 · Linux 服务端版
+
+            ### 新增
+
+            - **Linux 无界面服务端**：`nexusctl` 命令 + `nexus-boot-runner` 守护进程，由 systemd 托管（user unit + linger，或 `--system` 系统级 unit）。TOML 配置管理项目/服务；支持顺序启动、就绪检查（等待/TCP/日志关键字）、未就绪阻断、逐服务崩溃重启、状态/PID/日志与启停命令。独立 tar.gz，不需要 WebView/Node/数据库。
+            - **共享开机启动核心**：Windows GUI、Windows 独立启动器与 Linux runner 共用 `boot-core`；Windows 行为不变。
+
+            ### 调整
+
+            - Windows 独立启动器不再链接 Tauri/WebView2；Linux 包与 Windows 桌面版同 tag、同一个 Release 分两组资产发布。
 
             ## 2.2.0 · AI 联动控制 Nexus
 
