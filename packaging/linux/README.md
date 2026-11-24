@@ -59,7 +59,7 @@ cd nexus-<版本>-linux-<架构>
 安装到：
 
 - 二进制：`~/.local/bin/nexusctl`、`~/.local/bin/nexus-boot-runner`
-- 配置：`~/.config/nexus/nexus.toml`（仅当不存在时从示例复制）
+- 配置：`~/.config/nexus/nexus.toml`（仅当不存在时创建**空配置**；示例在 `share/nexus.example.toml`，不会复制）
 - 数据：`~/.nexus/`
 - systemd user unit：`~/.config/systemd/user/nexus-boot-runner.service`（由 `boot install` 写入）
 
@@ -74,7 +74,7 @@ sudo ./install.sh --system
 安装到：
 
 - 二进制：`/usr/local/bin/`
-- 配置：`/etc/nexus/nexus.toml`
+- 配置：`/etc/nexus/nexus.toml`（仅当不存在时创建**空配置**；示例在 `share/nexus.example.toml`，不会复制）
 - 数据：`/var/lib/nexus/`
 - systemd unit：`/etc/systemd/system/nexus-boot-runner.service`（由 `boot install` 写入）
 
@@ -118,7 +118,8 @@ sudo loginctl enable-linger "$USER"
 nexusctl boot status     # linger: on
 ```
 
-> 示例配置里的 `/srv/app`、`npm run start` 只是模板；用 CLI 添加真实服务前，先删掉示例：
+> 新安装的正式配置默认是**空的**（示例只在 `share/nexus.example.toml`，不会被复制）。
+> 如果你从旧安装升级、配置里仍有示例 `app/api`，先删掉：
 > `nexusctl service remove app api`、`nexusctl project remove app`。
 
 ### 5.1 最小用法与默认值
@@ -263,7 +264,7 @@ nexusctl project remove <名字>        # 项目下必须没有服务
 ### 7.3 服务
 
 ```bash
-nexusctl service list [--json]
+nexusctl service list [-p <项目>] [--json]   # -p 只看某个项目
 # 必填只有 -p / -n / -c；下面方括号里的都是可选项
 nexusctl service add -p <项目> -n <服务> -c <命令> \
   [--workdir <目录>] [--env K=V]... \

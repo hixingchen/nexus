@@ -17,8 +17,11 @@ if [ "$MODE" = "--system" ]; then
   install -m 0755 "$ROOT/bin/nexusctl" "$BIN_DIR/nexusctl"
   install -m 0755 "$ROOT/bin/nexus-boot-runner" "$BIN_DIR/nexus-boot-runner"
   if [ ! -f "$CONF_FILE" ]; then
-    install -m 0600 "$ROOT/share/nexus.example.toml" "$CONF_FILE"
+    # 正式配置从空开始，不复制示例项目/服务，避免装完就出现 app/api
+    printf 'version = 1\n' > "$CONF_FILE"
+    chmod 0600 "$CONF_FILE"
   fi
+  echo "[nexus] 示例配置（不会被复制到正式配置）：$ROOT/share/nexus.example.toml"
   echo "[nexus] 已安装到 $BIN_DIR"
   echo "[nexus] 配置：$CONF_FILE"
   echo "[nexus] 下一步：sudo $BIN_DIR/nexusctl --system --run-as <用户> boot install"
@@ -30,8 +33,11 @@ else
   install -m 0755 "$ROOT/bin/nexusctl" "$BIN_DIR/nexusctl"
   install -m 0755 "$ROOT/bin/nexus-boot-runner" "$BIN_DIR/nexus-boot-runner"
   if [ ! -f "$CONF_FILE" ]; then
-    install -m 0600 "$ROOT/share/nexus.example.toml" "$CONF_FILE"
+    # 正式配置从空开始，不复制示例项目/服务，避免装完就出现 app/api
+    printf 'version = 1\n' > "$CONF_FILE"
+    chmod 0600 "$CONF_FILE"
   fi
+  echo "[nexus] 示例配置（不会被复制到正式配置）：$ROOT/share/nexus.example.toml"
   echo "[nexus] 已安装到 $BIN_DIR"
   echo "[nexus] 配置：$CONF_FILE"
   case ":$PATH:" in

@@ -81,6 +81,9 @@ enum ProjectCmd {
 enum ServiceCmd {
     /// 列出服务与运行状态
     List {
+        /// 只看某个项目下的服务
+        #[arg(short = 'p', long)]
+        project: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -286,7 +289,7 @@ fn project_cmd(layout: &Layout, cmd: ProjectCmd) -> Result<(), String> {
 
 fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
     match cmd {
-        ServiceCmd::List { json } => list_services(layout, json),
+        ServiceCmd::List { project, json } => list_services(layout, json, project.as_deref()),
         ServiceCmd::Add {
             project,
             name,
@@ -485,11 +488,17 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
     }
 }
 
-fn list_services(layout: &Layout, json: bool) -> Result<(), String> {
+fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(), String> {
     let cfg = Config::load(&layout.config_path)?;
+    if let Some(p) = project {
+        if cfg.find_project(p).is_none() {
+            return Err(format!("项目不存在: {}", p));
+        }
+    }
     let state = client::state(layout);
+    let rows_all = service_rows(&cfg, state.as_ref(), project);
     if json {
-        let services = service_rows(&cfg, state.as_ref())
+        let services = rows_all
             .into_iter()
             .map(|(s, row)| {
                 serde_json::json!({
@@ -513,14 +522,14 @@ fn list_services(layout: &Layout, json: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    if cfg.services.is_empty() {
-        println!("（没有服务）");
+    if rows_all.is_empty() {
+        println!(
+            "{}",
+            if project.is_some() { "（该项目下没有服务）" } else { "（没有服务）" }
+        );
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = service_rows(&cfg, state.as_ref())
-        .into_iter()
-        .map(|(_, row)| row)
-        .collect();
+    let rows: Vec<Vec<String>> = rows_all.into_iter().map(|(_, row)| row).collect();
     output::table(
         &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
         &rows,
@@ -528,12 +537,17 @@ fn list_services(layout: &Layout, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 配置里的服务 + 状态 → (服务引用, 表格行)。
+/// 配置里的服务 + 状态 → (服务引用, 表格行)；`project` 非空时只保留该项目。
 fn service_rows<'a>(
     cfg: &'a Config,
     state: Option<&BootRunnerState>,
+    project: Option<&str>,
 ) -> Vec<(&'a Service, Vec<String>)> {
-    let mut services: Vec<&Service> = cfg.services.iter().collect();
+    let mut services: Vec<&Service> = cfg
+        .services
+        .iter()
+        .filter(|s| project.is_none_or(|p| s.project == p))
+        .collect();
     services.sort_by(|a, b| {
         a.order
             .cmp(&b.order)
@@ -726,7 +740,7 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
         let services = cfg
             .as_ref()
             .map(|cfg| {
-                service_rows(cfg, state.as_ref())
+                service_rows(cfg, state.as_ref(), None)
                     .into_iter()
                     .map(|(s, row)| {
                         serde_json::json!({
@@ -795,7 +809,7 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
     if let Ok(cfg) = Config::load(&layout.config_path) {
         if !cfg.services.is_empty() {
             println!();
-            let rows: Vec<Vec<String>> = service_rows(&cfg, state.as_ref())
+            let rows: Vec<Vec<String>> = service_rows(&cfg, state.as_ref(), None)
                 .into_iter()
                 .map(|(_, row)| row)
                 .collect();
@@ -858,5 +872,38 @@ mod tests {
     fn canonical_dir_rejects_missing() {
         let p = std::env::temp_dir().join("nexus-does-not-exist-xyz");
         assert!(canonical_dir(&p, "目录").is_err());
+    }
+
+    #[test]
+    fn service_rows_filters_by_project() {
+        let mut cfg = Config::default();
+        cfg.projects.push(Project {
+            name: "a".into(),
+            path: "/tmp/a".into(),
+        });
+        cfg.projects.push(Project {
+            name: "b".into(),
+            path: "/tmp/b".into(),
+        });
+        let svc = |project: &str, name: &str| Service {
+            project: project.into(),
+            name: name.into(),
+            command: "true".into(),
+            workdir: String::new(),
+            env: Default::default(),
+            boot: false,
+            order: 0,
+            ready: String::new(),
+            required: false,
+            crash_restart: true,
+        };
+        cfg.services.push(svc("a", "x"));
+        cfg.services.push(svc("b", "y"));
+
+        let only_a = service_rows(&cfg, None, Some("a"));
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].0.project, "a");
+        assert_eq!(service_rows(&cfg, None, None).len(), 2);
+        assert!(service_rows(&cfg, None, Some("missing")).is_empty());
     }
 }
