@@ -87,6 +87,15 @@ enum ServiceCmd {
         #[arg(long)]
         json: bool,
     },
+    /// 查看某个服务的详情（启动命令、目录、环境变量、状态）
+    Show {
+        /// 项目名
+        project: String,
+        /// 服务名
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// 添加服务
     Add {
         /// 所属项目名（需先用 project add 创建）
@@ -295,6 +304,9 @@ fn project_cmd(layout: &Layout, cmd: ProjectCmd) -> Result<(), String> {
 fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
     match cmd {
         ServiceCmd::List { project, json } => list_services(layout, json, project.as_deref()),
+        ServiceCmd::Show { project, name, json } => {
+            show_service(layout, &project, &name, json)
+        }
         ServiceCmd::Add {
             project,
             name,
@@ -539,6 +551,103 @@ fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(
         &["PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY"],
         &rows,
     );
+    Ok(())
+}
+
+fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Result<(), String> {
+    let cfg = Config::load(&layout.config_path)?;
+    let svc = cfg
+        .find_service(project, name)
+        .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
+    let id = svc.id();
+    let state = client::state(layout);
+    let st = state.as_ref().and_then(|s| s.services.get(&id));
+    let log_path = st
+        .map(|s| s.log_path.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            service_log_path_in(&layout.logs_dir(), &id)
+                .to_string_lossy()
+                .into_owned()
+        });
+    let workdir = cfg.workdir_of(svc);
+    let project_path = cfg
+        .find_project(&svc.project)
+        .map(|p| p.path.clone())
+        .unwrap_or_default();
+
+    if json {
+        let status = st.map(|s| {
+            serde_json::json!({
+                "phase": s.phase.clone(),
+                "pid": s.pid,
+                "ready_at": s.ready_at.clone(),
+                "error": s.error.clone(),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "project": svc.project.clone(),
+                "name": svc.name.clone(),
+                "id": id,
+                "project_path": project_path,
+                "command": svc.command.clone(),
+                "workdir": workdir,
+                "env": svc.env.clone(),
+                "boot": svc.boot,
+                "order": svc.order,
+                "ready": svc.ready.clone(),
+                "required": svc.required,
+                "crash_restart": svc.crash_restart,
+                "status": status,
+                "log_path": log_path,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("项目:       {}", svc.project);
+    println!("服务:       {}", svc.name);
+    println!("ID:         {}", id);
+    println!("启动命令:   {}", svc.command);
+    println!("项目路径:   {}", project_path);
+    println!("工作目录:   {}", workdir);
+    println!("开机自启:   {}", if svc.boot { "yes" } else { "no" });
+    println!("启动顺序:   {}", svc.order);
+    println!(
+        "就绪检查:   {}",
+        if svc.ready.trim().is_empty() {
+            describe_ready(&svc.ready)
+        } else {
+            format!("{}（{}）", describe_ready(&svc.ready), svc.ready)
+        }
+    );
+    println!("未就绪阻断: {}", if svc.required { "yes" } else { "no" });
+    println!("崩溃重启:   {}", if svc.crash_restart { "yes" } else { "no" });
+    if svc.env.is_empty() {
+        println!("环境变量:   （无）");
+    } else {
+        println!("环境变量:");
+        for (k, v) in &svc.env {
+            println!("  {}={}", k, v);
+        }
+    }
+    match st {
+        Some(s) => {
+            println!(
+                "运行状态:   {}（pid {}）",
+                s.phase,
+                s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+            );
+            if !s.error.is_empty() {
+                println!("最近错误:   {}", s.error);
+            }
+        }
+        None => println!("运行状态:   无（runner 未运行或还没有状态）"),
+    }
+    println!("日志:       {}", log_path);
     Ok(())
 }
 

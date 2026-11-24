@@ -146,9 +146,26 @@ sudo nexusctl --system service add -p app -n demo -c "sleep 3600" --boot
 ```bash
 sudo nexusctl --system service list          # 所有项目
 sudo nexusctl --system service list -p app   # 只看 app 项目
+sudo nexusctl --system service show app web  # 看 web 的启动命令/目录/env/状态
 ```
 
 输出列：`PROJECT SERVICE BOOT ORDER STATUS PID READY`。
+
+`service show` 会显示：
+
+```text
+启动命令:   npm run start
+项目路径:   /srv/app
+工作目录:   /srv/app/web
+环境变量:   ...
+开机自启:   yes
+启动顺序:   20
+就绪检查:   TCP 127.0.0.1:3000（tcp:127.0.0.1:3000）
+运行状态:   ready（pid 1234）
+日志:       /var/lib/nexus/boot/systemd/logs/app_web.log
+```
+
+加 `--json` 可输出结构化数据。
 
 ### 第 4 步：安装/启动开机 unit
 
@@ -314,6 +331,7 @@ nexusctl project remove <名字>        # 项目下必须没有服务
 
 ```bash
 nexusctl service list [-p <项目>] [--json]   # -p 只看某个项目
+nexusctl service show <项目> <服务> [--json]  # 详情：启动命令/目录/env/状态
 # 必填只有 -p / -n / -c；下面方括号里的都是可选项
 nexusctl service add -p <项目> -n <服务> -c <命令> \
   [--workdir <目录>] [--env K=V]... \
