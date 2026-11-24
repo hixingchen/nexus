@@ -202,8 +202,11 @@ enum ServiceCmd {
     },
     /// 删除服务（先停止）
     Remove { project: String, name: String },
+    /// 启动单个服务
     Start { project: String, name: String },
+    /// 停止单个服务
     Stop { project: String, name: String },
+    /// 重启单个服务
     Restart { project: String, name: String },
     /// 设为开机自动启动（下次启动生效；现在启动用 start）
     EnableBoot { project: String, name: String },
