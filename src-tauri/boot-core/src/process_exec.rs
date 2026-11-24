@@ -8,7 +8,9 @@
 //! 生命周期锁、端口/失败态等 UI 侧职责；启动器只需要“起进程、杀进程组、查启动时间”。
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -288,6 +290,11 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
 
         // 只对**进程组**发信号：pgid 在组内还有成员时不会被系统回收，
         // 而单个 pid 可能已被复用——对着 pid 补刀会误杀无关进程。
+        //
+        // **不在这里等"组消失"**：直接子进程退出后会变成僵尸，直到调用方
+        // `Child::wait/try_wait` 回收前都还挂在进程组里。在这里等会把正常停止误报成
+        // "SIGKILL 后仍未退出"（CI 实测），而且调用方本来就持有 Child，应该在那边
+        // 回收并复核存活（与 Windows 侧 taskkill + survivors 复核同一口径）。
         let term = unsafe { libc::kill(-pgid, libc::SIGTERM) };
         if term != 0 {
             let err = std::io::Error::last_os_error();
@@ -296,18 +303,17 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
             }
             return Err(format!("kill(-{}, SIGTERM) 失败: {}", pid, err));
         }
-
-        if wait_gone(pgid, 3) {
-            return Ok(());
+        // 给 TERM 一个短暂宽限，再把仍活着的组员 KILL 掉
+        std::thread::sleep(Duration::from_millis(300));
+        let killed = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        if killed != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(format!("kill(-{}, SIGKILL) 失败: {}", pid, err));
         }
-        // 宽限期内没退：KILL 整个组，再等
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-        if wait_gone(pgid, 2) {
-            return Ok(());
-        }
-        Err(format!("进程组 {} 在 SIGKILL 后仍未退出", pid))
+        Ok(())
     }
 }
 
@@ -326,28 +332,6 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> bool
             Err(_) => return true,
         }
     }
-}
-
-/// 等进程组消失（最多 `secs` 秒）。
-#[cfg(unix)]
-fn wait_gone(pgid: i32, secs: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    loop {
-        if !signal_ok(-pgid) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// `kill(target, 0)` 成功或 EPERM（存在但无权限）都算存在。
-#[cfg(unix)]
-fn signal_ok(target: i32) -> bool {
-    let rc = unsafe { libc::kill(target, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(all(test, unix))]
@@ -369,17 +353,25 @@ mod tests {
         let pid = child.id();
         assert!(process_start_time_millis(pid).is_some());
         kill_process_tree(pid).expect("终止进程组");
-        for _ in 0..40 {
+        // 调用方负责回收直接子进程（它退出后是僵尸，僵尸也挂在进程组里）
+        let mut exited = false;
+        for _ in 0..60 {
             if child.try_wait().ok().flatten().is_some() {
+                exited = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(child.try_wait().ok().flatten().is_some(), "直接子进程应已退出");
-        assert!(
-            !crate::winproc::group_alive(pid),
-            "进程组里不应还有成员"
-        );
+        assert!(exited, "直接子进程应已退出");
+        let mut gone = false;
+        for _ in 0..60 {
+            if !crate::winproc::group_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "进程组里不应还有成员");
     }
 
     #[test]
