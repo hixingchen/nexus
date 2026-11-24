@@ -1,6 +1,6 @@
 name: Release
 
-# 发版：push 一个 v* tag → 在 windows runner 上打包 → 附到 GitHub Release（草稿）
+# 发版：push 一个 v* tag → Windows GUI 打包 + Linux 服务端打包 → 附到同一个 GitHub Release
 #
 # 为什么不并进 ci.yml：门禁只需要读代码（那里的"权限最小化"注释是刻意的），而发布必须写
 # contents 才能建 release、传 assets。合在一个文件里，就得把一个只在打 tag 时才跑的能力
@@ -21,22 +21,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 版本号散在三处（package.json / tauri.conf.json / Cargo.toml），而安装包的文件名取自
-      # tauri.conf.json、release 的 tag 取自这次 push、应用内「关于」显示的是 Cargo.toml
-      # （`commands/app.rs` 的 `env!("CARGO_PKG_VERSION")`）。不一致时发出去的包与 tag 对不上号，
-      # 而 release 一旦公开就难收回（下载链接可能已经被转发）。
-      # **只校验一处是最难发现的子集**：漏改 Cargo.toml 时 tag 与安装包名都对、发布顺利，
-      # 只有关于页显示旧版本。所以三处都比对（都与 tag 比，等价于三处互等）。
-      - name: 校验 tag 与三处版本号一致
+      # 版本号散在六处（package.json / tauri.conf.json / 四个 Cargo.toml：GUI、boot-core、
+      # Linux 服务端），而安装包的文件名取自 tauri.conf.json、release 的 tag 取自这次 push、
+      # 应用内「关于」显示的是 Cargo.toml（`commands/app.rs` 的 `env!("CARGO_PKG_VERSION")`）。
+      # 不一致时发出去的包与 tag 对不上号，而 release 一旦公开就难收回。
+      # **只校验一处是最难发现的子集**：漏改某个 Cargo.toml 时 tag 与安装包名都对、发布顺利，
+      # 只有关于页/Linux 包显示旧版本。所以六处都比对（都与 tag 比，等价于六处互等）。
+      - name: 校验 tag 与六处版本号一致
         shell: bash
         run: |
           PKG=$(node -p "require('./package.json').version")
           CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
           # Cargo.toml 里行首的 `version = ` 只有 [package] 那一处（依赖用的是内联 table）
           CARGO=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/Cargo.toml | head -n 1)
+          BOOT_CORE=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/boot-core/Cargo.toml | head -n 1)
+          LINUX=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/linux/Cargo.toml | head -n 1)
+          RUNNER=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/boot-runner/Cargo.toml | head -n 1)
 
           fail=0
-          for entry in "package.json=$PKG" "src-tauri/tauri.conf.json=$CONF" "src-tauri/Cargo.toml=$CARGO"; do
+          for entry in "package.json=$PKG" "src-tauri/tauri.conf.json=$CONF" "src-tauri/Cargo.toml=$CARGO" "src-tauri/boot-core/Cargo.toml=$BOOT_CORE" "src-tauri/linux/Cargo.toml=$LINUX" "src-tauri/boot-runner/Cargo.toml=$RUNNER"; do
             file="${entry%%=*}"
             ver="${entry#*=}"
             if [ -z "$ver" ]; then
@@ -48,7 +51,7 @@ jobs:
             fi
           done
           [ "$fail" = 0 ] || exit 1
-          echo "三处版本号一致：$PKG（tag $GITHUB_REF_NAME）"
+          echo "六处版本号一致：$PKG（tag $GITHUB_REF_NAME）"
 
       # 不带 version：pnpm 版本由 package.json 的 `packageManager` 字段决定（单一来源），
       # 两处都指定会被 action 拒绝（Multiple versions of pnpm specified）
@@ -92,6 +95,15 @@ jobs:
       - name: 后端单元测试
         working-directory: src-tauri
         run: cargo test --lib
+
+      # 开机启动共享核心的 Windows 平台分支（Job Object / 进程走查 / 注册表）
+      - name: 共享核心 clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy -p boot-core -p nexus-boot-runner --all-targets -- -D warnings
+
+      - name: 共享核心单元测试
+        working-directory: src-tauri
+        run: cargo test -p boot-core
 
       # tauri.conf.json 的 beforeBuildCommand 是 `npm run build`（tsc && vite build），
       # 会再构建一次——上面那步是显式的、失败点可归因的那份，这份是打包必需的。
@@ -143,12 +155,22 @@ jobs:
 
             ## 安装
 
+            ### Windows 桌面版
+
             下载下面任一安装包（均为 64 位 Windows）：
 
             - **`…-setup.exe`** — NSIS 安装器，双击即装
             - **`…_en-US.msi`** — MSI，适合静默 / 批量部署
 
             **系统要求**：Windows 10 / 11。依赖系统自带的 WebView2 运行时（Win11 与较新的 Win10 已内置）。
+
+            ### Linux 服务端版（无界面）
+
+            下载 **`nexus-<版本>-linux-x86_64.tar.gz`**（不需要 WebView/Node/数据库）。
+            解压后执行 `./install.sh`，用 `nexusctl project add` / `service add` / `boot install`
+            管理项目与服务；详见包内 `share/README.md`。
+
+            支持 systemd user unit + linger（无人登录也启动）或 `--system` 系统级 unit。
 
             ## 首次使用
 
@@ -160,5 +182,44 @@ jobs:
 
             ## 已知限制
 
-            - 目前**只打包发布 Windows**：macOS / Linux 有对应的命令分支，但进程树清理、文件剪贴板互通等能力为 Windows 实现，未参与打包也未经测试
+            - **Windows 桌面版**目前只打包发布 Windows；macOS 未支持。Linux 提供独立的**无界面服务端版**（见上），不含 GUI/编辑器/AI 面板
             - `.class` 反编译需要本机有 JRE，没有时自动回退到字节码视图
+
+  release-linux:
+    # 串行：等 Windows job 建好 Release，再把 Linux 资产挂上去。
+    # 两个 job 并行各自建同名 Release 有竞态；串行 + gh release upload 最直接。
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # tag 可以指向任意提交：发布前把 Linux 侧的门禁也跑一遍（与 ci.yml 同款）。
+      - name: 服务端 clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy -p boot-core -p nexus-linux --all-targets -- -D warnings
+
+      - name: 服务端单元测试
+        working-directory: src-tauri
+        run: cargo test -p boot-core -p nexus-linux
+
+      - name: 服务端端到端冒烟
+        run: bash scripts/test-linux-e2e.sh
+
+      - name: 构建 Linux 服务端包
+        run: bash scripts/package-linux.sh
+
+      # 与 Windows 安装包是两组独立资产：同一个 tag/Release，但互不包含。
+      - name: 上传到同一个 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            src-tauri/target/linux-package/nexus-*-linux-x86_64.tar.gz \
+            src-tauri/target/linux-package/nexus-*-linux-x86_64.tar.gz.sha256 \
+            --clobber

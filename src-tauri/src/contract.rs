@@ -947,12 +947,10 @@ const COVERED_RESPONSE: &[&str] = &[
         "NvmCommandResult", "NvmInstallResult",
         // 开机启动的命令结果/状态（IPC 载荷）
         "BootRunnerStatus", "BootServiceStatus", "BootToggleResult",
-        // 豁免：以下是**启动器与磁盘之间的文件格式**（manifest.json / state.json / 命令队列），
-        // runner 与 Nexus 只在文件里读写，不经 invoke 出前端——前端看到的是上面的状态 DTO。
-        "BootManifest", "BootService", "BootRunnerState", "BootServiceState",
-        "BootCommand", "BootCommandResult",
-        // runner 的单实例锁文件（pid + 启动时刻），只在 boot_runner 内部读写
-        "LockInfo",
+        // BootManifest / BootService / BootRunnerState / BootServiceState / BootCommand /
+        // BootCommandResult / LockInfo 已移到 `boot-core`（启动器与磁盘之间的文件格式，
+        // 不经 Tauri IPC），因此不在本文件 `src/` 的扫描/覆盖范围内；
+        // 前端看到的是上面的 BootRunnerStatus / BootServiceStatus / BootToggleResult。
         // 豁免：这两个是**模板导出文件的格式**，只在 export/import 命令内部读写磁盘，
         // 不经 invoke 出前端，因此没有 keys_of 断言。它们的字段用 camelCase 是为了
         // 文件给人看、可手工编辑——与"响应 DTO 一律 snake_case"不冲突（那条规则只管 IPC 载荷）

@@ -4,10 +4,13 @@ use tauri::State;
 use crate::AppState;
 
 // 平台分支约定（ARCH-10）：本应用只打包 Windows（`tauri.conf.json` 的 `bundle.targets`
-// 只有 nsis/msi）。下面 `#[cfg(target_os = "macos" | "linux")]` 的分支是**可编译但未参与
-// 打包、未经测试**的降级实现：保留它们是因为成本极低（各 5 行）且能让非 Windows 上
-// `cargo check` 通过；但它们**不是**受支持的功能——改 Windows 路径时无需同步维护，
+// 只有 nsis/msi）。下面 `#[cfg(target_os = "macos" | "linux")]` 的分支是**未参与打包、
+// 未经测试**的降级实现；它们**不是**受支持的功能——改 Windows 路径时无需同步维护，
 // 也不要据此认为"项目已支持 mac/linux"。
+//
+// 注意：2.2.0 的 AI 模块（`core::ai` / `core::runtime`）无条件依赖 Windows 专有模块，
+// 因此整个 GUI crate 在非 Windows 上**当前并不保证能编译**；Linux 用户请使用独立的
+// 无界面服务端版（`src-tauri/linux`，不链接 Tauri）。
 
 /// 在系统终端中打开路径（Windows: 新开 cmd 窗口并定位到目录）
 ///

@@ -10,9 +10,10 @@ name = "nexus-boot-runner"
 path = "src/main.rs"
 
 [dependencies]
-# 复用 Nexus 的 core::boot / boot_runner，不复制业务逻辑；
+# 复用 boot-core 的 runner 主循环，不复制业务逻辑；
 # 独立 crate 是为了让 Tauri 的 MSI bundler 不会把同一个 sidecar 当成两个组件。
-nexus = { path = ".." }
+# 直接依赖 boot-core（而不是 nexus lib）让它不再链接 Tauri/WebView2。
+boot-core = { path = "../boot-core" }
 
 [build-dependencies]
 # tauri-build 已经在依赖图里，复用它嵌入图标不会新增下载包

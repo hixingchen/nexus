@@ -1,0 +1,41 @@
+# Nexus Linux 服务端配置（唯一真相）
+#
+# 修改后执行 `nexusctl boot sync`（或直接用 nexusctl 子命令修改）让 runner 重新加载。
+# 注意：用 nexusctl 修改会重写本文件，手写注释可能丢失；直接编辑文件则完全支持。
+
+version = 1
+
+# 全局环境变量（可选）：叠加在系统环境快照之上、服务自己的 env 之下。
+[env]
+# JAVA_HOME = "/usr/lib/jvm/temurin-21"
+# PATH = "/usr/local/bin:/usr/bin:/bin"
+
+[[projects]]
+name = "app"
+path = "/srv/app"
+
+[[services]]
+project = "app"
+name = "api"
+command = "npm run start"
+# 省略 workdir 时使用项目路径
+# workdir = "/srv/app/api"
+boot = true
+order = 10
+# 就绪检查：none / wait:5 / tcp:127.0.0.1:3000 / log:关键字 / JSON
+ready = "tcp:127.0.0.1:3000"
+# 未就绪时阻断后续开机服务
+required = true
+# 稳定运行后崩溃自动重启（启动失败不重启）
+crash_restart = true
+
+[services.env]
+NODE_ENV = "production"
+
+# 非开机服务也可以放在配置里：runner 会管理它，只是不会自动拉起。
+# [[services]]
+# project = "app"
+# name = "worker"
+# command = "node worker.js"
+# boot = false
+# order = 20

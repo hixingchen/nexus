@@ -1,6 +1,17 @@
 # Nexus
 
-开发环境管理平台：把多个项目的多个服务（前端/后端/中间件…）集中在一处启停、看日志、改配置、翻代码，基于 **Tauri 2 + React + TypeScript** 构建，**以 Windows 为主平台**（macOS/Linux 有对应的命令分支，但进程树清理、文件剪贴板互通等能力为 Windows 实现；这些分支可编译但未参与打包、未经测试，见 `src-tauri/src/commands/editor.rs` 顶部的平台分支约定）。
+开发环境管理平台：把多个项目的多个服务（前端/后端/中间件…）集中在一处启停、看日志、改配置、翻代码，基于 **Tauri 2 + React + TypeScript** 构建，**以 Windows 为主平台**（macOS/Linux 的 GUI 分支未参与打包、未经完整测试；2.2.0 的 AI 模块含 Windows 专有依赖，非 Windows 构建不保证通过。Linux 用户请使用下面的无界面服务端版）。
+
+## Linux 服务端版（无界面）
+
+仓库同时提供一个**独立的 Linux 服务端发行物**（不是 GUI 的移植）：
+`nexusctl` 命令 + `nexus-boot-runner` 守护进程，由 systemd 托管，复用同一套
+manifest / 就绪检查 / 崩溃重启语义。适用场景：在 Linux 服务器上用命令管理项目与服务、
+开机按顺序拉起并做就绪阻断。
+
+- 安装与用法：[`packaging/linux/README.md`](packaging/linux/README.md)
+- 打包/发布：与 Windows 桌面版同 tag、同一个 GitHub Release 的**两组独立资产**
+- 不包含：GUI、编辑器、文件树、AI 面板、数据库
 
 ## 功能特性
 
@@ -227,7 +238,12 @@ nexus/
 │   │   ├── database/             # rusqlite + schema 增量迁移
 │   │   ├── contract.rs           # IPC 字段命名契约测试（响应 snake_case / 请求 camelCase）
 │   │   └── logger.rs             # 控制台 + 文件双写日志
-│   └── Cargo.toml
+│   ├── boot-core/                # 开机启动共享核心（无 Tauri：manifest/health/runner）
+│   ├── boot-runner/              # Windows 独立启动器（依赖 boot-core）
+│   ├── linux/                    # Linux 服务端：nexusctl + nexus-boot-runner
+│   └── Cargo.toml                # workspace 根（GUI + 三个 crate）
+├── packaging/linux/              # Linux 安装脚本、示例配置、使用说明
+├── scripts/package-linux.sh      # Linux 服务端 tar.gz 打包脚本
 ├── tailwind.config.js
 ├── vite.config.ts
 └── package.json

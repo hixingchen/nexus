@@ -45,12 +45,70 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
+      # 开机启动的共享核心（boot-core）在 Windows 上也有平台分支
+      # （Job Object / 进程走查 / 注册表环境）：Linux job 覆盖不到它们。
+      - name: 共享核心 clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy -p boot-core -p nexus-boot-runner --all-targets -- -D warnings
+
+      - name: 共享核心单元测试
+        working-directory: src-tauri
+        run: cargo test -p boot-core
+
       # `#[ignore]` 那批守的是本机才有的真实行为（剪贴板 / 回收站 / 目录联接 / nvm 探测），
       # 默认不执行是有意的（会动本机资源，见 README「校验」），但**从不编译**会让它们悄悄失效：
       # 契约一变红灯永远不亮，而它们看起来覆盖了这些模块。`--list` 只要求仍能编译，不真跑。
       - name: 被忽略的用例仍能编译（不执行）
         working-directory: src-tauri
         run: cargo test --lib -- --ignored --list
+
+      - name: 共享核心被忽略用例仍能编译（不执行）
+        working-directory: src-tauri
+        run: cargo test -p boot-core -- --ignored --list
+
+  linux-headless:
+    # Linux 服务端版没有 Tauri/WebKit 依赖：这里只构建/测试 boot-core + nexus-linux，
+    # 并在 CI 里跑一次打包脚本，确保发版路径不是"只在本地能过"。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: clippy（0 警告）
+        working-directory: src-tauri
+        run: cargo clippy -p boot-core -p nexus-linux --all-targets -- -D warnings
+
+      - name: 单元测试
+        working-directory: src-tauri
+        run: cargo test -p boot-core -p nexus-linux
+
+      # 真实 runner + 真实进程组 + 文件命令协议（不依赖 systemd）
+      - name: 服务端端到端冒烟
+        run: bash scripts/test-linux-e2e.sh
+
+      # unit 语法用 systemd 官方工具验；不启动、不依赖用户 bus
+      - name: 校验 systemd unit 语法
+        working-directory: src-tauri
+        run: |
+          cargo build -q -p nexus-linux --bins
+          TMP=$(mktemp -d)
+          # 用 /bin/true 作为 ExecStart 的替身：verify 只解析 unit，不执行它
+          ./target/debug/nexusctl --system --run-as root \
+            --config "$TMP/nexus.toml" --data-dir "$TMP/data" \
+            --runner /bin/true boot unit \
+            > "$TMP/nexus-boot-runner.service"
+          cat "$TMP/nexus-boot-runner.service"
+          systemd-analyze verify "$TMP/nexus-boot-runner.service"
+
+      - name: 打包自检
+        run: bash scripts/package-linux.sh
 
   frontend:
     runs-on: ubuntu-latest

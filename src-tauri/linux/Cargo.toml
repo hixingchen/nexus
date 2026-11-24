@@ -1,0 +1,26 @@
+[package]
+name = "nexus-linux"
+version = "2.2.0"
+edition = "2021"
+description = "Nexus Linux 服务端：配置管理 CLI + systemd 启动器"
+publish = false
+
+[[bin]]
+name = "nexusctl"
+path = "src/bin/nexusctl.rs"
+
+[[bin]]
+name = "nexus-boot-runner"
+path = "src/bin/nexus_boot_runner.rs"
+
+[dependencies]
+boot-core = { path = "../boot-core" }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+dirs = "~5.0"
+chrono = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

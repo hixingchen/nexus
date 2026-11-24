@@ -1,7 +1,7 @@
 [workspace]
 # 启动器是独立 crate（不能在主 package 里加第二个 bin，否则 Tauri 的 MSI
 # bundler 会把同一个 externalBin 当成两个组件，报 ICE30）。
-members = ["boot-runner"]
+members = ["boot-runner", "boot-core", "linux"]
 
 [package]
 name = "nexus"
@@ -18,6 +18,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
+# 开机启动的共享核心（无 Tauri）：manifest/state/health/restart/runner 主循环
+# 与 Linux 服务端共用一份实现。
+boot-core = { path = "boot-core" }
 # zstd-safe 只有 >=8.2.0 修掉了 2026-10-16 的一批内存安全 advisory；0.13 依赖的
 # zstd-safe 7.x 没有修复版本，因此必须升到 zstd 0.14（对应 zstd-safe 8.2）
 zstd = "0.14"

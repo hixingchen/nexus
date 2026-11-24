@@ -22,49 +22,8 @@ pub mod winenv;
 #[cfg(windows)]
 pub mod job_object;
 
-/// 游离子进程走查（见 `winproc` 的模块说明）。
+/// 游离子进程走查（实现见 `boot-core::winproc`）。
 ///
-/// 非 Windows 上是**空桩**：没有"另开窗口"这种语义（`start` 是 cmd 内建命令，
-/// unix 下 `sh -c` 的孙进程默认由进程组管理），认领永远找不到东西，
-/// 于是 `process.rs` 可以只写一条代码路径。
-#[cfg(windows)]
+/// Windows 沿父 pid 链认领；Linux 用进程组判定（`build_command` 为每个服务
+/// 建立了独立进程组）。GUI 只在 Windows 打包，但模块本身两端都可编译。
 pub mod winproc;
-
-#[cfg(not(windows))]
-pub mod winproc {
-    pub(crate) struct ProcEntry {
-        pub pid: u32,
-        pub ppid: u32,
-        pub name: String,
-    }
-
-    pub(crate) fn snapshot_processes() -> Vec<ProcEntry> {
-        Vec::new()
-    }
-
-    pub(crate) fn descendants(_root: u32, _snapshot: &[ProcEntry]) -> Vec<u32> {
-        Vec::new()
-    }
-
-    pub(crate) fn name_of(_pid: u32, _snapshot: &[ProcEntry]) -> String {
-        "?".to_string()
-    }
-
-    pub(crate) fn process_image_path(_pid: u32) -> Option<String> {
-        None
-    }
-
-    pub(crate) struct OwnedProcess;
-
-    impl OwnedProcess {
-        pub(crate) fn open(_pid: u32) -> Option<Self> {
-            None
-        }
-        pub(crate) fn is_alive(&self) -> bool {
-            false
-        }
-        pub(crate) fn exit_code(&self) -> Option<i32> {
-            None
-        }
-    }
-}
