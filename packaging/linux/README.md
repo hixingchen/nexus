@@ -207,6 +207,7 @@ sudo nexusctl project remove app
 | `ready` | `none`（进程存活即就绪） | 服务要等端口/日志关键字才算启动完成 |
 | `required` | `false` | 该服务未就绪时要阻断后续开机服务 |
 | `crash_restart` | `true` | 不想在崩溃后自动重启（加 `--no-crash-restart`） |
+| `stop_timeout_secs` | 全局默认 10 | 需要更长的优雅停止/更短强制停止（加 `--stop-timeout N`） |
 
 ### 5.2 什么时候需要进阶参数
 
@@ -226,6 +227,11 @@ nexusctl service set app web --env NODE_ENV=production
 
 # 关闭崩溃自动重启
 nexusctl service set app web --no-crash-restart
+
+# 服务自己需要更长的收尾时间（默认 10s；0=直接强杀）
+nexusctl service set app web --stop-timeout 30
+# 清除服务覆盖，回退全局默认
+nexusctl service set app web --reset-stop-timeout
 
 # 非开机服务：不写 --boot，之后手动启动
 nexusctl service add -p app -n tools -c "sleep 3600"
@@ -285,6 +291,13 @@ nexusctl --config /path/nexus.toml --data-dir /path/data ...
 | `ready` | 就绪检查（见下） |
 | `required` | 未就绪时是否阻断后续开机服务（默认 false） |
 | `crash_restart` | 稳定运行后崩溃是否自动重启（默认 true） |
+| `stop_timeout_secs` | 单服务停止宽限；省略继承 `[settings]`，0 = 直接强杀 |
+
+`[settings]`：
+
+| 字段 | 说明 |
+|---|---|
+| `stop_timeout_secs` | 全局停止宽限，默认 10 秒（Docker 同量级） |
 
 `[env]`：全局环境变量，叠加在环境快照之上、服务 `env` 之下。
 
@@ -375,18 +388,21 @@ nexusctl restart <项目> [服务]
 # 必填只有 -p / -n / -c；下面方括号里的都是可选项
 nexusctl service add -p <项目> -n <服务> -c <命令> \
   [--project-path <项目目录>] [--workdir <目录>] [--env K=V]... \
-  [--boot] [--order N] [--ready <检查>] [--required] [--no-crash-restart]
+  [--boot] [--order N] [--ready <检查>] [--required] [--no-crash-restart] \
+  [--stop-timeout N]
 nexusctl service set <项目> <服务> \
   [--command <命令>] [--workdir <目录>] [--env K=V]... [--clear-env] \
   [--order N] [--ready <检查>] \
   [--boot|--no-boot] [--required|--no-required] \
-  [--crash-restart|--no-crash-restart]
+  [--crash-restart|--no-crash-restart] \
+  [--stop-timeout N | --reset-stop-timeout]
 nexusctl service remove <项目> <服务>   # 运行中的服务要先 stop
 nexusctl service start|stop|restart <项目> <服务>
 nexusctl service enable-boot|disable-boot <项目> <服务>
 ```
 
 - `--project-path`：项目不存在时自动创建，省去一条 `project add`。
+- `--stop-timeout`：停止宽限秒数；`0` = 直接强杀；不写继承 `[settings]`（默认 10s）。
 - `service add --boot` 在 runner 已运行时**会立即启动**新服务；runner 未运行时等下次启动。
 - `enable-boot` 只改“下次 runner 启动时是否自动拉起”，不会立刻启动；现在启动用 `start`。
 - `disable-boot` 不会停止正在运行的实例。
@@ -499,7 +515,8 @@ nexusctl boot uninstall      # 停 runner、disable、删除 unit；配置/日�
 
 - `nexusctl logs <项目> <服务>` 读服务日志；`--lines` 控制尾部行数，`-f/--follow` 持续跟踪。
 - 日志读取有 8MB 上限（只读末尾），日志再大也不会整份进内存。
-- 状态阶段：`pending` / `starting` / `ready` / `failed` / `exited` / `stopped` / `skipped` / `restarting`。
+- 状态阶段：`pending` / `starting` / `ready` / `failed` / `exited` / `stopping` / `stopped` / `skipped` / `restarting`。
+- 停止语义：先对服务及后代发 TERM，等 `stop_timeout_secs`（默认 10s）；到点仍未退出才 KILL。正常退出会提前返回，不等满宽限。
 - 服务日志只包含命令的 stdout/stderr；如果服务自己另写日志（如 Tomcat 的 `logs/catalina.out`），
   需要看它自己的文件，或者用前台模式启动让输出进入 Nexus 日志。
 

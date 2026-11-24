@@ -8,14 +8,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use boot_core::boot::{safe_file_stem, BootCheck};
+use boot_core::boot::{
+    safe_file_stem, BootCheck, DEFAULT_STOP_TIMEOUT_SECS,
+};
 
 pub const CONFIG_VERSION: u32 = 1;
+/// 单次停止宽限的上限，防止配置成一天。
+pub const MAX_STOP_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_version")]
     pub version: u32,
+    #[serde(default)]
+    pub settings: Settings,
     /// 全局环境变量：叠加在系统环境快照之上、服务自己的 `env` 之下。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -23,6 +29,13 @@ pub struct Config {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub services: Vec<Service>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// 全局停止宽限；服务自己的 `stop_timeout_secs` 优先。0 = 直接强杀。
+    #[serde(default = "default_stop_timeout")]
+    pub stop_timeout_secs: u64,
 }
 
 fn default_version() -> u32 {
@@ -33,10 +46,21 @@ fn default_true() -> bool {
     true
 }
 
+fn default_stop_timeout() -> u64 {
+    DEFAULT_STOP_TIMEOUT_SECS
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            settings: Settings::default(),
             env: BTreeMap::new(),
             projects: Vec::new(),
             services: Vec::new(),
@@ -72,6 +96,9 @@ pub struct Service {
     pub required: bool,
     #[serde(default = "default_true")]
     pub crash_restart: bool,
+    /// 单服务停止宽限；None = 继承 `[settings]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u64>,
 }
 
 impl Service {
@@ -126,6 +153,12 @@ impl Config {
             ));
         }
         validate_env(&self.env, "全局 env")?;
+        if self.settings.stop_timeout_secs > MAX_STOP_TIMEOUT_SECS {
+            return Err(format!(
+                "全局 stop_timeout_secs 必须在 0-{} 之间",
+                MAX_STOP_TIMEOUT_SECS
+            ));
+        }
 
         let mut project_names = BTreeSet::new();
         for p in &self.projects {
@@ -159,6 +192,15 @@ impl Config {
                 ));
             }
             validate_env(&s.env, &format!("服务「{}.{}」的 env", s.project, s.name))?;
+            if s.stop_timeout_secs
+                .map(|secs| secs > MAX_STOP_TIMEOUT_SECS)
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "服务「{}.{}」的 stop_timeout_secs 必须在 0-{} 之间",
+                    s.project, s.name, MAX_STOP_TIMEOUT_SECS
+                ));
+            }
             parse_ready(&s.ready).map_err(|e| {
                 format!("服务「{}.{}」的就绪检查无效: {}", s.project, s.name, e)
             })?;
@@ -192,6 +234,21 @@ impl Config {
         self.services
             .iter_mut()
             .find(|s| s.project == project && s.name == name)
+    }
+
+    /// 服务生效的停止宽限：服务覆盖 → `[settings]` → 默认 10。
+    pub fn stop_timeout_of(&self, s: &Service) -> u64 {
+        s.stop_timeout_secs
+            .unwrap_or(self.settings.stop_timeout_secs)
+    }
+
+    /// 停止宽限来源（给 `service show` 解释用）。
+    pub fn stop_timeout_source(&self, s: &Service) -> &'static str {
+        if s.stop_timeout_secs.is_some() {
+            "服务配置"
+        } else {
+            "全局设置"
+        }
     }
 
     /// 服务的工作目录：未配置时回退到项目路径。
@@ -348,6 +405,7 @@ mod tests {
             ready: "tcp:127.0.0.1:3000".into(),
             required: true,
             crash_restart: true,
+            stop_timeout_secs: None,
         });
         cfg
     }
@@ -407,6 +465,18 @@ mod tests {
         );
         assert!(parse_ready("tcp:127.0.0.1:0").is_err());
         assert!(parse_ready("whatever").is_err());
+    }
+
+    #[test]
+    fn stop_timeout_inherits_and_overrides() {
+        let mut cfg = sample();
+        assert_eq!(cfg.stop_timeout_of(&cfg.services[0]), DEFAULT_STOP_TIMEOUT_SECS);
+        cfg.settings.stop_timeout_secs = 30;
+        assert_eq!(cfg.stop_timeout_of(&cfg.services[0]), 30);
+        cfg.services[0].stop_timeout_secs = Some(0);
+        assert_eq!(cfg.stop_timeout_of(&cfg.services[0]), 0);
+        cfg.services[0].stop_timeout_secs = Some(MAX_STOP_TIMEOUT_SECS + 1);
+        assert!(cfg.validate().unwrap_err().contains("stop_timeout_secs"));
     }
 
     #[test]

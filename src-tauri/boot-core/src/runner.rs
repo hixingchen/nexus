@@ -360,16 +360,10 @@ mod imp {
         for svc in &manifest.services {
             services.insert(svc.id.clone(), BootServiceState {
                 phase: "pending".into(),
-                pid: None,
-                process_started_at: None,
-                process_alive: None,
-                started_at: None,
-                ready_at: None,
-                exit_code: None,
-                error: String::new(),
                 log_path: svc.log_path.clone(),
                 name: svc.name.clone(),
                 project_id: svc.project_id.clone(),
+                ..Default::default()
             });
         }
         BootRunnerState {
@@ -903,94 +897,303 @@ mod imp {
             // 直接删掉，设置页就不会再显示一条点不动的历史项。仍在 manifest 里的保留
             // （配置还在，只是这次停了）。
             let keep_in_manifest = self.find_service(id).is_some();
+            let stop_timeout_secs = self
+                .find_service(id)
+                .map(|s| s.stop_timeout_secs)
+                .unwrap_or(crate::boot::DEFAULT_STOP_TIMEOUT_SECS);
             let Some(mut run) = self.running.remove(id) else {
                 self.set_state(id, |s| {
                     s.phase = "stopped".into();
                     s.pid = None;
                     s.process_alive = Some(false);
+                    s.stop_result = "graceful".into();
+                    s.stopped_at = Some(chrono::Utc::now().to_rfc3339());
                 });
                 if !keep_in_manifest {
                     self.state.services.remove(id);
                 }
+                self.write_state();
                 return Ok(());
             };
-            let mut kill_error = String::new();
+
+            let original_pid = run
+                .child
+                .as_ref()
+                .map(|c| c.id())
+                .or_else(|| run.adopted.first().map(|a| a.pid))
+                .unwrap_or(0);
+            let stop_started = Instant::now();
+            self.set_state(id, |s| {
+                s.phase = "stopping".into();
+                s.error.clear();
+                s.stop_result.clear();
+                s.stop_elapsed_ms = 0;
+                s.stop_killed = 0;
+                s.stop_survivors.clear();
+                s.stopped_at = None;
+            });
+            self.write_state();
+
+            // 先把已经退出的直接子进程回收掉，避免僵尸干扰快照/等待。
+            let mut child_status: Option<std::process::ExitStatus> = None;
             if let Some(child) = run.child.as_mut() {
-                if let Err(e) = crate::process_exec::kill_process_tree(child.id()) {
-                    kill_error = e;
+                if let Ok(Some(st)) = child.try_wait() {
+                    child_status = Some(st);
+                    run.child = None;
                 }
             }
-            // 直接子进程已经退出时，真正在跑的是认领的后代——必须一起结束，
-            // 否则 Tomcat 这类“另开窗口”的服务点了停止还在跑。
-            for a in &run.adopted {
-                if a.handle.is_alive() {
-                    if let Err(e) = crate::process_exec::kill_process_tree(a.pid) {
-                        if kill_error.is_empty() {
+
+            let mut kill_error = String::new();
+            let targets_count;
+            #[cfg(target_os = "linux")]
+            let mut killed = 0usize;
+            #[cfg(not(target_os = "linux"))]
+            let killed;
+            #[cfg(target_os = "linux")]
+            let mut stop_result = "graceful";
+            #[cfg(not(target_os = "linux"))]
+            let stop_result;
+            #[cfg(target_os = "linux")]
+            let mut remaining_targets: Vec<u32> = Vec::new();
+            #[cfg(not(target_os = "linux"))]
+            let remaining_targets: Vec<u32> = Vec::new();
+
+            #[cfg(target_os = "linux")]
+            {
+                use crate::process_exec::{
+                    alive_stop_targets, signal_stop_groups, signal_stop_targets,
+                    snapshot_stop_targets,
+                };
+
+                let mut roots = Vec::new();
+                let mut groups = Vec::new();
+                if let Some(child) = run.child.as_ref() {
+                    roots.push(child.id());
+                    groups.push(child.id());
+                }
+                for a in &run.adopted {
+                    if a.handle.is_alive() {
+                        roots.push(a.pid);
+                        groups.push(a.pid);
+                    }
+                }
+                groups.sort_unstable();
+                groups.dedup();
+
+                // ★ 必须在发任何 TERM 之前快照；setsid 的子进程仍能通过 ppid 找到。
+                let targets = snapshot_stop_targets(&roots, &groups, std::process::id());
+                targets_count = targets.len();
+
+                if !targets.is_empty() || !groups.is_empty() || run.child.is_some() {
+                    if stop_timeout_secs > 0 {
+                        if let Err(e) = signal_stop_targets(&targets, libc::SIGTERM) {
                             kill_error = e;
+                        }
+                        if let Err(e) = signal_stop_groups(&groups, libc::SIGTERM) {
+                            if kill_error.is_empty() {
+                                kill_error = e;
+                            }
+                        }
+                        let deadline = Instant::now() + Duration::from_secs(stop_timeout_secs);
+                        let mut last_beat = Instant::now();
+                        loop {
+                            if let Some(child) = run.child.as_mut() {
+                                if let Ok(Some(st)) = child.try_wait() {
+                                    child_status = Some(st);
+                                    run.child = None;
+                                }
+                            }
+                            let alive = alive_stop_targets(&targets);
+                            let adopted_alive = run.adopted.iter().any(|a| a.handle.is_alive());
+                            if alive.is_empty() && !adopted_alive && run.child.is_none() {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            if last_beat.elapsed() >= Duration::from_secs(1) {
+                                // stop 可能持续几十秒；不续心跳会让 CLI 误判 runner 失联。
+                                self.write_state();
+                                last_beat = Instant::now();
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+
+                    let alive = alive_stop_targets(&targets);
+                    let adopted_alive = run.adopted.iter().any(|a| a.handle.is_alive());
+                    if !alive.is_empty() || adopted_alive || run.child.is_some() {
+                        killed = alive.len();
+                        stop_result = if stop_timeout_secs == 0 { "forced" } else { "timeout" };
+                        if let Err(e) = signal_stop_targets(&targets, libc::SIGKILL) {
+                            if kill_error.is_empty() {
+                                kill_error = e;
+                            }
+                        }
+                        if let Err(e) = signal_stop_groups(&groups, libc::SIGKILL) {
+                            if kill_error.is_empty() {
+                                kill_error = e;
+                            }
+                        }
+                        let deadline = Instant::now() + STOP_WAIT;
+                        let mut last_beat = Instant::now();
+                        loop {
+                            if let Some(child) = run.child.as_mut() {
+                                if let Ok(Some(st)) = child.try_wait() {
+                                    child_status = Some(st);
+                                    run.child = None;
+                                }
+                            }
+                            let alive = alive_stop_targets(&targets);
+                            let adopted_alive = run.adopted.iter().any(|a| a.handle.is_alive());
+                            if alive.is_empty() && !adopted_alive && run.child.is_none() {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            if last_beat.elapsed() >= Duration::from_secs(1) {
+                                self.write_state();
+                                last_beat = Instant::now();
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+
+                    // 最终仍存活的快照目标；不能只靠 child/adopted 判断，
+                    // 因为 setsid 的 ffmpeg 可能既不是 child、也不在 adopted 里。
+                    remaining_targets = alive_stop_targets(&targets)
+                        .into_iter()
+                        .map(|t| t.pid)
+                        .collect();
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Windows / 其它 Unix：保持既有的强杀语义；Windows 不做优雅阶段。
+                if let Some(child) = run.child.as_mut() {
+                    if let Err(e) = crate::process_exec::kill_process_tree(child.id()) {
+                        kill_error = e;
+                    }
+                }
+                // 直接子进程已经退出时，真正在跑的是认领的后代——必须一起结束。
+                for a in &run.adopted {
+                    if a.handle.is_alive() {
+                        if let Err(e) = crate::process_exec::kill_process_tree(a.pid) {
+                            if kill_error.is_empty() {
+                                kill_error = e;
+                            }
                         }
                     }
                 }
-            }
-            let deadline = Instant::now() + STOP_WAIT;
-            while Instant::now() < deadline {
-                let child_dead = match run.child.as_mut() {
-                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-                    None => true,
-                };
-                let adopted_dead = run.adopted.iter().all(|a| !a.handle.is_alive());
-                if child_dead && adopted_dead {
-                    break;
+                targets_count = run.child.is_some() as usize + run.adopted.len();
+                killed = targets_count;
+                stop_result = "forced";
+
+                let deadline = Instant::now() + STOP_WAIT;
+                while Instant::now() < deadline {
+                    if let Some(child) = run.child.as_mut() {
+                        if let Ok(Some(st)) = child.try_wait() {
+                            child_status = Some(st);
+                            run.child = None;
+                        }
+                    }
+                    let child_dead = run.child.is_none();
+                    let adopted_dead = run.adopted.iter().all(|a| !a.handle.is_alive());
+                    if child_dead && adopted_dead {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
-            // 超时后**复核存活**：taskkill 返回成功不等于进程真的死了（安全软件拦截、
-            // 不可终止状态）。仍活着就说“未停掉”，并把它留在 running 表里，下一次停止
-            // 还能重试；不能写一个假的 stopped——那会让后续 start 再起一份。
-            let (child_running, child_status) = match run.child.as_mut() {
-                Some(child) => match child.try_wait() {
-                    Ok(Some(status)) => (false, Some(status)),
-                    Ok(None) => (true, None),
-                    Err(_) => (true, None), // 查不了按“可能还活着”处理，方向偏保守
-                },
-                None => (false, None),
-            };
+
+            // 最后一次回收直接子进程，避免把“已退出但没 wait”算成残留。
+            if let Some(child) = run.child.as_mut() {
+                if let Ok(Some(st)) = child.try_wait() {
+                    child_status = Some(st);
+                    run.child = None;
+                }
+            }
+
+            let mut survivors = remaining_targets;
+            if let Some(child) = run.child.as_ref() {
+                survivors.push(child.id());
+            }
+            for a in &run.adopted {
+                if a.handle.is_alive() {
+                    survivors.push(a.pid);
+                }
+            }
+            survivors.sort_unstable();
+            survivors.dedup();
+
+            let child_running = run.child.is_some();
             let adopted_running = run.adopted.iter().any(|a| a.handle.is_alive());
-            if stop_has_survivors(child_running, adopted_running) {
-                let pid = run.child.as_ref().map(|c| c.id())
-                    .or_else(|| run.adopted.iter().find(|a| a.handle.is_alive()).map(|a| a.pid))
-                    .unwrap_or(0);
+            let has_survivors =
+                stop_has_survivors(child_running, adopted_running) || !survivors.is_empty();
+            let elapsed_ms = stop_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+            if has_survivors {
+                let pid = survivors.first().copied().unwrap_or(original_pid);
                 let msg = format!(
                     "停止未完成：仍有进程在运行（pid {}）{}",
                     pid,
-                    if kill_error.is_empty() { String::new() } else { format!("；{}", kill_error) }
+                    if kill_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!("；{}", kill_error)
+                    }
                 );
                 self.set_state(id, |s| {
                     s.phase = "ready".into(); // 仍在运行：保持可被下一次停止操作
                     s.pid = Some(pid);
                     s.process_alive = Some(true);
                     s.error = msg.clone();
+                    s.stop_result = stop_result.into();
+                    s.stop_elapsed_ms = elapsed_ms;
+                    s.stop_killed = killed as u32;
+                    s.stop_survivors = survivors.clone();
+                    s.stopped_at = None;
                 });
                 self.running.insert(id.to_string(), run);
                 self.log.info(&format!("⚠ {}", msg));
                 self.write_state();
                 return Err(msg);
             }
-            let pid_log = run.child.as_ref().map(|c| c.id())
-                .or_else(|| run.adopted.first().map(|a| a.pid))
-                .unwrap_or(0);
-            let code = child_status.and_then(|s| s.code())
+
+            let code = child_status
+                .and_then(|s| s.code())
                 .or_else(|| run.adopted.iter().find_map(|a| a.handle.exit_code()));
             self.set_state(id, |s| {
                 s.phase = "stopped".into();
                 s.pid = None;
                 s.process_alive = Some(false);
                 s.exit_code = code;
-                s.error = if kill_error.is_empty() { String::new() } else { format!("停止未完成: {}", kill_error) };
+                s.error = if kill_error.is_empty() {
+                    String::new()
+                } else {
+                    format!("停止未完成: {}", kill_error)
+                };
+                s.stop_result = stop_result.into();
+                s.stop_elapsed_ms = elapsed_ms;
+                s.stop_killed = killed as u32;
+                s.stop_survivors.clear();
+                s.stopped_at = Some(chrono::Utc::now().to_rfc3339());
             });
             if !keep_in_manifest {
                 self.state.services.remove(id);
             }
-            self.log.info(&format!("已停止服务「{}」pid={}", run.name, pid_log));
+            self.log.info(&format!(
+                "[stop] service={} pid={} collected={} timeout={}s result={} wait={:.1}s killed={} survivors=0",
+                run.name,
+                original_pid,
+                targets_count,
+                stop_timeout_secs,
+                stop_result,
+                elapsed_ms as f64 / 1000.0,
+                killed
+            ));
             self.write_state();
             Ok(())
         }
@@ -1217,6 +1420,7 @@ mod imp {
                 required: false,
                 order: 0,
                 crash_restart: true,
+                stop_timeout_secs: 10,
                 boot_enabled: true,
                 log_path: log_path.to_string_lossy().to_string(),
             };
@@ -1303,6 +1507,7 @@ mod imp {
                 required: false,
                 order: 0,
                 crash_restart: true,
+                stop_timeout_secs: 10,
                 boot_enabled: true,
                 log_path: dir.join("logs").join("s1.log").to_string_lossy().to_string(),
             };
@@ -1363,6 +1568,7 @@ mod imp {
                 required: false,
                 order: 0,
                 crash_restart: true,
+                stop_timeout_secs: 10,
                 boot_enabled: true,
                 log_path: dir.join("logs").join(format!("{}.log", id)).to_string_lossy().to_string(),
             };
@@ -1457,6 +1663,7 @@ mod imp {
                 required: false,
                 order: 0,
                 crash_restart: true,
+                stop_timeout_secs: 10,
                 boot_enabled: true,
                 log_path: dir.join("logs").join("s1.log").to_string_lossy().to_string(),
             };
@@ -1542,6 +1749,7 @@ mod imp {
                 required: false,
                 order: 0,
                 crash_restart: true,
+                stop_timeout_secs: 10,
                 boot_enabled: true,
                 log_path: dir.join("logs").join("s1.log").to_string_lossy().to_string(),
             };

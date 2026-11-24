@@ -111,6 +111,7 @@ pub fn generate(
             required: s.required,
             order: s.order,
             crash_restart: s.crash_restart,
+            stop_timeout_secs: config.stop_timeout_of(s),
             boot_enabled: s.boot,
         });
     }
@@ -176,6 +177,7 @@ mod tests {
             ready: "tcp:127.0.0.1:3000".into(),
             required: true,
             crash_restart: true,
+            stop_timeout_secs: None,
         });
         cfg.services.push(Service {
             project: "app".into(),
@@ -188,6 +190,7 @@ mod tests {
             ready: String::new(),
             required: false,
             crash_restart: false,
+            stop_timeout_secs: None,
         });
         cfg
     }
@@ -229,6 +232,18 @@ mod tests {
         assert_eq!(env.get("USER").map(String::as_str), Some("deploy"));
         assert_eq!(env.get("LOGNAME").map(String::as_str), Some("deploy"));
         assert_eq!(env.get("HOME").map(String::as_str), Some("/custom/home"));
+    }
+
+    #[test]
+    fn manifest_uses_effective_stop_timeout() {
+        let dir = temp_dir("stop-timeout");
+        let mut cfg = sample_config();
+        cfg.settings.stop_timeout_secs = 30;
+        cfg.services[0].stop_timeout_secs = Some(0);
+        let m = generate(&cfg, &dir, None).expect("生成");
+        assert_eq!(m.services[0].stop_timeout_secs, 0);
+        assert_eq!(m.services[1].stop_timeout_secs, 30);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -260,6 +260,7 @@ pub fn sync_manifest_to(
             required,
             order,
             crash_restart,
+            stop_timeout_secs: boot_core::boot::DEFAULT_STOP_TIMEOUT_SECS,
             // Windows 的 manifest 只收 boot_enabled=1 的服务，全部自动启动。
             boot_enabled: true,
         });

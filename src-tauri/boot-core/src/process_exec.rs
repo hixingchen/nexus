@@ -235,6 +235,194 @@ pub fn probe_process_start_time(_pid: u32) -> ProcessProbe {
     ProcessProbe::Gone
 }
 
+// ─── Linux 停止目标快照 ──────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopTarget {
+    pub pid: u32,
+    pub start_ms: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct ProcInfo {
+    pid: u32,
+    ppid: u32,
+    pgrp: u32,
+    state: char,
+    start_ms: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_btime_secs() -> Option<u64> {
+    std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(pid: u32, text: &str, btime_ms: u64, hz: u64) -> Option<ProcInfo> {
+    let close = text.rfind(')')?;
+    let fields: Vec<&str> = text[close + 1..].split_whitespace().collect();
+    if fields.len() <= 19 {
+        return None;
+    }
+    let state = fields[0].chars().next()?;
+    let ppid = fields[1].parse::<u32>().ok()?;
+    let pgrp = fields[2].parse::<u32>().ok()?;
+    let ticks = fields[19].parse::<u64>().ok()?;
+    Some(ProcInfo {
+        pid,
+        ppid,
+        pgrp,
+        state,
+        start_ms: btime_ms.saturating_add(ticks.saturating_mul(1000) / hz),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_table() -> Vec<ProcInfo> {
+    let Some(btime) = linux_btime_secs() else {
+        return Vec::new();
+    };
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as u64 } else { 100 };
+    let btime_ms = btime.saturating_mul(1000);
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else { continue };
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+            continue;
+        };
+        if let Some(info) = parse_proc_stat(pid, &text, btime_ms, hz) {
+            out.push(info);
+        }
+    }
+    out
+}
+
+/// 停止前快照：服务直接子进程、已认领的进程组、同组成员，以及它们的 ppid 后代。
+///
+/// **必须在发任何信号之前调用。** `groups` 只传调用方确认仍属于该服务的 pgid；
+/// runner 自己的 pid/进程组会被排除。
+#[cfg(target_os = "linux")]
+pub fn snapshot_stop_targets(
+    roots: &[u32],
+    groups: &[u32],
+    runner_pid: u32,
+) -> Vec<StopTarget> {
+    use std::collections::{HashMap, HashSet};
+
+    let own_group = unsafe { libc::getpgrp() } as u32;
+    let table = linux_process_table();
+    if table.is_empty() {
+        return Vec::new();
+    }
+    let by_pid: HashMap<u32, &ProcInfo> = table.iter().map(|p| (p.pid, p)).collect();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in &table {
+        children.entry(p.ppid).or_default().push(p.pid);
+    }
+
+    let group_set: HashSet<u32> = groups.iter().copied().collect();
+    let mut discovered: HashSet<u32> = HashSet::new();
+    let mut queue: Vec<u32> = Vec::new();
+    let mut roots_set: HashSet<u32> = roots.iter().copied().collect();
+    for p in &table {
+        if group_set.contains(&p.pgrp) {
+            roots_set.insert(p.pid);
+        }
+    }
+    for pid in roots_set {
+        if discovered.insert(pid) {
+            queue.push(pid);
+        }
+    }
+    let mut targets = Vec::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    while let Some(pid) = queue.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(info) = by_pid.get(&pid) {
+            if pid != runner_pid && info.pgrp != own_group && info.state != 'Z' {
+                targets.push(StopTarget { pid, start_ms: info.start_ms });
+            }
+        }
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                if discovered.insert(kid) {
+                    queue.push(kid);
+                }
+            }
+        }
+    }
+    targets.sort_by_key(|t| t.pid);
+    targets
+}
+
+/// 给快照中的目标发信号；启动时间不匹配（pid 复用）时跳过。
+#[cfg(target_os = "linux")]
+pub fn signal_stop_targets(targets: &[StopTarget], signal: i32) -> Result<usize, String> {
+    let mut sent = 0usize;
+    let mut errors = Vec::new();
+    for t in targets {
+        if t.pid <= 1 || process_start_time_millis(t.pid) != Some(t.start_ms) {
+            continue;
+        }
+        let rc = unsafe { libc::kill(t.pid as i32, signal) };
+        if rc == 0 {
+            sent += 1;
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            errors.push(format!("kill({}, {}) 失败: {}", t.pid, signal, err));
+        }
+    }
+    if errors.is_empty() { Ok(sent) } else { Err(errors.join("; ")) }
+}
+
+/// 进程组兜底信号；组 id 由调用方确认为该服务所有。
+#[cfg(target_os = "linux")]
+pub fn signal_stop_groups(groups: &[u32], signal: i32) -> Result<usize, String> {
+    let own_group = unsafe { libc::getpgrp() } as u32;
+    let mut sent = 0usize;
+    let mut errors = Vec::new();
+    for &pgid in groups {
+        if pgid <= 1 || pgid == own_group || pgid > i32::MAX as u32 {
+            continue;
+        }
+        let rc = unsafe { libc::kill(-(pgid as i32), signal) };
+        if rc == 0 {
+            sent += 1;
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            errors.push(format!("kill(-{}, {}) 失败: {}", pgid, signal, err));
+        }
+    }
+    if errors.is_empty() { Ok(sent) } else { Err(errors.join("; ")) }
+}
+
+/// 快照中仍存活的目标（按启动时间复核）。
+#[cfg(target_os = "linux")]
+pub fn alive_stop_targets(targets: &[StopTarget]) -> Vec<StopTarget> {
+    targets
+        .iter()
+        .copied()
+        .filter(|t| process_start_time_millis(t.pid) == Some(t.start_ms))
+        .collect()
+}
+
 // ─── 终止 ────────────────────────────────────────────────────
 
 /// 终止进程树/进程组。
@@ -381,6 +569,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(gone, "进程组里不应还有成员");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_snapshot_catches_setsid_child_while_parent_alive() {
+        use std::io::{BufRead, BufReader};
+        let mut child = build_command("setsid sleep 30 & echo $!; wait")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("起服务");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("读子 pid");
+        let setsid_pid: u32 = line.trim().parse().expect("解析 setsid pid");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let targets = snapshot_stop_targets(&[child.id()], &[child.id()], std::process::id());
+        assert!(
+            targets.iter().any(|t| t.pid == setsid_pid),
+            "快照应通过 ppid 找到 setsid 子进程: {:?}",
+            targets
+        );
+        signal_stop_targets(&targets, libc::SIGTERM).expect("TERM 快照目标");
+        signal_stop_groups(&[child.id()], libc::SIGTERM).expect("TERM 进程组");
+        let _ = child.wait();
+        for _ in 0..60 {
+            if process_start_time_millis(setsid_pid).is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = signal_stop_targets(&targets, libc::SIGKILL);
+        let _ = signal_stop_groups(&[child.id()], libc::SIGKILL);
+        panic!("setsid 子进程未退出");
     }
 
     #[test]

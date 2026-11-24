@@ -68,6 +68,23 @@ echo "=== 详情/配置/日志 ==="
 "${CTL[@]}" status
 "${CTL[@]}" status --json | grep -q '"unit"'
 
+echo "=== 停止语义：setsid 后代 + 宽限 ==="
+"${CTL[@]}" service add -p app -n setsid -c "setsid sleep 300 & wait" --order 4 --stop-timeout 2 >/dev/null
+"${CTL[@]}" start app setsid
+"${CTL[@]}" service show app setsid | grep -q '停止宽限:   2s'
+"${CTL[@]}" stop app setsid
+if pgrep -f "sleep 300" >/dev/null 2>&1; then
+  echo "[linux-e2e] setsid 子进程未被停止：" >&2
+  pgrep -af "sleep 300" >&2 || true
+  exit 1
+fi
+"${CTL[@]}" service remove app setsid >/dev/null
+
+"${CTL[@]}" service add -p app -n term -c "trap '' TERM; sleep 30" --order 5 --stop-timeout 1 >/dev/null
+"${CTL[@]}" start app term
+"${CTL[@]}" stop app term
+"${CTL[@]}" service remove app term >/dev/null
+
 echo "=== 新增 --boot 服务自动启动 ==="
 "${CTL[@]}" service add -p app -n autoboot -c "echo autoboot-started; sleep 30" --boot --order 3
 "${CTL[@]}" service show app autoboot | grep -q '运行状态:   ready'

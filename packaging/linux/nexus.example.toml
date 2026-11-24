@@ -5,6 +5,11 @@
 
 version = 1
 
+# 全局设置（可选）
+[settings]
+# 停止服务时先 TERM，等这么多秒仍未退出才 KILL；0 = 直接强杀
+stop_timeout_secs = 10
+
 # 全局环境变量（可选）：叠加在系统环境快照之上、服务自己的 env 之下。
 [env]
 # JAVA_HOME = "/usr/lib/jvm/temurin-21"
@@ -28,6 +33,8 @@ ready = "tcp:127.0.0.1:3000"
 required = true
 # 稳定运行后崩溃自动重启（启动失败不重启）
 crash_restart = true
+# 可选：单服务停止宽限；不写继承 [settings]（默认 10 秒）
+# stop_timeout_secs = 10
 
 [services.env]
 NODE_ENV = "production"

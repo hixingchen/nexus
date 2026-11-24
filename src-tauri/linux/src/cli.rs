@@ -1,7 +1,7 @@
 //! `nexusctl` 子命令实现。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
@@ -10,7 +10,10 @@ use boot_core::boot::{
 };
 
 use crate::client;
-use crate::config::{describe_ready, parse_env_arg, parse_ready, Config, Project, Service};
+use crate::config::{
+    describe_ready, parse_env_arg, parse_ready, Config, Project, Service,
+    MAX_STOP_TIMEOUT_SECS,
+};
 use crate::layout::Layout;
 use crate::manifest;
 use crate::output;
@@ -223,6 +226,9 @@ enum ServiceCmd {
         /// 未就绪时阻断后续开机服务
         #[arg(long)]
         required: bool,
+        /// 停止宽限秒数（0=直接强杀；不写继承全局默认）
+        #[arg(long)]
+        stop_timeout: Option<u64>,
         /// 关闭“稳定运行后崩溃自动重启”
         #[arg(long)]
         no_crash_restart: bool,
@@ -260,6 +266,12 @@ enum ServiceCmd {
         crash_restart: bool,
         #[arg(long)]
         no_crash_restart: bool,
+        /// 停止宽限秒数（0=直接强杀）
+        #[arg(long)]
+        stop_timeout: Option<u64>,
+        /// 清除服务自己的停止宽限，回退全局设置
+        #[arg(long)]
+        reset_stop_timeout: bool,
     },
     /// 删除服务（先停止）
     Remove { project: String, name: String },
@@ -426,6 +438,7 @@ fn quick_add(
             order: None,
             ready,
             required: false,
+            stop_timeout: None,
             no_crash_restart: false,
         },
     )
@@ -674,12 +687,12 @@ fn project_action(layout: &Layout, project: &str, action: ProjectAction) -> Resu
         }
         ProjectAction::Stop => {
             for s in services.iter().rev() {
-                send_project_op(layout, "stop", s, Duration::from_secs(30), &mut failures);
+                send_project_op(layout, "stop", s, stop_wait_timeout(&cfg, s), &mut failures);
             }
         }
         ProjectAction::Restart => {
             for s in services.iter().rev() {
-                send_project_op(layout, "stop", s, Duration::from_secs(30), &mut failures);
+                send_project_op(layout, "stop", s, stop_wait_timeout(&cfg, s), &mut failures);
             }
             for s in &services {
                 send_project_op(layout, "start", s, Duration::from_secs(180), &mut failures);
@@ -714,17 +727,21 @@ fn simple_action(
     let Some(name) = service else {
         return project_action(layout, project, action);
     };
-    ensure_service(layout, project, name)?;
+    let cfg = Config::load(&layout.config_path)?;
+    let svc = cfg
+        .find_service(project, name)
+        .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
     let id = format!("{}.{}", project, name);
     let op = match action {
         ProjectAction::Start => "start",
         ProjectAction::Stop => "stop",
         ProjectAction::Restart => "restart",
     };
-    let timeout = if matches!(action, ProjectAction::Stop) {
-        Duration::from_secs(30)
-    } else {
-        Duration::from_secs(180)
+    let stop_timeout = stop_wait_timeout(&cfg, svc);
+    let timeout = match action {
+        ProjectAction::Start => Duration::from_secs(180),
+        ProjectAction::Stop => stop_timeout,
+        ProjectAction::Restart => stop_timeout.saturating_add(Duration::from_secs(180)),
     };
     send_op(layout, op, &id, timeout)?;
     println!("已{} {}", action.verb(), id);
@@ -778,8 +795,12 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             order,
             ready,
             required,
+            stop_timeout,
             no_crash_restart,
         } => {
+            if let Some(secs) = stop_timeout {
+                validate_stop_timeout(secs)?;
+            }
             let mut cfg = Config::load_or_default(&layout.config_path)?;
             if cfg.find_project(&project).is_none() {
                 let Some(path) = project_path else {
@@ -821,6 +842,7 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
                 ready,
                 required,
                 crash_restart: !no_crash_restart,
+                stop_timeout_secs: stop_timeout,
             });
             let reloaded = save_and_sync(layout, &cfg)?;
             println!(
@@ -866,6 +888,8 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             no_required,
             crash_restart,
             no_crash_restart,
+            stop_timeout,
+            reset_stop_timeout,
         } => {
             if boot && no_boot {
                 return Err("--boot 与 --no-boot 不能同时使用".into());
@@ -875,6 +899,12 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             }
             if crash_restart && no_crash_restart {
                 return Err("--crash-restart 与 --no-crash-restart 不能同时使用".into());
+            }
+            if stop_timeout.is_some() && reset_stop_timeout {
+                return Err("--stop-timeout 与 --reset-stop-timeout 不能同时使用".into());
+            }
+            if let Some(secs) = stop_timeout {
+                validate_stop_timeout(secs)?;
             }
             let workdir = match workdir {
                 Some(w) if !w.trim().is_empty() => Some(
@@ -922,6 +952,12 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             }
             if no_crash_restart {
                 svc.crash_restart = false;
+            }
+            if reset_stop_timeout {
+                svc.stop_timeout_secs = None;
+            }
+            if let Some(secs) = stop_timeout {
+                svc.stop_timeout_secs = Some(secs);
             }
             if clear_env {
                 svc.env.clear();
@@ -978,16 +1014,25 @@ fn service_cmd(layout: &Layout, cmd: ServiceCmd) -> Result<(), String> {
             Ok(())
         }
         ServiceCmd::Stop { project, name } => {
-            ensure_service(layout, &project, &name)?;
+            let cfg = Config::load(&layout.config_path)?;
+            let svc = cfg
+                .find_service(&project, &name)
+                .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
             let id = format!("{}.{}", project, name);
-            send_op(layout, "stop", &id, Duration::from_secs(30))?;
+            send_op(layout, "stop", &id, stop_wait_timeout(&cfg, svc))?;
             println!("已停止 {}", id);
             Ok(())
         }
         ServiceCmd::Restart { project, name } => {
-            ensure_service(layout, &project, &name)?;
+            let cfg = Config::load(&layout.config_path)?;
+            let svc = cfg
+                .find_service(&project, &name)
+                .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
             let id = format!("{}.{}", project, name);
-            send_op(layout, "restart", &id, Duration::from_secs(180))?;
+            // restart = 停止宽限 + 启动/就绪超时（180s）
+            let timeout = stop_wait_timeout(&cfg, svc)
+                .saturating_add(Duration::from_secs(180));
+            send_op(layout, "restart", &id, timeout)?;
             println!("已重启 {}", id);
             Ok(())
         }
@@ -1108,6 +1153,8 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
                 "ready": svc.ready.clone(),
                 "required": svc.required,
                 "crash_restart": svc.crash_restart,
+                "stop_timeout_secs": cfg.stop_timeout_of(svc),
+                "stop_timeout_source": cfg.stop_timeout_source(svc),
                 "status": status,
                 "log_path": log_path,
                 "runner_reachable": runner_ok,
@@ -1137,6 +1184,11 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
     println!(
         "崩溃重启:   {}",
         if svc.crash_restart { "yes" } else { "no" }
+    );
+    println!(
+        "停止宽限:   {}s（来源：{}）",
+        cfg.stop_timeout_of(svc),
+        cfg.stop_timeout_source(svc)
     );
     if svc.env.is_empty() {
         println!("环境变量:   （无）");
@@ -1233,6 +1285,8 @@ fn service_json(cfg: &Config, s: &Service, row: &[String]) -> serde_json::Value 
         "ready": s.ready.clone(),
         "command": s.command.clone(),
         "workdir": cfg.workdir_of(s),
+        "stop_timeout_secs": cfg.stop_timeout_of(s),
+        "stop_timeout_source": cfg.stop_timeout_source(s),
         "status": row[4].clone(),
         "pid": row[5].clone(),
     })
@@ -1253,6 +1307,38 @@ fn set_boot(layout: &Layout, project: &str, name: &str, boot: bool) -> Result<()
     svc.boot = boot;
     save_and_sync(layout, &cfg)?;
     Ok(())
+}
+
+/// 单服务停止时 CLI 的等待时间：宽限 + 10s 余量，至少 30s。
+fn stop_wait_timeout(cfg: &Config, svc: &Service) -> Duration {
+    Duration::from_secs(cfg.stop_timeout_of(svc).saturating_add(10).max(30))
+}
+
+/// runner 退出时要顺序停全部服务：按所有服务的宽限总和放大等待。
+fn shutdown_wait_timeout(layout: &Layout) -> Duration {
+    let secs = Config::load(&layout.config_path)
+        .map(|cfg| {
+            cfg.services
+                .iter()
+                .map(|s| cfg.stop_timeout_of(s))
+                .fold(0u64, u64::saturating_add)
+        })
+        .unwrap_or(0);
+    Duration::from_secs(secs.saturating_add(30).max(30))
+}
+
+/// 等 runner 退出（state.runner_pid 变成 0 或心跳过期）。
+fn wait_runner_exit(layout: &Layout, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match client::state(layout) {
+            Some(s) if s.runner_pid != 0 && runner_reachable(&s) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 fn send_op(layout: &Layout, op: &str, id: &str, timeout: Duration) -> Result<(), String> {
@@ -1309,16 +1395,9 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
             // 直接 systemctl disable --now 只会让 systemd 用 cgroup 强杀，状态文件不干净。
             if let Some(st) = client::state(layout) {
                 if runner_reachable(&st) {
-                    let _ = client::send(layout, "shutdown", None, Duration::from_secs(10));
-                    // 给 runner 一点时间 stop_all + 写最终状态；最长等 5 秒。
-                    for _ in 0..50 {
-                        match client::state(layout) {
-                            Some(s) if s.runner_pid != 0 && runner_reachable(&s) => {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            _ => break,
-                        }
-                    }
+                    let timeout = shutdown_wait_timeout(layout);
+                    let _ = client::send(layout, "shutdown", None, timeout);
+                    let _ = wait_runner_exit(layout, timeout);
                 }
             }
             let warnings = systemd::uninstall(layout)?;
@@ -1448,17 +1527,16 @@ fn stop_runner(layout: &Layout, stop_unit: bool) -> Result<(), String> {
     let mut stopped = false;
     if let Some(st) = client::state(layout) {
         if runner_reachable(&st) {
-            let result = client::send(layout, "shutdown", None, Duration::from_secs(10))?;
+            let timeout = shutdown_wait_timeout(layout);
+            let result = client::send(layout, "shutdown", None, timeout)?;
             if !result.ok {
                 return Err(result.error);
             }
-            for _ in 0..50 {
-                match client::state(layout) {
-                    Some(s) if s.runner_pid != 0 && runner_reachable(&s) => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    _ => break,
-                }
+            if !wait_runner_exit(layout, timeout) {
+                return Err(format!(
+                    "runner 在 {} 秒内未退出（服务可能仍在停止）",
+                    timeout.as_secs()
+                ));
             }
             stopped = true;
         }
@@ -1674,6 +1752,16 @@ fn save_and_sync(layout: &Layout, cfg: &Config) -> Result<bool, String> {
     client::reload_if_running(layout)
 }
 
+fn validate_stop_timeout(secs: u64) -> Result<(), String> {
+    if secs > MAX_STOP_TIMEOUT_SECS {
+        return Err(format!(
+            "--stop-timeout 必须在 0-{} 秒之间",
+            MAX_STOP_TIMEOUT_SECS
+        ));
+    }
+    Ok(())
+}
+
 fn parse_envs(args: &[String]) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut out = std::collections::BTreeMap::new();
     for raw in args {
@@ -1789,6 +1877,7 @@ mod tests {
             ready: String::new(),
             required: false,
             crash_restart: true,
+            stop_timeout_secs: None,
         };
         cfg.services.push(svc("p", "b", 20));
         cfg.services.push(svc("p", "a", 10));
@@ -1823,6 +1912,7 @@ mod tests {
             ready: String::new(),
             required: false,
             crash_restart: true,
+            stop_timeout_secs: None,
         };
         cfg.services.push(svc("a", "x"));
         cfg.services.push(svc("b", "y"));

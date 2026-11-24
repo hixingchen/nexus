@@ -20,6 +20,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub const HEARTBEAT_STALE_MS: i64 = 10_000;
 /// 启动器状态文件的版本
 pub const STATE_VERSION: u32 = 1;
+/// 停止服务的默认优雅宽限（Docker / systemd 同量级）
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
 
 pub use crate::health::{normalize as normalize_check, parse as parse_check, HealthCheck as BootCheck};
 
@@ -50,6 +52,9 @@ pub struct BootService {
     /// 稳定运行后崩溃是否自动重启（服务设置里的开关，默认开）。
     #[serde(default = "default_true")]
     pub crash_restart: bool,
+    /// 优雅停止宽限（秒）。0 = 直接强杀；旧 manifest 缺省 10。
+    #[serde(default = "default_stop_timeout")]
+    pub stop_timeout_secs: u64,
     /// 是否在 runner 启动时**自动拉起**。
     ///
     /// Windows 的 manifest 只收 boot_enabled=1 的服务，因此旧 manifest 没有这个字段；
@@ -61,6 +66,10 @@ pub struct BootService {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_stop_timeout() -> u64 {
+    DEFAULT_STOP_TIMEOUT_SECS
 }
 
 // ─── 路径 / 原子写 ──────────────────────────────────────────
@@ -126,6 +135,17 @@ pub struct BootServiceState {
     pub ready_at: Option<String>,
     pub exit_code: Option<i32>,
     pub error: String,
+    /// 最近一次停止结果：graceful / timeout / forced；空 = 没有停止记录
+    #[serde(default)]
+    pub stop_result: String,
+    #[serde(default)]
+    pub stop_elapsed_ms: u64,
+    #[serde(default)]
+    pub stop_killed: u32,
+    #[serde(default)]
+    pub stop_survivors: Vec<u32>,
+    #[serde(default)]
+    pub stopped_at: Option<String>,
     pub log_path: String,
     pub name: String,
     pub project_id: String,

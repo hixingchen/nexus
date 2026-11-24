@@ -538,6 +538,9 @@ function servicePhase(s: BootServiceStatus): {
   if (!s.phase) {
     return { text: '未由启动器管理', textCls: 'text-nexus-muted/50', dot: 'bg-nexus-muted/40' };
   }
+  if (s.phase === 'stopping') {
+    return { text: '停止中', textCls: 'text-nexus-warning', dot: 'bg-nexus-warning' };
+  }
   if (s.alive) {
     if (s.phase === 'starting') {
       return { text: '启动中', textCls: 'text-nexus-warning', dot: 'bg-nexus-warning' };

@@ -65,6 +65,7 @@ pub fn render_unit(layout: &Layout, runner: &Path) -> Result<String, String> {
          ExecStart={runner} --manifest {manifest} --mode {mode}\n\
          Restart=on-failure\n\
          RestartSec=3\n\
+         TimeoutStopSec=300\n\
          KillMode=control-group\n\
          UMask=0077\n\
          StandardOutput=journal\n\
