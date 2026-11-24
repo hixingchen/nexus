@@ -80,11 +80,15 @@ sudo ./install.sh --system
 
 系统级 unit 默认在开机时启动，不需要 linger。
 
+> **系统级安装后，后续所有命令都要带 `--system`**。不带 `--system` 是用户级，
+> 读的是 `~/.config/nexus/nexus.toml`，两套配置互不相通。
+
 > `install.sh` 只安装二进制和示例配置，**不会自动启用开机启动**；启用用 `boot install`。
 
 ## 5. 五分钟快速开始
 
 以下用用户级为例；系统级把 `nexusctl` 换成 `sudo nexusctl --system`，并在 `boot install` 时加 `--run-as <用户>`。
+**系统级命令必须带 `--system`**，否则读的是用户级配置（`~/.config/nexus/nexus.toml`）。
 
 ```bash
 # 1) 添加一个项目（路径必须已存在）
