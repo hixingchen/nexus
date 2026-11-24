@@ -28,6 +28,8 @@ extern "system" {
         hProcess: HANDLE,
     ) -> BOOL;
 
+    fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) -> BOOL;
+
     fn OpenProcess(
         dwDesiredAccess: DWORD,
         bInheritHandle: BOOL,
@@ -129,6 +131,21 @@ impl JobObject {
     pub fn assign_child(&self, child: &std::process::Child) -> Result<(), String> {
         use std::os::windows::io::AsRawHandle;
         self.assign_raw(child.as_raw_handle() as isize, Some(child.id()))
+    }
+
+    /// 立即终止 Job 内所有进程（含已脱离父进程链的子孙）。
+    pub fn terminate(&self) -> Result<(), String> {
+        unsafe {
+            let ret = TerminateJobObject(self.handle, 1);
+            if ret == 0 {
+                Err(format!(
+                    "TerminateJobObject 失败: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     /// 按 pid 加入 Job Object（不持有 `Child` 的场景：tokio 子进程只在 await 期间存在）。
@@ -236,6 +253,45 @@ mod tests {
             if std::time::Instant::now() > deadline {
                 let _ = child.kill();
                 panic!("drop 掉 Job 之后进程 {} 仍然活着 —— KILL_ON_JOB_CLOSE 没生效（结构体偏移或限制没写对？）", pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_terminate_job_kills_assigned_process() {
+        let job = JobObject::new().expect("创建 Job Object");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 6 127.0.0.1 > NUL"])
+            .env("NoDefaultCurrentDirectoryInExePath", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("起测试进程");
+        let pid = child.id();
+        if let Err(e) = job.assign_child(&child) {
+            eprintln!("跳过：本机无法把子进程赋入 Job（{}）", e);
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            crate::winproc::OwnedProcess::open(pid).map(|p| p.is_alive()).unwrap_or(false),
+            "测试进程在赋入 Job 后 200ms 就没了——这条断言的前提不成立"
+        );
+
+        job.terminate().expect("TerminateJobObject");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::winproc::OwnedProcess::open(pid)
+            .map(|p| p.is_alive())
+            .unwrap_or(false)
+        {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("TerminateJobObject 后进程 {} 仍然活着", pid);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

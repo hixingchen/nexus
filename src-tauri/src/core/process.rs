@@ -125,6 +125,9 @@ struct CleanupEntry {
     done_stdout: Option<Receiver<()>>,
     done_stderr: Option<Receiver<()>>,
     stop_flag: Option<Arc<AtomicBool>>,
+    /// Windows：这个服务自己的 Job，停止时连脱离父链的后代一起收。
+    #[cfg(windows)]
+    job: Option<super::job_object::JobObject>,
 }
 
 // ─── ProcessManager ─────────────────────────────────────────
@@ -169,6 +172,9 @@ pub(crate) struct ProcessInfo {
     /// 否则 taskkill 未杀净（孙进程持管道）时，旧进程输出会串进新服务的日志，
     /// 且"停止后日志还在涨"，与已停止状态矛盾
     pub(crate) stop_flag: Arc<AtomicBool>,
+    /// Windows：这个服务自己的 Job，停止时 `TerminateJobObject` 收整棵树。
+    #[cfg(windows)]
+    job: Option<super::job_object::JobObject>,
 }
 
 /// 运行快照的详细元素（`get_running` 用来算就绪阶段与监听端口）。
@@ -375,10 +381,21 @@ impl ProcessManager {
             cmd.envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
 
+        // 每个服务独立 Job：停止单个服务时能连脱离父链的后代一起收。
+        #[cfg(windows)]
+        let mut service_job = match super::job_object::JobObject::new() {
+            Ok(job) => Some(job),
+            Err(e) => {
+                log::warn!("[nexus] 服务 {} 创建独立 Job Object 失败: {}", key, e);
+                None
+            }
+        };
         // 有 Job Object 时**挂起创建**（CQ-27①）：纳管与唤醒都在下面按顺序做。
         // `creation_flags` 是设置不是追加，所以这里必须用与 build_command 同一组常量
         #[cfg(windows)]
-        if self.job.is_some() {
+        let suspended = self.job.is_some() || service_job.is_some();
+        #[cfg(windows)]
+        if suspended {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(SERVICE_CREATE_FLAGS | CREATE_SUSPENDED);
         }
@@ -408,36 +425,49 @@ impl ProcessManager {
             })?;
 
         #[cfg(windows)]
-        if let Some(ref job) = self.job {
-            // 纳管失败**必须让用户看见**（CQ-27）：它只在"Nexus 被强杀/崩溃"时才有后果
-            // （该服务的进程会残留），而那正是用户最需要线索的时刻——只写进 nexus.log
-            // 等于没有。这里写进服务自己的日志缓冲，日志面板里直接看得到
-            if let Err(e) = job.assign_child(&child) {
-                self.append_system_line(key, format!(
-                    "⚠ 未能纳入 Job Object：{} —— Nexus 异常退出（崩溃/被杀）时该服务的进程可能残留，正常退出不受影响",
-                    e
-                ));
+        {
+            if let Some(ref job) = self.job {
+                // 纳管失败**必须让用户看见**（CQ-27）：它只在"Nexus 被强杀/崩溃"时才有后果
+                // （该服务的进程会残留），而那正是用户最需要线索的时刻——只写进 nexus.log
+                // 等于没有。这里写进服务自己的日志缓冲，日志面板里直接看得到
+                if let Err(e) = job.assign_child(&child) {
+                    self.append_system_line(key, format!(
+                        "⚠ 未能纳入共享 Job Object：{} —— Nexus 异常退出（崩溃/被杀）时该服务的进程可能残留，正常退出不受影响",
+                        e
+                    ));
+                }
+            }
+            if let Some(job) = service_job.as_ref() {
+                if let Err(e) = job.assign_child(&child) {
+                    self.append_system_line(key, format!(
+                        "⚠ 未能纳入独立 Job Object：{} —— 停止时可能漏掉已脱离父进程链的后代",
+                        e
+                    ));
+                    service_job = None;
+                }
             }
             // 纳管之后再放行（顺序不能反：先唤醒就等于回到"spawn 之后再绑定"的老样子）。
             // 唤醒失败是**致命**的——进程挂在创建态，服务永远起不来，必须杀掉并如实报错，
             // 否则用户看到的是"启动了但一行输出都没有"这种查不下去的状态
-            if let Err(e) = resume_suspended_child(child.id()) {
-                kill_and_reap(&mut child, Duration::from_millis(2000));
-                let msg = format!("启动失败: 进程已创建但无法唤醒（{}）", e);
-                self.append_system_line(key, msg.clone());
-                if let Ok(mut failed) = self.failed.lock() {
-                    failed.insert(key.to_string(), FailedService {
-                        service_id: key.to_string(),
-                        service_name: name.to_string(),
-                        exit_code: None,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        source: "local".into(),
-                        port_conflict: None,
-                        uptime_ms: None,
-                        crash_restart,
-                    });
+            if suspended {
+                if let Err(e) = resume_suspended_child(child.id()) {
+                    kill_and_reap(&mut child, Duration::from_millis(2000));
+                    let msg = format!("启动失败: 进程已创建但无法唤醒（{}）", e);
+                    self.append_system_line(key, msg.clone());
+                    if let Ok(mut failed) = self.failed.lock() {
+                        failed.insert(key.to_string(), FailedService {
+                            service_id: key.to_string(),
+                            service_name: name.to_string(),
+                            exit_code: None,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            source: "local".into(),
+                            port_conflict: None,
+                            uptime_ms: None,
+                            crash_restart,
+                        });
+                    }
+                    return Err(msg);
                 }
-                return Err(msg);
             }
         }
 
@@ -532,6 +562,8 @@ impl ProcessManager {
                 child: Some(child), adopted: Vec::new(), follow: None,
                 done_stdout: done_rx_opt.take(), done_stderr: Some(done_rx2),
                 stop_flag: Some(Arc::clone(&stop_flag)),
+                #[cfg(windows)]
+                job: service_job,
             }, None);
             return Err(format!("{} 已在运行中", key));
         }
@@ -549,6 +581,8 @@ impl ProcessManager {
             done_stdout: done_rx_opt,
             done_stderr: Some(done_rx2),
             stop_flag,
+            #[cfg(windows)]
+            job: service_job,
         });
         // 与新实例入表在同一把 processes 锁内清除旧失败标记（锁序 processes → failed，
         // 与 tick 的落表路径一致）。这样 tick 的落表只有两种结局：先于本句（被本句清掉）
@@ -1395,6 +1429,8 @@ fn take_cleanup_entry(key: String, info: &mut ProcessInfo) -> CleanupEntry {
         done_stdout: info.done_stdout.take(),
         done_stderr: info.done_stderr.take(),
         stop_flag: Some(Arc::clone(&info.stop_flag)),
+        #[cfg(windows)]
+        job: info.job.take(),
     }
 }
 
@@ -1623,7 +1659,7 @@ pub(crate) fn kill_descendants_of(_pid: u32) -> usize {
 }
 
 fn cleanup_process(entry: CleanupEntry, snapshot: Option<&[super::winproc::ProcEntry]>) -> CleanupOutcome {
-    let CleanupEntry { key: _key, pid, started_at, mut child, adopted, follow, done_stdout, done_stderr, stop_flag } = entry;
+    let CleanupEntry { key: _key, pid, started_at, mut child, adopted, follow, done_stdout, done_stderr, stop_flag, #[cfg(windows)] job } = entry;
     // 先置停止标志：reader 线程立刻停止写缓冲与 emit。
     // 否则进程树未杀净（孙进程持管道）时旧线程会继续往同一个 key 写日志——
     // 表现为"已停止的服务日志还在涨"，重启后新旧进程输出还会串台
@@ -1669,6 +1705,13 @@ fn cleanup_process(entry: CleanupEntry, snapshot: Option<&[super::winproc::ProcE
     for orphan in &orphans {
         log::info!("[nexus] 结束游离孙进程 (pid={})", orphan);
         kill(*orphan, "游离孙进程");
+    }
+    // taskkill 按父链收完后，再用 per-service Job 补收已脱离父链的成员。
+    #[cfg(windows)]
+    if let Some(job) = job.as_ref() {
+        if let Err(e) = job.terminate() {
+            log::warn!("[nexus] TerminateJobObject 失败 (pid={}): {}", pid, e);
+        }
     }
     let exited = match child.as_mut() {
         Some(c) => wait_with_timeout(c, Duration::from_millis(2000)),

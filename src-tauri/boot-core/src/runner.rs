@@ -89,6 +89,9 @@ mod imp {
         child_started_at: u64,
         /// 直接子进程退出后接管的存活后代
         adopted: Vec<crate::process_exec::AdoptedChild>,
+        /// Windows：每个服务独立的 Job，停止时能连整棵树一起收。
+        #[cfg(windows)]
+        job: Option<crate::job_object::JobObject>,
         /// 本次启动注入的实例标记；用于找回 setsid/double-fork 到新会话的后代。
         instance_tag: String,
         name: String,
@@ -504,11 +507,34 @@ mod imp {
             if let Some(job) = &self.job {
                 if let Err(e) = job.assign_child(&child) {
                     self.log.info(&format!(
-                        "⚠ 服务「{}」未纳入 Job Object（runner 异常退出时可能残留）: {}",
+                        "⚠ 服务「{}」未纳入共享 Job Object（runner 异常退出时可能残留）: {}",
                         svc.name, e
                     ));
                 }
             }
+
+            // 每个服务再单独一个 Job：停止单个服务时 `TerminateJobObject` 能收到
+            // 已脱离父进程链的子孙；共享 Job 仍负责 runner 整体退出时兜底。
+            #[cfg(windows)]
+            let service_job = match crate::job_object::JobObject::new() {
+                Ok(job) => match job.assign_child(&child) {
+                    Ok(()) => Some(job),
+                    Err(e) => {
+                        self.log.info(&format!(
+                            "⚠ 服务「{}」未纳入独立 Job Object（停止范围可能不完整）: {}",
+                            svc.name, e
+                        ));
+                        None
+                    }
+                },
+                Err(e) => {
+                    self.log.info(&format!(
+                        "⚠ 服务「{}」创建独立 Job Object 失败（停止范围可能不完整）: {}",
+                        svc.name, e
+                    ));
+                    None
+                }
+            };
 
             let pid = child.id();
             let process_started_at = crate::process_exec::process_start_time_millis(pid).unwrap_or(0);
@@ -516,6 +542,8 @@ mod imp {
                 child: Some(child),
                 child_started_at: process_started_at,
                 adopted: Vec::new(),
+                #[cfg(windows)]
+                job: service_job,
                 instance_tag,
                 name: svc.name.clone(),
                 log_path: svc.log_path.clone(),
@@ -1138,21 +1166,49 @@ mod imp {
 
             #[cfg(not(target_os = "linux"))]
             {
-                // Windows / 其它 Unix：保持既有的强杀语义；Windows 不做优雅阶段。
+                // Windows / 其它 Unix：保持强杀语义；Windows 不做优雅阶段。
+                let mut taskkill_error = String::new();
                 if let Some(child) = run.child.as_mut() {
                     if let Err(e) = crate::process_exec::kill_process_tree(child.id()) {
-                        kill_error = e;
+                        if taskkill_error.is_empty() {
+                            taskkill_error = e;
+                        }
                     }
                 }
                 // 直接子进程已经退出时，真正在跑的是认领的后代——必须一起结束。
                 for a in &run.adopted {
                     if a.handle.is_alive() {
                         if let Err(e) = crate::process_exec::kill_process_tree(a.pid) {
-                            if kill_error.is_empty() {
-                                kill_error = e;
+                            if taskkill_error.is_empty() {
+                                taskkill_error = e;
                             }
                         }
                     }
+                }
+
+                // taskkill 先按父链收；Job 再补收已脱离父链/Job 内的其它成员。
+                #[cfg(windows)]
+                let job_terminated = if let Some(job) = run.job.as_ref() {
+                    match job.terminate() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            if kill_error.is_empty() {
+                                kill_error = e;
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                #[cfg(not(windows))]
+                let job_terminated = false;
+                if job_terminated {
+                    // 子进程已被 taskkill 收掉时 taskkill 可能报“找不到进程”，忽略。
+                    taskkill_error.clear();
+                }
+                if !taskkill_error.is_empty() && kill_error.is_empty() {
+                    kill_error = taskkill_error;
                 }
                 targets_count = run.child.is_some() as usize + run.adopted.len();
                 killed = targets_count;

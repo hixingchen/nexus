@@ -140,6 +140,12 @@ jobs:
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
 
+            ## 2.8.0 · Windows 停止范围
+
+            - **每个服务独立 Job Object**：boot runner 与 GUI 本地服务在共享 Job 之外，再各自一个 per-service Job；停止时 `TerminateJobObject` 收掉已脱离父进程链的子孙，然后仍保留 `taskkill /T /F` 兜底。
+            - 共享 Job 仍负责 Nexus/runner 异常退出时整体清理；per-service Job 在服务正常退出/停止后随句柄关闭。
+            - **仍未做**：Windows 没有可靠的控制台优雅信号，停止仍是强制；`stop_timeout` 的 Windows 语义、CTRL_BREAK best-effort 留作后续。
+
             ## 2.7.0 · Linux 服务端版
 
             ### 停止语义 P1：覆盖 double-fork / reparent
