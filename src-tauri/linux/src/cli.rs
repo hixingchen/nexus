@@ -389,12 +389,20 @@ fn quick_add(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("app");
-    let project = default_name(dir_name);
-    let service = name.unwrap_or_else(|| project.clone());
 
+    // 先按目录找已有项目：`project add --name 自定义名` 之后，add 仍能挂到它下面，
+    // 而不是按目录名再建一个同路径项目。
     let cfg = Config::load_or_default(&layout.config_path)?;
+    let project = match cfg
+        .projects
+        .iter()
+        .find(|p| project_path_matches(p, &canonical))
+    {
+        Some(existing) => existing.name.clone(),
+        None => default_name(dir_name),
+    };
     if let Some(existing) = cfg.find_project(&project) {
-        if Path::new(&existing.path) != canonical {
+        if !project_path_matches(existing, &canonical) {
             return Err(format!(
                 "项目名 {} 已存在，但路径是 {}（不是 {}）。请用 service add -p <项目> 指定已有项目",
                 project,
@@ -403,6 +411,7 @@ fn quick_add(
             ));
         }
     }
+    let service = name.unwrap_or_else(|| project.clone());
 
     service_cmd(
         layout,
@@ -420,6 +429,15 @@ fn quick_add(
             no_crash_restart: false,
         },
     )
+}
+
+/// 项目路径是否指向同一个目录（配置文件里的路径可能没规范化）。
+fn project_path_matches(project: &Project, canonical: &Path) -> bool {
+    let path = Path::new(&project.path);
+    path == canonical
+        || std::fs::canonicalize(path)
+            .map(|p| p == canonical)
+            .unwrap_or(false)
 }
 
 /// 目录名 → 合法的项目名：非法字符替换为 `-`，并去掉首尾的 `-`。

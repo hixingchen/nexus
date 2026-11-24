@@ -93,16 +93,26 @@ sudo loginctl enable-linger "$USER"
 
 假设项目目录 `/srv/app` 已存在，启动命令 `npm run start`。
 
-### 第 1 步：加服务（一行）
+### 第 1 步：添加项目
+
+```bash
+sudo nexusctl project add /srv/app --name app
+```
+
+- 目录必须已存在。
+- `--name app` 是项目名，后面 start/stop/status 都用它；不写则默认取目录名。
+- 如果跳过这步，下一步的 `add` 也会自动创建项目；显式写出来更容易理解。
+
+### 第 2 步：添加服务（一行）
 
 ```bash
 sudo nexusctl add /srv/app -c "npm run start" --boot
 ```
 
-- `/srv/app`：项目目录。项目名默认取目录名（这里是 `app`），服务名默认与项目名相同（`app`）。
+- `add` 会按目录路径识别第 1 步的项目（即使项目名是自定义的）。
+- 服务名默认与项目名相同（这里是 `app`）；加第二个服务时用 `--name worker`。
 - `-c`：启动命令。
 - `--boot`：开机自启；runner 正在运行时**立即启动**。
-- 同一个项目加第二个服务：加 `--name worker`。
 - 要等端口就绪：加 `--ready tcp:127.0.0.1:3000`；不写就是进程存活即就绪。
 
 加完后用 `nexusctl status` 看实际项目名/服务名；下面的命令就用显示出来的名字。
@@ -115,7 +125,7 @@ sudo nexusctl add /srv/app -c "sleep 3600" --boot
 
 需要工作目录、环境变量、启动顺序、未就绪阻断等进阶选项时，再用完整写法（见 5.2）。
 
-### 第 2 步：查看状态/日志
+### 第 3 步：查看状态/日志
 
 ```bash
 sudo nexusctl status                  # 总览：unit、runner、全部服务
@@ -141,7 +151,7 @@ app      worker   no    0      stopped  -     进程存活即可
 
 加 `--json` 可输出结构化数据。
 
-### 第 3 步：启动/停止/重启
+### 第 4 步：启动/停止/重启
 
 ```bash
 # 单个服务
@@ -158,7 +168,7 @@ sudo nexusctl restart app
 这些是**立即操作**，不会改变 `--boot` 标记。它们要求 runner 在运行（安装脚本已经启动）。
 `add --boot` 在 runner 运行时也会立即启动服务；不加 `--boot` 的服务加完后用 `start`。
 
-### 第 4 步：开机自启
+### 第 5 步：开机自启
 
 装机时已经执行过 `boot install`，systemd unit 已启用；不写 `--run-as` 时以 root 运行，
 写了则按 unit 里的 `User=` 降权。**不需要每个服务再安装一次**：
@@ -169,7 +179,7 @@ sudo nexusctl status
 systemctl is-enabled nexus-boot-runner.service
 ```
 
-### 第 5 步：删除
+### 第 6 步：删除
 
 ```bash
 sudo nexusctl stop app app
