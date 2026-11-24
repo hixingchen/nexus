@@ -2,11 +2,81 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use boot_core::textenc::decode_to_string;
+
+/// 终端语义色。ANSI 用零宽转义序列，表格计算列宽时要跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Green,
+    Red,
+    Yellow,
+    Cyan,
+    Dim,
+}
+
+impl Color {
+    fn code(self) -> &'static str {
+        match self {
+            Color::Green => "32",
+            Color::Red => "31",
+            Color::Yellow => "33",
+            Color::Cyan => "36",
+            Color::Dim => "2",
+        }
+    }
+}
+
+fn color_enabled() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
+/// 给终端文本上色；非 TTY / NO_COLOR / TERM=dumb 时原样返回。
+pub fn paint(text: &str, color: Color) -> String {
+    if !color_enabled() {
+        return text.to_string();
+    }
+    format!("\x1b[{}m{}\x1b[0m", color.code(), text)
+}
+
+/// 状态机 → 颜色：成功绿、失败红、进行中黄、停止灰。
+pub fn phase_color(phase: &str) -> Option<Color> {
+    match phase {
+        "ready" => Some(Color::Green),
+        "failed" => Some(Color::Red),
+        "starting" | "restarting" | "pending" => Some(Color::Yellow),
+        "stopped" | "exited" | "skipped" => Some(Color::Dim),
+        _ => None,
+    }
+}
+
+/// 终端显示宽度：跳过 ANSI CSI 序列，避免颜色码把表格撑歪。
+fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
 
 /// 一次最多读日志末尾这么多字节：日志再大也不会整份进内存。
 pub const MAX_TAIL_BYTES: u64 = 8 * 1024 * 1024;
@@ -16,11 +86,11 @@ const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 /// 打印表头 + 行；列宽按字符数计算（服务名限制 ASCII，状态可能是中文）。
 pub fn table(headers: &[&str], rows: &[Vec<String>]) {
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|h| visible_width(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.chars().count());
+                widths[i] = widths[i].max(visible_width(cell));
             }
         }
     }
@@ -32,7 +102,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
             }
             line.push_str(cell);
             if i + 1 < cells.len() {
-                let pad = widths[i].saturating_sub(cell.chars().count());
+                let pad = widths[i].saturating_sub(visible_width(cell));
                 line.push_str(&" ".repeat(pad));
             }
         }
@@ -213,6 +283,13 @@ pub fn map_to_json(map: &BTreeMap<String, String>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_width_ignores_ansi_color() {
+        assert_eq!(visible_width("ready"), 5);
+        assert_eq!(visible_width("\x1b[32mready\x1b[0m"), 5);
+        assert_eq!(visible_width("a\x1b[1;31mb\x1b[0mc"), 3);
+    }
 
     fn temp_log(tag: &str) -> std::path::PathBuf {
         let path =

@@ -571,7 +571,7 @@ fn show_project(layout: &Layout, name: &str, json: bool) -> Result<(), String> {
         println!("（该项目下没有服务）");
         return Ok(());
     }
-    let table_rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
+    let table_rows = display_rows(rows);
     output::table(
         &[
             "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
@@ -1051,7 +1051,7 @@ fn list_services(layout: &Layout, json: bool, project: Option<&str>) -> Result<(
         );
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = rows_all.into_iter().map(|(_, row)| row).collect();
+    let rows = display_rows(rows_all);
     output::table(
         &[
             "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
@@ -1148,9 +1148,13 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
     }
     match st {
         Some(s) => {
+            let phase = match output::phase_color(&s.phase) {
+                Some(color) => output::paint(&s.phase, color),
+                None => s.phase.clone(),
+            };
             println!(
                 "运行状态:   {}（pid {}）",
-                s.phase,
+                phase,
                 s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
             );
             if !s.error.is_empty() {
@@ -1203,6 +1207,18 @@ fn service_rows<'a>(
                 describe_ready(&s.ready),
             ];
             (s, row)
+        })
+        .collect()
+}
+
+/// 终端表格用的行：只给 STATUS 列上色；JSON 路径继续用未着色的 `service_rows`。
+fn display_rows(rows: Vec<(&Service, Vec<String>)>) -> Vec<Vec<String>> {
+    rows.into_iter()
+        .map(|(_, mut row)| {
+            if let Some(color) = output::phase_color(&row[4]) {
+                row[4] = output::paint(&row[4], color);
+            }
+            row
         })
         .collect()
 }
@@ -1554,45 +1570,60 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
         layout.unit_path.display(),
         if unit_exists { "" } else { "（未安装）" }
     );
-    println!(
-        "active:  {}",
-        match unit.active {
-            Some(true) => "active",
-            Some(false) => "inactive",
-            None => "unknown",
-        }
-    );
-    println!(
-        "enabled: {}",
-        match unit.enabled {
-            Some(true) => "yes（开机自启）",
-            Some(false) => "no",
-            None => "unknown",
-        }
-    );
+    let active_text = match unit.active {
+        Some(true) => "active",
+        Some(false) => "inactive",
+        None => "unknown",
+    };
+    let active_color = match unit.active {
+        Some(true) => output::Color::Green,
+        Some(false) => output::Color::Red,
+        None => output::Color::Yellow,
+    };
+    println!("active:  {}", output::paint(active_text, active_color));
+    let enabled_text = match unit.enabled {
+        Some(true) => "yes（开机自启）",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    let enabled_color = match unit.enabled {
+        Some(true) => output::Color::Green,
+        Some(false) => output::Color::Yellow,
+        None => output::Color::Yellow,
+    };
+    println!("enabled: {}", output::paint(enabled_text, enabled_color));
     if !layout.system {
-        println!(
-            "linger:  {}",
-            match unit.linger {
-                Some(true) => "on（无人登录也启动）",
-                Some(false) => "off（登录后才启动；sudo loginctl enable-linger <user>）",
-                None => "unknown",
-            }
-        );
+        let linger_text = match unit.linger {
+            Some(true) => "on（无人登录也启动）",
+            Some(false) => "off（登录后才启动；sudo loginctl enable-linger <user>）",
+            None => "unknown",
+        };
+        let linger_color = match unit.linger {
+            Some(true) => output::Color::Green,
+            _ => output::Color::Yellow,
+        };
+        println!("linger:  {}", output::paint(linger_text, linger_color));
     }
     match state.as_ref() {
-        Some(s) => println!(
-            "runner:  pid={} mode={} heartbeat={} {}",
-            s.runner_pid,
-            s.mode,
-            s.heartbeat_at,
-            if reachable {
-                "reachable"
+        Some(s) => {
+            let runner_state = if reachable { "reachable" } else { "unreachable" };
+            let runner_color = if reachable {
+                output::Color::Green
             } else {
-                "unreachable"
-            }
+                output::Color::Red
+            };
+            println!(
+                "runner:  pid={} mode={} heartbeat={} {}",
+                s.runner_pid,
+                s.mode,
+                s.heartbeat_at,
+                output::paint(runner_state, runner_color)
+            );
+        }
+        None => println!(
+            "runner:  {}",
+            output::paint("未运行（没有 state.json）", output::Color::Red)
         ),
-        None => println!("runner:  未运行（没有 state.json）"),
     }
 
     match cfg_result {
@@ -1610,7 +1641,7 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join(" / ");
                 println!("服务: {} 个（{}）", rows.len(), summary);
-                let table_rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
+                let table_rows = display_rows(rows);
                 output::table(
                     &[
                         "PROJECT", "SERVICE", "BOOT", "ORDER", "STATUS", "PID", "READY",
@@ -1619,7 +1650,7 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
                 );
             }
         }
-        Some(Err(e)) => println!("配置:   {}", e),
+        Some(Err(e)) => println!("配置:   {}", output::paint(&e, output::Color::Red)),
         None => {}
     }
     Ok(())

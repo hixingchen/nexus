@@ -157,6 +157,9 @@ app      worker   no    0      stopped  -     进程存活即可
 
 加 `--json` 可输出结构化数据。
 
+在终端里状态会自动上色：`active`/`ready` 绿色、`failed` 红色、`starting` 黄色。
+输出到管道/文件，或设置 `NO_COLOR=1` 时自动关闭颜色，不会污染脚本输出。
+
 ### 第 4 步：启动/停止/重启
 
 ```bash
