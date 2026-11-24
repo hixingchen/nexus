@@ -53,20 +53,27 @@ sha256sum -c nexus-<版本>-linux-<架构>.tar.gz.sha256
 ```bash
 tar xzf nexus-<版本>-linux-<架构>.tar.gz
 cd nexus-<版本>-linux-<架构>
-sudo ./install.sh --system --run-as admin
+sudo ./install.sh --system
 ```
 
-- `--run-as admin`：runner 和所有服务进程以该用户身份运行（按实际替换，示例用 `admin`；
-  必须是系统里已存在的用户；建议非 root，例如 `useradd -r -m -s /bin/bash admin`）。
+- 不写 `--run-as` 时，systemd unit 不设置 `User=`，runner 与所有服务**以 root 运行**。
+  这是最简单的用法，但权限较大。
+- 更安全（推荐）：用一个已存在的非 root 用户降权：
+  ```bash
+  sudo ./install.sh --system --run-as admin
+  ```
+  `admin` 按实际替换；该用户要能读项目目录并写它的日志/工作目录。
 - 安装到：二进制 `/usr/local/bin/`，配置 `/etc/nexus/nexus.toml`，数据 `/var/lib/nexus/`。
 - 脚本会立即写入 systemd unit、`enable --now` 并启动 runner。空配置也会常驻，
   之后加服务不用再执行 `boot install`。
 - 安装完成后所有命令**不需要 `--system`**：默认就是系统级。
 
-如果安装时没写 `--run-as`，补一次：
+之后想从 root 改成非 root 运行（或换用户），执行一次：
 
 ```bash
 sudo nexusctl --run-as admin boot install
+# 反过来从非 root 改回 root：
+sudo nexusctl --run-as root boot install
 ```
 
 ### 4.1 桌面/用户级（可选；服务器忽略）
@@ -421,11 +428,12 @@ nexusctl config validate   # 校验配置
 ### 8.1 系统级 unit（服务器默认）
 
 ```bash
-sudo nexusctl --run-as <用户> boot install
+sudo nexusctl boot install              # 不降权，以 root 运行
+sudo nexusctl --run-as <用户> boot install  # 推荐：降权到非 root 用户
 ```
 
 - unit 文件：`/etc/systemd/system/nexus-boot-runner.service`
-- `User=<用户>`；以该用户跑 runner 和它拉起的服务。
+- 指定 `--run-as` 时写 `User=<用户>`；不指定则不写 `User=`，systemd 默认 root。
 - 开机时由 `multi-user.target` 启动，不需要 linger。
 - 查看：`systemctl status nexus-boot-runner.service`
 - 日志：`journalctl -u nexus-boot-runner.service -e`，或 `nexusctl logs --runner -f`

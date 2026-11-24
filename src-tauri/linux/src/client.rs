@@ -18,7 +18,7 @@ pub fn require_runner(layout: &Layout) -> Result<BootRunnerState, String> {
     let Some(st) = state(layout) else {
         let how = if layout.system {
             format!(
-                "sudo nexusctl --run-as <用户> boot install，或 systemctl start {}",
+                "sudo nexusctl boot install（要降权可加 --run-as <用户>），或 systemctl start {}",
                 layout.unit_name()
             )
         } else {

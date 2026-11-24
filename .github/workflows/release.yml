@@ -140,6 +140,11 @@ jobs:
             - **可诊断性**：前端错误也写进 `~/.nexus/logs/nexus.log`（行首带 `[frontend]`），打包版没有控制台也能追因；同一个错误 60 秒内超过 5 条会被限流，并在日志里**明说**"已开始丢弃"
             - **界面**：深色主题、自定义标题栏、可拖拽面板与布局持久化、全局搜索；**Markdown 文件默认打开渲染预览**（标签栏一点即切回源码编辑，视图模式按标签各记）；快捷键（Ctrl+S 保存、Ctrl+F 查找、Ctrl+Z / Ctrl+Shift+Z 撤销重做、Ctrl+W 关闭标签、Esc 关闭面板）
 
+            ## 2.4.1 · Linux 服务端版
+
+            - **`--run-as` 改为可选**：`sudo ./install.sh --system` 即可安装并启用；不写时 systemd unit 不设置 `User=`，runner 与服务以 root 运行。仍推荐 `--run-as <非 root 用户>` 降权。
+            - 安装脚本不再在缺少 `--run-as` 时停下等第二步；升级时自动读取已有 unit 的 `User=`。
+
             ## 2.4.0 · Linux 服务端版
 
             ### 新增 / 调整
@@ -193,7 +198,8 @@ jobs:
             解压后一条命令安装并启用开机自启：
 
             ```bash
-            sudo ./install.sh --system --run-as <运行用户>
+            sudo ./install.sh --system
+            # 推荐降权：sudo ./install.sh --system --run-as <运行用户>
             ```
 
             之后用 `nexusctl status`、`nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <目录> --boot`

@@ -34,14 +34,16 @@ pub fn render_unit(layout: &Layout, runner: &Path) -> Result<String, String> {
     let mode = if layout.system { "system" } else { "user" };
 
     let (after, wanted, user_line) = if layout.system {
-        let user = layout
-            .run_as
-            .as_deref()
-            .ok_or_else(|| "system 模式缺少 run_as".to_string())?;
+        // 不写 --run-as 时不生成 User=，systemd 默认以 root 运行。
         (
             "After=network-online.target\nWants=network-online.target",
             "WantedBy=multi-user.target",
-            format!("User={}\n", user),
+            layout
+                .run_as
+                .as_deref()
+                .filter(|user| *user != "root")
+                .map(|user| format!("User={}\n", user))
+                .unwrap_or_default(),
         )
     } else {
         (
@@ -171,12 +173,6 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
                 .into(),
         );
     }
-    if layout.system && layout.run_as.is_none() {
-        return Err(
-            "system 模式需要 --run-as <用户>（或用 sudo 运行以自动采用 SUDO_USER）".into(),
-        );
-    }
-
     let unit = render_unit(layout, runner)?;
     if let Some(parent) = layout.unit_path.parent() {
         std::fs::create_dir_all(parent)
@@ -191,11 +187,10 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
     }
 
     if layout.system {
-        let user = layout
-            .run_as
-            .as_deref()
-            .ok_or_else(|| "system 模式缺少 run_as".to_string())?;
-        chown_tree(&layout.data_dir, user)?;
+        // 指定了运行用户才需要把数据目录交给它；省略 --run-as 时 runner 以 root 运行。
+        if let Some(user) = layout.run_as.as_deref() {
+            chown_tree(&layout.data_dir, user)?;
+        }
     }
 
     // 升级场景：unit 已在跑时 `enable --now` 不会重载新二进制，必须 restart。
@@ -208,7 +203,7 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
     }
 
     let user = if layout.system {
-        layout.run_as.clone()
+        layout.run_as.clone().or_else(|| Some("root".to_string()))
     } else {
         layout.current_user()
     };
@@ -218,6 +213,12 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
         user.as_deref().and_then(linger_enabled)
     };
     let mut warnings = Vec::new();
+    if layout.system && layout.run_as.is_none() {
+        warnings.push(
+            "未指定 --run-as：runner 与所有服务将以 root 运行（不推荐；建议 --run-as <非 root 用户>）"
+                .into(),
+        );
+    }
     if matches!(linger, Some(false)) {
         warnings.push(format!(
             "linger 未开启：无人登录时不会启动。执行 `sudo loginctl enable-linger {}`",
@@ -262,7 +263,7 @@ pub fn status(layout: &Layout) -> Status {
     let active = systemctl_active(layout);
     let enabled = systemctl_enabled(layout);
     let user = if layout.system {
-        layout.run_as.clone()
+        layout.run_as.clone().or_else(|| Some("root".to_string()))
     } else {
         layout.current_user()
     };
@@ -533,6 +534,23 @@ mod tests {
         assert!(unit.contains("User=deploy"));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(unit.contains("--mode system"));
+    }
+
+    #[test]
+    fn system_unit_without_run_as_omits_user() {
+        let mut l = layout(true);
+        l.run_as = None;
+        let unit = render_unit(&l, Path::new("/usr/local/bin/nexus-boot-runner")).unwrap();
+        assert!(!unit.contains("User="), "省略 --run-as 时交给 systemd 默认 root");
+        assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn system_unit_with_explicit_root_also_omits_user() {
+        let mut l = layout(true);
+        l.run_as = Some("root".into());
+        let unit = render_unit(&l, Path::new("/usr/local/bin/nexus-boot-runner")).unwrap();
+        assert!(!unit.contains("User="), "显式 root 与默认 root 生成同样的 unit");
     }
 
     #[test]

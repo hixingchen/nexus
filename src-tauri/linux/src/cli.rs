@@ -25,7 +25,7 @@ pub struct Cli {
     /// 兼容旧用法：系统级现在是默认，保留该参数不报错
     #[arg(long, global = true, hide = true)]
     system: bool,
-    /// 系统级 unit 的服务运行用户（默认 SUDO_USER；安装时必填）
+    /// 系统级 unit 的服务运行用户（省略则 systemd 以 root 运行；建议指定非 root 用户）
     #[arg(long, global = true)]
     run_as: Option<String>,
     /// 配置文件路径（默认 /etc/nexus/nexus.toml；--user 时 ~/.config/nexus/nexus.toml）

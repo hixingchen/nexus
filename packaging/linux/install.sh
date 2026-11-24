@@ -2,7 +2,7 @@
 # Nexus Linux 服务端安装脚本。
 #
 # 默认按当前身份选择模式：root 装系统级（服务器推荐），普通用户装用户级（桌面）。
-# 系统级可用 --run-as <用户> 在安装当天就写好 systemd unit 并启动 runner。
+# 系统级不写 --run-as 时由 systemd 以 root 运行；建议指定一个非 root 用户降权。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,11 +15,12 @@ usage() {
 
   --system        安装到 /usr/local/bin、/etc/nexus、/var/lib/nexus（需要 root）
   --user          安装到 ~/.local/bin、~/.config/nexus、~/.nexus（桌面场景）
-  --run-as <用户> 系统级：runner 以该用户身份运行服务；同时立即安装并启用开机 unit
+  --run-as <用户> 系统级：runner 以该用户身份运行服务；不写则以 root 运行（不推荐）
   -h, --help      显示本帮助
 
 不指定 --system/--user 时：root 用系统级，其它用户用用户级。
-服务器（无桌面）只需要系统级：sudo ./install.sh --system --run-as <运行用户>
+服务器（无桌面）只需要系统级：sudo ./install.sh --system
+更安全：sudo ./install.sh --system --run-as <非 root 用户>
 EOF
 }
 
@@ -48,7 +49,7 @@ fi
 
 if [ "$MODE" = "system" ]; then
   if [ "$(id -u)" -ne 0 ]; then
-    echo "[nexus] --system 需要 root（请用 sudo ./install.sh --system --run-as <用户>）" >&2
+    echo "[nexus] --system 需要 root（请用 sudo ./install.sh --system）" >&2
     exit 1
   fi
   BIN_DIR="/usr/local/bin"
@@ -71,15 +72,14 @@ if [ "$MODE" = "system" ]; then
   if [ -n "$RUN_AS" ]; then
     echo "[nexus] 安装 systemd unit（服务运行用户：$RUN_AS）..."
     "$BIN_DIR/nexusctl" --run-as "$RUN_AS" boot install
-    echo "[nexus] 完成。后续命令不需要 --system："
-    echo "  nexusctl status"
-    echo "  nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <项目目录> --boot"
-    echo "  systemctl status nexus-boot-runner"
   else
-    echo "[nexus] 下一步（root 直接运行时要指定服务用户）："
-    echo "  sudo nexusctl --run-as <运行用户> boot install"
-    echo "然后：nexusctl status"
+    echo "[nexus] 未指定 --run-as：runner 与服务将以 root 运行（建议 --run-as <非 root 用户>）" >&2
+    "$BIN_DIR/nexusctl" boot install
   fi
+  echo "[nexus] 完成。后续命令不需要 --system："
+  echo "  nexusctl status"
+  echo "  nexusctl service add -p <项目> -n <服务> -c '<命令>' --project-path <项目目录> --boot"
+  echo "  systemctl status nexus-boot-runner"
 else
   BIN_DIR="${HOME}/.local/bin"
   CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus"

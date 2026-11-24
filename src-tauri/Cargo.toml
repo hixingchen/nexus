@@ -5,7 +5,7 @@ members = ["boot-runner", "boot-core", "linux"]
 
 [package]
 name = "nexus"
-version = "2.4.0"
+version = "2.4.1"
 description = "Nexus - Development Environment Manager"
 authors = ["Nexus Team"]
 edition = "2021"
