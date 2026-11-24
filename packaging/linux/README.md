@@ -90,10 +90,9 @@ sudo ./install.sh --system
 # 1) 添加一个项目（路径必须已存在）
 nexusctl project add /srv/app --name app
 
-# 2) 添加一个服务：开机启动、10 秒后算就绪
-nexusctl service add -p app -n demo \
-  -c "sleep 3600" \
-  --boot --order 10 --ready wait:10
+# 2) 添加一个服务：只有 -p/-n/-c 必填；--boot 表示开机自启
+#    workdir / order / ready / required / env / crash_restart 都有默认值
+nexusctl service add -p app -n app -c "sleep 3600" --boot
 
 # 3) 看配置
 nexusctl service list
@@ -121,6 +120,57 @@ nexusctl boot status     # linger: on
 
 > 示例配置里的 `/srv/app`、`npm run start` 只是模板；用 CLI 添加真实服务前，先删掉示例：
 > `nexusctl service remove app api`、`nexusctl project remove app`。
+
+### 5.1 最小用法与默认值
+
+**服务必填参数只有 3 个**：`-p` 项目、`-n` 服务名、`-c` 命令；要开机自启再加 `--boot`。
+其它参数不写就用默认值：
+
+| 参数 | 默认值 | 什么时候改 |
+|---|---|---|
+| `workdir` | 项目路径 | 服务不在项目根目录 |
+| `env` | 空 | 需要 `NODE_ENV`、`JAVA_HOME`、`HOME` 等 |
+| `boot` | `false` | 要开机自动拉起（加 `--boot`） |
+| `order` | `0` | 多个开机服务需要固定先后顺序 |
+| `ready` | `none`（进程存活即就绪） | 服务要等端口/日志关键字才算启动完成 |
+| `required` | `false` | 该服务未就绪时要阻断后续开机服务 |
+| `crash_restart` | `true` | 不想在崩溃后自动重启（加 `--no-crash-restart`） |
+
+```bash
+# 最小：项目路径即工作目录，启动即算就绪
+nexusctl service add -p app -n app -c "npm run start" --boot
+
+# 按需加参数（不是必须的）：
+nexusctl service add -p app -n web -c "npm run start" \
+  --workdir /srv/app/web \
+  --env NODE_ENV=production \
+  --boot --order 20 \
+  --ready tcp:127.0.0.1:3000 --required
+```
+
+`ready` 的默认值是“进程活着就算就绪”。如果这个服务后面还有别的服务依赖它（比如后端要等数据库端口），
+再给数据库加 `--ready tcp:127.0.0.1:5432 --required`；否则可以先不写。
+
+### 5.2 常见进阶场景
+
+```bash
+# 改端口/等端口就绪
+nexusctl service set app web --ready tcp:127.0.0.1:8080
+
+# 调整启动顺序，并在未就绪时阻断后续
+nexusctl service set app db --order 10 --required
+nexusctl service set app api --order 20 --required
+
+# 加环境变量
+nexusctl service set app web --env NODE_ENV=production
+
+# 关闭崩溃自动重启
+nexusctl service set app web --no-crash-restart
+
+# 非开机服务：不写 --boot；之后手动启动
+nexusctl service add -p app -n tools -c "sleep 3600"
+nexusctl service start app tools
+```
 
 ## 6. 配置
 
@@ -214,6 +264,7 @@ nexusctl project remove <名字>        # 项目下必须没有服务
 
 ```bash
 nexusctl service list [--json]
+# 必填只有 -p / -n / -c；下面方括号里的都是可选项
 nexusctl service add -p <项目> -n <服务> -c <命令> \
   [--workdir <目录>] [--env K=V]... \
   [--boot] [--order N] [--ready <检查>] [--required] [--no-crash-restart]
