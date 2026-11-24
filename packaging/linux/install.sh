@@ -61,8 +61,9 @@ if [ "$MODE" = "system" ]; then
   if [ ! -f "$CONF_FILE" ]; then
     # 正式配置从空开始，不复制示例项目/服务，避免装完就出现 app/api
     printf 'version = 1\n' > "$CONF_FILE"
-    chmod 0600 "$CONF_FILE"
   fi
+  # 已有配置也收紧权限：里面可能有环境变量/命令
+  chmod 0600 "$CONF_FILE"
   echo "[nexus] 已安装：$BIN_DIR/nexusctl、$BIN_DIR/nexus-boot-runner"
   echo "[nexus] 配置：$CONF_FILE（示例：$ROOT/share/nexus.example.toml，不会被复制）"
 
@@ -90,8 +91,8 @@ else
   if [ ! -f "$CONF_FILE" ]; then
     # 正式配置从空开始，不复制示例项目/服务，避免装完就出现 app/api
     printf 'version = 1\n' > "$CONF_FILE"
-    chmod 0600 "$CONF_FILE"
   fi
+  chmod 0600 "$CONF_FILE"
   echo "[nexus] 已安装：$BIN_DIR/nexusctl、$BIN_DIR/nexus-boot-runner"
   echo "[nexus] 配置：$CONF_FILE（示例：$ROOT/share/nexus.example.toml，不会被复制）"
   case ":$PATH:" in

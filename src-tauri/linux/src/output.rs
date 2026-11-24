@@ -115,12 +115,24 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) {
     }
 }
 
+/// 打开日志文件；Unix 上拒绝符号链接，避免日志路径把 root CLI 引到别的文件。
+fn open_log(path: &Path) -> std::io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 /// 读取日志末尾的原始字节（最多 [`MAX_TAIL_BYTES`]），行尾统一补 `\n`。
 ///
 /// 不整份读文件：服务日志可能被用户程序写大，整份 `read_to_end` 会让 CLI
 /// 在低内存机器上直接失败。文件在元数据之后继续增长也不会读超过上限。
 pub fn read_tail_bytes(path: &Path, lines: usize) -> std::io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+    let mut file = open_log(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -199,7 +211,7 @@ pub fn follow_file(path: &Path, lines: usize) -> Result<(), String> {
     let mut last_len = 0u64;
     loop {
         if file.is_none() {
-            match File::open(path) {
+            match open_log(path) {
                 Ok(mut f) => {
                     if read_from_start {
                         f.seek(SeekFrom::Start(0))
@@ -314,5 +326,17 @@ mod tests {
             read_tail(&path, 10).expect_err("文件不存在").kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_tail_refuses_symlink_log() {
+        let target = temp_log("symlink-target");
+        std::fs::write(&target, "secret\n").expect("写目标");
+        let link = temp_log("symlink-link");
+        std::os::unix::fs::symlink(&target, &link).expect("建符号链接");
+        assert!(read_tail(&link, 10).is_err(), "日志读取必须拒绝符号链接");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
     }
 }

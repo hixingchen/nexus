@@ -66,6 +66,7 @@ pub fn render_unit(layout: &Layout, runner: &Path) -> Result<String, String> {
          Restart=on-failure\n\
          RestartSec=3\n\
          KillMode=control-group\n\
+         UMask=0077\n\
          StandardOutput=journal\n\
          StandardError=journal\n\
          \n\
@@ -173,6 +174,13 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
                 .into(),
         );
     }
+    // 先把运行用户校验/数据目录改属主做完，避免用户名写错时留下半套 unit。
+    if layout.system {
+        if let Some(user) = layout.run_as.as_deref() {
+            chown_tree(&layout.data_dir, user)?;
+        }
+    }
+
     let unit = render_unit(layout, runner)?;
     if let Some(parent) = layout.unit_path.parent() {
         std::fs::create_dir_all(parent)
@@ -184,13 +192,6 @@ pub fn install(layout: &Layout, runner: &Path) -> Result<InstallReport, String> 
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&layout.unit_path, std::fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("设置 unit 权限失败: {}", e))?;
-    }
-
-    if layout.system {
-        // 指定了运行用户才需要把数据目录交给它；省略 --run-as 时 runner 以 root 运行。
-        if let Some(user) = layout.run_as.as_deref() {
-            chown_tree(&layout.data_dir, user)?;
-        }
     }
 
     // 升级场景：unit 已在跑时 `enable --now` 不会重载新二进制，必须 restart。
@@ -447,9 +448,16 @@ fn chown_path(path: &Path, uid: u32, gid: u32, follow: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// 用 `getpwnam_r` 查 uid/gid：避免 `getpwnam` 的静态缓冲区（多线程下不安全）。
 #[cfg(unix)]
-fn user_ids(name: &str) -> Result<(u32, u32), String> {
+struct UserInfo {
+    uid: u32,
+    gid: u32,
+    home: Option<String>,
+}
+
+/// 用 `getpwnam_r` 查用户：避免 `getpwnam` 的静态缓冲区（多线程下不安全）。
+#[cfg(unix)]
+fn lookup_user(name: &str) -> Result<UserInfo, String> {
     use std::ffi::CString;
     let c = CString::new(name).map_err(|_| format!("用户名含 NUL: {}", name))?;
     let mut buf_len = 16 * 1024;
@@ -470,7 +478,16 @@ fn user_ids(name: &str) -> Result<(u32, u32), String> {
             if result.is_null() {
                 return Err(format!("用户不存在: {}", name));
             }
-            return Ok((pwd.pw_uid, pwd.pw_gid));
+            let home = if pwd.pw_dir.is_null() {
+                None
+            } else {
+                let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+                dir.to_str()
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            return Ok(UserInfo { uid: pwd.pw_uid, gid: pwd.pw_gid, home });
         }
         if rc == libc::EINTR {
             continue;
@@ -484,6 +501,24 @@ fn user_ids(name: &str) -> Result<(u32, u32), String> {
             name,
             std::io::Error::from_raw_os_error(rc)
         ));
+    }
+}
+
+#[cfg(unix)]
+fn user_ids(name: &str) -> Result<(u32, u32), String> {
+    lookup_user(name).map(|u| (u.uid, u.gid))
+}
+
+/// 目标用户的家目录；用户不存在或非 Unix 时返回 None。
+pub fn user_home(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        lookup_user(name).ok().and_then(|u| u.home)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
     }
 }
 
@@ -514,6 +549,7 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(!unit.contains("User="));
         assert!(unit.contains("KillMode=control-group"));
+        assert!(unit.contains("UMask=0077"));
         let runner_q = unit_quote(runner.to_str().unwrap()).unwrap();
         let manifest_q = unit_quote(l.manifest_path().to_str().unwrap()).unwrap();
         assert!(
@@ -568,6 +604,15 @@ mod tests {
         assert_eq!(is_active_state("inactive\n"), Some(false));
         assert_eq!(is_active_state("failed\n"), Some(false));
         assert_eq!(is_active_state(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_lookup_finds_root_and_rejects_unknown() {
+        let root = user_ids("root").expect("root 应存在");
+        assert!(root.0 < u32::MAX);
+        assert!(user_home("root").is_some());
+        assert!(user_ids("nexus-no-such-user-xyz").is_err());
     }
 
     #[cfg(unix)]

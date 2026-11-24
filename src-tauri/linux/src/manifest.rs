@@ -44,13 +44,23 @@ const ENV_WHITELIST: &[&str] = &[
 ];
 
 /// 当前环境快照 + 配置里的全局 env（后者覆盖快照）。
-pub fn env_snapshot(config: &Config) -> BTreeMap<String, String> {
+///
+/// 系统级以 `--run-as <用户>` 运行时，CLI 本身可能是 root；不能把 root 的
+/// `HOME/USER/LOGNAME` 带进服务环境。这里用目标用户覆盖，服务的 `env` 仍可再覆盖。
+pub fn env_snapshot(config: &Config, run_as: Option<&str>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for key in ENV_WHITELIST {
         if let Ok(v) = std::env::var(key) {
             if !v.trim().is_empty() {
                 out.insert((*key).to_string(), v);
             }
+        }
+    }
+    if let Some(user) = run_as {
+        out.insert("USER".into(), user.to_string());
+        out.insert("LOGNAME".into(), user.to_string());
+        if let Some(home) = crate::systemd::user_home(user) {
+            out.insert("HOME".into(), home);
         }
     }
     for (k, v) in &config.env {
@@ -60,9 +70,13 @@ pub fn env_snapshot(config: &Config) -> BTreeMap<String, String> {
 }
 
 /// 生成并写盘 manifest；返回生成的结构（runner 读的是同一份文件）。
-pub fn generate(config: &Config, boot_dir: &Path) -> Result<BootManifest, String> {
+pub fn generate(
+    config: &Config,
+    boot_dir: &Path,
+    run_as: Option<&str>,
+) -> Result<BootManifest, String> {
     config.validate()?;
-    let snapshot = env_snapshot(config);
+    let snapshot = env_snapshot(config, run_as);
     let logs_dir = boot_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)
         .map_err(|e| format!("创建日志目录失败 {}: {}", logs_dir.display(), e))?;
@@ -182,7 +196,7 @@ mod tests {
     fn generates_all_services_with_boot_flag_and_env_merge() {
         let dir = temp_dir("manifest");
         let cfg = sample_config();
-        let m = generate(&cfg, &dir).expect("生成 manifest");
+        let m = generate(&cfg, &dir, None).expect("生成 manifest");
         assert_eq!(m.services.len(), 2, "非开机服务也要在 manifest 里");
         assert_eq!(m.services[0].id, "app.api");
         assert!(m.services[0].boot_enabled);
@@ -208,11 +222,21 @@ mod tests {
     }
 
     #[test]
+    fn run_as_overrides_identity_env_but_config_wins() {
+        let mut cfg = Config::default();
+        cfg.env.insert("HOME".into(), "/custom/home".into());
+        let env = env_snapshot(&cfg, Some("deploy"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("deploy"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("deploy"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/custom/home"));
+    }
+
+    #[test]
     fn default_workdir_and_sorting() {
         let dir = temp_dir("sort");
         let mut cfg = sample_config();
         cfg.services[0].order = 99;
-        let m = generate(&cfg, &dir).expect("生成");
+        let m = generate(&cfg, &dir, None).expect("生成");
         assert_eq!(m.services[0].id, "app.worker", "order 小的先出现");
         let _ = std::fs::remove_dir_all(&dir);
     }

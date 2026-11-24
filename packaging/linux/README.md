@@ -306,8 +306,8 @@ nexusctl --config /path/nexus.toml --data-dir /path/data ...
 `CARGO_HOME`、`GOROOT` 等路径/工具类变量（不包含代理凭据/密钥）。
 
 - 安装/切换 Node、Java 后 PATH 变了：执行 `nexusctl boot sync` 刷新。
-- 系统级 unit 以 `--run-as <用户>` 运行时，CLI 若以 root 执行，快照里的 `HOME/USER` 是 root；
-  需要时给服务显式加 `--env HOME=/home/<用户> --env USER=<用户> --env LOGNAME=<用户>`。
+- 系统级指定 `--run-as <用户>` 时，manifest 会把 `USER`/`LOGNAME`/`HOME` 指向该用户，
+  不会把 root 的身份带进服务；服务自己的 `--env` 仍然优先级最高。
 
 ## 7. 命令参考
 
@@ -607,10 +607,12 @@ nexusctl service add -p app -n web -c "..." --boot --order 30 --ready tcp:127.0.
 ## 12. 安全与权限
 
 - 尽量让服务以**非 root** 用户运行：系统级 install 时用 `--run-as <用户>`，unit 会设置 `User=`。
-- 用户级配置默认 0600；数据目录用户级 0700、系统级 0750。
+- 配置文件始终 0600；数据目录（配置/state/日志/命令）统一 0700。
+- systemd unit 设置 `UMask=0077`，runner 新建的 state/服务日志默认 0600。
+- `nexusctl logs` 只允许读数据目录 `logs/` 下的直接文件，并拒绝符号链接，避免被日志路径引到系统文件。
 - 命令、环境变量和日志可能含敏感信息；不要把密码直接写进命令行，优先用服务 `env`（配置 0600）
   或服务自己的配置文件。
-- system 级安装需要 root；unit 文件 root 所有，服务进程按 `User=` 降权。
+- system 级安装需要 root；unit 文件 root 所有，服务进程按 `User=` 降权。省略 `--run-as` 则以 root 运行，权限更大。
 - 端口是否对外开放由服务自身和防火墙决定，Nexus 不修改防火墙。
 
 ## 13. 升级、备份、多实例

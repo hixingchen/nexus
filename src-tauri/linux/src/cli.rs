@@ -1070,14 +1070,14 @@ fn show_service(layout: &Layout, project: &str, name: &str, json: bool) -> Resul
     let state = client::state(layout);
     let runner_ok = state.as_ref().map(runner_reachable).unwrap_or(false);
     let st = state.as_ref().and_then(|s| s.services.get(&id));
+    let fallback_log = service_log_path_in(&layout.logs_dir(), &id)
+        .to_string_lossy()
+        .into_owned();
     let log_path = st
-        .map(|s| s.log_path.clone())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| {
-            service_log_path_in(&layout.logs_dir(), &id)
-                .to_string_lossy()
-                .into_owned()
-        });
+        .map(|s| PathBuf::from(&s.log_path))
+        .filter(|p| trusted_log_path(layout, p))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(fallback_log);
     let workdir = cfg.workdir_of(svc);
     let project_path = cfg
         .find_project(&svc.project)
@@ -1276,7 +1276,7 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
                 cfg.save(&layout.config_path)?;
             }
             layout.ensure_dirs()?;
-            manifest::generate(&cfg, &layout.boot_dir)?;
+            manifest::generate(&cfg, &layout.boot_dir, layout.run_as.as_deref())?;
             let runner = layout.runner_path(runner)?;
             let report = systemd::install(layout, &runner)?;
             println!("已生成 manifest：{}", layout.manifest_path().display());
@@ -1348,7 +1348,7 @@ fn boot_cmd(layout: &Layout, runner: Option<PathBuf>, cmd: BootCmd) -> Result<()
         BootCmd::Sync => {
             let cfg = Config::load(&layout.config_path)?;
             layout.ensure_dirs()?;
-            manifest::generate(&cfg, &layout.boot_dir)?;
+            manifest::generate(&cfg, &layout.boot_dir, layout.run_as.as_deref())?;
             let reloaded = client::reload_if_running(layout)?;
             println!(
                 "manifest 已更新：{}{}",
@@ -1391,18 +1391,26 @@ fn logs_cmd(
     }
 }
 
+/// 日志路径必须是数据目录 logs/ 下的直接文件；state.json 被篡改也不能让 CLI 读别处。
+fn trusted_log_path(layout: &Layout, path: &Path) -> bool {
+    let logs = layout.logs_dir();
+    path.parent() == Some(logs.as_path()) && path.file_name().is_some()
+}
+
 fn service_log_path(layout: &Layout, project: &str, name: &str) -> Result<PathBuf, String> {
     let cfg = Config::load(&layout.config_path)?;
     cfg.find_service(project, name)
         .ok_or_else(|| format!("服务不存在: {}.{}", project, name))?;
     let id = format!("{}.{}", project, name);
+    let fallback = service_log_path_in(&layout.logs_dir(), &id);
     let state = client::state(layout);
     Ok(state
         .as_ref()
         .and_then(|s| s.services.get(&id))
         .map(|s| PathBuf::from(&s.log_path))
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| service_log_path_in(&layout.logs_dir(), &id)))
+        .filter(|p| trusted_log_path(layout, p))
+        .unwrap_or(fallback))
 }
 
 fn show_service_log(
@@ -1662,7 +1670,7 @@ fn boot_status(layout: &Layout, json: bool) -> Result<(), String> {
 fn save_and_sync(layout: &Layout, cfg: &Config) -> Result<bool, String> {
     layout.ensure_dirs()?;
     cfg.save(&layout.config_path)?;
-    manifest::generate(cfg, &layout.boot_dir)?;
+    manifest::generate(cfg, &layout.boot_dir, layout.run_as.as_deref())?;
     client::reload_if_running(layout)
 }
 

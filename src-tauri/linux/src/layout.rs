@@ -126,8 +126,9 @@ impl Layout {
 
     /// 确保目录存在；system 模式下由调用方负责 chown。
     ///
-    /// 数据目录里有服务命令（可能含凭据）与日志，默认收紧到 0700（用户级）/
-    /// 0750（系统级，组内可读）。system 模式的 chown 在 systemd::install 里做。
+    /// 数据目录里有服务命令、环境变量与日志，统一收紧到 0700：
+    /// 只有 owner（系统级是 root/`--run-as` 用户）能进，组和其他用户都不可读。
+    /// system 模式的 chown 在 systemd::install 里做。
     pub fn ensure_dirs(&self) -> Result<(), String> {
         let dirs = [
             &self.data_dir,
@@ -143,9 +144,8 @@ impl Layout {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = if self.system { 0o750 } else { 0o700 };
             for dir in dirs {
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                     .map_err(|e| format!("设置目录权限失败 {}: {}", dir.display(), e))?;
             }
         }
