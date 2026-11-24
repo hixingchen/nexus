@@ -935,11 +935,20 @@ mod imp {
             self.write_state();
 
             // 先把已经退出的直接子进程回收掉，避免僵尸干扰快照/等待。
+            // 如果 runner 还没来得及 poll_children（stop 命令先到），这里要立刻认领
+            // 它的进程组/后代，否则 startup.sh 这类“包装进程已退出”的服务会漏杀。
             let mut child_status: Option<std::process::ExitStatus> = None;
+            let mut exited_child: Option<(u32, u64)> = None;
             if let Some(child) = run.child.as_mut() {
                 if let Ok(Some(st)) = child.try_wait() {
+                    exited_child = Some((child.id(), run.child_started_at));
                     child_status = Some(st);
                     run.child = None;
+                }
+            }
+            if let Some((pid, started_at)) = exited_child {
+                if run.adopted.is_empty() {
+                    run.adopted = crate::process_exec::adopt_survivors(pid, started_at);
                 }
             }
 
