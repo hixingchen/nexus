@@ -89,10 +89,13 @@ enum ServiceCmd {
     },
     /// 添加服务
     Add {
+        /// 所属项目名（需先用 project add 创建）
         #[arg(short = 'p', long)]
         project: String,
+        /// 服务名（用于 start/stop/logs；可与项目名不同）
         #[arg(short = 'n', long)]
         name: String,
+        /// 启动命令（由 sh -c 在工作目录执行）
         #[arg(short = 'c', long)]
         command: String,
         /// 工作目录（默认项目路径）
@@ -119,7 +122,9 @@ enum ServiceCmd {
     },
     /// 修改服务信息
     Set {
+        /// 项目名
         project: String,
+        /// 服务名
         name: String,
         #[arg(short = 'c', long)]
         command: Option<String>,

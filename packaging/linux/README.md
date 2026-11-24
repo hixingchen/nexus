@@ -85,97 +85,142 @@ sudo ./install.sh --system
 
 > `install.sh` 只安装二进制和示例配置，**不会自动启用开机启动**；启用用 `boot install`。
 
-## 5. 五分钟快速开始
+## 5. 五分钟快速开始（详细）
 
-以下用用户级为例；系统级把 `nexusctl` 换成 `sudo nexusctl --system`，并在 `boot install` 时加 `--run-as <用户>`。
-**系统级命令必须带 `--system`**，否则读的是用户级配置（`~/.config/nexus/nexus.toml`）。
+下面以**系统级**为例（服务器推荐）。用户级安装请把 `sudo nexusctl --system` 换成 `nexusctl`，
+`boot install` 不要加 `--run-as`，并开启 linger。
 
-```bash
-# 1) 添加一个项目（路径必须已存在）
-nexusctl project add /srv/app --name app
+> 系统级所有命令都必须带 `--system`；不带 `--system` 读的是用户级配置，两套配置互不相通。
 
-# 2) 添加一个服务：只有 -p/-n/-c 必填；--boot 表示开机自启
-#    workdir / order / ready / required / env / crash_restart 都有默认值
-nexusctl service add -p app -n app -c "sleep 3600" --boot
+假设：
 
-# 3) 看配置
-nexusctl service list
+- 项目目录 `/srv/app` 已存在
+- 服务名 `web`
+- 启动命令 `npm run start`（只测试时可以换成 `sleep 3600`）
 
-# 4) 安装/启动 systemd unit（会生成 manifest）
-nexusctl boot install
-sleep 3
-
-# 5) 看运行状态和日志
-nexusctl boot status
-nexusctl service list
-nexusctl boot logs app demo --lines 50
-
-# 6) 停止/重启
-nexusctl service stop app demo
-nexusctl service start app demo
-```
-
-无人登录也要启动（仅用户级需要）：
+### 第 1 步：创建项目
 
 ```bash
-sudo loginctl enable-linger "$USER"
-nexusctl boot status     # linger: on
+sudo nexusctl --system project add /srv/app --name app
 ```
 
-> 新安装的正式配置默认是**空的**（示例只在 `share/nexus.example.toml`，不会被复制）。
-> 如果你从旧安装升级、配置里仍有示例 `app/api`，先删掉：
-> `nexusctl service remove app api`、`nexusctl project remove app`。
+- 位置参数 `/srv/app`：项目目录，必须已存在
+- `--name app`：项目名；后面 `-p app` 就用它
 
-### 5.1 最小用法与默认值
+### 第 2 步：添加服务
 
-**服务必填参数只有 3 个**：`-p` 项目、`-n` 服务名、`-c` 命令；要开机自启再加 `--boot`。
-其它参数不写就用默认值：
+```bash
+sudo nexusctl --system service add \
+  --project app \
+  --name web \
+  --command "npm run start" \
+  --boot
+```
+
+四个关键参数：
+
+| 选项 | 全称 | 必填 | 含义 |
+|---|---|---|---|
+| `-p` | `--project` | 是 | 服务属于哪个项目（第 1 步 `--name` 的值） |
+| `-n` | `--name` | 是 | 服务名，用于 start/stop/logs；可以和项目名不同 |
+| `-c` | `--command` | 是 | 启动命令；由 `sh -c` 在工作目录执行 |
+| `--boot` | — | 否 | 开机（runner 启动）时自动拉起 |
+
+等价短写：
+
+```bash
+sudo nexusctl --system service add -p app -n web -c "npm run start" --boot
+```
+
+只测试命令本身、不接真实项目时：
+
+```bash
+sudo nexusctl --system service add -p app -n demo -c "sleep 3600" --boot
+```
+
+其它参数不写就用默认值：`workdir=项目路径`、`order=0`、`ready=进程存活`、
+`required=false`、`crash_restart=true`。详见 5.1。
+
+### 第 3 步：查看
+
+```bash
+sudo nexusctl --system service list          # 所有项目
+sudo nexusctl --system service list -p app   # 只看 app 项目
+```
+
+输出列：`PROJECT SERVICE BOOT ORDER STATUS PID READY`。
+
+### 第 4 步：安装/启动开机 unit
+
+```bash
+sudo nexusctl --system --run-as admin boot install
+```
+
+- `service add --boot` 只是标记“这个服务要开机启动”；
+- `boot install` 才真正生成 manifest、写 systemd unit、启动 runner；
+- 第一次做开机自启时**两个都要**；
+- 示例 `admin` 是服务进程的运行用户，按实际替换；系统级必填；
+- 用户级不需要 `--run-as`，执行 `nexusctl boot install` 后
+  再 `sudo loginctl enable-linger "$USER"`。
+
+### 第 5 步：状态、日志、启停
+
+```bash
+sudo nexusctl --system boot status
+sudo nexusctl --system service list -p app
+sudo nexusctl --system boot logs app web --lines 100
+
+sudo nexusctl --system service stop app web
+sudo nexusctl --system service start app web
+```
+
+`service stop/start` 是立即操作，不会改变 `--boot` 标记。
+
+### 第 6 步：删除
+
+```bash
+sudo nexusctl --system service stop app web
+sudo nexusctl --system service remove app web
+sudo nexusctl --system project remove app
+```
+
+### 5.1 默认值（不写就用）
 
 | 参数 | 默认值 | 什么时候改 |
 |---|---|---|
 | `workdir` | 项目路径 | 服务不在项目根目录 |
-| `env` | 空 | 需要 `NODE_ENV`、`JAVA_HOME`、`HOME` 等 |
+| `env` | 空 | 需要 NODE_ENV、JAVA_HOME、HOME 等 |
 | `boot` | `false` | 要开机自动拉起（加 `--boot`） |
 | `order` | `0` | 多个开机服务需要固定先后顺序 |
 | `ready` | `none`（进程存活即就绪） | 服务要等端口/日志关键字才算启动完成 |
 | `required` | `false` | 该服务未就绪时要阻断后续开机服务 |
 | `crash_restart` | `true` | 不想在崩溃后自动重启（加 `--no-crash-restart`） |
 
-```bash
-# 最小：项目路径即工作目录，启动即算就绪
-nexusctl service add -p app -n app -c "npm run start" --boot
-
-# 按需加参数（不是必须的）：
-nexusctl service add -p app -n web -c "npm run start" \
-  --workdir /srv/app/web \
-  --env NODE_ENV=production \
-  --boot --order 20 \
-  --ready tcp:127.0.0.1:3000 --required
-```
-
-`ready` 的默认值是“进程活着就算就绪”。如果这个服务后面还有别的服务依赖它（比如后端要等数据库端口），
-再给数据库加 `--ready tcp:127.0.0.1:5432 --required`；否则可以先不写。
-
-### 5.2 常见进阶场景
+### 5.2 什么时候需要进阶参数
 
 ```bash
-# 改端口/等端口就绪
-nexusctl service set app web --ready tcp:127.0.0.1:8080
+# 服务在自己的子目录
+nexusctl --system service set app web --workdir /srv/app/web
 
-# 调整启动顺序，并在未就绪时阻断后续
-nexusctl service set app db --order 10 --required
-nexusctl service set app api --order 20 --required
+# 等端口起来才算就绪
+nexusctl --system service set app web --ready tcp:127.0.0.1:3000
+
+# 多服务顺序 + 未就绪阻断
+nexusctl --system service set app db --order 10 --required
+nexusctl --system service set app api --order 20 --required
 
 # 加环境变量
-nexusctl service set app web --env NODE_ENV=production
+nexusctl --system service set app web --env NODE_ENV=production
 
 # 关闭崩溃自动重启
-nexusctl service set app web --no-crash-restart
+nexusctl --system service set app web --no-crash-restart
 
-# 非开机服务：不写 --boot；之后手动启动
-nexusctl service add -p app -n tools -c "sleep 3600"
-nexusctl service start app tools
+# 非开机服务：不写 --boot，之后手动启动
+nexusctl --system service add -p app -n tools -c "sleep 3600"
+nexusctl --system service start app tools
 ```
+
+Tomcat / Java / Python 等完整示例见第 10 节。
 
 ## 6. 配置
 
