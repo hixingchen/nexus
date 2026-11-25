@@ -66,5 +66,8 @@ CLAUDE.md
 # 前端调试 harness（CDP 复现用，见 memory/tauri-frontend-test-harness）
 repro/
 
-# 本地方案/分析文档（不随仓库提交）
-docs/
+# 本地问题记录（不随仓库提交）
+/docs/issues/
+
+# 本地分析文档（不随仓库提交）
+/docs/feature-analysis-*.md

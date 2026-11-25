@@ -12,6 +12,7 @@ manifest / 就绪检查 / 崩溃重启语义。适用场景：在 Linux 服务�
 - 无桌面服务器默认系统级：`sudo ./install.sh --system` 一条命令完成安装并启用（不降权，以 root 运行；
   推荐加 `--run-as <非 root 用户>`）；日常用 `nexusctl add <目录> -c '<命令>' --boot`、`nexusctl status`、`nexusctl start/stop/restart <项目> [服务]`、`nexusctl logs <项目> <服务> -f`
 - 安装与用法：[`packaging/linux/README.md`](packaging/linux/README.md)
+- Windows 桌面版操作手册：[`docs/manuals/README.md`](docs/manuals/README.md)
 - 打包/发布：与 Windows 桌面版同 tag、同一个 GitHub Release 的**两组独立资产**；
   Linux 资产同时提供 `x86_64` 与 `aarch64`（按 `uname -m` 选择）
 - 不包含：GUI、编辑器、文件树、AI 面板、数据库
