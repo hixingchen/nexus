@@ -251,13 +251,12 @@ jobs:
             - **Windows 桌面版**目前只打包发布 Windows；macOS 未支持。Linux 提供独立的**无界面服务端版**（见上），不含 GUI/编辑器/AI 面板
             - `.class` 反编译需要本机有 JRE，没有时自动回退到字节码视图
 
-  release-linux:
-    # 串行：等 Windows job 建好 Release，再把 Linux 资产挂上去。
-    # 两个 job 并行各自建同名 Release 有竞态；串行 + gh release upload 最直接。
+  build-linux:
+    # 与 Windows 构建**并行**：Linux 只负责测试 + 打包并上传 artifact。
+    # Windows job 建好 Release 后，release-linux 只做镜像上传，不再串行等待。
     #
     # 只改 Windows 时，在提交信息里带 [skip-linux] 可跳过 Linux 测试/打包；
     # 之后 Linux 有更新时用 linux-repackage.yml 补同名资产，或正常 tag 全量发布。
-    needs: release
     if: ${{ !contains(github.event.head_commit.message || '', '[skip-linux]') }}
     runs-on: ubuntu-22.04
     steps:
@@ -284,12 +283,30 @@ jobs:
       - name: 构建 Linux 服务端包
         run: bash scripts/package-linux.sh
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-linux-x86_64
+          path: src-tauri/target/linux-package/
+          if-no-files-found: error
+          retention-days: 3
+
+  release-linux:
+    # 只负责把并行构建好的 Linux 资产挂到 Windows job 创建的同一个 Release。
+    needs: [release, build-linux]
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip-linux]') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nexus-linux-x86_64
+          path: linux-package
+
       # 与 Windows 安装包是两组独立资产：同一个 tag/Release，但互不包含。
       - name: 上传到同一个 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
-            src-tauri/target/linux-package/nexus-*-linux-x86_64.tar.gz \
-            src-tauri/target/linux-package/nexus-*-linux-x86_64.tar.gz.sha256 \
+            linux-package/nexus-*-linux-x86_64.tar.gz \
+            linux-package/nexus-*-linux-x86_64.tar.gz.sha256 \
             --clobber
