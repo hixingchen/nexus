@@ -20,6 +20,9 @@ permissions:
 
 jobs:
   build:
+    # 与 release.yml 的 release-linux 同口径：提交信息带 [skip-linux] 的
+    # Windows-only 发布不构建 aarch64；workflow_dispatch 补发不受影响。
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[skip-linux]') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

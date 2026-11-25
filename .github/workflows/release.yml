@@ -254,7 +254,11 @@ jobs:
   release-linux:
     # 串行：等 Windows job 建好 Release，再把 Linux 资产挂上去。
     # 两个 job 并行各自建同名 Release 有竞态；串行 + gh release upload 最直接。
+    #
+    # 只改 Windows 时，在提交信息里带 [skip-linux] 可跳过 Linux 测试/打包；
+    # 之后 Linux 有更新时用 linux-repackage.yml 补同名资产，或正常 tag 全量发布。
     needs: release
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip-linux]') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
